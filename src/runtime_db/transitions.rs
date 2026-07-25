@@ -499,6 +499,31 @@ impl RuntimeTransitionRepository<'_> {
             if !matches!(&command.mutation, QueueMutation::Upsert(_)) && !mutation_applied {
                 return Ok(TransitionCommit::default());
             }
+            // When a message transitions to Interrupted (via Release or Settle),
+            // clean up any shadow comparison records written during the prior
+            // Claim/Settlement phase. Without this, stale records cause identity
+            // conflicts after restart when the scheduler re-processes the
+            // interrupted message with a new payload_hash.
+            let is_interrupted = matches!(
+                (&command.operation, &command.mutation),
+                (QueueOperation::Release, QueueMutation::Upsert(r))
+                    if r.status == QueueEntryStatus::Interrupted
+            ) || matches!(
+                (&command.operation, &command.mutation),
+                (QueueOperation::Settle, QueueMutation::Upsert(r))
+                    if r.status == QueueEntryStatus::Interrupted
+            );
+            if is_interrupted {
+                let message_id = match &command.mutation {
+                    QueueMutation::Upsert(record) => &record.message_id,
+                    _ => unreachable!("queue operation validation rejects this combination"),
+                };
+                scheduler_protocol_repository::delete_shadow_comparisons_for_message_tx(
+                    tx,
+                    &command.agent_id,
+                    message_id,
+                )?;
+            }
             let shadow_comparison = scheduler_protocol_repository::validate_shadow_comparison_tx(
                 tx,
                 &command.agent_id,

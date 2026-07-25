@@ -129,7 +129,7 @@ use continuation::{resolve_continuation, ContinuationTrigger};
 use subagent::sanitize_subagent_result;
 use turn::LoopControlOptions;
 
-const ENQUEUE_AGENT_STATE_MAX_ATTEMPTS: usize = 3;
+pub(crate) const ENQUEUE_AGENT_STATE_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub(super) struct WorkItemCompletionReportPromotion {
@@ -1041,6 +1041,12 @@ struct RuntimeAgent {
 impl RuntimeAgent {
     fn persist_state(&mut self, storage: &AppStorage) -> Result<()> {
         let started = std::time::Instant::now();
+        // persist_state bypasses OCC (uses upsert, not expected-snapshot
+        // validation). This is intentional for control-plane operations
+        // (Start/Stop/shutdown) that need to force-write agent state.
+        // After a successful write, last_persisted_state is set to
+        // self.state so subsequent commit_queue OCC checks use the
+        // correct baseline. On failure, self.state is reverted.
         if let Err(error) = storage.write_agent(&self.state) {
             self.state = self.last_persisted_state.clone();
             crate::diagnostics::record_storage_persist_state(started.elapsed());
@@ -2240,7 +2246,10 @@ impl RuntimeHandle {
         Ok(commit)
     }
 
-    async fn refresh_enqueue_agent_state_baseline(&self, agent_id: &str) -> Result<bool> {
+    pub(crate) async fn refresh_enqueue_agent_state_baseline(
+        &self,
+        agent_id: &str,
+    ) -> Result<bool> {
         let mut guard = self.inner.agent.lock().await;
         let Some(latest_persisted_state) = self.inner.runtime_db.agent_states().latest(agent_id)?
         else {
@@ -2296,7 +2305,7 @@ impl RuntimeHandle {
     async fn commit_queue_terminal_settlement_with_evidence(
         &self,
         record: QueueEntryRecord,
-        mut audit_events: Vec<AuditEvent>,
+        audit_events: Vec<AuditEvent>,
         notify_scheduler: bool,
         terminal_transition: Option<&turn::TurnTerminalTransition>,
         committed_agent_state: Option<AgentState>,
@@ -2312,77 +2321,98 @@ impl RuntimeHandle {
                 &[scheduler::SETTLEMENT_SCENARIO, scheduler::DELIVERY_SCENARIO],
                 self.scheduler_protocol_production_commands_enabled(),
             )?;
-        let (projection_state, queue_len, agent_state) = {
-            let guard = self.inner.agent.lock().await;
-            let mut state = committed_agent_state.unwrap_or_else(|| guard.state.clone());
-            let agent_state = if let Some(transition) = terminal_transition {
-                state.current_turn_id = Some(transition.terminal.turn_id.clone());
-                state.last_turn_terminal = Some(transition.terminal.clone());
-                Some(crate::runtime_db::transitions::AgentStateMutation {
-                    expected: Some(Box::new(guard.last_persisted_state.clone())),
-                    record: Box::new(state.clone()),
-                })
-            } else {
-                None
+        let original_audit_len = audit_events.len();
+        let mut command = crate::runtime_db::transitions::QueueTransitionCommand {
+            agent_id: record.agent_id.clone(),
+            operation: crate::runtime_db::transitions::QueueOperation::Settle,
+            mutation: crate::runtime_db::transitions::QueueMutation::Upsert(record.clone()),
+            scheduler_claim_work_item: None,
+            scheduler_protocol_bootstrap: None,
+            scheduler_protocol_commands: scheduler_protocol_commands.clone(),
+            scheduler_authority_scenarios: vec![
+                scheduler::SETTLEMENT_SCENARIO,
+                scheduler::DELIVERY_SCENARIO,
+            ],
+            scheduler_rollout_expectations: scheduler_rollout_expectations.clone(),
+            agent_state: None,
+            message_evidence: Vec::new(),
+            transcript_entries: transcript_entries.clone(),
+            turn_record: terminal_transition.map(|transition| transition.turn_record.clone()),
+            audit_events: audit_events.clone(),
+            scheduler_shadow_comparison: None,
+            scheduler_delivery_shadow_comparison: None,
+            scheduler_semantic_shadow: None,
+            notify_scheduler,
+            fault: None,
+            brief_evidence: brief_evidence.clone(),
+        };
+        for attempt in 0..ENQUEUE_AGENT_STATE_MAX_ATTEMPTS {
+            // Rebuild guard-dependent fields from the current baseline.
+            let (agent_state, shadow_comparison, delivery_shadow_comparison) = {
+                let guard = self.inner.agent.lock().await;
+                let mut state = committed_agent_state
+                    .clone()
+                    .unwrap_or_else(|| guard.state.clone());
+                let agent_state = if let Some(transition) = terminal_transition {
+                    state.current_turn_id = Some(transition.terminal.turn_id.clone());
+                    state.last_turn_terminal = Some(transition.terminal.clone());
+                    Some(crate::runtime_db::transitions::AgentStateMutation {
+                        expected: Some(Box::new(guard.last_persisted_state.clone())),
+                        record: Box::new(state.clone()),
+                    })
+                } else {
+                    None
+                };
+                let queue_len = guard.queue.len();
+                let projection = scheduler::SchedulerProjection::from_state_with_queue_len_at(
+                    &self.inner.storage,
+                    &state,
+                    queue_len,
+                    self.now(),
+                )?;
+                let shadow_comparison =
+                    scheduler::shadow_comparison_for_settlement(&projection, &record)
+                        .map(scheduler_executor::scheduler_shadow_comparison_command)
+                        .transpose()?;
+                let delivery_shadow_comparison =
+                    scheduler::shadow_comparison_for_delivery(&projection, &record)
+                        .map(scheduler_executor::scheduler_shadow_comparison_command)
+                        .transpose()?;
+                (agent_state, shadow_comparison, delivery_shadow_comparison)
             };
-            (state, guard.queue.len(), agent_state)
-        };
-        let shadow_comparison = {
-            let projection = scheduler::SchedulerProjection::from_state_with_queue_len_at(
-                &self.inner.storage,
-                &projection_state,
-                queue_len,
-                self.now(),
-            )?;
-            scheduler::shadow_comparison_for_settlement(&projection, &record)
-                .map(scheduler_executor::scheduler_shadow_comparison_command)
-                .transpose()?
-        };
-        let delivery_shadow_comparison = {
-            let projection = scheduler::SchedulerProjection::from_state_with_queue_len_at(
-                &self.inner.storage,
-                &projection_state,
-                queue_len,
-                self.now(),
-            )?;
-            scheduler::shadow_comparison_for_delivery(&projection, &record)
-                .map(scheduler_executor::scheduler_shadow_comparison_command)
-                .transpose()?
-        };
-        if let Some(transition) = terminal_transition {
-            audit_events.push(AuditEvent::legacy(
-                "turn_terminal",
-                serde_json::to_value(&transition.terminal)?,
-            ));
-            audit_events.push(Self::turn_record_audit_event(&transition.turn_record));
+            command.agent_state = agent_state;
+            command.scheduler_shadow_comparison = shadow_comparison;
+            command.scheduler_delivery_shadow_comparison = delivery_shadow_comparison;
+            command.audit_events = audit_events.clone();
+            command.audit_events.truncate(original_audit_len);
+            if let Some(transition) = terminal_transition {
+                command.audit_events.push(AuditEvent::legacy(
+                    "turn_terminal",
+                    serde_json::to_value(&transition.terminal)?,
+                ));
+                command
+                    .audit_events
+                    .push(Self::turn_record_audit_event(&transition.turn_record));
+            }
+            command.fault = self.take_transition_fault();
+            match self.inner.runtime_db.transitions().commit_queue(&command) {
+                Ok(commit) => {
+                    return Ok(self.apply_transition_commit(commit).await.applied);
+                }
+                Err(error) => {
+                    let can_retry = attempt + 1 < ENQUEUE_AGENT_STATE_MAX_ATTEMPTS
+                        && retryable_enqueue_agent_state_conflict(&error, &record.agent_id);
+                    if !can_retry
+                        || !self
+                            .refresh_enqueue_agent_state_baseline(&record.agent_id)
+                            .await?
+                    {
+                        return Err(error);
+                    }
+                }
+            }
         }
-        let commit = self.inner.runtime_db.transitions().commit_queue(
-            &crate::runtime_db::transitions::QueueTransitionCommand {
-                agent_id: record.agent_id.clone(),
-                operation: crate::runtime_db::transitions::QueueOperation::Settle,
-                mutation: crate::runtime_db::transitions::QueueMutation::Upsert(record),
-                scheduler_claim_work_item: None,
-                scheduler_protocol_bootstrap: None,
-                scheduler_protocol_commands,
-                scheduler_authority_scenarios: vec![
-                    scheduler::SETTLEMENT_SCENARIO,
-                    scheduler::DELIVERY_SCENARIO,
-                ],
-                scheduler_rollout_expectations,
-                agent_state,
-                message_evidence: Vec::new(),
-                transcript_entries,
-                turn_record: terminal_transition.map(|transition| transition.turn_record.clone()),
-                audit_events,
-                scheduler_shadow_comparison: shadow_comparison,
-                scheduler_delivery_shadow_comparison: delivery_shadow_comparison,
-                scheduler_semantic_shadow: None,
-                notify_scheduler,
-                fault: self.take_transition_fault(),
-                brief_evidence,
-            },
-        )?;
-        Ok(self.apply_transition_commit(commit).await.applied)
+        unreachable!("settlement OCC retry loop always returns or errors")
     }
 
     async fn canonical_queue_settlement_commands(
@@ -2870,6 +2900,7 @@ impl RuntimeHandle {
         let mut recovered = 0;
 
         for mut entry in claimed {
+            let _guard = self.inner.agent.lock().await;
             let expected_entry = entry.clone();
             let activation_id = scheduler_executor::canonical_activation_id(&entry.message_id);
             let Some(activation) = snapshot.activations.get(&activation_id) else {
@@ -3408,7 +3439,10 @@ fn normalized_turn_id(turn_id: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn retryable_enqueue_agent_state_conflict(error: &anyhow::Error, agent_id: &str) -> bool {
+pub(crate) fn retryable_enqueue_agent_state_conflict(
+    error: &anyhow::Error,
+    agent_id: &str,
+) -> bool {
     error.chain().any(|source| {
         source
             .downcast_ref::<RuntimeStateTransitionConflict>()
