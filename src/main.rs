@@ -47,7 +47,10 @@ use holon::{
     solve::{run_solve, SolveRequest},
     storage::AppStorage,
     tui::run_tui,
-    types::{AuditEvent, AuthorityClass, ControlAction, TimerStatus},
+    types::{
+        AgentDeletionPhase, AgentDeletionStatus, AgentRegistryStatus, AuditEvent, AuthorityClass,
+        ControlAction, TimerStatus,
+    },
 };
 use tokio::net::TcpListener;
 use tracing::warn;
@@ -3154,7 +3157,39 @@ async fn handle_agent_command(config: &AppConfig, command: Option<AgentCommands>
         Some(AgentCommands::Status { agent_id }) => {
             let agent = agent_id.unwrap_or_else(|| config.default_agent_id.clone());
             let client = LocalClient::new(config.clone())?;
-            print_json(&serde_json::to_value(client.agent_status(&agent).await?)?)
+            match client.agent_status(&agent).await {
+                Ok(summary) => print_json(&serde_json::to_value(summary)?),
+                Err(err) => {
+                    // If the agent is being deleted, show deletion status as JSON instead.
+                    if let Some(http_err) = err.downcast_ref::<LocalHttpError>() {
+                        if http_err.has_code("agent_deleting") || http_err.has_code("agent_deleted")
+                        {
+                            let deletion = client.get_agent_deletion_status(&agent).await?;
+                            return print_json(&serde_json::to_value(&deletion)?);
+                        }
+                    }
+                    Err(err)
+                }
+            }
+        }
+        Some(AgentCommands::Delete {
+            agent_id,
+            yes,
+            cascade_private_children,
+            wait,
+            timeout,
+            json,
+        }) => {
+            handle_agent_delete(
+                config,
+                &agent_id,
+                yes,
+                cascade_private_children,
+                wait,
+                timeout,
+                json,
+            )
+            .await
         }
         Some(AgentCommands::Create { agent_id, template }) => {
             post_control_json(
@@ -3224,6 +3259,139 @@ async fn control_agent_lifecycle(
     let agent = agent_id.unwrap_or_else(|| config.default_agent_id.clone());
     let client = LocalClient::new(config.clone())?;
     print_json(&client.control_agent(&agent, action).await?)
+}
+
+async fn handle_agent_delete(
+    config: &AppConfig,
+    agent_id: &str,
+    yes: bool,
+    cascade_private_children: bool,
+    wait: bool,
+    timeout: Option<u64>,
+    json: bool,
+) -> Result<()> {
+    let client = LocalClient::new(config.clone())?;
+
+    // Confirmation
+    if !yes {
+        if std::io::stdin().is_terminal() {
+            eprintln!();
+            eprintln!("⚠  Permanently delete agent \"{agent_id}\"?");
+            eprintln!("   This operation is irreversible.");
+            eprintln!("   Agent home and all associated data will be removed.");
+            eprint!("\n   Proceed? [y/N]: ");
+            std::io::stderr().flush()?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            if !input.trim().eq_ignore_ascii_case("y") {
+                eprintln!("Cancelled.");
+                return Ok(());
+            }
+        } else {
+            anyhow::bail!(
+                "interactive confirmation unavailable in non-interactive mode.\n\
+                 Re-run with --yes (-y) to skip confirmation:\n  \
+                 holon agent delete {agent_id} --yes"
+            );
+        }
+    }
+
+    // Initiate deletion
+    let response = match client
+        .delete_agent(agent_id, cascade_private_children)
+        .await
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            if let Some(http_err) = err.downcast_ref::<LocalHttpError>() {
+                if http_err.has_code("agent_deleting") {
+                    eprintln!(
+                        "Agent \"{agent_id}\" is already being deleted.\n\
+                         Check progress: holon agent status {agent_id}"
+                    );
+                    return Ok(());
+                }
+                if http_err.has_code("agent_deleted") {
+                    eprintln!("Agent \"{agent_id}\" was already deleted.");
+                    return Ok(());
+                }
+            }
+            return Err(err);
+        }
+    };
+
+    if json {
+        return print_json(&serde_json::to_value(&response)?);
+    }
+
+    eprintln!(
+        "Deleting agent \"{agent_id}\" (phase: {})",
+        format_deletion_phase(&response.job.phase)
+    );
+
+    if wait {
+        let timeout_secs = timeout.unwrap_or(300);
+        wait_for_deletion(&client, agent_id, timeout_secs).await?;
+    }
+    Ok(())
+}
+
+async fn wait_for_deletion(client: &LocalClient, agent_id: &str, timeout_secs: u64) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for deletion to complete ({timeout_secs}s)\n\
+                 Agent \"{agent_id}\" is still in Deleting state.\n\
+                 Check progress: holon agent status {agent_id}"
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let status = client.get_agent_deletion_status(agent_id).await?;
+        if let Some(ref job) = status.job {
+            match job.status {
+                AgentDeletionStatus::Completed => {
+                    eprintln!("Deleted agent \"{agent_id}\"");
+                    return Ok(());
+                }
+                AgentDeletionStatus::RetryableFailed => {
+                    eprintln!(
+                        "Deletion failed (retryable): {}\n\
+                         The deletion job will be retried.\n\
+                         Check progress: holon agent status {agent_id}",
+                        job.last_error.as_deref().unwrap_or("unknown error")
+                    );
+                    return Ok(());
+                }
+                AgentDeletionStatus::Pending | AgentDeletionStatus::Running => {}
+            }
+        }
+        match status.identity.status {
+            AgentRegistryStatus::Deleted => {
+                eprintln!("Deleted agent \"{agent_id}\"");
+                return Ok(());
+            }
+            AgentRegistryStatus::Active => {
+                eprintln!("Agent \"{agent_id}\" is active (deletion may have been cancelled).");
+                return Ok(());
+            }
+            AgentRegistryStatus::Deleting => {} // keep polling
+        }
+    }
+}
+
+fn format_deletion_phase(phase: &AgentDeletionPhase) -> &'static str {
+    use AgentDeletionPhase::*;
+    match phase {
+        Fence => "Fence",
+        Quiesce => "Quiesce",
+        Ingress => "Ingress",
+        Scheduler => "Scheduler",
+        Workspace => "Workspace",
+        Index => "Index",
+        Home => "Home",
+        Finalize => "Finalize",
+    }
 }
 
 async fn handle_skills_command(config: &AppConfig, command: SkillsCommands) -> Result<()> {
