@@ -377,9 +377,16 @@ impl RuntimeHandle {
         &self,
         work_item: &crate::types::WorkItemRecord,
     ) -> Result<Option<String>> {
-        if let Some(message_id) = self.duplicate_work_queue_tick_message_id(
+        if let Some((message_id, message_created_at)) = self.duplicate_work_queue_tick_message_id(
             &scheduler::work_queue_tick_idempotency_key(work_item, "queued_available"),
         )? {
+            // Even when the idempotency key matches, a provider failure may have
+            // left the WorkItem still runnable. Check whether any work signal
+            // appeared after the matched tick so we do not permanently suppress
+            // the retry tick.
+            if self.has_work_signal_after(work_item, message_created_at, "queued_available")? {
+                return Ok(None);
+            }
             return Ok(Some(message_id));
         }
         let recent_messages = self
@@ -411,9 +418,15 @@ impl RuntimeHandle {
         &self,
         work_item: &crate::types::WorkItemRecord,
     ) -> Result<Option<String>> {
-        if let Some(message_id) = self.duplicate_work_queue_tick_message_id(
+        if let Some((message_id, message_created_at)) = self.duplicate_work_queue_tick_message_id(
             &scheduler::work_queue_tick_idempotency_key(work_item, "continue_active"),
         )? {
+            // Same rationale as duplicate_queued_available_message_id: a provider
+            // failure during the active continuation turn must not permanently
+            // suppress the retry tick when the WorkItem still has pending work.
+            if self.has_work_signal_after(work_item, message_created_at, "continue_active")? {
+                return Ok(None);
+            }
             return Ok(Some(message_id));
         }
         let recent_briefs = self
@@ -436,7 +449,7 @@ impl RuntimeHandle {
     fn duplicate_work_queue_tick_message_id(
         &self,
         idempotency_key: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<(String, chrono::DateTime<chrono::Utc>)>> {
         Ok(self
             .inner
             .storage
@@ -459,7 +472,7 @@ impl RuntimeHandle {
                     .and_then(|value| value.as_str())
                     == Some(idempotency_key)
             })
-            .map(|message| message.id))
+            .map(|message| (message.id, message.created_at)))
     }
 
     fn duplicate_wake_hint_message_id(&self, pending: &PendingWakeHint) -> Result<Option<String>> {
@@ -1099,23 +1112,6 @@ mod tests {
                 [scenario_class],
             )
             .unwrap();
-    }
-
-    fn wait_for_audit_event(test_runtime: &TestRuntime, kind: &str, label: &str) -> AuditEvent {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            let events = test_runtime
-                .runtime
-                .inner
-                .storage
-                .read_recent_events(20)
-                .unwrap();
-            if let Some(event) = events.iter().find(|event| event.kind == kind) {
-                return event.clone();
-            }
-            assert!(std::time::Instant::now() < deadline, "{label}");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
     }
 
     fn set_agent_idle(test_runtime: &TestRuntime) {
@@ -1835,7 +1831,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_system_tick_explicit_idempotency_key_wins_over_newer_signals() {
+    fn queued_system_tick_explicit_idempotency_key_allows_newer_signals() {
         let test_runtime = test_runtime();
         set_agent_idle(&test_runtime);
 
@@ -1896,25 +1892,15 @@ mod tests {
             .unwrap();
 
         assert!(
-            !emitted,
-            "same work-item revision must not emit another queued tick even when recent-ledger fallback would see a newer signal"
+            emitted,
+            "a newer work signal must allow another queued tick despite the matching idempotency key"
         );
-        assert!(get_emitted_system_ticks(&test_runtime).is_empty());
-        let decision = wait_for_audit_event(
-            &test_runtime,
-            "scheduler_decision",
-            "duplicate decision should be recorded",
-        );
-        assert_eq!(decision.data["decision"].as_str(), Some("Noop"));
+        let ticks = get_emitted_system_ticks(&test_runtime);
+        assert_eq!(ticks.len(), 1);
         assert_eq!(
-            decision.data["reason"].as_str(),
-            Some("duplicate_queued_available")
+            ticks[0].1["idempotency_key"].as_str(),
+            Some("work_queue:queued_available:wi-queued:1")
         );
-        assert!(decision.data["evidence"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value.as_str() == Some("message_id=existing-work-queue-tick")));
     }
 
     #[test]
