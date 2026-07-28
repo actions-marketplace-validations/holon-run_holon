@@ -7,7 +7,7 @@ use crate::runtime_db::evidence::content_hash;
 use crate::runtime_db::evidence::insert_audit_event_tx;
 #[cfg(test)]
 use crate::runtime_db::migrations::{
-    backfill_wait_condition_payload_columns, backfill_work_item_recheck_columns,
+    apply_migration, backfill_wait_condition_payload_columns, backfill_work_item_recheck_columns,
     current_schema_version, ensure_migration_table, max_known_migration_version, table_exists,
     MIGRATIONS,
 };
@@ -841,6 +841,42 @@ mod tests {
         revision: u64,
         preflight_revision: u64,
     ) -> RolloutManifest {
+        let dependency_classes = scenario_class
+            .parse::<SchedulerScenarioClass>()
+            .map(|scenario| scenario.authoritative_dependencies())
+            .unwrap_or_default();
+        let classes = std::iter::once(scenario_class)
+            .chain(
+                dependency_classes
+                    .iter()
+                    .map(|dependency| dependency.as_str()),
+            )
+            .map(|scenario_class| {
+                (
+                    scenario_class.to_string(),
+                    scheduler_phase3_rollout_class_evidence(scenario_class),
+                )
+            })
+            .collect();
+        RolloutManifest {
+            revision,
+            preflight_revision,
+            preflight_for_manifest_revision: revision,
+            preflight_succeeded: true,
+            protocol_build: format!("holon-0.30.0-phase3-{revision}"),
+            schema_build: format!("scheduler-protocol-schema-v{revision}"),
+            schema_revision: revision,
+            fixture_corpus_revision: format!("scheduler-workitem-phase3-v{revision}"),
+            classes,
+            safety_divergence_bps: 0,
+            canonical_state_divergence_bps: 0,
+            allowed_observational_divergence: BTreeMap::new(),
+            approver: "phase3-reviewer".into(),
+            approved_at: "2026-07-21T00:00:00Z".into(),
+        }
+    }
+
+    fn scheduler_phase3_rollout_class_evidence(scenario_class: &str) -> RolloutClassEvidence {
         let (minimum_shadow_samples, minimum_shadow_duration_secs, scenario_evidence) =
             match scenario_class {
                 "reducer_only_candidates" => (
@@ -911,42 +947,24 @@ mod tests {
             .chain(scenario_evidence)
             .map(Into::into)
             .collect();
-        RolloutManifest {
-            revision,
-            preflight_revision,
-            preflight_for_manifest_revision: revision,
-            preflight_succeeded: true,
-            protocol_build: format!("holon-0.30.0-phase3-{revision}"),
-            schema_build: format!("scheduler-protocol-schema-v{revision}"),
-            schema_revision: revision,
-            fixture_corpus_revision: format!("scheduler-workitem-phase3-v{revision}"),
-            classes: BTreeMap::from([(
-                scenario_class.into(),
-                RolloutClassEvidence {
-                    configured_mode: ScenarioMode::Authoritative,
-                    minimum_shadow_samples,
-                    minimum_shadow_duration_secs,
-                    observed_shadow_samples: minimum_shadow_samples,
-                    observed_shadow_duration_secs: minimum_shadow_duration_secs,
-                    maximum_p99_latency_regression_bps: 500,
-                    observed_p99_latency_regression_bps: 100,
-                    hard_blocker_count: 0,
-                    unresolved_divergence_count: 0,
-                    required_evidence: evidence.clone(),
-                    verified_evidence: evidence,
-                    rollback_policy: RollbackPolicy {
-                        trigger: RollbackTrigger::AnyHardBlocker,
-                        action: RollbackAction::StopAdmissionsAndRevert {
-                            target: ScenarioMode::Shadow,
-                        },
-                    },
+        RolloutClassEvidence {
+            configured_mode: ScenarioMode::Authoritative,
+            minimum_shadow_samples,
+            minimum_shadow_duration_secs,
+            observed_shadow_samples: minimum_shadow_samples,
+            observed_shadow_duration_secs: minimum_shadow_duration_secs,
+            maximum_p99_latency_regression_bps: 500,
+            observed_p99_latency_regression_bps: 100,
+            hard_blocker_count: 0,
+            unresolved_divergence_count: 0,
+            required_evidence: evidence.clone(),
+            verified_evidence: evidence,
+            rollback_policy: RollbackPolicy {
+                trigger: RollbackTrigger::AnyHardBlocker,
+                action: RollbackAction::StopAdmissionsAndRevert {
+                    target: ScenarioMode::Shadow,
                 },
-            )]),
-            safety_divergence_bps: 0,
-            canonical_state_divergence_bps: 0,
-            allowed_observational_divergence: BTreeMap::new(),
-            approver: "phase3-reviewer".into(),
-            approved_at: "2026-07-21T00:00:00Z".into(),
+            },
         }
     }
 
@@ -1215,7 +1233,107 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(readiness_index_count, 0);
+        let activation_input_columns = connection
+            .prepare("PRAGMA table_info(scheduler_activation_inputs)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+        assert!(activation_input_columns.contains("owner_kind"));
+        assert!(activation_input_columns.contains("owner_id"));
+        assert!(activation_input_columns.contains("expected_admitted_generation"));
+        assert!(!activation_input_columns.contains("work_item_id"));
+        assert!(!activation_input_columns.contains("expected_scheduling_generation"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn migration_38_upgrades_legacy_activation_input_owner() -> Result<()> {
+        let (_temp_dir, db_path, lock_path) = temp_paths()?;
+        {
+            let mut connection = open_connection(&db_path)?;
+            ensure_migration_table(&connection)?;
+            for migration in MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version <= 37)
+            {
+                apply_migration(&mut connection, migration)?;
+            }
+            connection.execute(
+                "INSERT INTO scheduler_activation_inputs (
+                   agent_id,
+                   attachment_id,
+                   activation_id,
+                   work_item_id,
+                   expected_scheduling_generation,
+                   expected_dispatch_revision,
+                   message_id,
+                   turn_id,
+                   boundary,
+                   round,
+                   payload_json,
+                   created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                (
+                    "agent-a",
+                    "attachment-a",
+                    "activation-a",
+                    "work-a",
+                    3_u64,
+                    4_u64,
+                    "message-a",
+                    "turn-a",
+                    "after_provider_round",
+                    2_u64,
+                    serde_json::json!({
+                        "id": "attachment-a",
+                        "activation_id": "activation-a",
+                        "work_item_id": "work-a",
+                        "expected_scheduling_generation": 3,
+                        "expected_dispatch_revision": 4,
+                        "message_id": "message-a",
+                        "turn_id": "turn-a",
+                        "boundary": "after_provider_round",
+                        "round": 2,
+                        "provenance": {
+                            "origin": "operator",
+                            "trust": "operator_instruction",
+                            "source_id": "message-a",
+                            "correlation_id": "activation-a",
+                            "causation_id": null
+                        },
+                        "created_at": "2026-07-28T00:00:00Z"
+                    })
+                    .to_string(),
+                    "2026-07-28T00:00:00Z",
+                ),
+            )?;
+        }
+
+        RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
+        let connection = open_connection(&db_path)?;
+        let (owner_kind, owner_id, generation, payload_json): (String, String, u64, String) =
+            connection.query_row(
+                "SELECT owner_kind, owner_id, expected_admitted_generation, payload_json
+                 FROM scheduler_activation_inputs
+                 WHERE agent_id = 'agent-a' AND attachment_id = 'attachment-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        assert_eq!(
+            (owner_kind, owner_id, generation),
+            ("work_item".into(), "work-a".into(), 3)
+        );
+        let attachment: ActivationInputAttachment = serde_json::from_str(&payload_json)?;
+        assert_eq!(
+            attachment.owner,
+            SchedulerOwner::WorkItem {
+                work_item_id: "work-a".into(),
+            }
+        );
+        assert_eq!(attachment.expected_admitted_generation, 3);
+        let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
+        assert!(payload.get("work_item_id").is_none());
+        assert!(payload.get("expected_scheduling_generation").is_none());
         Ok(())
     }
 
@@ -1241,6 +1359,98 @@ mod tests {
             error.sqlite_error_code(),
             Some(ErrorCode::ConstraintViolation)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_38_normalizes_unsafe_operator_interjection_authority() -> Result<()> {
+        let (_temp_dir, db_path, lock_path) = temp_paths()?;
+        {
+            let mut connection = open_connection(&db_path)?;
+            ensure_migration_table(&connection)?;
+            for migration in MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version <= 37)
+            {
+                apply_migration(&mut connection, migration)?;
+            }
+            connection.execute_batch(
+                r#"
+INSERT INTO scheduler_rollout_preflights (
+  preflight_revision, manifest_revision, state, manifest_json, created_at, updated_at
+) VALUES (1, 1, 'consumed', '{}', '2026-07-28T00:00:00Z', '2026-07-28T00:00:00Z');
+INSERT INTO scheduler_rollout_manifests (
+  manifest_revision, preflight_revision, payload_json, installed_at
+) VALUES (1, 1, '{}', '2026-07-28T00:00:00Z');
+INSERT INTO scheduler_scenario_authorities (
+  scenario_class, mode, rollback_target, manifest_revision, preflight_revision, updated_at
+) VALUES
+  ('operator_interjection', 'authoritative', 'shadow', 1, 1, '2026-07-28T00:00:00Z'),
+  ('work_item_autonomous_continuation', 'authoritative', 'shadow', 1, 1, '2026-07-28T00:00:00Z'),
+  ('exact_task_rejoin', 'authoritative', 'shadow', 1, 1, '2026-07-28T00:00:00Z'),
+  ('exact_wait_resume', 'authoritative', 'shadow', 1, 1, '2026-07-28T00:00:00Z'),
+  ('explicitly_bound_operator_input', 'shadow', 'off', NULL, NULL, '2026-07-28T00:00:00Z'),
+  ('settlement', 'authoritative', 'shadow', 1, 1, '2026-07-28T00:00:00Z');
+"#,
+            )?;
+        }
+
+        RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
+        let connection = open_connection(&db_path)?;
+        let normalized: (String, Option<i64>, Option<i64>, String) = connection.query_row(
+            "SELECT mode, manifest_revision, preflight_revision, rollback_target
+             FROM scheduler_scenario_authorities
+             WHERE scenario_class = 'operator_interjection'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(normalized, ("shadow".into(), None, None, "shadow".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn migration_38_preserves_safe_operator_interjection_authority() -> Result<()> {
+        let (_temp_dir, db_path, lock_path) = temp_paths()?;
+        {
+            let mut connection = open_connection(&db_path)?;
+            ensure_migration_table(&connection)?;
+            for migration in MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version <= 37)
+            {
+                apply_migration(&mut connection, migration)?;
+            }
+            connection.execute_batch(
+                r#"
+INSERT INTO scheduler_rollout_preflights (
+  preflight_revision, manifest_revision, state, manifest_json, created_at, updated_at
+) VALUES (1, 1, 'consumed', '{}', '2026-07-28T00:00:00Z', '2026-07-28T00:00:00Z');
+INSERT INTO scheduler_rollout_manifests (
+  manifest_revision, preflight_revision, payload_json, installed_at
+) VALUES (1, 1, '{}', '2026-07-28T00:00:00Z');
+INSERT INTO scheduler_scenario_authorities (
+  scenario_class, mode, rollback_target, manifest_revision, preflight_revision, updated_at
+) VALUES
+  ('operator_interjection', 'authoritative', 'shadow', 1, 1, '2026-07-28T00:00:00Z'),
+  ('work_item_autonomous_continuation', 'authoritative', 'shadow', 1, 1, '2026-07-28T00:00:00Z'),
+  ('exact_task_rejoin', 'authoritative', 'shadow', 1, 1, '2026-07-28T00:00:00Z'),
+  ('exact_wait_resume', 'authoritative', 'shadow', 1, 1, '2026-07-28T00:00:00Z'),
+  ('explicitly_bound_operator_input', 'authoritative', 'shadow', 1, 1, '2026-07-28T00:00:00Z'),
+  ('settlement', 'authoritative', 'shadow', 1, 1, '2026-07-28T00:00:00Z');
+"#,
+            )?;
+        }
+
+        RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
+        let connection = open_connection(&db_path)?;
+        let preserved: (String, Option<i64>, Option<i64>) = connection.query_row(
+            "SELECT mode, manifest_revision, preflight_revision
+             FROM scheduler_scenario_authorities
+             WHERE scenario_class = 'operator_interjection'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(preserved, ("authoritative".into(), Some(1), Some(1)));
         Ok(())
     }
 
@@ -2203,8 +2413,10 @@ mod tests {
         let attachment = ActivationInputAttachment {
             id: "attachment-a".into(),
             activation_id: "activation-a".into(),
-            work_item_id: "work-a".into(),
-            expected_scheduling_generation: 1,
+            owner: SchedulerOwner::WorkItem {
+                work_item_id: "work-a".into(),
+            },
+            expected_admitted_generation: 1,
             expected_dispatch_revision: 0,
             message_id: "interjection-message".into(),
             turn_id: "turn-a".into(),
@@ -2966,34 +3178,43 @@ mod tests {
                     },
                     Decision::ProtocolConfigured,
                 ),
-                (
-                    format!("{scenario_class}-shadow"),
-                    RolloutCommand::ChangeScenarioAuthority {
-                        scenario_class: scenario_class.into(),
-                        expected_config_revision: 2,
-                        expected_manifest_revision: 1,
-                        expected_preflight_revision: 1,
-                        mode: ScenarioMode::Shadow,
-                    },
-                    Decision::ScenarioAuthorityChanged,
-                ),
-                (
-                    format!("{scenario_class}-authoritative"),
-                    RolloutCommand::ChangeScenarioAuthority {
-                        scenario_class: scenario_class.into(),
-                        expected_config_revision: 3,
-                        expected_manifest_revision: 1,
-                        expected_preflight_revision: 1,
-                        mode: ScenarioMode::Authoritative,
-                    },
-                    Decision::ScenarioAuthorityChanged,
-                ),
             ] {
                 let committed = db
                     .transitions()
                     .commit_scheduler_rollout_command(&identity, &command, None)?;
                 assert_eq!(committed.result.decision, expected_decision);
             }
+            let mut config_revision = 2;
+            for authority_scenario in scenario
+                .authoritative_dependencies()
+                .iter()
+                .copied()
+                .chain(std::iter::once(scenario))
+            {
+                for mode in [ScenarioMode::Shadow, ScenarioMode::Authoritative] {
+                    let committed = db.transitions().commit_scheduler_rollout_command(
+                        &format!(
+                            "{}-{}-{mode:?}",
+                            scenario_class,
+                            authority_scenario.as_str()
+                        ),
+                        &RolloutCommand::ChangeScenarioAuthority {
+                            scenario_class: authority_scenario.as_str().into(),
+                            expected_config_revision: config_revision,
+                            expected_manifest_revision: 1,
+                            expected_preflight_revision: 1,
+                            mode,
+                        },
+                        None,
+                    )?;
+                    assert_eq!(
+                        committed.result.decision,
+                        Decision::ScenarioAuthorityChanged
+                    );
+                    config_revision += 1;
+                }
+            }
+            let authoritative_config_revision = config_revision;
             let authoritative_expectations = db
                 .transitions()
                 .scheduler_rollout_expectations(&[scenario], true)?;
@@ -3074,17 +3295,18 @@ mod tests {
             assert!(after_missing.rollout.hard_blockers.iter().any(|blocker| {
                 blocker.scenario_class == scenario_class
                     && blocker.blocker_code == "canonical_evidence_missing"
-                    && blocker.config_revision == 4
+                    && blocker.config_revision == authoritative_config_revision
                     && blocker.manifest_revision == 1
                     && blocker.preflight_revision == 1
             }));
 
             let replacement_manifest = scheduler_phase3_rollout_manifest(scenario_class, 2, 2);
+            let after_missing_config_revision = authoritative_config_revision + 1;
             for (identity, command, expected_decision) in [
                 (
                     format!("{scenario_class}-replacement-open"),
                     RolloutCommand::OpenPreflight {
-                        expected_config_revision: 5,
+                        expected_config_revision: after_missing_config_revision,
                         manifest_revision: 2,
                     },
                     Decision::RolloutPreflightOpened,
@@ -3092,7 +3314,7 @@ mod tests {
                 (
                     format!("{scenario_class}-replacement-complete"),
                     RolloutCommand::CompletePreflight {
-                        expected_config_revision: 5,
+                        expected_config_revision: after_missing_config_revision,
                         expected_preflight_revision: 2,
                         manifest: replacement_manifest.clone(),
                     },
@@ -3101,27 +3323,50 @@ mod tests {
                 (
                     format!("{scenario_class}-replacement-install"),
                     RolloutCommand::InstallManifest {
-                        expected_config_revision: 5,
+                        expected_config_revision: after_missing_config_revision,
                         manifest: replacement_manifest.clone(),
                     },
                     Decision::ManifestInstalled,
-                ),
-                (
-                    format!("{scenario_class}-reauthorize-after-missing"),
-                    RolloutCommand::ChangeScenarioAuthority {
-                        scenario_class: scenario_class.into(),
-                        expected_config_revision: 6,
-                        expected_manifest_revision: 2,
-                        expected_preflight_revision: 2,
-                        mode: ScenarioMode::Authoritative,
-                    },
-                    Decision::ScenarioAuthorityChanged,
                 ),
             ] {
                 let committed = db
                     .transitions()
                     .commit_scheduler_rollout_command(&identity, &command, None)?;
-                assert_eq!(committed.result.decision, expected_decision);
+                assert_eq!(
+                    committed.result.decision, expected_decision,
+                    "{identity}: {:?}",
+                    committed.result.diagnostics
+                );
+            }
+            let mut reauthorized_config_revision = after_missing_config_revision + 1;
+            for authority_scenario in scenario
+                .authoritative_dependencies()
+                .iter()
+                .copied()
+                .chain(std::iter::once(scenario))
+            {
+                let identity = format!(
+                    "{scenario_class}-reauthorize-{}-after-missing",
+                    authority_scenario.as_str()
+                );
+                let committed = db.transitions().commit_scheduler_rollout_command(
+                    &identity,
+                    &RolloutCommand::ChangeScenarioAuthority {
+                        scenario_class: authority_scenario.as_str().into(),
+                        expected_config_revision: reauthorized_config_revision,
+                        expected_manifest_revision: 2,
+                        expected_preflight_revision: 2,
+                        mode: ScenarioMode::Authoritative,
+                    },
+                    None,
+                )?;
+                assert_eq!(
+                    committed.result.decision,
+                    Decision::ScenarioAuthorityChanged,
+                    "{identity}: {:?}",
+                    committed.result.diagnostics
+                );
+                reauthorized_config_revision += 1;
             }
             let authoritative_expectations = db
                 .transitions()
@@ -3174,7 +3419,7 @@ mod tests {
                 .any(|blocker| {
                     blocker.scenario_class == scenario_class
                         && blocker.blocker_code == "phase5h_cutover_mismatch"
-                        && blocker.config_revision == 7
+                        && blocker.config_revision == reauthorized_config_revision
                         && blocker.manifest_revision == 2
                         && blocker.preflight_revision == 2
                 }));

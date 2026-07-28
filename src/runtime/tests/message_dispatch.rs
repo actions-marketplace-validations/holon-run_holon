@@ -8,9 +8,10 @@
 use super::super::message_dispatch::MessageDispatchPlan;
 use super::super::*;
 use super::support::*;
+use crate::domain::scheduler_protocol::ScenarioMode;
 use crate::types::{
-    AuthorityClass, ClosureDecision, ClosureOutcome, MessageBody, MessageKind, MessageOrigin,
-    Priority, RuntimePosture,
+    AuthorityClass, ClosureDecision, ClosureOutcome, ExecutionAdmissionProvenance, MessageBody,
+    MessageKind, MessageOrigin, Priority, RuntimePosture,
 };
 
 fn task_metadata() -> serde_json::Value {
@@ -44,12 +45,19 @@ fn task_status_message() -> MessageEnvelope {
 }
 
 fn task_result_message() -> MessageEnvelope {
-    let mut msg = message_of_kind(
+    let mut msg = MessageEnvelope::new(
+        "default",
         MessageKind::TaskResult,
+        MessageOrigin::Task {
+            task_id: "task-dispatch-1".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Normal,
         MessageBody::Text {
             text: "result payload".into(),
         },
     );
+    msg.task_id = Some("task-dispatch-1".into());
     msg.metadata = Some(task_metadata());
     msg
 }
@@ -382,5 +390,9 @@ fn message_dispatch_plan_public_fields_are_constructible_from_tests() {
         continuation_trigger: None,
         continuation_resolution: None,
         model_turn_allowed: false,
+        execution_admission_provenance: ExecutionAdmissionProvenance::LegacyCompat {
+            scenario_class: None,
+            effective_mode: ScenarioMode::Off,
+        },
     };
 }
