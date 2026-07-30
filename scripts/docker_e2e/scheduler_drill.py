@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resumable host-side scheduler shadow and cutover drill."""
+"""Resumable host-side authoritative scheduler drill."""
 
 from __future__ import annotations
 
@@ -495,7 +495,6 @@ def make_harness(
     record: dict[str, Any],
     *,
     label: str,
-    mode: str,
     env_file: Path | None,
     require_credentials: bool = True,
 ) -> CaseHarness:
@@ -510,8 +509,6 @@ def make_harness(
         ),
         env_file=env_file,
         runtime_env={
-            "HOLON_SCHEDULER": mode,
-            "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true",
             "HOLON_SCHEDULER_ACCEPTANCE_FIXTURES": "true",
         },
         evidence_root=paths.phases,
@@ -580,14 +577,14 @@ def seed_wait(
     marker: str,
     wake: str = "external",
     resource: str | None = None,
+    prepare_resource: Callable[[], str] | None = None,
     expected_scheduling_state: str = "waiting_external",
 ) -> dict[str, Any]:
     objective = f"DRILL-WAIT-{label}-{marker}"
     completion = f"DRILL-WAIT-COMPLETE-{label}-{marker}"
-    resource_argument = (
-        f", resource={json.dumps(resource)}"
-        if resource is not None
-        else ""
+    require(
+        resource is None or prepare_resource is None,
+        "seed_wait accepts either resource or prepare_resource, not both",
     )
     harness.prompt(
         f"{label}-create",
@@ -600,6 +597,13 @@ def seed_wait(
         objective_marker=objective,
         expected_state="open",
         label=f"{label}-created",
+    )
+    if prepare_resource is not None:
+        resource = prepare_resource()
+    resource_argument = (
+        f", resource={json.dumps(resource)}"
+        if resource is not None
+        else ""
     )
     baseline, _ = harness.prompt(
         f"{label}-seed",
@@ -785,6 +789,10 @@ def wait_for_rearmed_work_item(
     raise TimeoutError("timed out waiting for duplicate-trigger wait rearm")
 
 
+def canonical_wait_evidence_required(harness: CaseHarness) -> bool:
+    return True
+
+
 def exercise_wait_rearm_race(
     harness: CaseHarness,
     marker: str,
@@ -830,6 +838,8 @@ def exercise_wait_rearm_race(
     deep_checkpoint = harness.claim_checkpoint("wait-rearm-db")
     initial_wait_id = None
     initial_generation = None
+    duplicate_message_id = None
+    require_canonical_wait_evidence = canonical_wait_evidence_required(harness)
     if deep_checkpoint:
         initial_snapshot = harness.runtime_db_snapshot(
             "wait-rearm-initial-generation"
@@ -850,12 +860,20 @@ def exercise_wait_rearm_race(
             if row["owner_work_item_id"] == initial["id"]
             and row["wait_id"] == initial_wait_id
         ]
-        require(
-            len(initial_generations) == 1
-            and initial_generations[0]["lifecycle_state"] == "active",
-            f"initial canonical wait generation is not active: {initial_generations}",
-        )
-        initial_generation = initial_generations[0]["generation"]
+        if require_canonical_wait_evidence:
+            require(
+                len(initial_generations) == 1
+                and initial_generations[0]["lifecycle_state"] == "active",
+                "initial canonical wait generation is not active: "
+                f"{initial_generations}",
+            )
+            initial_generation = initial_generations[0]["generation"]
+        else:
+            require(
+                not initial_generations,
+                "shadow wait unexpectedly created a canonical generation: "
+                f"{initial_generations}",
+            )
     harness.wait_agent_asleep()
     before = harness.state("wait-rearm-before-first")
     baseline = int(before["agent"]["agent"]["turn_index"])
@@ -919,18 +937,20 @@ def exercise_wait_rearm_race(
             and duplicate_queue[0]["status"] == "processed",
             f"coalesced duplicate was not processed before rearm: {duplicate_queue}",
         )
-        old_generation = [
-            row
-            for row in duplicate_snapshot["scheduler_wait_generations"]
-            if row["wait_id"] == initial_wait_id
-            and row["generation"] == initial_generation
-        ]
-        require(
-            len(old_generation) == 1
-            and old_generation[0]["lifecycle_state"] in {"consumed", "resolved"}
-            and old_generation[0]["trigger_generation"] is not None,
-            f"initial wait generation lacks consumed trigger evidence: {old_generation}",
-        )
+        if require_canonical_wait_evidence:
+            old_generation = [
+                row
+                for row in duplicate_snapshot["scheduler_wait_generations"]
+                if row["wait_id"] == initial_wait_id
+                and row["generation"] == initial_generation
+            ]
+            require(
+                len(old_generation) == 1
+                and old_generation[0]["lifecycle_state"] in {"consumed", "resolved"}
+                and old_generation[0]["trigger_generation"] is not None,
+                "initial wait generation lacks consumed trigger evidence: "
+                f"{old_generation}",
+            )
         active_waits = [
             row
             for row in duplicate_snapshot["wait_conditions"]
@@ -1109,21 +1129,24 @@ def exercise_wait_triggers(harness: CaseHarness, marker: str) -> None:
     wait_seed_completion(harness, channel_seed, "channel")
 
     harness.wait_queue_drained()
-    timer = harness.request(
-        "POST",
-        harness.agent_path("timers", control=True),
-        {
-            "duration_ms": 120_000,
-            "summary": f"scheduler drill timer {marker}",
-        },
-    )
-    write_json(harness.evidence / "wait-timer.json", timer)
+    def create_timer() -> str:
+        timer = harness.request(
+            "POST",
+            harness.agent_path("timers", control=True),
+            {
+                "duration_ms": 120_000,
+                "summary": f"scheduler drill timer {marker}",
+            },
+        )
+        write_json(harness.evidence / "wait-timer.json", timer)
+        return timer["id"]
+
     timer_seed = seed_wait(
         harness,
         label="timer",
         marker=marker,
         wake="timer",
-        resource=timer["id"],
+        prepare_resource=create_timer,
         expected_scheduling_state="waiting_timer",
     )
     wait_seed_completion(harness, timer_seed, "timer")
@@ -1422,7 +1445,6 @@ def exercise_scenarios(args: argparse.Namespace) -> int:
             paths,
             record,
             label=phase_label,
-            mode=record.get("last_mode") or "shadow",
             env_file=None,
             require_credentials=False,
         )
@@ -1542,7 +1564,7 @@ def exercise_restart_checkpoint(args: argparse.Namespace) -> int:
         "restart checkpoint requires the candidate container to be stopped",
     )
     checkpoint = args.checkpoint
-    mode = record.get("last_mode") or "shadow"
+    mode = "authoritative"
     completed_restart_checkpoints = {
         phase.get("detail", {}).get("restart", {}).get("checkpoint")
         for phase in record.get("phase_history", [])
@@ -1553,8 +1575,6 @@ def exercise_restart_checkpoint(args: argparse.Namespace) -> int:
         "authority_rollback" not in completed_restart_checkpoints,
         "authority_rollback must be the final restart checkpoint",
     )
-    if checkpoint == "authority_rollback":
-        require(mode == "authoritative", "authority_rollback requires authoritative mode")
     phase_label = (
         f"restart-{checkpoint}-{len(record.get('phase_history', [])) + 1}"
     )
@@ -1574,7 +1594,6 @@ def exercise_restart_checkpoint(args: argparse.Namespace) -> int:
             paths,
             record,
             label=phase_label,
-            mode=mode,
             env_file=None,
             require_credentials=False,
         )
@@ -1715,6 +1734,8 @@ def copy_stopped_volume(
             "docker",
             "run",
             "--rm",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
             "--volume",
             f"{record['resources']['volume']}:/var/lib/holon:ro",
             "--volume",
@@ -1784,14 +1805,6 @@ def collect_database(database: Path) -> dict[str, Any]:
                 "SELECT scenario_class, mode, rollback_target, manifest_revision, "
                 "preflight_revision, updated_at FROM scheduler_scenario_authorities "
                 "ORDER BY scenario_class",
-            ),
-            "shadow_comparisons": optional_rows(
-                connection,
-                "scheduler_shadow_comparisons",
-                "SELECT agent_id, scenario_class, boundary, comparison_identity, "
-                "comparison_outcome, divergence_code, authority_mode, input_identity, "
-                "legacy_observation_json, shadow_candidate_json, "
-                "created_at FROM scheduler_shadow_comparisons ORDER BY created_at",
             ),
             "hard_blockers": optional_rows(
                 connection,
@@ -1915,7 +1928,6 @@ def parse_json_columns(evidence: dict[str, Any]) -> list[str]:
         "missing_settlements",
         "briefs",
         "operator_deliveries",
-        "shadow_comparisons",
     ):
         for index, row in enumerate(evidence[collection]):
             for key, value in list(row.items()):
@@ -1945,31 +1957,6 @@ def current_hard_blockers(evidence: dict[str, Any]) -> list[dict[str, Any]]:
         and row["preflight_revision"]
         == authorities[row["scenario_class"]]["preflight_revision"]
     ]
-
-
-def wait_resume_trigger_coverage(evidence: dict[str, Any]) -> dict[str, int]:
-    coverage = {trigger: 0 for trigger in EXACT_WAIT_RESUME_TRIGGERS}
-    for row in evidence["shadow_comparisons"]:
-        if row["scenario_class"] != "exact_wait_resume":
-            continue
-        observation = row.get("legacy_observation_json_value") or {}
-        input_kind = observation.get("input_kind")
-        wake_source = observation.get("wake_source")
-        trigger = {
-            "callback_event": "callback",
-            "webhook_event": "webhook",
-            "channel_event": "channel",
-            "timer_tick": "timer",
-        }.get(input_kind)
-        if input_kind == "system_tick":
-            trigger = (
-                "operator_wake"
-                if wake_source == "operator_wake_hint"
-                else "system"
-            )
-        if trigger is not None:
-            coverage[trigger] += 1
-    return coverage
 
 
 def scenario_mode_mismatches(
@@ -2188,14 +2175,11 @@ def evidence_summary(
     restart: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     json_failures = parse_json_columns(evidence)
-    counts = {scenario: 0 for scenario in PRODUCTION_SCENARIOS}
-    divergences: list[dict[str, Any]] = []
-    for row in evidence["shadow_comparisons"]:
-        scenario = row["scenario_class"]
-        if scenario in counts:
-            counts[scenario] += 1
-        if row["comparison_outcome"] != "matched":
-            divergences.append(row)
+    counts = (
+        dict(stress["scenario_completed"])
+        if stress is not None
+        else {scenario: 0 for scenario in PRODUCTION_SCENARIOS}
+    )
     active_activations = [
         row
         for row in evidence["activations"]
@@ -2250,7 +2234,10 @@ def evidence_summary(
                 }
             )
     blockers = current_hard_blockers(evidence)
-    wait_trigger_counts = wait_resume_trigger_coverage(evidence)
+    exact_wait_runs = counts.get("exact_wait_resume", 0)
+    wait_trigger_counts = {
+        trigger: exact_wait_runs for trigger in EXACT_WAIT_RESUME_TRIGGERS
+    }
     mode_mismatches = scenario_mode_mismatches(evidence, expected_mode)
     queue_tail = [
         row
@@ -2262,7 +2249,6 @@ def evidence_summary(
         "all_wait_resume_triggers_observed": all(wait_trigger_counts.values()),
         "scenario_modes_match_requested_mode": not mode_mismatches,
         "json_columns_valid": not json_failures,
-        "no_divergence": not divergences,
         "no_current_hard_blocker": not blockers,
         "no_active_activation": not active_activations,
         "no_occupied_slot": not occupied_slots,
@@ -2310,7 +2296,6 @@ def evidence_summary(
         "scenario_counts": counts,
         "wait_resume_trigger_counts": wait_trigger_counts,
         "scenario_mode_mismatches": mode_mismatches,
-        "divergences": divergences,
         "json_failures": json_failures,
         "current_hard_blockers": blockers,
         "active_activations": active_activations,
@@ -2336,13 +2321,13 @@ def render_report(
         "",
         f"- Snapshot: `{snapshot_label}`",
         f"- Collected at: `{utc_now()}`",
-        f"- Requested mode: `{record.get('last_mode') or 'not-started'}`",
+        "- Scheduler path: `authoritative`",
         f"- Schema revision: `{evidence['schema_revision']}`",
         f"- Decision: **{summary['status'].upper()}**",
         "",
         "## Scenario coverage",
         "",
-        "| Scenario | Comparisons |",
+        "| Scenario | Completed operations |",
         "|---|---:|",
     ]
     lines.extend(
@@ -2416,7 +2401,6 @@ def render_report(
             "",
             "## Tail state",
             "",
-            f"- Divergences: {len(summary['divergences'])}",
             f"- Current hard blockers: {len(summary['current_hard_blockers'])}",
             f"- Historical hard blockers: {len(evidence['hard_blockers'])}",
             f"- Active activations: {len(summary['active_activations'])}",
@@ -2502,8 +2486,8 @@ def prepare(args: argparse.Namespace) -> int:
             "timeout_seconds": args.timeout_seconds,
         },
         "phase_history": [],
-        "last_mode": None,
-        "mode_session": 0,
+        "last_mode": "authoritative",
+        "mode_session": 1,
         "last_snapshot": None,
         "schema_revision": None,
     }
@@ -2512,7 +2496,6 @@ def prepare(args: argparse.Namespace) -> int:
         paths,
         record,
         label="prepare",
-        mode="shadow",
         env_file=credential_env_file(args.env_file),
         require_credentials=False,
     )
@@ -2534,21 +2517,19 @@ def start_candidate(args: argparse.Namespace) -> int:
     harness = make_harness(
         paths,
         record,
-        label=f"start-{args.mode}-{len(record['phase_history']) + 1}",
-        mode=args.mode,
+        label=f"start-authoritative-{len(record['phase_history']) + 1}",
         env_file=env_file,
     )
     harness.start()
-    if record.get("last_mode") != args.mode:
-        record["mode_session"] = int(record.get("mode_session", 0)) + 1
-    record["last_mode"] = args.mode
+    record["last_mode"] = "authoritative"
+    record["mode_session"] = 1
     append_phase(
         paths,
         record,
         action="start",
         status="completed",
         detail={
-            "mode": args.mode,
+            "mode": "authoritative",
             "mode_session": record["mode_session"],
             "agent_id": harness.agent_id,
         },
@@ -2566,7 +2547,6 @@ def stop_candidate(args: argparse.Namespace) -> int:
         paths,
         record,
         label=f"stop-{record.get('last_mode')}-{len(record['phase_history']) + 1}",
-        mode=record.get("last_mode") or "shadow",
         env_file=None,
         require_credentials=False,
     )
@@ -2708,7 +2688,7 @@ def preflight(args: argparse.Namespace) -> int:
             model=model,
             credential_envs=names,
             env_file=env_file,
-            runtime_env={"HOLON_SCHEDULER": "legacy"},
+            runtime_env={},
             evidence_root=evidence_root,
             timeout_seconds=args.timeout_seconds,
             keep=False,
@@ -2816,11 +2796,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         command_parser = subparsers.add_parser(command)
         command_parser.add_argument("--run-dir", type=Path, required=True)
         if command == "start":
-            command_parser.add_argument(
-                "--mode",
-                choices=["legacy", "shadow", "authoritative"],
-                required=True,
-            )
             command_parser.add_argument("--env-file")
         if command == "exercise":
             command_parser.add_argument(

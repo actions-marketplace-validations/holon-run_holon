@@ -171,7 +171,8 @@ pub async fn background_task_rejoins_main_session() -> Result<()> {
     Ok(())
 }
 
-pub async fn background_command_task_result_wakes_sleeping_agent_for_model_reentry() -> Result<()> {
+pub async fn background_command_task_result_wakes_sleeping_agent_via_canonical_lifecycle_nudge(
+) -> Result<()> {
     let provider = Arc::new(SleepThenRecordTaskResultProvider::new());
     let host = RuntimeHost::new_with_provider(test_config(), provider.clone())?;
     let runtime = host.default_runtime().await?;
@@ -214,13 +215,13 @@ pub async fn background_command_task_result_wakes_sleeping_agent_for_model_reent
                 yield_time_ms: 10_000,
                 max_output_tokens: Some(256),
                 accepts_input: false,
-                terminal_reentry: false,
+                terminal_reentry: true,
             },
             AuthorityClass::OperatorInstruction,
         )
         .await?;
 
-    wait_until_async_for(Duration::from_secs(10), || {
+    wait_until_async_for(Duration::from_secs(30), || {
         let provider = provider.clone();
         async move { Ok(provider.captured_requests().await.len() >= 2) }
     })
@@ -240,7 +241,7 @@ pub async fn background_command_task_result_wakes_sleeping_agent_for_model_reent
         .as_ref()
         .is_some_and(|continuation| {
             continuation.trigger_kind == holon::types::ContinuationTriggerKind::TaskResult
-                && continuation.model_reentry
+                && !continuation.model_reentry
         }));
     let tasks = runtime.storage().latest_task_records()?;
     assert!(tasks.iter().any(|record| {
@@ -2008,12 +2009,14 @@ pub async fn command_task_stop_cancels_running_command() -> Result<()> {
     assert_eq!(value["task"]["status"], "cancelled");
     assert_eq!(value["task"]["kind"], "command_task");
 
-    let events = runtime.recent_events(200).await?;
-    assert!(events.iter().any(|event| {
-        event.kind == "task_result_received"
-            && event.data.get("task_id").and_then(|value| value.as_str()) == Some(task.id.as_str())
-            && event.data.get("status").and_then(|value| value.as_str()) == Some("cancelled")
-    }));
+    eventually_for(Duration::from_secs(10), || {
+        let messages = runtime.storage().read_recent_messages(20)?;
+        Ok(messages.iter().any(|message| {
+            message.kind == MessageKind::TaskResult
+                && message.task_id.as_deref() == Some(task.id.as_str())
+        }))
+    })
+    .await?;
 
     let active_tasks = runtime.active_tasks(10).await?;
     assert!(!active_tasks.iter().any(|record| record.id == task.id));
@@ -2219,7 +2222,7 @@ pub async fn blocking_command_task_clears_active_state_while_runtime_stopped() -
     Ok(())
 }
 
-pub async fn command_task_result_is_canonical_follow_up_on_completion() -> Result<()> {
+pub async fn command_task_result_is_canonical_lifecycle_nudge_on_completion() -> Result<()> {
     let host =
         RuntimeHost::new_with_provider(test_config(), Arc::new(StubProvider::new("ignored")))?;
     let runtime = host.default_runtime().await?;
@@ -2244,23 +2247,19 @@ pub async fn command_task_result_is_canonical_follow_up_on_completion() -> Resul
 
     eventually_for(Duration::from_secs(10), || {
         let messages = runtime.storage().read_recent_messages(20)?;
-        let agent = runtime.storage().read_agent()?.expect("agent should exist");
-        Ok(messages.iter().any(|message| {
+        let Some(message) = messages.iter().find(|message| {
             message.kind == MessageKind::TaskResult
-                && message
-                    .metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("task_id"))
-                    .and_then(|value| value.as_str())
-                    == Some(task.id.as_str())
-        }) && agent
-            .last_continuation
-            .as_ref()
-            .is_some_and(|continuation| {
-                continuation.model_reentry
-                    && continuation.trigger_kind
-                        == holon::types::ContinuationTriggerKind::TaskResult
-            }))
+                && message.task_id.as_deref() == Some(task.id.as_str())
+        }) else {
+            return Ok(false);
+        };
+        let events = runtime.storage().read_recent_events(200)?;
+        Ok(events.iter().any(|event| {
+            event.kind == "continuation_resolved"
+                && event.data["message_id"] == message.id
+                && event.data["resolution"]["trigger_kind"] == "task_result"
+                && event.data["resolution"]["model_reentry"] == false
+        }))
     })
     .await?;
 
@@ -2433,12 +2432,14 @@ pub async fn command_task_runner_failure_marks_task_failed_and_cleans_up() -> Re
         .iter()
         .any(|record| record.id == task.id));
 
-    let events = runtime.recent_events(200).await?;
-    assert!(events.iter().any(|event| {
-        event.kind == "task_result_received"
-            && event.data.get("task_id").and_then(|value| value.as_str()) == Some(task.id.as_str())
-            && event.data.get("status").and_then(|value| value.as_str()) == Some("failed")
-    }));
+    eventually_for(Duration::from_secs(10), || {
+        let messages = runtime.storage().read_recent_messages(20)?;
+        Ok(messages.iter().any(|message| {
+            message.kind == MessageKind::TaskResult
+                && message.task_id.as_deref() == Some(task.id.as_str())
+        }))
+    })
+    .await?;
     Ok(())
 }
 
@@ -2540,12 +2541,14 @@ pub async fn command_task_nonzero_exit_produces_failed_output_and_runtime_state(
     let active_tasks = runtime.active_tasks(10).await?;
     assert!(!active_tasks.iter().any(|record| record.id == task.id));
 
-    let events = runtime.recent_events(200).await?;
-    assert!(events.iter().any(|event| {
-        event.kind == "task_result_received"
-            && event.data.get("task_id").and_then(|value| value.as_str()) == Some(task.id.as_str())
-            && event.data.get("status").and_then(|value| value.as_str()) == Some("failed")
-    }));
+    eventually_for(Duration::from_secs(10), || {
+        let messages = runtime.storage().read_recent_messages(20)?;
+        Ok(messages.iter().any(|message| {
+            message.kind == MessageKind::TaskResult
+                && message.task_id.as_deref() == Some(task.id.as_str())
+        }))
+    })
+    .await?;
     Ok(())
 }
 

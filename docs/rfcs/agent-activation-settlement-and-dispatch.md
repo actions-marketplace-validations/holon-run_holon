@@ -489,7 +489,11 @@ SchedulerOwner =
 
 `AgentLifecycle` is not a missing WorkItem and must not be implemented with a
 placeholder WorkItem. It admits agent-scoped waits and unbound lifecycle
-inspection turns without registering WorkItem demand.
+inspection turns without registering WorkItem demand. An unbound managed task
+whose durable task record requests terminal re-entry also admits such a
+lifecycle turn directly; it does not require a synthetic agent-scoped wait.
+An unbound runtime timer tick follows the same lifecycle-nudge path, while a
+timer tick matching an active timer wait remains an exact wait resume.
 
 An exact lifecycle wait resume still requires a trusted wait identity and
 generation fence. Generic callback, webhook, channel, or wake-hint ingress

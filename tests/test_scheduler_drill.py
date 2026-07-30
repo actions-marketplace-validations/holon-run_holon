@@ -8,12 +8,56 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts.docker_e2e import scheduler_drill as drill
 
 
 class SchedulerDrillTests(unittest.TestCase):
+    def test_seed_wait_prepares_dynamic_resource_after_work_item_creation(self) -> None:
+        events: list[str] = []
+        harness = Mock()
+        harness.prompt.side_effect = lambda label, *_args, **_kwargs: (
+            events.append(f"prompt:{label}") or (17, {})
+        )
+        harness.wait_work_item.side_effect = lambda **_kwargs: (
+            events.append("work-item-created")
+            or {"id": "work_timer", "state": "open"}
+        )
+        harness.work_items.return_value = [
+            {
+                "id": "work_timer",
+                "objective": "DRILL-WAIT-timer-marker",
+                "state": "open",
+            }
+        ]
+        harness.wait_work_item_scheduling_state.return_value = {
+            "id": "work_timer",
+            "scheduling_state": "waiting_timer",
+        }
+
+        seed = drill.seed_wait(
+            harness,
+            label="timer",
+            marker="marker",
+            wake="timer",
+            prepare_resource=lambda: events.append("timer-created") or "timer_1",
+            expected_scheduling_state="waiting_timer",
+        )
+
+        self.assertEqual(
+            events,
+            [
+                "prompt:timer-create",
+                "work-item-created",
+                "timer-created",
+                "prompt:timer-seed",
+            ],
+        )
+        self.assertEqual(seed["work_item_id"], "work_timer")
+        seed_prompt = harness.prompt.call_args_list[1].args[1]
+        self.assertIn('resource="timer_1"', seed_prompt)
+
     def test_drill_prefix_is_a_scoped_operator_request(self) -> None:
         self.assertIn("current operator turn", drill.DRILL_PREFIX)
         self.assertNotIn("OVERRIDES", drill.DRILL_PREFIX)
@@ -50,39 +94,11 @@ class SchedulerDrillTests(unittest.TestCase):
         evidence = {
             "protocol_config": [
                 {
-                    "protocol_mode": "shadow",
+                    "protocol_mode": "authoritative",
                     "config_revision": 1,
                 }
             ],
             "scenario_authorities": [],
-            "shadow_comparisons": [
-                {
-                    "scenario_class": scenario,
-                    "comparison_outcome": "matched",
-                    "legacy_observation_json": "{}",
-                }
-                for scenario in drill.PRODUCTION_SCENARIOS
-            ]
-            + [
-                {
-                    "scenario_class": "exact_wait_resume",
-                    "comparison_outcome": "matched",
-                    "legacy_observation_json": json.dumps(
-                        {
-                            "input_kind": input_kind,
-                            "wake_source": wake_source,
-                        }
-                    ),
-                }
-                for input_kind, wake_source in (
-                    ("callback_event", "external_callback"),
-                    ("webhook_event", "external_callback"),
-                    ("channel_event", "channel_signal"),
-                    ("timer_tick", "wait_deadline"),
-                    ("system_tick", "system_tick"),
-                    ("system_tick", "operator_wake_hint"),
-                )
-            ],
             "hard_blockers": [],
             "work_demands": [],
             "activations": [
@@ -106,14 +122,24 @@ class SchedulerDrillTests(unittest.TestCase):
             "incomplete_turns": [],
             "queue_status": [{"status": "processed", "count": 8}],
         }
-        summary = drill.evidence_summary(evidence)
+        stress = {
+            "scenario_completed": {
+                scenario: 1 for scenario in drill.PRODUCTION_SCENARIOS
+            },
+            "scenario_shortfalls": {},
+            "failed_count": 0,
+            "latest_phase_status": "completed",
+            "injection_shortfalls": {},
+            "missing_required_injections": [],
+        }
+        summary = drill.evidence_summary(evidence, stress=stress)
         self.assertEqual(summary["status"], "go")
         self.assertTrue(all(summary["checks"].values()))
 
-        evidence["shadow_comparisons"][0]["comparison_outcome"] = "diverged"
-        summary = drill.evidence_summary(evidence)
+        evidence["activations"][0]["lifecycle_state"] = "running"
+        summary = drill.evidence_summary(evidence, stress=stress)
         self.assertEqual(summary["status"], "no-go")
-        self.assertFalse(summary["checks"]["no_divergence"])
+        self.assertFalse(summary["checks"]["no_active_activation"])
 
     def test_report_is_external_evidence_only(self) -> None:
         evidence = {
@@ -129,7 +155,6 @@ class SchedulerDrillTests(unittest.TestCase):
                 scenario: 1 for scenario in drill.PRODUCTION_SCENARIOS
             },
             "checks": {"all_scenarios_observed": True},
-            "divergences": [],
             "current_hard_blockers": [],
             "active_activations": [],
             "occupied_slots": [],
@@ -368,6 +393,9 @@ class SchedulerDrillTests(unittest.TestCase):
         self.assertEqual(summary["injection_completed"]["stale"], 0)
         self.assertEqual(summary["injection_completed"]["duplicate"], 1)
         self.assertEqual(summary["injection_completed"]["out_of_order"], 1)
+
+    def test_wait_rearm_always_requires_canonical_evidence(self) -> None:
+        self.assertTrue(drill.canonical_wait_evidence_required(Mock()))
 
     def test_exercise_records_failed_phase_when_harness_setup_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
