@@ -1,0 +1,20 @@
+[[skills]]
+kind = "github"
+repo = "holon-run/holon"
+path = "skills/ghx"
+
+[[skills]]
+kind = "github"
+repo = "holon-run/holon"
+path = "skills/github-issue-solve"
+
+[[skills]]
+kind = "github"
+repo = "holon-run/holon"
+path = "skills/github-pr-fix"
+
+[[skills]]
+kind = "github"
+repo = "holon-run/holon"
+path = "skills/github-review"
+

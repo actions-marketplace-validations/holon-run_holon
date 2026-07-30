@@ -1,0 +1,426 @@
+use super::*;
+use crate::provider::ProviderAttemptTimeline;
+use crate::runtime_error::{describe_runtime_error, RuntimeErrorContext, RuntimeErrorDescriptor};
+use crate::types::{
+    BriefRecord, FailureArtifact, FailureArtifactCategory, RuntimeFailureSummary, TranscriptEntry,
+    TurnTerminalRecord,
+};
+
+pub(super) struct RuntimeFailureArtifacts {
+    pub(super) brief: BriefRecord,
+    pub(super) transcript: TranscriptEntry,
+    pub(super) failure_summary: RuntimeFailureSummary,
+}
+
+impl RuntimeHandle {
+    #[cfg(test)]
+    pub(super) async fn ensure_runtime_failure_terminal(
+        &self,
+        last_assistant_message: Option<String>,
+        duration_ms: u64,
+    ) -> Result<TurnTerminalRecord> {
+        let existing = {
+            let guard = self.inner.agent.lock().await;
+            guard
+                .state
+                .last_turn_terminal
+                .clone()
+                .filter(|terminal| terminal.turn_index == guard.state.turn_index)
+        };
+        if let Some(terminal) = existing {
+            return Ok(terminal);
+        }
+        self.persist_turn_aborted_record(
+            "",
+            "runtime_error",
+            last_assistant_message,
+            duration_ms,
+            true,
+        )
+        .await
+    }
+
+    fn sanitize_failure_artifact_url(raw: &str) -> String {
+        let Ok(mut url) = reqwest::Url::parse(raw) else {
+            return raw.to_string();
+        };
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_query(None);
+        url.set_fragment(None);
+        url.to_string()
+    }
+
+    fn sanitize_failure_artifact_path(raw: &str) -> String {
+        const TRACE_MARKER: &str = ".holon/http-trace/";
+        raw.find(TRACE_MARKER)
+            .map(|index| raw[index..].to_string())
+            .unwrap_or_else(|| {
+                std::path::Path::new(raw)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("<redacted-path>")
+                    .to_string()
+            })
+    }
+
+    fn metadata_enum_value<T: serde::Serialize>(value: &T) -> String {
+        let json = to_json_value(value);
+        json.as_str()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| json.to_string())
+    }
+
+    fn provider_failure_category(failure_kind: &str) -> FailureArtifactCategory {
+        match failure_kind {
+            "timeout" | "connection" | "rate_limited" | "server_error" => {
+                FailureArtifactCategory::Transport
+            }
+            "auth_error" | "contract_error" | "invalid_response" | "unsupported_transport" => {
+                FailureArtifactCategory::Protocol
+            }
+            _ => FailureArtifactCategory::Unknown,
+        }
+    }
+
+    fn failure_artifact_for_provider_timeline(
+        error_summary: &str,
+        attempt_timeline: &ProviderAttemptTimeline,
+        descriptor: &RuntimeErrorDescriptor,
+        mut context: RuntimeErrorContext,
+    ) -> FailureArtifact {
+        let latest_attempt = attempt_timeline.attempts.iter().rev().find(|attempt| {
+            attempt.failure_kind.is_some() || attempt.transport_diagnostics.is_some()
+        });
+
+        let mut kind = latest_attempt
+            .and_then(|attempt| attempt.failure_kind.clone())
+            .unwrap_or_else(|| "unknown".into());
+        kind.retain(|c: char| !c.is_whitespace());
+
+        let mut metadata = std::collections::BTreeMap::new();
+        if let Some(winning_model_ref) = attempt_timeline.winning_model_ref.clone() {
+            metadata.insert("winning_model_ref".into(), winning_model_ref);
+        }
+        if let Some(provider) = latest_attempt.map(|attempt| attempt.provider.clone()) {
+            metadata.insert("provider".into(), provider);
+        }
+        if let Some(model_ref) = latest_attempt.map(|attempt| attempt.model_ref.clone()) {
+            metadata.insert("model_ref".into(), model_ref);
+        }
+        if let Some(diag) =
+            latest_attempt.and_then(|attempt| attempt.transport_diagnostics.as_ref())
+        {
+            if let Some(status) = diag.status {
+                metadata.insert("status".into(), status.to_string());
+            }
+            metadata.insert("transport_stage".into(), diag.stage.clone());
+            if let Some(url) = diag.url.clone() {
+                metadata.insert("url".into(), Self::sanitize_failure_artifact_url(&url));
+            }
+            if let Some(http_trace) = diag.http_trace.as_ref() {
+                metadata.insert("http_trace_mode".into(), http_trace.mode.clone());
+                metadata.insert(
+                    "http_trace_path".into(),
+                    Self::sanitize_failure_artifact_path(&http_trace.path),
+                );
+            }
+            metadata.insert(
+                "reqwest_is_timeout".into(),
+                diag.reqwest
+                    .as_ref()
+                    .map(|req| req.is_timeout)
+                    .unwrap_or(false)
+                    .to_string(),
+            );
+            metadata.insert(
+                "reqwest_is_connect".into(),
+                diag.reqwest
+                    .as_ref()
+                    .map(|req| req.is_connect)
+                    .unwrap_or(false)
+                    .to_string(),
+            );
+            metadata.insert(
+                "reqwest_is_request".into(),
+                diag.reqwest
+                    .as_ref()
+                    .map(|req| req.is_request)
+                    .unwrap_or(false)
+                    .to_string(),
+            );
+            metadata.insert(
+                "reqwest_is_body".into(),
+                diag.reqwest
+                    .as_ref()
+                    .map(|req| req.is_body)
+                    .unwrap_or(false)
+                    .to_string(),
+            );
+            metadata.insert(
+                "reqwest_is_decode".into(),
+                diag.reqwest
+                    .as_ref()
+                    .map(|req| req.is_decode)
+                    .unwrap_or(false)
+                    .to_string(),
+            );
+            metadata.insert(
+                "reqwest_is_redirect".into(),
+                diag.reqwest
+                    .as_ref()
+                    .map(|req| req.is_redirect)
+                    .unwrap_or(false)
+                    .to_string(),
+            );
+        }
+
+        let source_chain = latest_attempt
+            .and_then(|attempt| attempt.transport_diagnostics.as_ref())
+            .map(|diag| diag.source_chain.clone())
+            .filter(|chain| !chain.is_empty())
+            .unwrap_or_else(|| descriptor.source_chain.clone());
+        context.provider = latest_attempt.map(|attempt| attempt.provider.clone());
+        context.model_ref = latest_attempt.map(|attempt| attempt.model_ref.clone());
+
+        FailureArtifact {
+            category: Self::provider_failure_category(&kind),
+            kind,
+            summary: error_summary.to_string(),
+            domain: Some(descriptor.domain),
+            retryable: Some(descriptor.retryable),
+            recovery_hint: descriptor.recovery_hint.clone(),
+            provider: latest_attempt
+                .map(|attempt| attempt.provider.clone())
+                .or_else(|| metadata.get("provider").cloned()),
+            model_ref: latest_attempt
+                .map(|attempt| attempt.model_ref.clone())
+                .or_else(|| metadata.get("model_ref").cloned()),
+            status: latest_attempt
+                .and_then(|attempt| attempt.transport_diagnostics.as_ref())
+                .and_then(|diag| diag.status),
+            task_id: None,
+            exit_status: None,
+            source_chain,
+            context: Box::new(context),
+            metadata,
+        }
+    }
+
+    fn failure_artifact_for_runtime_error(
+        message: &MessageEnvelope,
+        failure_text: &str,
+        descriptor: &RuntimeErrorDescriptor,
+        context: RuntimeErrorContext,
+    ) -> FailureArtifact {
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(
+            "message_kind".into(),
+            Self::metadata_enum_value(&message.kind),
+        );
+        metadata.insert("message_id".into(), message.id.clone());
+        metadata.insert(
+            "delivery_surface".into(),
+            Self::metadata_enum_value(&message.delivery_surface),
+        );
+        metadata.insert(
+            "admission_context".into(),
+            Self::metadata_enum_value(&message.admission_context),
+        );
+        metadata.insert(
+            "authority_class".into(),
+            Self::metadata_enum_value(&message.authority_class),
+        );
+        FailureArtifact {
+            category: FailureArtifactCategory::Runtime,
+            kind: descriptor.code.clone(),
+            summary: failure_text.to_string(),
+            domain: Some(descriptor.domain),
+            retryable: Some(descriptor.retryable),
+            recovery_hint: descriptor.recovery_hint.clone(),
+            provider: None,
+            model_ref: None,
+            status: None,
+            task_id: None,
+            exit_status: None,
+            source_chain: descriptor.source_chain.clone(),
+            context: Box::new(context),
+            metadata,
+        }
+    }
+
+    fn failure_artifact(
+        message: &MessageEnvelope,
+        failure_text: &str,
+        error: &anyhow::Error,
+        context: RuntimeErrorContext,
+    ) -> FailureArtifact {
+        let descriptor = describe_runtime_error(error);
+        if let Some(timeline) = provider_attempt_timeline(error) {
+            if !timeline.attempts.is_empty() {
+                return Self::failure_artifact_for_provider_timeline(
+                    failure_text,
+                    timeline,
+                    &descriptor,
+                    context,
+                );
+            }
+        }
+
+        Self::failure_artifact_for_runtime_error(message, failure_text, &descriptor, context)
+    }
+
+    pub(super) fn summarize_runtime_failure_error(error: &anyhow::Error) -> String {
+        const MAX_ERROR_SUMMARY_LEN: usize = 200;
+
+        let raw = error.to_string();
+        let first_line = raw
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("unknown error");
+
+        let mut summary = String::new();
+        let mut char_count = 0usize;
+        let mut truncated = false;
+
+        for segment in first_line.split_whitespace() {
+            let segment_len = segment.chars().count();
+            let separator_len = usize::from(!summary.is_empty());
+            if char_count + separator_len + segment_len > MAX_ERROR_SUMMARY_LEN {
+                truncated = true;
+                if summary.is_empty() {
+                    let prefix_limit = MAX_ERROR_SUMMARY_LEN.saturating_sub(1);
+                    let prefix = segment.chars().take(prefix_limit).collect::<String>();
+                    if !prefix.is_empty() {
+                        summary.push_str(&prefix);
+                    }
+                }
+                break;
+            }
+            if !summary.is_empty() {
+                summary.push(' ');
+                char_count += 1;
+            }
+            summary.push_str(segment);
+            char_count += segment_len;
+        }
+
+        if truncated {
+            while summary.chars().count() >= MAX_ERROR_SUMMARY_LEN {
+                summary.pop();
+            }
+            summary.push('…');
+        }
+
+        summary
+    }
+
+    pub(super) fn concise_runtime_failure_text(
+        message: &MessageEnvelope,
+        error: &anyhow::Error,
+    ) -> String {
+        let message_kind = to_json_value(&message.kind)
+            .as_str()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "message".to_string());
+        let descriptor = describe_runtime_error(error);
+        let error_summary =
+            Self::summarize_runtime_failure_error(&anyhow::anyhow!(descriptor.operator_message));
+        format!(
+            "Turn failed while processing {}: {}",
+            message_kind, error_summary
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) async fn persist_runtime_failure_artifacts(
+        &self,
+        message: &MessageEnvelope,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let terminal = self.ensure_runtime_failure_terminal(None, 0).await?;
+        let artifacts = self
+            .build_runtime_failure_artifacts(message, error, &terminal)
+            .await?;
+        self.persist_brief(&artifacts.brief).await?;
+        self.persist_turn_record(&terminal).await?;
+        self.persist_transcript_evidence(&artifacts.transcript)?;
+        {
+            let mut guard = self.inner.agent.lock().await;
+            guard.state.last_runtime_failure = Some(artifacts.failure_summary);
+            guard.persist_state(&self.inner.storage)?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn build_runtime_failure_artifacts(
+        &self,
+        message: &MessageEnvelope,
+        error: &anyhow::Error,
+        terminal: &TurnTerminalRecord,
+    ) -> Result<RuntimeFailureArtifacts> {
+        let failure_text = Self::concise_runtime_failure_text(message, error);
+        let attempt_timeline = provider_attempt_timeline(error);
+        let (run_id, current_work_item_id) = {
+            let guard = self.inner.agent.lock().await;
+            (
+                guard.state.current_run_id.clone(),
+                guard
+                    .state
+                    .current_turn_work_item_id
+                    .clone()
+                    .or_else(|| guard.state.current_work_item_id.clone()),
+            )
+        };
+        let context = RuntimeErrorContext {
+            message_id: Some(message.id.clone()),
+            turn_id: Some(terminal.turn_id.clone()),
+            run_id,
+            work_item_id: message.work_item_id.clone().or(current_work_item_id),
+            task_id: message.task_id.clone(),
+            correlation_id: message.correlation_id.clone(),
+            causation_id: message.causation_id.clone(),
+            ..RuntimeErrorContext::default()
+        };
+        let descriptor = describe_runtime_error(error);
+        let failure_artifact = Self::failure_artifact(message, &failure_text, error, context);
+        let token_usage = attempt_timeline
+            .as_ref()
+            .and_then(|timeline| timeline.aggregated_token_usage.clone());
+        let error_chain = failure_artifact.source_chain.clone();
+        let mut brief = brief::make_failure(&message.agent_id, message, failure_text.clone());
+        brief.turn_id = Some(terminal.turn_id.clone());
+        brief.turn_index = Some(terminal.turn_index);
+        let transcript = TranscriptEntry::new(
+            message.agent_id.clone(),
+            TranscriptEntryKind::RuntimeFailure,
+            None,
+            Some(message.id.clone()),
+            serde_json::json!({
+                "kind": message.kind,
+                "origin": message.origin,
+                "authority_class": message.authority_class,
+                "delivery_surface": message.delivery_surface,
+                "admission_context": message.admission_context,
+                "error": descriptor.operator_message,
+                "error_chain": error_chain,
+                "text": failure_text,
+                "failure_artifact": failure_artifact.clone(),
+                "token_usage": token_usage,
+                "provider_attempt_timeline": attempt_timeline,
+            }),
+        );
+        Ok(RuntimeFailureArtifacts {
+            brief,
+            transcript,
+            failure_summary: RuntimeFailureSummary {
+                occurred_at: Utc::now(),
+                summary: failure_text,
+                phase: RuntimeFailurePhase::RuntimeTurn,
+                detail_hint: Some("run `holon daemon logs` for details".into()),
+                failure_artifact: Some(failure_artifact),
+            },
+        })
+    }
+}

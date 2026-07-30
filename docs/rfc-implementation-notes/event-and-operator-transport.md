@@ -1,0 +1,54 @@
+# Event and Operator Transport Implementation Notes
+
+Related handles:
+
+- `rfc-event-stream-interface`
+- `rfc-remote-operator-transport-and-delivery`
+- `rfc-operator-wait-and-intervention`
+
+## Current implementation posture
+
+The runtime has internal event projection and operator notification surfaces.
+These already preserve a distinction between runtime posture, closure outcome,
+task lifecycle, and operator-facing delivery.
+
+The main unfinished area is not local event production; it is the stable remote
+operator contract:
+
+- which events are replayable;
+- which events are only live notifications;
+- how origin/trust/priority are represented over transport;
+- how delivery failure, retries, and duplicate suppression are surfaced;
+- how operator intervention attaches to an existing work item or waiting
+  posture.
+
+The v0.14 replay/projection minimum is:
+
+- `/events` is a recent replay projection surface, not the raw append-only log
+  as a public API.
+- replay preserves safe provenance outside the event payload: event id,
+  per-agent durable `event_seq`, timestamp, event kind, agent id, origin, trust,
+  authority class, delivery surface, admission context, transport/source, reply
+  route, message id, task id, work item id, correlation id, and causation id
+  when available.
+- replay and SSE cursors use ledger-assigned `event_seq`; response-local
+  sequence numbers must not drive ordering, paging, or TUI truncation.
+- operator replay is the default projection and includes canonical standard
+  event payloads.
+- client display density is handled by presentation policy, not by clipping the
+  replay payload.
+- cursor expiry remains a deterministic `/state` refresh path rather than a
+  client-side history reconstruction guess.
+
+## Open gaps
+
+1. Define the remote operator delivery envelope before treating a transport as
+   authoritative.
+2. Preserve provenance across operator input, external channel input, and
+   runtime-generated notifications.
+3. Keep closure result delivery separate from internal traces and task output.
+4. Add verification that replayed remote events cannot elevate trust or
+   overwrite operator-origin input provenance.
+
+Tracked by #912 for event ingress and provenance, #919 for operator-facing
+event presentation, and #922 for replay/provenance verification.

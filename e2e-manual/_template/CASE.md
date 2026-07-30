@@ -1,36 +1,41 @@
-# <case-name>
+# case-name
 
 ## Purpose
 
-Describe what this case validates.
+Describe the end-to-end behavior being validated.
 
 ## Preconditions
 
-- Required tools/accounts
-- Required environment variables
-- Required repo state
+- Required repositories, secrets, tokens, and branches.
+- Required workflow references.
 
 ## Steps
 
-1. Step one
-2. Step two
-3. Step three
+1. Prepare the live target.
+2. Trigger Holon.
+3. Wait for completion.
+4. Validate expected side effects.
+5. Collect evidence.
 
 ## Expected
 
-- Observable expected behavior
+- Expected workflow result.
+- Expected GitHub side effects.
 
 ## Pass / Fail Criteria
 
-- Pass: explicit success conditions
-- Fail (`infra-fail`): infra pipeline conditions
-- Fail (`agent-fail`): agent behavior conditions
+- Pass:
+  - Workflow exits successfully.
+  - Required artifact exists.
+  - Required side effect is visible on GitHub.
+- Fail (`infra-fail`):
+  - Auth, workflow, checkout, model, runtime, or token broker failure.
+- Fail (`agent-fail`):
+  - Runtime completes but expected agent behavior is missing.
 
 ## Evidence to Capture
 
-- Required logs/files/URLs for debugging
-
-## Known Failure Modes
-
-- Common failure mode 1
-- Common failure mode 2
+- Workflow run URL.
+- Target issue/PR URL.
+- `holon-solve-output` artifact.
+- Relevant GitHub side-effect URLs.

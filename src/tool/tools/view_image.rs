@@ -1,0 +1,1016 @@
+use std::{
+    fs::{self, File},
+    io::Read,
+    path::Path,
+};
+
+use anyhow::{anyhow, Result};
+use chrono::Utc;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+use crate::{
+    runtime::{RuntimeHandle, ViewImageObservationCacheKey},
+    system::ExecutionScopeKind,
+    tool::{helpers::invalid_tool_input, spec::typed_spec, ToolError, ToolResult},
+    types::{
+        AuthorityClass, ToolCapabilityFamily, ViewImageGeneratedBy, ViewImageObservation,
+        ViewImageReferenceSize, ViewImageResult, ViewImageSelectedMode, ViewImageVisionSelection,
+        ViewImageVisualReference,
+    },
+};
+
+use super::{serialize_success, BuiltinToolDefinition};
+use crate::tool::helpers::{parse_tool_args, validate_non_empty};
+
+pub(crate) const NAME: &str = crate::tool::names::VIEW_IMAGE;
+const VISUAL_OBSERVATION_SCHEMA: &str = "visual_observation.v1";
+const VIEW_IMAGE_OBSERVATION_GENERATION_POLICY: &str = "openai-compatible-image-input.v1";
+pub(crate) const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_IMAGE_PIXELS: u64 = 50_000_000;
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ViewImageArgs {
+    pub(crate) path: String,
+    pub(crate) prompt: String,
+}
+
+pub(crate) fn definition() -> Result<BuiltinToolDefinition> {
+    Ok(BuiltinToolDefinition {
+        family: ToolCapabilityFamily::LocalEnvironment,
+        spec: typed_spec::<ViewImageArgs>(
+            NAME,
+            include_str!("../tool_descriptions/view_image.md"),
+        )?,
+    })
+}
+
+pub(crate) async fn execute(
+    runtime: &RuntimeHandle,
+    _agent_id: &str,
+    _authority_class: &AuthorityClass,
+    input: &Value,
+) -> Result<crate::tool::ToolResult> {
+    let args: ViewImageArgs = parse_tool_args(NAME, input)?;
+    let path = validate_non_empty(args.path, NAME, "path")?;
+    let prompt = validate_non_empty(args.prompt, NAME, "prompt")?;
+    let execution = runtime
+        .effective_execution(ExecutionScopeKind::AgentTurn)
+        .await?;
+    let resolved_path = execution.workspace.resolve_read_path(&path)?;
+    let image = read_visual_reference(&resolved_path)?;
+    let visual_reference = image.visual_reference;
+    let cache_key = observation_cache_key(&visual_reference, &prompt);
+    let vision_selection = runtime.current_view_image_vision_selection().await?;
+    if let Some(observation) = runtime.cached_view_image_observation(&cache_key).await {
+        let selected_mode = vision_selection.selected_mode.clone();
+        return serialize_success(
+            NAME,
+            &ViewImageResult {
+                visual_reference,
+                observation,
+                selected_mode,
+                vision_selection,
+                summary_text: Some("ViewImage reused cached visual observation".to_string()),
+            },
+        );
+    }
+    if vision_selection.selected_mode == ViewImageSelectedMode::Unavailable {
+        return Err(vision_adapter_unavailable(vision_selection));
+    }
+    let raw_observation = runtime
+        .generate_view_image_observation(&prompt, &visual_reference.mime, &image.bytes)
+        .await
+        .map_err(|error| vision_observation_failed(&vision_selection, error))?;
+    let observation = parse_visual_observation(
+        &raw_observation,
+        &visual_reference,
+        &prompt,
+        &vision_selection,
+    )
+    .map_err(|error| vision_observation_failed(&vision_selection, error))?;
+    runtime
+        .cache_view_image_observation(cache_key, observation.clone())
+        .await;
+    let summary_text = Some(format!(
+        "ViewImage generated a visual observation with {}/{} for {}",
+        vision_selection
+            .vision_provider
+            .as_deref()
+            .unwrap_or("unknown-provider"),
+        vision_selection
+            .vision_model
+            .as_deref()
+            .unwrap_or("unknown-model"),
+        visual_reference.mime
+    ));
+    serialize_success(
+        NAME,
+        &ViewImageResult {
+            visual_reference,
+            observation,
+            selected_mode: vision_selection.selected_mode.clone(),
+            vision_selection,
+            summary_text,
+        },
+    )
+}
+
+pub(crate) fn render_for_model(result: &ToolResult) -> Result<String> {
+    let value = result
+        .envelope
+        .result
+        .as_ref()
+        .ok_or_else(|| anyhow!("ViewImage success result missing payload"))?;
+    let result: ViewImageResult = serde_json::from_value(value.clone())?;
+    Ok(render_view_image_result(&result))
+}
+
+fn render_view_image_result(result: &ViewImageResult) -> String {
+    let reference = &result.visual_reference;
+    let observation = &result.observation;
+    let mut lines = vec![
+        "ViewImage visual observation".to_string(),
+        format!(
+            "Reference: {} ({}, {} bytes, sha256 {}, path {})",
+            reference.id,
+            reference.mime,
+            reference.byte_count,
+            reference.sha256,
+            reference.path.display()
+        ),
+        format!(
+            "Size: {}",
+            match (reference.size.width, reference.size.height) {
+                (Some(width), Some(height)) => format!("{width}x{height}"),
+                (Some(width), None) => format!("{width}xunknown"),
+                (None, Some(height)) => format!("unknownx{height}"),
+                (None, None) => "unknown".to_string(),
+            }
+        ),
+        format!(
+            "Generated by: {}/{} ({:?})",
+            observation
+                .generated_by
+                .provider
+                .as_deref()
+                .unwrap_or("unknown-provider"),
+            observation
+                .generated_by
+                .model
+                .as_deref()
+                .unwrap_or("unknown-model"),
+            observation.generated_by.mode
+        ),
+        format!("Prompt: {}", observation.prompt),
+        format!("Summary: {}", observation.summary),
+    ];
+
+    push_json_section(&mut lines, "OCR", &observation.ocr);
+    push_json_section(&mut lines, "Elements", &observation.elements);
+    push_json_section(&mut lines, "Relations", &observation.relations);
+    push_json_section(&mut lines, "Issues", &observation.issues);
+    if !observation.uncertainties.is_empty() {
+        lines.push(format!(
+            "Uncertainties: {}",
+            observation.uncertainties.join("; ")
+        ));
+    }
+    push_json_section(
+        &mut lines,
+        "External sources",
+        &observation.external_sources,
+    );
+
+    lines.join("\n")
+}
+
+fn push_json_section(lines: &mut Vec<String>, label: &str, values: &[Value]) {
+    if values.is_empty() {
+        return;
+    }
+    let rendered = serde_json::to_string(values).unwrap_or_else(|_| "<unrenderable>".to_string());
+    lines.push(format!("{label}: {rendered}"));
+}
+
+fn vision_adapter_unavailable(selection: ViewImageVisionSelection) -> anyhow::Error {
+    ToolError::new(
+        "vision_adapter_unavailable",
+        "ViewImage requires an OpenAI-compatible model with image input support, but no configured provider/model can generate visual observations.",
+    )
+    .with_details(json!({
+        "selected_mode": selection.selected_mode,
+        "selection_reason": selection.selection_reason,
+        "primary_provider": selection.primary_provider,
+        "primary_model": selection.primary_model,
+        "candidates": selection.candidates,
+    }))
+    .with_recovery_hint("configure a primary or fallback OpenAI-compatible vision model whose metadata advertises image_input")
+    .into()
+}
+
+fn vision_observation_failed(
+    selection: &ViewImageVisionSelection,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    ToolError::new(
+        "vision_observation_failed",
+        format!("ViewImage could not generate a visual observation: {error}"),
+    )
+    .with_details(json!({
+        "selected_mode": selection.selected_mode,
+        "selection_reason": selection.selection_reason,
+        "vision_provider": selection.vision_provider,
+        "vision_model": selection.vision_model,
+        "error": error.to_string(),
+    }))
+    .with_recovery_hint("configure an OpenAI-compatible vision model with valid credentials, or retry after provider failures are resolved")
+    .into()
+}
+
+fn observation_cache_key(
+    visual_reference: &ViewImageVisualReference,
+    prompt: &str,
+) -> ViewImageObservationCacheKey {
+    ViewImageObservationCacheKey {
+        visual_reference_id: visual_reference.id.clone(),
+        prompt: prompt.to_string(),
+        observation_schema: VISUAL_OBSERVATION_SCHEMA.to_string(),
+        generation_policy: VIEW_IMAGE_OBSERVATION_GENERATION_POLICY.to_string(),
+    }
+}
+
+fn parse_visual_observation(
+    raw: &str,
+    visual_reference: &ViewImageVisualReference,
+    prompt: &str,
+    selection: &ViewImageVisionSelection,
+) -> Result<ViewImageObservation> {
+    let value = parse_observation_json(raw)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("vision adapter response must be a JSON object"))?;
+    if object.get("type").and_then(Value::as_str) != Some("visual_observation") {
+        return Err(anyhow!(
+            "vision adapter response `type` must be visual_observation"
+        ));
+    }
+    if object.get("schema").and_then(Value::as_str) != Some(VISUAL_OBSERVATION_SCHEMA) {
+        return Err(anyhow!(
+            "vision adapter response `schema` must be {VISUAL_OBSERVATION_SCHEMA}"
+        ));
+    }
+    let summary = object
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+        .ok_or_else(|| anyhow!("vision adapter response must include a non-empty `summary`"))?
+        .to_string();
+    Ok(ViewImageObservation {
+        kind: "visual_observation".to_string(),
+        schema: VISUAL_OBSERVATION_SCHEMA.to_string(),
+        visual_reference_id: visual_reference.id.clone(),
+        prompt: prompt.to_string(),
+        generated_by: ViewImageGeneratedBy {
+            mode: selection.selected_mode.clone(),
+            provider: selection.vision_provider.clone(),
+            model: selection.vision_model.clone(),
+            selection_reason: Some(selection.selection_reason.clone()),
+        },
+        summary,
+        ocr: optional_value_array(object.get("ocr"), "ocr"),
+        elements: optional_value_array(object.get("elements"), "elements"),
+        relations: optional_value_array(object.get("relations"), "relations"),
+        issues: optional_value_array(object.get("issues"), "issues"),
+        uncertainties: optional_uncertainties(object.get("uncertainties")),
+        external_sources: optional_value_array(object.get("external_sources"), "external_sources"),
+    })
+}
+
+fn parse_observation_json(raw: &str) -> Result<Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("vision adapter response was empty"));
+    }
+    if let Ok(value) = serde_json::from_str(trimmed) {
+        return Ok(value);
+    }
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|body| body.strip_suffix("```"))
+        .map(str::trim);
+    if let Some(unfenced) = unfenced {
+        if let Ok(value) = serde_json::from_str(unfenced) {
+            return Ok(value);
+        }
+    }
+    let Some(start) = trimmed.find('{') else {
+        return Err(anyhow!("vision adapter response did not contain JSON"));
+    };
+    let Some(end) = trimmed.rfind('}') else {
+        return Err(anyhow!(
+            "vision adapter response did not contain a complete JSON object"
+        ));
+    };
+    serde_json::from_str(&trimmed[start..=end])
+        .map_err(|error| anyhow!("vision adapter returned invalid observation JSON: {error}"))
+}
+
+fn optional_value_array(value: Option<&Value>, field: &str) -> Vec<Value> {
+    match value {
+        Some(Value::Array(values)) => values.clone(),
+        Some(Value::Object(object)) => vec![Value::Object(object.clone())],
+        Some(Value::String(text)) if !text.trim().is_empty() => {
+            // OCR entries expose text; every other current observation array describes an item.
+            let text_field = if field == "ocr" {
+                "text"
+            } else {
+                "description"
+            };
+            vec![json!({ text_field: text.trim() })]
+        }
+        Some(Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)) | None => {
+            Vec::new()
+        }
+    }
+}
+
+fn optional_uncertainties(value: Option<&Value>) -> Vec<String> {
+    let values = match value {
+        Some(Value::Array(values)) => values.as_slice(),
+        Some(value) => std::slice::from_ref(value),
+        None => return Vec::new(),
+    };
+    values.iter().filter_map(uncertainty_text).collect()
+}
+
+fn uncertainty_text(value: &Value) -> Option<String> {
+    let text = value.as_str().or_else(|| {
+        let object = value.as_object()?;
+        ["text", "description", "summary", "message"]
+            .iter()
+            .find_map(|field| object.get(*field).and_then(Value::as_str))
+    })?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReadImage {
+    pub(crate) visual_reference: ViewImageVisualReference,
+    pub(crate) bytes: Vec<u8>,
+}
+
+pub(crate) fn read_visual_reference(path: &Path) -> Result<ReadImage> {
+    let file_metadata = fs::metadata(path).map_err(|error| {
+        invalid_tool_input(
+            NAME,
+            "ViewImage `path` must refer to a readable local image file",
+            json!({
+                "field": "path",
+                "path": path,
+                "io_error": error.to_string(),
+            }),
+            "provide a readable PNG, JPEG, GIF, or WebP image file path",
+        )
+    })?;
+    if !file_metadata.is_file() {
+        return Err(invalid_tool_input(
+            NAME,
+            "ViewImage `path` must refer to a regular file",
+            json!({
+                "field": "path",
+                "path": path,
+                "validation_error": "not a regular file",
+            }),
+            "provide a path to a readable PNG, JPEG, GIF, or WebP image file",
+        ));
+    }
+    let byte_count = file_metadata.len();
+    if byte_count > MAX_IMAGE_BYTES {
+        return Err(invalid_tool_input(
+            NAME,
+            "ViewImage `path` exceeds the maximum supported image file size",
+            json!({
+                "field": "path",
+                "path": path,
+                "byte_count": byte_count,
+                "max_byte_count": MAX_IMAGE_BYTES,
+            }),
+            "provide a smaller local image file",
+        ));
+    }
+    let mut file = File::open(path).map_err(|error| {
+        ToolError::new(
+            "image_read_failed",
+            format!("failed to read image file: {error}"),
+        )
+        .with_details(json!({
+            "path": path,
+            "io_error": error.to_string(),
+        }))
+        .with_recovery_hint("provide a readable local image file path")
+    })?;
+    let mut bytes = Vec::with_capacity(byte_count as usize);
+    file.by_ref()
+        .take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ToolError::new(
+                "image_read_failed",
+                format!("failed to read image file: {error}"),
+            )
+            .with_details(json!({
+                "path": path,
+                "io_error": error.to_string(),
+            }))
+            .with_recovery_hint("provide a readable local image file path")
+        })?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return Err(invalid_tool_input(
+            NAME,
+            "ViewImage `path` exceeds the maximum supported image file size",
+            json!({
+                "field": "path",
+                "path": path,
+                "byte_count": bytes.len(),
+                "max_byte_count": MAX_IMAGE_BYTES,
+            }),
+            "provide a smaller local image file",
+        ));
+    }
+    let Some(header) = ImageHeader::parse(&bytes) else {
+        return Err(invalid_tool_input(
+            NAME,
+            "ViewImage `path` must refer to a supported image file",
+            json!({
+                "field": "path",
+                "path": path,
+                "validation_error": "unsupported image header",
+                "supported_media_types": ["image/png", "image/jpeg", "image/gif", "image/webp"],
+            }),
+            "provide a PNG, JPEG, GIF, or WebP image file",
+        ));
+    };
+    if let (Some(width), Some(height)) = (header.width, header.height) {
+        let pixels = u64::from(width) * u64::from(height);
+        if pixels > MAX_IMAGE_PIXELS {
+            return Err(invalid_tool_input(
+                NAME,
+                "ViewImage `path` exceeds the maximum supported decoded pixel count",
+                json!({
+                    "field": "path",
+                    "path": path,
+                    "width": width,
+                    "height": height,
+                    "pixel_count": pixels,
+                    "max_pixel_count": MAX_IMAGE_PIXELS,
+                }),
+                "provide an image with fewer decoded pixels",
+            ));
+        }
+    }
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let visual_reference = ViewImageVisualReference {
+        kind: "visual_reference".to_string(),
+        id: format!("vis_{}", &sha256[..16]),
+        path: path.to_path_buf(),
+        sha256,
+        mime: header.media_type.to_string(),
+        byte_count: bytes.len() as u64,
+        size: ViewImageReferenceSize {
+            width: header.width,
+            height: header.height,
+        },
+        created_at: Utc::now(),
+    };
+    Ok(ReadImage {
+        visual_reference,
+        bytes,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImageHeader {
+    media_type: &'static str,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+impl ImageHeader {
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        parse_png(bytes)
+            .or_else(|| parse_gif(bytes))
+            .or_else(|| parse_webp(bytes))
+            .or_else(|| parse_jpeg(bytes))
+    }
+}
+
+fn parse_png(bytes: &[u8]) -> Option<ImageHeader> {
+    if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    Some(ImageHeader {
+        media_type: "image/png",
+        width: Some(u32::from_be_bytes(bytes[16..20].try_into().ok()?)),
+        height: Some(u32::from_be_bytes(bytes[20..24].try_into().ok()?)),
+    })
+}
+
+fn parse_gif(bytes: &[u8]) -> Option<ImageHeader> {
+    if bytes.len() < 10 || !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        return None;
+    }
+    Some(ImageHeader {
+        media_type: "image/gif",
+        width: Some(u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32),
+        height: Some(u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32),
+    })
+}
+
+fn parse_webp(bytes: &[u8]) -> Option<ImageHeader> {
+    if bytes.len() < 30 || !bytes.starts_with(b"RIFF") || &bytes[8..12] != b"WEBP" {
+        return None;
+    }
+    match &bytes[12..16] {
+        b"VP8 " if bytes.len() >= 30 && &bytes[23..26] == b"\x9d\x01\x2a" => {
+            let width = u16::from_le_bytes(bytes[26..28].try_into().ok()?) & 0x3fff;
+            let height = u16::from_le_bytes(bytes[28..30].try_into().ok()?) & 0x3fff;
+            Some(ImageHeader {
+                media_type: "image/webp",
+                width: Some(width as u32),
+                height: Some(height as u32),
+            })
+        }
+        b"VP8L" if bytes.len() >= 25 => {
+            let packed = u32::from_le_bytes(bytes[21..25].try_into().ok()?);
+            Some(ImageHeader {
+                media_type: "image/webp",
+                width: Some((packed & 0x3fff) + 1),
+                height: Some(((packed >> 14) & 0x3fff) + 1),
+            })
+        }
+        b"VP8X" if bytes.len() >= 30 => Some(ImageHeader {
+            media_type: "image/webp",
+            width: Some(read_u24_le(&bytes[24..27]) + 1),
+            height: Some(read_u24_le(&bytes[27..30]) + 1),
+        }),
+        _ => None,
+    }
+}
+
+fn read_u24_le(bytes: &[u8]) -> u32 {
+    u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16)
+}
+
+fn parse_jpeg(bytes: &[u8]) -> Option<ImageHeader> {
+    if bytes.len() < 4 || !bytes.starts_with(&[0xff, 0xd8]) {
+        return None;
+    }
+    let mut offset = 2usize;
+    while offset + 4 <= bytes.len() {
+        while offset < bytes.len() && bytes[offset] == 0xff {
+            offset += 1;
+        }
+        if offset >= bytes.len() {
+            break;
+        }
+        let marker = bytes[offset];
+        offset += 1;
+        if marker == 0xd9 || marker == 0xda {
+            break;
+        }
+        if offset + 2 > bytes.len() {
+            break;
+        }
+        let segment_len = u16::from_be_bytes(bytes[offset..offset + 2].try_into().ok()?) as usize;
+        if segment_len < 2 || offset + segment_len > bytes.len() {
+            break;
+        }
+        if is_jpeg_sof_marker(marker) && segment_len >= 7 {
+            return Some(ImageHeader {
+                media_type: "image/jpeg",
+                height: Some(
+                    u16::from_be_bytes(bytes[offset + 3..offset + 5].try_into().ok()?) as u32,
+                ),
+                width: Some(
+                    u16::from_be_bytes(bytes[offset + 5..offset + 7].try_into().ok()?) as u32,
+                ),
+            });
+        }
+        offset += segment_len;
+    }
+    None
+}
+
+fn is_jpeg_sof_marker(marker: u8) -> bool {
+    matches!(
+        marker,
+        0xc0 | 0xc1 | 0xc2 | 0xc3 | 0xc5 | 0xc6 | 0xc7 | 0xc9 | 0xca | 0xcb | 0xcd | 0xce | 0xcf
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use tempfile::tempdir;
+
+    #[test]
+    fn parses_png_header_dimensions() {
+        let bytes = png_header_bytes(640, 480);
+
+        let header = ImageHeader::parse(&bytes).unwrap();
+
+        assert_eq!(header.media_type, "image/png");
+        assert_eq!(header.width, Some(640));
+        assert_eq!(header.height, Some(480));
+    }
+
+    #[test]
+    fn parses_jpeg_sof_dimensions() {
+        let bytes = [
+            0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x00, 0x00, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x01,
+            0x2c, 0x02, 0x80, 0x03, 0x01, 0x11, 0x00,
+        ];
+
+        let header = ImageHeader::parse(&bytes).unwrap();
+
+        assert_eq!(header.media_type, "image/jpeg");
+        assert_eq!(header.width, Some(640));
+        assert_eq!(header.height, Some(300));
+    }
+
+    #[test]
+    fn reads_visual_reference() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        let bytes = png_header_bytes(320, 240);
+        fs::write(&path, &bytes).unwrap();
+
+        let image = read_visual_reference(&path).unwrap();
+        let reference = image.visual_reference;
+
+        assert_eq!(reference.kind, "visual_reference");
+        assert_eq!(reference.mime, "image/png");
+        assert_eq!(reference.byte_count, bytes.len() as u64);
+        assert_eq!(reference.size.width, Some(320));
+        assert_eq!(reference.size.height, Some(240));
+        assert_eq!(reference.sha256, format!("{:x}", Sha256::digest(&bytes)));
+        assert!(reference.id.starts_with("vis_"));
+        assert_eq!(image.bytes, bytes);
+    }
+
+    #[test]
+    fn parses_visual_observation_json_with_trusted_metadata() {
+        let reference = test_visual_reference();
+        let selection = test_vision_selection();
+
+        let observation = parse_visual_observation(
+            r#"{
+                "type": "visual_observation",
+                "schema": "visual_observation.v1",
+                "visual_reference_id": "provider_supplied",
+                "prompt": "provider supplied",
+                "summary": "A red square is visible.",
+                "ocr": [{"text": "OK"}],
+                "uncertainties": ["small text is unclear"]
+            }"#,
+            &reference,
+            "Inspect visible content.",
+            &selection,
+        )
+        .unwrap();
+
+        assert_eq!(observation.kind, "visual_observation");
+        assert_eq!(observation.schema, "visual_observation.v1");
+        assert_eq!(observation.visual_reference_id, reference.id);
+        assert_eq!(observation.prompt, "Inspect visible content.");
+        assert_eq!(observation.generated_by.provider.as_deref(), Some("openai"));
+        assert_eq!(observation.summary, "A red square is visible.");
+        assert_eq!(observation.ocr.len(), 1);
+        assert_eq!(
+            observation.uncertainties,
+            vec!["small text is unclear".to_string()]
+        );
+        assert!(observation.elements.is_empty());
+    }
+
+    #[test]
+    fn normalizes_object_uncertainties_from_vision_adapter() {
+        let observation = parse_visual_observation(
+            r#"{
+                "type": "visual_observation",
+                "schema": "visual_observation.v1",
+                "summary": "A logo is visible.",
+                "uncertainties": [
+                    {"text": "The inner shape may be stylized."},
+                    {"description": "Small text is hard to read."}
+                ]
+            }"#,
+            &test_visual_reference(),
+            "Describe the image.",
+            &test_vision_selection(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            observation.uncertainties,
+            vec![
+                "The inner shape may be stylized.".to_string(),
+                "Small text is hard to read.".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn normalizes_non_array_optional_fields_from_vision_adapter() {
+        let observation = parse_visual_observation(
+            r#"{
+                "type": "visual_observation",
+                "schema": "visual_observation.v1",
+                "summary": "A logo is visible.",
+                "ocr": "HOLON",
+                "elements": {"type": "logo"},
+                "relations": "The logo is above the wordmark.",
+                "issues": null,
+                "uncertainties": {"message": "Small details may be unclear."},
+                "external_sources": 42
+            }"#,
+            &test_visual_reference(),
+            "Describe the image.",
+            &test_vision_selection(),
+        )
+        .unwrap();
+
+        assert_eq!(observation.ocr, vec![json!({"text": "HOLON"})]);
+        assert_eq!(observation.elements, vec![json!({"type": "logo"})]);
+        assert_eq!(
+            observation.relations,
+            vec![json!({"description": "The logo is above the wordmark."})]
+        );
+        assert!(observation.issues.is_empty());
+        assert_eq!(
+            observation.uncertainties,
+            vec!["Small details may be unclear.".to_string()]
+        );
+        assert!(observation.external_sources.is_empty());
+    }
+
+    #[test]
+    fn ignores_unusable_optional_entries_without_hiding_invalid_core_fields() {
+        let observation = parse_visual_observation(
+            r#"{
+                "type": "visual_observation",
+                "schema": "visual_observation.v1",
+                "summary": "A logo is visible.",
+                "ocr": false,
+                "uncertainties": [null, 12, {}, "", {"text": "  "}]
+            }"#,
+            &test_visual_reference(),
+            "Describe the image.",
+            &test_vision_selection(),
+        )
+        .unwrap();
+
+        assert!(observation.ocr.is_empty());
+        assert!(observation.uncertainties.is_empty());
+
+        let error = parse_visual_observation(
+            r#"{
+                "type": "visual_observation",
+                "schema": "visual_observation.v1",
+                "summary": "",
+                "ocr": "HOLON"
+            }"#,
+            &test_visual_reference(),
+            "Describe the image.",
+            &test_vision_selection(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("non-empty `summary`"));
+    }
+
+    #[test]
+    fn parses_visual_observation_json_from_markdown_fence() {
+        let observation = parse_visual_observation(
+            "```json\n{\"type\":\"visual_observation\",\"schema\":\"visual_observation.v1\",\"summary\":\"A chart is visible.\"}\n```",
+            &test_visual_reference(),
+            "Describe the image.",
+            &test_vision_selection(),
+        )
+        .unwrap();
+
+        assert_eq!(observation.summary, "A chart is visible.");
+    }
+
+    #[test]
+    fn rejects_malformed_visual_observation_json() {
+        let error = parse_visual_observation(
+            "not json",
+            &test_visual_reference(),
+            "Describe the image.",
+            &test_vision_selection(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("did not contain JSON"));
+    }
+
+    #[test]
+    fn rejects_schema_incompatible_visual_observation() {
+        let error = parse_visual_observation(
+            r#"{"type":"visual_observation","schema":"visual_observation.v2","summary":"x"}"#,
+            &test_visual_reference(),
+            "Describe the image.",
+            &test_vision_selection(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("visual_observation.v1"));
+    }
+
+    #[test]
+    fn rejects_missing_visual_observation_type_or_schema() {
+        let error = parse_visual_observation(
+            r#"{"schema":"visual_observation.v1","summary":"x"}"#,
+            &test_visual_reference(),
+            "Describe the image.",
+            &test_vision_selection(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("`type`"));
+
+        let error = parse_visual_observation(
+            r#"{"type":"visual_observation","summary":"x"}"#,
+            &test_visual_reference(),
+            "Describe the image.",
+            &test_vision_selection(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("`schema`"));
+    }
+
+    #[test]
+    fn observation_cache_key_includes_schema_and_generation_policy() {
+        let reference = test_visual_reference();
+
+        let key = observation_cache_key(&reference, "What is visible?");
+
+        assert_eq!(key.visual_reference_id, reference.id);
+        assert_eq!(key.prompt, "What is visible?");
+        assert_eq!(key.observation_schema, "visual_observation.v1");
+        assert_eq!(key.generation_policy, "openai-compatible-image-input.v1");
+    }
+
+    #[test]
+    fn renders_visual_observation_for_text_only_replay() {
+        let reference = test_visual_reference();
+        let selection = test_vision_selection();
+        let result = ViewImageResult {
+            visual_reference: reference.clone(),
+            observation: ViewImageObservation {
+                kind: "visual_observation".to_string(),
+                schema: "visual_observation.v1".to_string(),
+                visual_reference_id: reference.id.clone(),
+                prompt: "What is visible?".to_string(),
+                generated_by: ViewImageGeneratedBy {
+                    mode: selection.selected_mode.clone(),
+                    provider: selection.vision_provider.clone(),
+                    model: selection.vision_model.clone(),
+                    selection_reason: Some(selection.selection_reason.clone()),
+                },
+                summary: "A red warning icon is visible.".to_string(),
+                ocr: vec![json!({"text": "WARN"})],
+                elements: vec![json!({"kind": "icon", "color": "red"})],
+                relations: Vec::new(),
+                issues: Vec::new(),
+                uncertainties: vec!["small text is unclear".to_string()],
+                external_sources: Vec::new(),
+            },
+            selected_mode: selection.selected_mode.clone(),
+            vision_selection: selection,
+            summary_text: Some("generated observation".to_string()),
+        };
+        let tool_result = ToolResult::success(NAME, serde_json::to_value(result).unwrap(), None);
+
+        let rendered = render_for_model(&tool_result).unwrap();
+
+        assert!(rendered.starts_with("ViewImage visual observation"));
+        assert!(rendered.contains("Reference: vis_test"));
+        assert!(rendered.contains("Prompt: What is visible?"));
+        assert!(rendered.contains("Summary: A red warning icon is visible."));
+        assert!(rendered.contains(r#""text":"WARN""#));
+        assert!(rendered.contains("Uncertainties: small text is unclear"));
+        assert!(!rendered.contains("\"tool_name\":\"ViewImage\""));
+        assert!(!rendered.contains("data_base64"));
+        assert!(!rendered.contains("input_image"));
+    }
+
+    #[test]
+    fn rejects_missing_file_as_invalid_tool_input() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing.png");
+
+        let error = ToolError::from_anyhow(&read_visual_reference(&path).unwrap_err());
+
+        assert_eq!(error.kind, "invalid_tool_input");
+        assert!(error.message.contains("readable local image file"));
+    }
+
+    #[test]
+    fn rejects_non_image_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("not-image.txt");
+        fs::write(&path, b"hello").unwrap();
+
+        let error = ToolError::from_anyhow(&read_visual_reference(&path).unwrap_err());
+
+        assert_eq!(error.kind, "invalid_tool_input");
+        assert!(error.message.contains("supported image file"));
+    }
+
+    #[test]
+    fn rejects_oversized_file_before_reading_contents() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("large.png");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_IMAGE_BYTES + 1).unwrap();
+
+        let error = ToolError::from_anyhow(&read_visual_reference(&path).unwrap_err());
+
+        assert_eq!(error.kind, "invalid_tool_input");
+        assert!(error.message.contains("file size"));
+    }
+
+    #[test]
+    fn rejects_oversized_decoded_pixel_count() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("huge.png");
+        fs::write(&path, png_header_bytes(100_000, 100_000)).unwrap();
+
+        let error = ToolError::from_anyhow(&read_visual_reference(&path).unwrap_err());
+
+        assert_eq!(error.kind, "invalid_tool_input");
+        assert!(error.message.contains("pixel count"));
+    }
+
+    #[test]
+    fn rejects_jpeg_without_sof_dimensions() {
+        let bytes = [0xff, 0xd8, 0xff, 0xd9];
+
+        assert!(ImageHeader::parse(&bytes).is_none());
+    }
+
+    #[test]
+    fn rejects_webp_without_recognized_dimensions() {
+        let mut bytes = b"RIFF\x1e\0\0\0WEBPUNKN".to_vec();
+        bytes.resize(30, 0);
+
+        assert!(ImageHeader::parse(&bytes).is_none());
+    }
+
+    fn png_header_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bytes
+    }
+
+    fn test_visual_reference() -> ViewImageVisualReference {
+        ViewImageVisualReference {
+            kind: "visual_reference".to_string(),
+            id: "vis_test".to_string(),
+            path: Path::new("image.png").to_path_buf(),
+            sha256: "sha256".to_string(),
+            mime: "image/png".to_string(),
+            byte_count: 10,
+            size: ViewImageReferenceSize {
+                width: Some(1),
+                height: Some(1),
+            },
+            created_at: Utc::now(),
+        }
+    }
+
+    fn test_vision_selection() -> ViewImageVisionSelection {
+        ViewImageVisionSelection {
+            selected_mode: ViewImageSelectedMode::VisionAdapter,
+            vision_provider: Some("openai".to_string()),
+            vision_model: Some("gpt-5.4".to_string()),
+            selection_reason: "test".to_string(),
+            primary_provider: Some("openai".to_string()),
+            primary_model: Some("gpt-5.4".to_string()),
+            candidates: Vec::new(),
+        }
+    }
+}

@@ -1,0 +1,1547 @@
+use super::*;
+use crate::model_catalog::{
+    ModelMetadataConstraint, ModelMetadataConstraintKind, ModelMetadataConstraintSource,
+    ModelMetadataField, ReasoningEffortValidationError,
+};
+use std::collections::HashSet;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModelRef {
+    pub provider: ProviderId,
+    pub model: String,
+}
+
+pub(crate) fn authenticated_model_route_candidates(
+    providers: &ProviderRegistry,
+    model_overrides: &HashMap<ModelRef, ModelRuntimeOverride>,
+) -> Vec<ModelRouteRef> {
+    let catalog = BuiltInModelCatalog::default();
+    authenticated_provider_ids(providers)
+        .into_iter()
+        .filter_map(|provider| {
+            catalog.preferred_route_for_provider(&provider).or_else(|| {
+                preferred_override_model_for_provider(&provider, model_overrides)
+                    .map(|model_ref| ModelRouteRef::from_legacy_model_ref(&model_ref))
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProviderEndpointId(String);
+
+impl ProviderEndpointId {
+    pub const DEFAULT: &'static str = "default";
+
+    pub fn default_endpoint() -> Self {
+        Self(Self::DEFAULT.to_string())
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        let normalized = value.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return Err(anyhow!("provider endpoint id must not be empty"));
+        }
+        if !normalized
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_')
+        {
+            return Err(anyhow!(
+                "invalid provider endpoint id {normalized}; expected lowercase ascii, digits, '-' or '_'"
+            ));
+        }
+        Ok(Self(normalized))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for ProviderEndpointId {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderEndpointId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        ProviderEndpointId::parse(&raw).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModelRouteRef {
+    pub provider: ProviderId,
+    pub endpoint: ProviderEndpointId,
+    pub model: String,
+}
+
+impl ModelRouteRef {
+    pub fn new(
+        provider: ProviderId,
+        endpoint: ProviderEndpointId,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider,
+            endpoint,
+            model: model.into(),
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("model route ref must not be empty"));
+        }
+        let (route, model) = trimmed.split_once('/').ok_or_else(|| {
+            anyhow!("invalid model route ref {trimmed}; expected provider@endpoint/model")
+        })?;
+        let (provider, endpoint) = route.split_once('@').ok_or_else(|| {
+            anyhow!("invalid model route ref {trimmed}; expected provider@endpoint/model")
+        })?;
+        let provider = ProviderId::parse(provider)?;
+        let endpoint = ProviderEndpointId::parse(endpoint)?;
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(anyhow!(
+                "invalid model route ref {trimmed}; model part must not be empty"
+            ));
+        }
+        Ok(Self::new(provider, endpoint, model))
+    }
+
+    pub fn parse_compatible(value: &str) -> Result<Self> {
+        let trimmed = value.trim();
+        let accepted_formats = || {
+            format!("invalid model reference {trimmed}; expected provider@endpoint/model or legacy provider/model")
+        };
+        if trimmed
+            .split_once('/')
+            .is_some_and(|(route, _)| route.contains('@'))
+        {
+            return Self::parse(trimmed).with_context(accepted_formats);
+        }
+        let model_ref = ModelRef::parse(trimmed).with_context(accepted_formats)?;
+        Ok(Self::from_legacy_model_ref(&model_ref))
+    }
+
+    pub fn from_legacy_model_ref(model_ref: &ModelRef) -> Self {
+        let (route_provider, route_endpoint) =
+            built_in_provider_endpoint_identity(&model_ref.provider).unwrap_or_else(|_| {
+                (
+                    model_ref.provider.clone(),
+                    ProviderEndpointId::default_endpoint(),
+                )
+            });
+        let catalog = BuiltInModelCatalog::default();
+        let model_ref = catalog.canonicalize_model_ref(model_ref);
+        let endpoint = if route_provider != model_ref.provider
+            || route_endpoint != ProviderEndpointId::default_endpoint()
+        {
+            route_endpoint
+        } else {
+            catalog
+                .preferred_route_for_model(&model_ref)
+                .map(|route| route.endpoint)
+                .unwrap_or(route_endpoint)
+        };
+        Self::new(route_provider, endpoint, model_ref.model)
+    }
+
+    pub fn model_ref(&self) -> ModelRef {
+        ModelRef::new(self.provider.clone(), self.model.clone())
+    }
+
+    pub fn as_string(&self) -> String {
+        format!(
+            "{}@{}/{}",
+            self.provider.as_str(),
+            self.endpoint.as_str(),
+            self.model
+        )
+    }
+
+    pub fn as_compact_display(&self) -> String {
+        if self.endpoint == ProviderEndpointId::default_endpoint() {
+            return self.model_ref().as_string();
+        }
+        self.as_string()
+    }
+}
+
+impl Serialize for ModelRouteRef {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.as_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelRouteRef {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        ModelRouteRef::parse_compatible(&raw).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelRouteCapability {
+    Turn,
+    VisionObservation,
+    ImageGeneration,
+}
+
+impl ModelRouteCapability {
+    pub fn model_supports(self, policy: &ResolvedRuntimeModelPolicy) -> bool {
+        match self {
+            Self::Turn => true,
+            Self::VisionObservation => policy.capabilities.image_input,
+            Self::ImageGeneration => policy.capabilities.image_generation,
+        }
+    }
+
+    pub fn transport_supports(self, transport: ProviderTransportKind) -> bool {
+        match self {
+            Self::Turn => true,
+            Self::VisionObservation => transport.supports_view_image_observation_generation(),
+            Self::ImageGeneration => transport.supports_image_generation(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedModelCapabilities {
+    pub intrinsic: crate::model_catalog::ModelIntrinsicCapabilities,
+    pub endpoint: crate::model_catalog::EndpointModelPolicy,
+    pub transport: TransportCapabilities,
+    pub image_input: bool,
+    pub image_output: bool,
+}
+
+impl ResolvedModelCapabilities {
+    fn resolve(policy: &mut ResolvedRuntimeModelPolicy, transport: ProviderTransportKind) -> Self {
+        let intrinsic = policy.capabilities.intrinsic();
+        let endpoint = crate::model_catalog::EndpointModelPolicy {
+            accepted_parameters: resolved_parameter_contracts(policy),
+        };
+        let transport = transport.capabilities();
+        let image_input = constrain_transport_capability(
+            policy,
+            ModelMetadataField::ImageInput,
+            policy.capabilities.image_input,
+            transport.image_input,
+        );
+        let image_output = constrain_transport_capability(
+            policy,
+            ModelMetadataField::ImageGeneration,
+            policy.capabilities.image_generation,
+            transport.image_output,
+        );
+        Self {
+            image_input,
+            image_output,
+            intrinsic,
+            endpoint,
+            transport,
+        }
+    }
+
+    pub fn supports(&self, capability: ModelRouteCapability) -> bool {
+        match capability {
+            ModelRouteCapability::Turn => true,
+            ModelRouteCapability::VisionObservation => self.image_input,
+            ModelRouteCapability::ImageGeneration => self.image_output,
+        }
+    }
+}
+
+fn constrain_transport_capability(
+    policy: &mut ResolvedRuntimeModelPolicy,
+    field: ModelMetadataField,
+    model_supports: bool,
+    transport_supports: bool,
+) -> bool {
+    let effective = model_supports && transport_supports;
+    if model_supports && !transport_supports {
+        let constraint = ModelMetadataConstraint {
+            field,
+            kind: ModelMetadataConstraintKind::Disabled,
+            source: ModelMetadataConstraintSource::TransportCapability,
+            requested: "true".to_string(),
+            effective: "false".to_string(),
+        };
+        if !policy.evidence.constraints.contains(&constraint) {
+            policy.evidence.constraints.push(constraint);
+        }
+    }
+    effective
+}
+
+fn resolved_parameter_contracts(
+    policy: &ResolvedRuntimeModelPolicy,
+) -> Vec<crate::model_catalog::ModelParameterSupport> {
+    let mut parameters = Vec::new();
+    if !policy.reasoning_effort_options.is_empty() {
+        parameters.push(crate::model_catalog::ModelParameterSupport {
+            name: "reasoning_effort".to_string(),
+            allowed_values: policy.reasoning_effort_options.clone(),
+        });
+    }
+    if policy.max_output_tokens_upper_limit.is_some() || policy.runtime_max_output_tokens > 0 {
+        parameters.push(crate::model_catalog::ModelParameterSupport {
+            name: "max_output_tokens".to_string(),
+            allowed_values: Vec::new(),
+        });
+    }
+    parameters
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProviderEndpointConfig {
+    pub provider: ProviderId,
+    pub endpoint: ProviderEndpointId,
+    pub runtime_config: ProviderRuntimeConfig,
+}
+
+impl ResolvedProviderEndpointConfig {
+    pub fn from_provider_runtime_config(runtime_config: ProviderRuntimeConfig) -> Self {
+        Self {
+            provider: runtime_config.id.clone(),
+            endpoint: ProviderEndpointId::default_endpoint(),
+            runtime_config,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModelRoute {
+    pub route_ref: ModelRouteRef,
+    pub model_ref: ModelRef,
+    pub endpoint: ResolvedProviderEndpointConfig,
+    pub policy: ResolvedRuntimeModelPolicy,
+    pub capabilities: ResolvedModelCapabilities,
+    pub requested_capability: ModelRouteCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedModelRouteMetadata {
+    pub route_ref: ModelRouteRef,
+    pub model_ref: ModelRef,
+    pub endpoint: ResolvedProviderEndpointConfig,
+    pub policy: ResolvedRuntimeModelPolicy,
+    pub capabilities: ResolvedModelCapabilities,
+}
+
+impl ResolvedModelRoute {
+    pub fn provider_config(&self) -> &ProviderRuntimeConfig {
+        &self.endpoint.runtime_config
+    }
+
+    pub fn provider_name(&self) -> &str {
+        self.endpoint.provider.as_str()
+    }
+
+    pub fn validate_reasoning_effort(
+        &self,
+        value: &str,
+    ) -> Result<(), ReasoningEffortValidationError> {
+        if self.provider_config().transport == ProviderTransportKind::OpenAiCodexResponses {
+            return self.policy.validate_reasoning_effort(value);
+        }
+
+        match value {
+            "low" | "medium" | "high" | "xhigh" | "max" => Ok(()),
+            _ => Err(ReasoningEffortValidationError::new(format!(
+                "invalid reasoning_effort '{value}'; must be one of low, medium, high, xhigh, max"
+            ))),
+        }
+    }
+}
+
+pub(crate) fn resolve_image_generation_model(
+    stored_config: &HolonConfigFile,
+) -> Result<Option<ModelRouteRef>> {
+    if let Ok(value) = env::var("HOLON_IMAGE_GENERATION_MODEL") {
+        return parse_image_generation_model_ref(&value);
+    }
+    if let Some(value) = &stored_config.image_generation.default {
+        return parse_image_generation_model_ref(value);
+    }
+    Ok(None)
+}
+
+fn parse_image_generation_model_ref(value: &str) -> Result<Option<ModelRouteRef>> {
+    if value.trim().eq_ignore_ascii_case("auto") {
+        Ok(None)
+    } else {
+        ModelRouteRef::parse_compatible(value).map(Some)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeModelCatalog {
+    pub default_model: ModelRouteRef,
+    pub fallback_models: Vec<ModelRouteRef>,
+    pub vision_model: Option<ModelRouteRef>,
+    pub image_generation_model: Option<ModelRouteRef>,
+    pub vision_candidate_models: Vec<ModelRouteRef>,
+    pub disable_provider_fallback: bool,
+    pub provider_endpoints: HashMap<ProviderId, ResolvedProviderEndpointConfig>,
+    pub built_in_catalog: BuiltInModelCatalog,
+    pub discovered_models: HashMap<ModelRef, BuiltInModelMetadata>,
+    pub model_overrides: HashMap<ModelRef, ModelRuntimeOverride>,
+    pub unknown_model_fallback: Option<ModelRuntimeOverride>,
+    pub configured_runtime_max_output_tokens: u32,
+}
+
+impl RuntimeModelCatalog {
+    pub fn from_config(config: &AppConfig) -> Self {
+        Self {
+            default_model: config.default_model.clone(),
+            fallback_models: config.fallback_models.clone(),
+            vision_model: config.vision_model.clone(),
+            image_generation_model: config.image_generation_model.clone(),
+            vision_candidate_models: config.vision_candidate_models.clone(),
+            disable_provider_fallback: config.provider_fallback_disabled(),
+            provider_endpoints: config
+                .providers
+                .iter()
+                .filter_map(|(provider, config)| {
+                    resolved_provider_endpoint_config(provider.clone(), config.clone())
+                        .ok()
+                        .map(|endpoint| (provider.clone(), endpoint))
+                })
+                .collect(),
+            built_in_catalog: BuiltInModelCatalog::default(),
+            discovered_models: config
+                .model_discovery_cache
+                .models()
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            model_overrides: config.validated_model_overrides.clone(),
+            unknown_model_fallback: config.validated_unknown_model_fallback.clone(),
+            configured_runtime_max_output_tokens: config.runtime_max_output_tokens,
+        }
+    }
+
+    pub fn resolve_model_route(
+        &self,
+        base_context_config: &ContextConfig,
+        model_ref: &ModelRef,
+        requested_capability: ModelRouteCapability,
+    ) -> Option<ResolvedModelRoute> {
+        let canonical_ref = self.built_in_catalog.canonicalize_model_ref(model_ref);
+        let model_ref = &canonical_ref;
+
+        let endpoint = self.resolve_endpoint_for_model(model_ref)?;
+        let route_ref = ModelRouteRef::new(
+            endpoint.provider.clone(),
+            endpoint.endpoint.clone(),
+            model_ref.model.clone(),
+        );
+        let metadata = self.resolve_explicit_model_metadata(base_context_config, &route_ref)?;
+        if !metadata.capabilities.supports(requested_capability) {
+            return None;
+        }
+        Some(ResolvedModelRoute {
+            route_ref: metadata.route_ref,
+            model_ref: metadata.model_ref,
+            endpoint: metadata.endpoint,
+            policy: metadata.policy,
+            capabilities: metadata.capabilities,
+            requested_capability,
+        })
+    }
+
+    pub fn resolve_explicit_model_route(
+        &self,
+        base_context_config: &ContextConfig,
+        route_ref: &ModelRouteRef,
+        requested_capability: ModelRouteCapability,
+    ) -> Option<ResolvedModelRoute> {
+        let metadata = self.resolve_explicit_model_metadata(base_context_config, route_ref)?;
+        if !metadata.capabilities.supports(requested_capability) {
+            return None;
+        }
+        Some(ResolvedModelRoute {
+            route_ref: metadata.route_ref,
+            model_ref: metadata.model_ref,
+            endpoint: metadata.endpoint,
+            policy: metadata.policy,
+            capabilities: metadata.capabilities,
+            requested_capability,
+        })
+    }
+
+    pub(crate) fn resolve_explicit_model_metadata(
+        &self,
+        base_context_config: &ContextConfig,
+        route_ref: &ModelRouteRef,
+    ) -> Option<ResolvedModelRouteMetadata> {
+        let canonical_model_ref = self
+            .built_in_catalog
+            .canonicalize_model_ref(&route_ref.model_ref());
+        let canonical_route_ref = ModelRouteRef::new(
+            route_ref.provider.clone(),
+            route_ref.endpoint.clone(),
+            canonical_model_ref.model.clone(),
+        );
+        let endpoint = self.provider_endpoints.values().find(|endpoint| {
+            endpoint.provider == canonical_route_ref.provider
+                && endpoint.endpoint == canonical_route_ref.endpoint
+        })?;
+        let mut policy =
+            self.resolved_model_policy_for_route(base_context_config, &canonical_route_ref);
+        let capabilities =
+            ResolvedModelCapabilities::resolve(&mut policy, endpoint.runtime_config.transport);
+        Some(ResolvedModelRouteMetadata {
+            route_ref: canonical_route_ref,
+            model_ref: canonical_model_ref,
+            endpoint: endpoint.clone(),
+            policy,
+            capabilities,
+        })
+    }
+
+    /// Resolve the provider endpoint config for a (possibly canonical) model ref.
+    /// Uses the canonical model's preferred route when available to find the
+    /// correct endpoint among multiple endpoints under the same provider.
+    fn resolve_endpoint_for_model(
+        &self,
+        model_ref: &ModelRef,
+    ) -> Option<&ResolvedProviderEndpointConfig> {
+        let model_endpoint = self
+            .built_in_catalog
+            .preferred_route_for_model(model_ref)
+            .map(|route| route.endpoint);
+        match model_endpoint {
+            // Model declares a specific non-default endpoint: find by (provider, endpoint)
+            Some(endpoint) => self
+                .provider_endpoints
+                .values()
+                .find(|e| e.provider == model_ref.provider && e.endpoint == endpoint),
+            // Default endpoint or no catalog metadata: direct key lookup
+            None => self.provider_endpoints.get(&model_ref.provider),
+        }
+    }
+
+    pub fn provider_chain(&self, model_override: Option<&ModelRouteRef>) -> Vec<ModelRouteRef> {
+        if self.disable_provider_fallback {
+            return vec![self.effective_model(model_override)];
+        }
+        let mut chain = Vec::new();
+        if let Some(model_override) = model_override {
+            chain.push(model_override.clone());
+        }
+        chain.push(self.default_model.clone());
+        for model in &self.fallback_models {
+            if !chain.iter().any(|existing| existing == model) {
+                chain.push(model.clone());
+            }
+        }
+        chain
+    }
+
+    pub fn provider_chain_for_turn(
+        &self,
+        model_override: Option<&ModelRouteRef>,
+        pending_fallback_model: Option<&ModelRouteRef>,
+    ) -> Vec<ModelRouteRef> {
+        let chain = self.provider_chain(model_override);
+        let Some(pending_fallback_model) = pending_fallback_model else {
+            return chain;
+        };
+        chain
+            .iter()
+            .position(|model| model == pending_fallback_model)
+            .map(|index| chain[index..].to_vec())
+            .unwrap_or_else(|| vec![pending_fallback_model.clone()])
+    }
+
+    pub fn effective_model(&self, model_override: Option<&ModelRouteRef>) -> ModelRouteRef {
+        model_override
+            .cloned()
+            .unwrap_or_else(|| self.default_model.clone())
+    }
+
+    pub fn resolved_model_policy(
+        &self,
+        base_context_config: &ContextConfig,
+        model_override: Option<&ModelRouteRef>,
+    ) -> ResolvedRuntimeModelPolicy {
+        let route_ref = self.effective_model(model_override);
+        self.resolve_explicit_model_metadata(base_context_config, &route_ref)
+            .map(|route| route.policy)
+            .unwrap_or_else(|| {
+                self.resolved_model_policy_for_route(base_context_config, &route_ref)
+            })
+    }
+
+    fn resolved_model_policy_for_route(
+        &self,
+        base_context_config: &ContextConfig,
+        route_ref: &ModelRouteRef,
+    ) -> ResolvedRuntimeModelPolicy {
+        let canonical_model_ref = self
+            .built_in_catalog
+            .canonicalize_model_ref(&route_ref.model_ref());
+        let canonical_route_ref = ModelRouteRef::new(
+            route_ref.provider.clone(),
+            route_ref.endpoint.clone(),
+            canonical_model_ref.model,
+        );
+        self.built_in_catalog.resolve_route_policy(
+            &canonical_route_ref,
+            &self.model_overrides,
+            &self.discovered_models,
+            self.unknown_model_fallback.as_ref(),
+            base_context_config,
+            self.configured_runtime_max_output_tokens,
+        )
+    }
+
+    pub fn resolved_context_config(
+        &self,
+        base_context_config: &ContextConfig,
+        model_override: Option<&ModelRouteRef>,
+    ) -> ContextConfig {
+        let policy = self.resolved_model_policy(base_context_config, model_override);
+        let mut resolved = base_context_config.clone();
+        resolved.prompt_budget_estimated_tokens = policy.prompt_budget_estimated_tokens;
+        resolved.compaction_trigger_estimated_tokens = policy.compaction_trigger_estimated_tokens;
+        resolved.compaction_keep_recent_estimated_tokens =
+            policy.compaction_keep_recent_estimated_tokens;
+        resolved
+    }
+
+    pub fn available_models(&self) -> Vec<BuiltInModelMetadata> {
+        let mut model_refs = self
+            .built_in_catalog
+            .list()
+            .into_iter()
+            .map(|model| model.model_ref)
+            .collect::<HashSet<_>>();
+        model_refs.extend(self.discovered_models.keys().cloned());
+        model_refs.extend(self.model_overrides.keys().cloned());
+        let base_context_config = ContextConfig::default();
+        let mut models = model_refs
+            .into_iter()
+            .map(|model_ref| self.resolved_catalog_entry(&base_context_config, &model_ref))
+            .collect::<Vec<_>>();
+        models.sort_by(|left, right| {
+            left.display_name
+                .cmp(&right.display_name)
+                .then_with(|| left.model_ref.as_string().cmp(&right.model_ref.as_string()))
+        });
+        models
+    }
+
+    fn resolved_catalog_entry(
+        &self,
+        base_context_config: &ContextConfig,
+        model_ref: &ModelRef,
+    ) -> BuiltInModelMetadata {
+        let canonical_model_ref = self.built_in_catalog.canonicalize_model_ref(model_ref);
+        self.built_in_catalog.resolve_catalog_entry(
+            &canonical_model_ref,
+            &self.model_overrides,
+            &self.discovered_models,
+            self.unknown_model_fallback.as_ref(),
+            base_context_config,
+            self.configured_runtime_max_output_tokens,
+        )
+    }
+
+    pub fn available_model_routes(&self) -> Vec<ModelRouteRef> {
+        let mut routes = self.built_in_catalog.list_routes();
+        for model in self.available_models() {
+            if !routes
+                .iter()
+                .any(|route| route.model_ref() == model.model_ref)
+            {
+                routes.push(ModelRouteRef::from_legacy_model_ref(&model.model_ref));
+            }
+        }
+        routes.sort_by_key(ModelRouteRef::as_string);
+        routes.dedup();
+        routes
+    }
+
+    pub fn select_view_image_vision_model(
+        &self,
+        base_context_config: &ContextConfig,
+        model_override: Option<&ModelRouteRef>,
+        pending_fallback_model: Option<&ModelRouteRef>,
+    ) -> ViewImageVisionSelection {
+        let chain = self.provider_chain_for_turn(model_override, pending_fallback_model);
+        let primary = chain
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.effective_model(model_override));
+        if let Some(model_ref) = &self.vision_model {
+            return self.select_view_image_vision_model_from_candidates(
+                base_context_config,
+                primary,
+                vec![model_ref.clone()],
+                "explicit_vision_model_supports_image_input",
+                "explicit_vision_model_unavailable",
+            );
+        }
+
+        let mut candidates = Vec::new();
+        candidates.push(primary.clone());
+        for model_ref in &self.vision_candidate_models {
+            if !candidates.iter().any(|existing| existing == model_ref) {
+                candidates.push(model_ref.clone());
+            }
+        }
+        for model_ref in chain {
+            if !candidates.iter().any(|existing| existing == &model_ref) {
+                candidates.push(model_ref);
+            }
+        }
+
+        self.select_view_image_vision_model_from_candidates(
+            base_context_config,
+            primary,
+            candidates,
+            "auto_discovered_vision_model_supports_image_input",
+            "no_configured_model_supports_view_image_observation",
+        )
+    }
+
+    pub(crate) fn select_view_image_vision_model_from_candidates(
+        &self,
+        base_context_config: &ContextConfig,
+        primary: ModelRouteRef,
+        model_refs: Vec<ModelRouteRef>,
+        selected_adapter_reason: &str,
+        unavailable_reason: &str,
+    ) -> ViewImageVisionSelection {
+        let mut candidates = Vec::new();
+        let mut selected = None;
+
+        for route_ref in &model_refs {
+            let resolved = self.resolve_explicit_model_metadata(base_context_config, route_ref);
+            let policy = resolved
+                .as_ref()
+                .map(|route| route.policy.clone())
+                .unwrap_or_else(|| {
+                    self.resolved_model_policy(base_context_config, Some(route_ref))
+                });
+            let image_input = policy.capabilities.image_input;
+            let supported_transport = resolved.as_ref().is_some_and(|route| {
+                ModelRouteCapability::VisionObservation
+                    .transport_supports(route.endpoint.runtime_config.transport)
+            });
+            let reason = if !image_input {
+                "model_lacks_image_input"
+            } else if supported_transport {
+                "model_advertises_image_input"
+            } else {
+                "provider_transport_unsupported_for_view_image_observation"
+            };
+            candidates.push(ViewImageVisionCandidate {
+                provider: route_ref.provider.as_str().to_string(),
+                model: route_ref.model.clone(),
+                model_ref: route_ref.as_string(),
+                image_input,
+                reason: reason.to_string(),
+            });
+            if resolved.is_some_and(|route| route.capabilities.image_input) && selected.is_none() {
+                selected = Some(route_ref.clone());
+            }
+        }
+
+        let Some(selected) = selected else {
+            return ViewImageVisionSelection {
+                selected_mode: ViewImageSelectedMode::Unavailable,
+                vision_provider: None,
+                vision_model: None,
+                selection_reason: unavailable_reason.to_string(),
+                primary_provider: Some(primary.provider.as_str().to_string()),
+                primary_model: Some(primary.model),
+                candidates,
+            };
+        };
+
+        let primary_supports_image = selected == primary;
+        ViewImageVisionSelection {
+            selected_mode: if primary_supports_image {
+                ViewImageSelectedMode::NativeImageWithObservation
+            } else {
+                ViewImageSelectedMode::VisionAdapter
+            },
+            vision_provider: Some(selected.provider.as_str().to_string()),
+            vision_model: Some(selected.model.clone()),
+            selection_reason: if primary_supports_image {
+                "current_primary_model_supports_image_input"
+            } else {
+                selected_adapter_reason
+            }
+            .to_string(),
+            primary_provider: Some(primary.provider.as_str().to_string()),
+            primary_model: Some(primary.model),
+            candidates,
+        }
+    }
+
+    pub fn select_generate_image_route(
+        &self,
+        base_context_config: &ContextConfig,
+        model_override: Option<&ModelRouteRef>,
+        pending_fallback_model: Option<&ModelRouteRef>,
+    ) -> Option<ResolvedModelRoute> {
+        let candidates = self
+            .image_generation_model
+            .clone()
+            .map(|model_ref| vec![model_ref])
+            .unwrap_or_else(|| {
+                self.provider_chain_for_turn(model_override, pending_fallback_model)
+            });
+        candidates.into_iter().find_map(|model_ref| {
+            self.resolve_explicit_model_route(
+                base_context_config,
+                &model_ref,
+                ModelRouteCapability::ImageGeneration,
+            )
+        })
+    }
+
+    pub fn select_generate_image_model(
+        &self,
+        base_context_config: &ContextConfig,
+        model_override: Option<&ModelRouteRef>,
+        pending_fallback_model: Option<&ModelRouteRef>,
+    ) -> Option<ModelRouteRef> {
+        self.select_generate_image_route(
+            base_context_config,
+            model_override,
+            pending_fallback_model,
+        )
+        .map(|route| route.route_ref)
+    }
+}
+
+impl Default for RuntimeModelCatalog {
+    fn default() -> Self {
+        Self {
+            default_model: ModelRouteRef::parse("openai@default/gpt-5.4")
+                .expect("valid default model route ref"),
+            fallback_models: Vec::new(),
+            vision_model: None,
+            image_generation_model: None,
+            vision_candidate_models: Vec::new(),
+            disable_provider_fallback: false,
+            provider_endpoints: HashMap::new(),
+            built_in_catalog: BuiltInModelCatalog::default(),
+            discovered_models: HashMap::new(),
+            model_overrides: HashMap::new(),
+            unknown_model_fallback: None,
+            configured_runtime_max_output_tokens: 8192,
+        }
+    }
+}
+
+impl ModelRef {
+    pub fn new(provider: ProviderId, model: impl Into<String>) -> Self {
+        Self {
+            provider,
+            model: model.into(),
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("model ref must not be empty"));
+        }
+        let (provider, model) = trimmed
+            .split_once('/')
+            .ok_or_else(|| anyhow!("invalid model ref {trimmed}; expected provider/model"))?;
+        let provider = ProviderId::parse(provider)?;
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(anyhow!(
+                "invalid model ref {trimmed}; model part must not be empty"
+            ));
+        }
+        Ok(Self {
+            provider,
+            model: model.to_string(),
+        })
+    }
+
+    pub fn as_string(&self) -> String {
+        format!("{}/{}", self.provider.as_str(), self.model)
+    }
+}
+
+impl Serialize for ModelRef {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.as_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelRef {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        ModelRef::parse(&raw).map_err(D::Error::custom)
+    }
+}
+
+pub(crate) fn resolve_model_catalog(
+    stored_config: &HolonConfigFile,
+) -> Result<HashMap<ModelRef, ModelRuntimeOverride>> {
+    stored_config
+        .models
+        .catalog
+        .iter()
+        .map(|(model_ref, override_config)| {
+            Ok((
+                ModelRef::parse(model_ref)?,
+                validate_model_runtime_override(override_config.clone())?,
+            ))
+        })
+        .collect()
+}
+
+pub(crate) fn validate_optional_model_runtime_override(
+    override_config: Option<ModelRuntimeOverride>,
+) -> Result<Option<ModelRuntimeOverride>> {
+    override_config
+        .map(validate_model_runtime_override)
+        .transpose()
+        .map(|value| value.filter(|entry| !entry.is_empty()))
+}
+
+pub(crate) fn resolve_model_selection_for_load_mode(
+    explicit_default: Option<ModelRouteRef>,
+    explicit_fallbacks: Option<Vec<ModelRouteRef>>,
+    providers: &ProviderRegistry,
+    model_overrides: &HashMap<ModelRef, ModelRuntimeOverride>,
+    mode: ConfigLoadMode,
+) -> Result<(ModelRouteRef, Vec<ModelRouteRef>)> {
+    if mode.skip_authenticated_model_resolution() {
+        let default_model = explicit_default.unwrap_or_else(|| {
+            ModelRouteRef::new(
+                ProviderId::openai(),
+                ProviderEndpointId::default_endpoint(),
+                "unknown",
+            )
+        });
+        let fallback_models = explicit_fallbacks.unwrap_or_default();
+        return Ok((
+            default_model.clone(),
+            dedupe_fallback_models(fallback_models, &default_model),
+        ));
+    }
+
+    resolve_model_selection_from_explicit(
+        explicit_default,
+        explicit_fallbacks,
+        providers,
+        model_overrides,
+    )
+}
+
+pub(crate) fn resolve_model_selection_from_explicit(
+    explicit_default: Option<ModelRouteRef>,
+    explicit_fallbacks: Option<Vec<ModelRouteRef>>,
+    providers: &ProviderRegistry,
+    model_overrides: &HashMap<ModelRef, ModelRuntimeOverride>,
+) -> Result<(ModelRouteRef, Vec<ModelRouteRef>)> {
+    let auth_candidates = if explicit_default.is_none() || explicit_fallbacks.is_none() {
+        authenticated_model_route_candidates(providers, model_overrides)
+    } else {
+        Vec::new()
+    };
+
+    let default_model = explicit_default
+        .or_else(|| auth_candidates.first().cloned())
+        .ok_or_else(|| {
+            anyhow!(
+                "no default model configured and no authenticated provider with a known model is available; set HOLON_MODEL or model.default, or configure provider credentials"
+            )
+        })?;
+    let fallback_models = explicit_fallbacks.unwrap_or_else(|| {
+        auth_candidates
+            .into_iter()
+            .filter(|model| model != &default_model)
+            .collect()
+    });
+
+    Ok((
+        default_model.clone(),
+        dedupe_fallback_models(fallback_models, &default_model),
+    ))
+}
+
+pub(crate) fn resolve_default_model(
+    stored_config: &HolonConfigFile,
+) -> Result<Option<ModelRouteRef>> {
+    if let Ok(value) = env::var("HOLON_MODEL") {
+        return ModelRouteRef::parse_compatible(&value).map(Some);
+    }
+    if let Some(value) = &stored_config.model.default {
+        return ModelRouteRef::parse_compatible(value).map(Some);
+    }
+    Ok(None)
+}
+
+pub(crate) fn resolve_fallback_models(
+    stored_config: &HolonConfigFile,
+) -> Result<Option<Vec<ModelRouteRef>>> {
+    if let Ok(value) = env::var("HOLON_MODEL_FALLBACKS") {
+        Ok(Some(parse_model_ref_list(&value)?))
+    } else if !stored_config.model.fallbacks.is_empty() {
+        Ok(Some(
+            stored_config
+                .model
+                .fallbacks
+                .iter()
+                .map(|value| ModelRouteRef::parse_compatible(value))
+                .collect::<Result<Vec<_>>>()?,
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn resolve_vision_model(
+    stored_config: &HolonConfigFile,
+) -> Result<Option<ModelRouteRef>> {
+    if let Ok(value) = env::var("HOLON_VISION_MODEL") {
+        return ModelRouteRef::parse_compatible(&value).map(Some);
+    }
+    if let Some(value) = &stored_config.vision.default {
+        return ModelRouteRef::parse_compatible(value).map(Some);
+    }
+    Ok(None)
+}
+
+fn authenticated_provider_ids(providers: &ProviderRegistry) -> Vec<ProviderId> {
+    let mut provider_ids = providers
+        .values()
+        .filter(|provider| provider_has_usable_auth(provider))
+        .map(|provider| provider.id.clone())
+        .collect::<Vec<_>>();
+    provider_ids.sort_by(|left, right| {
+        provider_auth_priority(left)
+            .cmp(&provider_auth_priority(right))
+            .then_with(|| left.as_str().cmp(right.as_str()))
+    });
+
+    provider_ids
+}
+
+pub(crate) fn provider_has_usable_auth(provider: &ProviderRuntimeConfig) -> bool {
+    match provider.auth.source {
+        CredentialSource::Env => provider.has_configured_credential(),
+        CredentialSource::AuthProfile => {
+            provider.has_configured_credential()
+                || (provider.id.is_openai_codex()
+                    && provider.auth.profile.as_deref() == Some(OPENAI_CODEX_CREDENTIAL_PROFILE)
+                    && provider
+                        .codex_home
+                        .as_deref()
+                        .map(|home| {
+                            codex_cli_auth_file_exists(home)
+                                && load_codex_cli_credential(home).is_ok()
+                        })
+                        .unwrap_or(false))
+        }
+        CredentialSource::ExternalCli => {
+            provider.auth.external.as_deref() == Some("codex_cli")
+                && provider
+                    .codex_home
+                    .as_deref()
+                    .map(|home| {
+                        codex_cli_auth_file_exists(home) && load_codex_cli_credential(home).is_ok()
+                    })
+                    .unwrap_or(false)
+        }
+        CredentialSource::None | CredentialSource::CredentialProcess => false,
+    }
+}
+
+pub(crate) fn provider_auth_priority(provider: &ProviderId) -> usize {
+    match provider.as_str() {
+        ProviderId::OPENAI_CODEX => 0,
+        ProviderId::OPENAI => 1,
+        ProviderId::ANTHROPIC => 2,
+        ProviderId::GEMINI => 3,
+        _ => 100,
+    }
+}
+
+pub(crate) fn preferred_override_model_for_provider(
+    provider: &ProviderId,
+    model_overrides: &HashMap<ModelRef, ModelRuntimeOverride>,
+) -> Option<ModelRef> {
+    let mut models = model_overrides
+        .keys()
+        .filter(|model| model.provider == *provider)
+        .cloned()
+        .collect::<Vec<_>>();
+    models.sort_by_key(ModelRef::as_string);
+    models.into_iter().next()
+}
+
+pub(crate) fn dedupe_fallback_models(
+    configured: Vec<ModelRouteRef>,
+    default_model: &ModelRouteRef,
+) -> Vec<ModelRouteRef> {
+    configured
+        .into_iter()
+        .filter(|model| model != default_model)
+        .fold(Vec::new(), |mut acc, model| {
+            if !acc.iter().any(|existing| existing == &model) {
+                acc.push(model);
+            }
+            acc
+        })
+}
+
+pub(crate) fn parse_model_ref_list(raw_value: &str) -> Result<Vec<ModelRouteRef>> {
+    let trimmed = raw_value.trim();
+    if trimmed.starts_with('[') {
+        let values: Vec<String> =
+            serde_json::from_str(trimmed).context("expected a JSON string array")?;
+        let parsed: Vec<ModelRouteRef> = values
+            .iter()
+            .map(|s| s.trim())
+            .filter(|value| !value.is_empty())
+            .map(ModelRouteRef::parse_compatible)
+            .collect::<Result<Vec<_>>>()?;
+        if parsed.is_empty() {
+            return Err(anyhow!("model ref list must not be empty"));
+        }
+        return Ok(parsed);
+    }
+    let values = raw_value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ModelRouteRef::parse_compatible)
+        .collect::<Result<Vec<_>>>()?;
+    if values.is_empty() {
+        return Err(anyhow!("model ref list must not be empty"));
+    }
+    Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_policy_preserves_exact_route_metadata_without_a_configured_endpoint() {
+        let catalog = RuntimeModelCatalog::default();
+        let route_ref = ModelRouteRef::parse("volcengine@plan/glm-5.2").unwrap();
+
+        let policy = catalog.resolved_model_policy(&ContextConfig::default(), Some(&route_ref));
+
+        assert_eq!(policy.reasoning_effort_options, ["low", "medium", "high"]);
+        assert_eq!(
+            policy
+                .evidence
+                .source_for(ModelMetadataField::ReasoningEffortOptions),
+            Some(crate::model_catalog::ModelMetadataOrigin::RouteBuiltin)
+        );
+    }
+
+    #[test]
+    fn resolved_capabilities_intersect_model_and_transport_image_output() {
+        let mut policy = ResolvedRuntimeModelPolicy {
+            capabilities: crate::model_catalog::ModelCapabilityFlags {
+                image_generation: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let capabilities = ResolvedModelCapabilities::resolve(
+            &mut policy,
+            ProviderTransportKind::AnthropicMessages,
+        );
+
+        assert!(capabilities
+            .intrinsic
+            .output_modalities
+            .contains(&crate::model_catalog::ModelModality::Image));
+        assert!(!capabilities.transport.image_output);
+        assert!(!capabilities.image_output);
+        assert!(!capabilities.supports(ModelRouteCapability::ImageGeneration));
+        assert_eq!(
+            policy.evidence.constraints,
+            [ModelMetadataConstraint {
+                field: ModelMetadataField::ImageGeneration,
+                kind: ModelMetadataConstraintKind::Disabled,
+                source: ModelMetadataConstraintSource::TransportCapability,
+                requested: "true".into(),
+                effective: "false".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn resolved_capabilities_record_each_transport_image_constraint_once() {
+        let mut policy = ResolvedRuntimeModelPolicy {
+            capabilities: crate::model_catalog::ModelCapabilityFlags {
+                image_input: true,
+                image_generation: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        for _ in 0..2 {
+            let capabilities = ResolvedModelCapabilities::resolve(
+                &mut policy,
+                ProviderTransportKind::GeminiGenerateContent,
+            );
+            assert!(!capabilities.image_input);
+            assert!(!capabilities.image_output);
+        }
+
+        assert_eq!(
+            policy.evidence.constraints,
+            [
+                ModelMetadataConstraint {
+                    field: ModelMetadataField::ImageInput,
+                    kind: ModelMetadataConstraintKind::Disabled,
+                    source: ModelMetadataConstraintSource::TransportCapability,
+                    requested: "true".into(),
+                    effective: "false".into(),
+                },
+                ModelMetadataConstraint {
+                    field: ModelMetadataField::ImageGeneration,
+                    kind: ModelMetadataConstraintKind::Disabled,
+                    source: ModelMetadataConstraintSource::TransportCapability,
+                    requested: "true".into(),
+                    effective: "false".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn resolved_capabilities_do_not_record_inactive_transport_constraints() {
+        let mut policy = ResolvedRuntimeModelPolicy::default();
+
+        let capabilities = ResolvedModelCapabilities::resolve(
+            &mut policy,
+            ProviderTransportKind::GeminiGenerateContent,
+        );
+
+        assert!(!capabilities.image_input);
+        assert!(!capabilities.image_output);
+        assert!(policy.evidence.constraints.is_empty());
+    }
+
+    #[test]
+    fn gemini_transport_does_not_advertise_unimplemented_vision_or_reasoning_controls() {
+        let catalog = crate::model_catalog::BuiltInModelCatalog::new();
+        let mut policy = catalog.resolve_policy(
+            &ModelRef::parse("gemini/gemini-3.5-flash").unwrap(),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            &crate::config::ContextConfig::default(),
+            8192,
+        );
+
+        assert!(policy.capabilities.image_input);
+        assert!(policy.capabilities.supports_reasoning);
+        assert!(policy.reasoning_effort_options.is_empty());
+
+        let capabilities = ResolvedModelCapabilities::resolve(
+            &mut policy,
+            ProviderTransportKind::GeminiGenerateContent,
+        );
+        assert!(!capabilities.transport.image_input);
+        assert!(!capabilities.image_input);
+        assert!(!capabilities.supports(ModelRouteCapability::VisionObservation));
+        assert!(capabilities
+            .endpoint
+            .accepted_parameters
+            .iter()
+            .all(|parameter| parameter.name != "reasoning_effort"));
+    }
+
+    #[test]
+    fn resolved_capabilities_preserve_reasoning_effort_allowed_values() {
+        let mut policy = ResolvedRuntimeModelPolicy {
+            reasoning_effort_options: vec!["low".into(), "high".into()],
+            ..Default::default()
+        };
+
+        let capabilities =
+            ResolvedModelCapabilities::resolve(&mut policy, ProviderTransportKind::OpenAiResponses);
+
+        assert_eq!(
+            capabilities.endpoint.accepted_parameters,
+            vec![
+                crate::model_catalog::ModelParameterSupport {
+                    name: "reasoning_effort".into(),
+                    allowed_values: vec!["low".into(), "high".into()],
+                },
+                crate::model_catalog::ModelParameterSupport {
+                    name: "max_output_tokens".into(),
+                    allowed_values: Vec::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn model_route_ref_round_trips_model_ids_with_slashes() {
+        let route_ref =
+            ModelRouteRef::parse("openrouter@default/anthropic/claude-3.5-sonnet").unwrap();
+        assert_eq!(route_ref.provider.as_str(), "openrouter");
+        assert_eq!(route_ref.endpoint.as_str(), "default");
+        assert_eq!(route_ref.model, "anthropic/claude-3.5-sonnet");
+        assert_eq!(
+            route_ref.as_string(),
+            "openrouter@default/anthropic/claude-3.5-sonnet"
+        );
+    }
+
+    #[test]
+    fn model_route_ref_compact_display_only_omits_default_endpoint() {
+        let default_route =
+            ModelRouteRef::parse("openrouter@default/anthropic/claude-3.5-sonnet").unwrap();
+        assert_eq!(
+            default_route.as_compact_display(),
+            "openrouter/anthropic/claude-3.5-sonnet"
+        );
+        assert_eq!(
+            default_route.as_string(),
+            "openrouter@default/anthropic/claude-3.5-sonnet"
+        );
+        assert_eq!(
+            serde_json::to_string(&default_route).unwrap(),
+            r#""openrouter@default/anthropic/claude-3.5-sonnet""#
+        );
+
+        let plan_route = ModelRouteRef::parse("volcengine@plan/glm-5.2").unwrap();
+        assert_eq!(plan_route.as_compact_display(), "volcengine@plan/glm-5.2");
+
+        let token_plan_route = ModelRouteRef::parse("dashscope@token-plan/qwen3.7-max").unwrap();
+        assert_eq!(
+            token_plan_route.as_compact_display(),
+            "dashscope@token-plan/qwen3.7-max"
+        );
+    }
+
+    #[test]
+    fn compatible_model_route_ref_keeps_legacy_model_remainder() {
+        let route_ref =
+            ModelRouteRef::parse_compatible("openrouter/anthropic/claude-3.5-sonnet").unwrap();
+        assert_eq!(route_ref.provider.as_str(), "openrouter");
+        assert_eq!(route_ref.endpoint.as_str(), "default");
+        assert_eq!(route_ref.model, "anthropic/claude-3.5-sonnet");
+    }
+
+    #[test]
+    fn compatible_model_route_ref_upgrades_builtin_endpoint() {
+        let route_ref =
+            ModelRouteRef::parse_compatible("volcengine-image-openai/doubao-seedream-5.0-lite")
+                .unwrap();
+        assert_eq!(route_ref.provider.as_str(), "volcengine");
+        assert_eq!(route_ref.endpoint.as_str(), "default");
+        assert_eq!(route_ref.model, "doubao-seedream-5.0-lite");
+    }
+
+    #[test]
+    fn compatible_model_route_ref_upgrades_legacy_plan_provider() {
+        let route_ref =
+            ModelRouteRef::parse_compatible("dashscope-token-plan/qwen3.7-max").unwrap();
+        assert_eq!(route_ref.provider.as_str(), "dashscope");
+        assert_eq!(route_ref.endpoint.as_str(), "token-plan");
+        assert_eq!(route_ref.model, "qwen3.7-max");
+    }
+
+    #[test]
+    fn compatible_model_route_ref_preserves_endpoint_across_model_alias() {
+        let route_ref = ModelRouteRef::parse_compatible("dashscope-token-plan/qwen-3.7").unwrap();
+        assert_eq!(route_ref.provider.as_str(), "dashscope");
+        assert_eq!(route_ref.endpoint.as_str(), "token-plan");
+        assert_eq!(route_ref.model, "qwen3.7-max");
+    }
+
+    #[test]
+    fn compatible_model_route_ref_rejects_malformed_route_segments() {
+        for value in [
+            "openai@/gpt-5.4",
+            "openai@@default/gpt-5.4",
+            "openai@default/",
+        ] {
+            let error = ModelRouteRef::parse_compatible(value)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("expected provider@endpoint/model or legacy provider/model"),
+                "unexpected error for {value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn compatible_model_route_ref_reports_both_accepted_formats() {
+        let error = ModelRouteRef::parse_compatible("not-a-model-ref")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected provider@endpoint/model or legacy provider/model"));
+    }
+
+    #[test]
+    fn model_route_ref_deserializes_legacy_and_serializes_canonical() {
+        let route_ref: ModelRouteRef =
+            serde_json::from_str(r#""anthropic/claude-sonnet-4""#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&route_ref).unwrap(),
+            r#""anthropic@default/claude-sonnet-4""#
+        );
+    }
+
+    #[test]
+    fn parse_model_ref_list_json_array() {
+        let refs =
+            parse_model_ref_list(r#"["openai-codex/gpt-5","anthropic/claude-sonnet-4"]"#).unwrap();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].provider.as_str(), "openai-codex");
+        assert_eq!(refs[1].provider.as_str(), "anthropic");
+    }
+
+    #[test]
+    fn parse_model_ref_list_json_array_single() {
+        let refs = parse_model_ref_list(r#"["openai-codex/gpt-5"]"#).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].provider.as_str(), "openai-codex");
+    }
+
+    #[test]
+    fn parse_model_ref_list_comma_separated() {
+        let refs = parse_model_ref_list("openai-codex/gpt-5, anthropic/claude-sonnet-4").unwrap();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].provider.as_str(), "openai-codex");
+        assert_eq!(refs[1].provider.as_str(), "anthropic");
+    }
+
+    #[test]
+    fn parse_model_ref_list_empty_json_array_rejected() {
+        assert!(parse_model_ref_list("[]").is_err());
+    }
+}
+
+pub(crate) fn parse_model_catalog_value(
+    raw_value: &str,
+) -> Result<BTreeMap<String, ModelRuntimeOverride>> {
+    let parsed: BTreeMap<String, ModelRuntimeOverride> =
+        serde_json::from_str(raw_value).context("models.catalog expects a JSON object")?;
+    let mut validated = BTreeMap::new();
+    for (model_ref, override_config) in parsed {
+        ModelRef::parse(&model_ref)?;
+        validated.insert(model_ref, validate_model_runtime_override(override_config)?);
+    }
+    Ok(validated)
+}
+
+pub(crate) fn parse_optional_model_runtime_override(
+    raw_value: &str,
+) -> Result<Option<ModelRuntimeOverride>> {
+    if raw_value.trim().eq_ignore_ascii_case("null") {
+        return Ok(None);
+    }
+    let parsed: ModelRuntimeOverride =
+        serde_json::from_str(raw_value).context("expected a JSON object or null")?;
+    validate_optional_model_runtime_override(Some(parsed))
+}
+
+pub(crate) fn validate_model_runtime_override(
+    override_config: ModelRuntimeOverride,
+) -> Result<ModelRuntimeOverride> {
+    if let Some(percent) = override_config.effective_context_window_percent {
+        if percent == 0 || percent > 100 {
+            return Err(anyhow!(
+                "effective_context_window_percent expects an integer from 1 to 100"
+            ));
+        }
+    }
+    if let (Some(window), Some(prompt_budget)) = (
+        override_config.context_window_tokens,
+        override_config.prompt_budget_estimated_tokens,
+    ) {
+        if prompt_budget > window {
+            return Err(anyhow!(
+                "prompt_budget_estimated_tokens must not exceed context_window_tokens"
+            ));
+        }
+    }
+    if let (Some(trigger), Some(prompt_budget)) = (
+        override_config.compaction_trigger_estimated_tokens,
+        override_config.prompt_budget_estimated_tokens,
+    ) {
+        if trigger > prompt_budget {
+            return Err(anyhow!(
+                "compaction_trigger_estimated_tokens must not exceed prompt_budget_estimated_tokens"
+            ));
+        }
+    }
+    if let (Some(keep_recent), Some(trigger)) = (
+        override_config.compaction_keep_recent_estimated_tokens,
+        override_config.compaction_trigger_estimated_tokens,
+    ) {
+        if keep_recent > trigger {
+            return Err(anyhow!(
+                "compaction_keep_recent_estimated_tokens must not exceed compaction_trigger_estimated_tokens"
+            ));
+        }
+    }
+    if override_config.is_empty() {
+        return Ok(ModelRuntimeOverride::default());
+    }
+    Ok(override_config)
+}
+
+pub(crate) fn ensure_unknown_model_fallback(
+    config: &mut HolonConfigFile,
+) -> &mut ModelRuntimeOverride {
+    config
+        .model
+        .unknown_fallback
+        .get_or_insert_with(ModelRuntimeOverride::default)
+}
+
+pub(crate) fn clear_unknown_model_fallback_field(
+    config: &mut HolonConfigFile,
+    clear: impl FnOnce(&mut ModelRuntimeOverride),
+) {
+    if let Some(value) = config.model.unknown_fallback.as_mut() {
+        clear(value);
+        if value.is_empty() {
+            config.model.unknown_fallback = None;
+        }
+    }
+}

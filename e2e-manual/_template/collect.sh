@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "Implement evidence collection for this case"
+echo "Implement this collector for the specific live e2e case."

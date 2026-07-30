@@ -1,0 +1,1560 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  agentBriefPatchFromEvents,
+  agentDetailErrorKind,
+  applyStreamEvents,
+  buildResumeRefreshes,
+  canUseRemoteRuntimeConnections,
+  hasEventIdentityConflict,
+  isSessionCacheContextCurrent,
+  isLoopbackWebHostname,
+  materializeProjectionDetail,
+  mergeBootstrapAgentState,
+  mergeCachedSessionIntoCurrent,
+  mergeTimelineEventPage,
+  missingBriefIdsForHydration,
+  readStoredRemoteConnectionProfiles,
+  resetSessionsForResume,
+  resetTransientRuntimeStateForResume,
+  readStoredRuntimeConnectionConfig,
+  runWithConcurrencyLimit,
+  sessionForEventLogEpoch,
+  skillDetailCacheKey,
+  streamEventFromBackfill,
+  useRuntimeStore,
+  writeStoredRuntimeConnectionConfig,
+} from "./runtime-store";
+import type { StreamEventEnvelopeDto } from "./client";
+import type { AgentSessionState } from "./runtime-store";
+import { createSessionProjectionState, reduceSessionProjection } from "./session-projection";
+import type { AgentSummary } from "./types";
+
+class MemoryStorage implements Storage {
+  private readonly items = new Map<string, string>();
+
+  get length() {
+    return this.items.size;
+  }
+
+  clear(): void {
+    this.items.clear();
+  }
+
+  getItem(key: string): string | null {
+    return this.items.get(key) ?? null;
+  }
+
+  key(index: number): string | null {
+    return Array.from(this.items.keys())[index] ?? null;
+  }
+
+  removeItem(key: string): void {
+    this.items.delete(key);
+  }
+
+  setItem(key: string, value: string): void {
+    this.items.set(key, value);
+  }
+}
+
+function sessionState(overrides: Partial<AgentSessionState> = {}): AgentSessionState {
+  return {
+    ...createSessionProjectionState(),
+    loading: false,
+    loadingOlder: false,
+    liveStatus: "idle",
+    cacheStatus: "unchecked",
+    contentStatus: "unknown",
+    syncStatus: "idle",
+    sendingPrompt: false,
+    detail: null,
+    workItemDetailsById: {},
+    taskDetailsById: {},
+    toolExecutionDetailsById: {},
+    ...overrides,
+  };
+}
+
+describe("skillDetailCacheKey", () => {
+  it("keeps global and agent-scoped versions separate", () => {
+    expect(skillDetailCacheKey("workspace:root:demo")).toBe("workspace:root:demo");
+    expect(skillDetailCacheKey("workspace:root:demo", "agent-a")).toBe(
+      "agent-a\u0000workspace:root:demo",
+    );
+  });
+});
+
+function agentSummary(overrides: Partial<AgentSummary> = {}): AgentSummary {
+  return {
+    id: "agent-a",
+    badge: "A",
+    profile: "default",
+    lifecycle: "asleep",
+    focusSummary: "",
+    workspace: "",
+    attention: "",
+    model: "default",
+    footer: "",
+    subtitle: "",
+    lastBrief: "",
+    lastTurnTime: "",
+    pending: 0,
+    activeTaskCount: 0,
+    waitingCount: 0,
+    posture: "",
+    postureReason: "",
+    ...overrides,
+  };
+}
+
+describe("agent snapshot merging", () => {
+  it("lets a fresh bootstrap snapshot clear cached running state and counts", () => {
+    const cached = agentSummary({
+      lifecycle: "awake-running",
+      currentRunId: "run-old",
+      pending: 3,
+      activeTaskCount: 2,
+      waitingCount: 1,
+      tasks: [{ id: "task-old", kind: "command", status: "running", summary: "old" }],
+    });
+    const fresh = agentSummary({
+      lifecycle: "asleep",
+      currentRunId: null,
+      pending: 0,
+      activeTaskCount: 0,
+      waitingCount: 0,
+      tasks: [],
+    });
+
+    expect(mergeBootstrapAgentState(fresh, cached)).toMatchObject({
+      lifecycle: "asleep",
+      currentRunId: null,
+      pending: 0,
+      activeTaskCount: 0,
+      waitingCount: 0,
+    });
+  });
+
+  it("preserves rich detail omitted by the bootstrap snapshot", () => {
+    const cachedWorkItem = { id: "work-1", objective: "Preserve me", state: "open", current: true };
+    const cached = agentSummary({
+      currentWork: cachedWorkItem,
+      workItems: [cachedWorkItem],
+      tasks: [{ id: "task-old", kind: "command", status: "completed", summary: "cached" }],
+      attachedWorkspaces: [{ workspaceId: "ws-1", name: "repo", anchor: "/repo" }],
+    });
+
+    expect(mergeBootstrapAgentState(agentSummary(), cached)).toMatchObject({
+      currentWork: cachedWorkItem,
+      workItems: [cachedWorkItem],
+      tasks: cached.tasks,
+      attachedWorkspaces: cached.attachedWorkspaces,
+    });
+  });
+});
+
+describe("resume session reset", () => {
+  it("clears stale transport loading state before reconciliation restarts", () => {
+    const reset = resetSessionsForResume({
+      "agent-a": sessionState({
+        loading: true,
+        loadingOlder: true,
+        sendingPrompt: true,
+        liveStatus: "recovering",
+        reconnectAttempt: 4,
+        briefHydrationById: {
+          loading: { briefId: "loading", status: "loading", attempt: 2 },
+          failed: { briefId: "failed", status: "failed", attempt: 5, errorKind: "timeout" },
+        },
+        workItemDetailsById: { "work-1": { loading: true } },
+        taskDetailsById: { "task-1": { loading: true } },
+        toolExecutionDetailsById: { "tool-1": { loading: true } },
+      }),
+    });
+
+    expect(reset["agent-a"]).toMatchObject({
+      loading: false,
+      loadingOlder: false,
+      sendingPrompt: false,
+      liveStatus: "stale",
+      reconnectAttempt: 0,
+      briefHydrationById: {
+        loading: { briefId: "loading", status: "pending", attempt: 2 },
+        failed: { briefId: "failed", status: "failed", attempt: 5, errorKind: "timeout" },
+      },
+      workItemDetailsById: { "work-1": { loading: false } },
+      taskDetailsById: { "task-1": { loading: false } },
+      toolExecutionDetailsById: { "tool-1": { loading: false } },
+    });
+  });
+
+  it("clears global transient loading state invalidated by the new generation", () => {
+    const patch = resetTransientRuntimeStateForResume({
+      ...useRuntimeStore.getState(),
+      modelCatalogLoading: true,
+      runtimeConfigLoading: true,
+      runtimeConfigSaving: true,
+      skillCatalogLoading: true,
+      skillDetailLoadingById: { skill: true },
+      templateCatalogLoading: true,
+      templateSyncInProgress: true,
+      templateDetailLoadingById: { template: true },
+      agentSkillCatalogLoadingByAgentId: { agent: true },
+      credentialStoreLoading: true,
+      codexDeviceLogin: { status: "waiting", jobId: "job-1" },
+      searchLoading: true,
+      searchResultContentLoadingBySourceRef: { source: true },
+      rightPanelView: {
+        kind: "task_detail",
+        agentId: "agent-a",
+        task: { id: "task-current", kind: "command", status: "running", summary: "Current" },
+        detailState: { loading: true },
+      },
+      rightPanelViewStack: [{
+        kind: "tool_execution_detail",
+        agentId: "agent-a",
+        toolExecutionId: "tool-stacked",
+        detailState: { loading: true },
+      }],
+    });
+
+    expect(patch).toMatchObject({
+      modelCatalogLoading: false,
+      runtimeConfigLoading: false,
+      runtimeConfigSaving: false,
+      skillCatalogLoading: false,
+      skillDetailLoadingById: { skill: false },
+      templateCatalogLoading: false,
+      templateSyncInProgress: false,
+      templateDetailLoadingById: { template: false },
+      agentSkillCatalogLoadingByAgentId: { agent: false },
+      credentialStoreLoading: false,
+      codexDeviceLogin: { status: "idle" },
+      searchLoading: false,
+      searchResultContentLoadingBySourceRef: { source: false },
+      rightPanelView: { detailState: { loading: false } },
+      rightPanelViewStack: [{ detailState: { loading: false } }],
+    });
+  });
+});
+
+describe("timeline events state", () => {
+  afterEach(() => {
+    useRuntimeStore.setState({
+      rightPanelOpen: true,
+      rightPanelView: undefined,
+      rightPanelViewStack: [],
+      timelineEventsByAgentId: {},
+    });
+  });
+
+  it("opens as a first-class right panel view and preserves back navigation", () => {
+    useRuntimeStore.setState({
+      selectedAgentId: "agent-a",
+      rightPanelView: { kind: "agent_overview", agentId: "agent-a" },
+      rightPanelViewStack: [],
+      timelineEventsByAgentId: {
+        "agent-a": {
+          eventsBySeq: { 1: { id: "event-1", event_seq: 1, type: "message_enqueued" } },
+          eventSeqs: [1],
+          oldestSeq: 1,
+          newestSeq: 1,
+          hasOlder: false,
+          loading: false,
+          loadingOlder: false,
+        },
+      },
+    });
+
+    useRuntimeStore.getState().showTimelineEvents("agent-a");
+    expect(useRuntimeStore.getState()).toMatchObject({
+      rightPanelOpen: true,
+      rightPanelView: { kind: "timeline_events", agentId: "agent-a" },
+      rightPanelViewStack: [{ kind: "agent_overview", agentId: "agent-a" }],
+    });
+
+    useRuntimeStore.getState().navigateBack();
+    expect(useRuntimeStore.getState()).toMatchObject({
+      rightPanelView: { kind: "agent_overview", agentId: "agent-a" },
+      rightPanelViewStack: [],
+    });
+  });
+
+  it("returns developer-only UI to a non-debug closed state when diagnostics are disabled", () => {
+    useRuntimeStore.setState({
+      selectedAgentId: "agent-a",
+      displayLevel: "debug",
+      displayLevelsByAgentId: {
+        "agent-a": "debug",
+        "agent-b": "verbose",
+      },
+      rightPanelOpen: true,
+      rightPanelView: { kind: "timeline_events", agentId: "agent-a" },
+      rightPanelViewStack: [
+        { kind: "agent_overview", agentId: "agent-a" },
+        { kind: "timeline_events", agentId: "agent-b" },
+      ],
+    });
+
+    useRuntimeStore.getState().disableDeveloperDiagnosticsUi("agent-a");
+
+    expect(useRuntimeStore.getState()).toMatchObject({
+      displayLevel: "info",
+      displayLevelsByAgentId: {
+        "agent-a": "info",
+        "agent-b": "verbose",
+      },
+      rightPanelOpen: false,
+      rightPanelView: { kind: "agent_overview", agentId: "agent-a" },
+      rightPanelViewStack: [{ kind: "agent_overview", agentId: "agent-a" }],
+    });
+  });
+
+  it("appends older pages in sequence order and resets on epoch changes", () => {
+    const initial = mergeTimelineEventPage(
+      {
+        eventsBySeq: {},
+        eventSeqs: [],
+        hasOlder: false,
+        loading: false,
+        loadingOlder: false,
+      },
+      [
+        { id: "event-3", event_seq: 3, event_log_epoch: "epoch-a", type: "task_created" },
+        { id: "event-2", event_seq: 2, event_log_epoch: "epoch-a", type: "message_enqueued" },
+      ],
+      "epoch-a",
+      true,
+      false,
+    );
+    const appended = mergeTimelineEventPage(
+      initial,
+      [{ id: "event-1", event_seq: 1, event_log_epoch: "epoch-a", type: "agent_state_changed" }],
+      "epoch-a",
+      false,
+      true,
+    );
+    expect(appended).toMatchObject({
+      eventLogEpoch: "epoch-a",
+      eventSeqs: [1, 2, 3],
+      oldestSeq: 1,
+      newestSeq: 3,
+      hasOlder: false,
+    });
+
+    expect(mergeTimelineEventPage(
+      appended,
+      [{ id: "event-1-new", event_seq: 1, event_log_epoch: "epoch-b", type: "message_enqueued" }],
+      "epoch-b",
+      false,
+      true,
+    )).toMatchObject({
+      eventLogEpoch: "epoch-b",
+      eventSeqs: [1],
+      eventsBySeq: { 1: { id: "event-1-new" } },
+    });
+  });
+});
+
+describe("runtime event epoch", () => {
+  it("drops seq-indexed history and hydration caches when the epoch changes", () => {
+    const current = sessionState({
+      eventLogEpoch: "epoch-old",
+      eventsBySeq: { 7: { id: "evt-old" } },
+      eventSeqs: [7],
+      messagesById: { msg: { id: "msg" } },
+      newestSeq: 7,
+      oldestSeq: 7,
+      hasOlder: true,
+      detail: {
+        agent: { id: "agent-1" } as NonNullable<AgentSessionState["detail"]>["agent"],
+        source: "http",
+        timeline: [],
+        events: [],
+        eventCursorSeq: 7,
+        hasOlderEvents: true,
+      },
+    });
+
+    const reset = sessionForEventLogEpoch(current, "epoch-new");
+
+    expect(reset.eventLogEpoch).toBe("epoch-new");
+    expect(reset.eventsBySeq).toEqual({});
+    expect(reset.eventSeqs).toEqual([]);
+    expect(reset.messagesById).toEqual({});
+    expect(reset.newestSeq).toBeUndefined();
+    expect(reset.oldestSeq).toBeUndefined();
+    expect(reset.hasOlder).toBeUndefined();
+    expect(reset.detail?.eventCursorSeq).toBeUndefined();
+    expect(reset.detail?.hasOlderEvents).toBeUndefined();
+  });
+
+  it("detects conflicting immutable content for the same epoch and sequence", () => {
+    const existing: StreamEventEnvelopeDto = {
+      id: "evt-1",
+      event_seq: 7,
+      event_log_epoch: "epoch-1",
+      contract_version: 1,
+      ts: "2026-07-16T00:00:00Z",
+      agent_id: "agent-1",
+      type: "legacy_event",
+      payload_schema: "holon.runtime_event.legacy",
+      payload_schema_version: 1,
+      provenance: {},
+      payload: { value: 1 },
+    };
+    const current = sessionState({
+      eventLogEpoch: "epoch-1",
+      eventsBySeq: { 7: existing },
+      eventSeqs: [7],
+    });
+
+    expect(hasEventIdentityConflict(current, [{ ...existing }])).toBe(false);
+    expect(
+      hasEventIdentityConflict(current, [
+        { ...existing, id: "evt-conflict", payload: { value: 2 } },
+      ]),
+    ).toBe(true);
+  });
+
+  it("preserves typed contract metadata when rebuilding gap backfill events", () => {
+    const provenance = {
+      source: "runtime",
+      correlation_id: "correlation-1",
+    };
+    const event = streamEventFromBackfill(
+      {
+        id: "evt-1",
+        event_seq: 7,
+        event_log_epoch: "",
+        contract_version: 2,
+        ts: "2026-07-16T00:00:00Z",
+        agent_id: "page-agent",
+        type: "brief_created",
+        payload_schema: "holon.runtime_event.brief_created",
+        payload_schema_version: 1,
+        provenance,
+        payload: { brief_id: "brief-1" },
+      },
+      "subscribed-agent",
+      "epoch-1",
+    );
+
+    expect(event).toMatchObject({
+      event_log_epoch: "epoch-1",
+      agent_id: "subscribed-agent",
+      contract_version: 2,
+      payload_schema: "holon.runtime_event.brief_created",
+      payload_schema_version: 1,
+      provenance,
+    });
+  });
+});
+
+describe("session cache restoration", () => {
+  it("rejects cache hydration captured for an older remote or generation", () => {
+    const captured = { remoteKey: "https://old.example", generation: 7 };
+
+    expect(isSessionCacheContextCurrent(captured, "https://old.example", 7)).toBe(true);
+    expect(isSessionCacheContextCurrent(captured, "https://new.example", 7)).toBe(false);
+    expect(isSessionCacheContextCurrent(captured, "https://old.example", 8)).toBe(false);
+  });
+
+  it("does not overwrite HTTP or SSE state that arrived while cache was loading", () => {
+    const current = sessionState({
+      eventLogEpoch: "epoch-live",
+      eventsBySeq: { 9: { id: "live-event", event_seq: 9 } },
+      eventSeqs: [9],
+      newestSeq: 9,
+      oldestSeq: 9,
+      liveStatus: "streaming",
+    });
+    const cached = {
+      ...createSessionProjectionState("epoch-cache"),
+      eventsBySeq: { 1: { id: "cached-event", event_seq: 1 } },
+      eventSeqs: [1],
+      newestSeq: 1,
+      oldestSeq: 1,
+    };
+
+    expect(mergeCachedSessionIntoCurrent(current, cached)).toBe(current);
+  });
+
+  it("restores cached projection into an empty session without changing UI state", () => {
+    const current = sessionState({ loading: true, liveStatus: "connecting" });
+    const cached = {
+      ...createSessionProjectionState("epoch-cache"),
+      eventsBySeq: { 1: { id: "cached-event", event_seq: 1 } },
+      eventSeqs: [1],
+      newestSeq: 1,
+      oldestSeq: 1,
+    };
+
+    const restored = mergeCachedSessionIntoCurrent(current, cached);
+
+    expect(restored.eventSeqs).toEqual([1]);
+    expect(restored.loading).toBe(true);
+    expect(restored.liveStatus).toBe("connecting");
+  });
+});
+
+function installWindow(localStorage: Storage, sessionStorage: Storage, hostname = "localhost") {
+  vi.stubGlobal("window", {
+    clearTimeout: () => undefined,
+    location: { hostname },
+    localStorage,
+    sessionStorage,
+  });
+}
+
+describe("runtime connection storage", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps active runtime connections isolated per window session", () => {
+    const sharedLocalStorage = new MemoryStorage();
+    const remoteWindowSession = new MemoryStorage();
+    const localWindowSession = new MemoryStorage();
+
+    installWindow(sharedLocalStorage, remoteWindowSession);
+    writeStoredRuntimeConnectionConfig({
+      mode: "remote",
+      baseUrl: "http://remote.example:7878/",
+      token: "remote-token",
+    });
+
+    installWindow(sharedLocalStorage, localWindowSession);
+    expect(readStoredRuntimeConnectionConfig()).toEqual({ mode: "local" });
+    writeStoredRuntimeConnectionConfig({ mode: "local" });
+
+    installWindow(sharedLocalStorage, remoteWindowSession);
+    expect(readStoredRuntimeConnectionConfig()).toEqual({
+      mode: "remote",
+      baseUrl: "http://remote.example:7878",
+      token: "remote-token",
+    });
+
+    installWindow(sharedLocalStorage, localWindowSession);
+    expect(readStoredRuntimeConnectionConfig()).toEqual({ mode: "local" });
+  });
+
+  it("retains saved remote tokens without making new windows remote by default", () => {
+    const sharedLocalStorage = new MemoryStorage();
+    const firstWindowSession = new MemoryStorage();
+    const secondWindowSession = new MemoryStorage();
+
+    installWindow(sharedLocalStorage, firstWindowSession);
+    writeStoredRuntimeConnectionConfig({
+      mode: "remote",
+      baseUrl: "http://remote.example:7878",
+      token: "saved-token",
+    });
+
+    installWindow(sharedLocalStorage, secondWindowSession);
+    expect(readStoredRuntimeConnectionConfig()).toEqual({ mode: "local" });
+    writeStoredRuntimeConnectionConfig({ mode: "remote", baseUrl: "http://remote.example:7878" });
+
+    expect(readStoredRuntimeConnectionConfig()).toEqual({
+      mode: "remote",
+      baseUrl: "http://remote.example:7878",
+      token: "saved-token",
+    });
+  });
+
+  it("keeps same-origin runtime tokens in the active window session", () => {
+    const sharedLocalStorage = new MemoryStorage();
+    const windowSession = new MemoryStorage();
+
+    installWindow(sharedLocalStorage, windowSession, "100.92.113.47");
+    writeStoredRuntimeConnectionConfig({ mode: "local", token: "same-origin-token" });
+
+    expect(readStoredRuntimeConnectionConfig()).toEqual({
+      mode: "local",
+      token: "same-origin-token",
+    });
+    expect(readStoredRemoteConnectionProfiles()).toEqual([]);
+  });
+
+  it("detects loopback page origins as eligible for remote runtime connections", () => {
+    expect(isLoopbackWebHostname("localhost")).toBe(true);
+    expect(isLoopbackWebHostname("127.0.0.1")).toBe(true);
+    expect(isLoopbackWebHostname("127.42.0.9")).toBe(true);
+    expect(isLoopbackWebHostname("::1")).toBe(true);
+    expect(isLoopbackWebHostname("100.92.113.47")).toBe(false);
+    expect(isLoopbackWebHostname("holon.example.test")).toBe(false);
+  });
+
+  it("forces same-origin local mode on non-loopback embedded pages", () => {
+    const sharedLocalStorage = new MemoryStorage();
+    const remoteWindowSession = new MemoryStorage();
+
+    installWindow(sharedLocalStorage, remoteWindowSession, "100.92.113.47");
+    expect(canUseRemoteRuntimeConnections()).toBe(false);
+
+    writeStoredRuntimeConnectionConfig({
+      mode: "remote",
+      baseUrl: "http://127.0.0.1:7878",
+      token: "saved-token",
+    });
+
+    expect(readStoredRuntimeConnectionConfig()).toEqual({ mode: "local" });
+    expect(readStoredRemoteConnectionProfiles()).toEqual([]);
+  });
+});
+
+describe("roster activity unread state", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("hydrates persisted roster activity per remote key", async () => {
+    const sharedLocalStorage = new MemoryStorage();
+    installWindow(sharedLocalStorage, new MemoryStorage());
+    sharedLocalStorage.setItem(
+      "holon.webGui.rosterActivityByRemote.v1",
+      JSON.stringify({
+        local: {
+          localAgent: { unreadCount: 2, lastUnreadSeq: 12, lastReadSeq: 7, briefAt: "2026-01-01T00:00:00.000Z" },
+        },
+        "http://remote.example:7878": {
+          remoteAgent: { unreadCount: 4, lastUnreadSeq: 20 },
+        },
+      }),
+    );
+
+    const { readStoredRosterActivity } = await import("./runtime-store");
+
+    expect(readStoredRosterActivity("local")).toEqual({
+      localAgent: { unreadCount: 2, lastUnreadSeq: 12, lastReadSeq: 7, briefAt: "2026-01-01T00:00:00.000Z" },
+    });
+    expect(readStoredRosterActivity("http://remote.example:7878")).toEqual({
+      remoteAgent: { unreadCount: 4, lastUnreadSeq: 20 },
+    });
+  });
+
+  it("counts unread brief and non-operator message events once by seq", async () => {
+    const { touchRosterActivityFromEvent } = await import("./runtime-store");
+    const afterBrief = touchRosterActivityFromEvent(
+      {},
+      "agent-a",
+      { agent_id: "agent-a", event_seq: 10, ts: "2026-01-01T00:00:00.000Z", type: "brief_created", payload: {} },
+      "agent-b",
+    );
+    const afterDuplicate = touchRosterActivityFromEvent(
+      afterBrief,
+      "agent-a",
+      { agent_id: "agent-a", event_seq: 10, ts: "2026-01-01T00:00:01.000Z", type: "brief_created", payload: {} },
+      "agent-b",
+    );
+    const afterAgentMessage = touchRosterActivityFromEvent(
+      afterDuplicate,
+      "agent-a",
+      {
+        agent_id: "agent-a",
+        event_seq: 11,
+        ts: "2026-01-01T00:00:02.000Z",
+        type: "message_enqueued",
+        payload: { origin: { kind: "agent" } },
+      },
+      "agent-b",
+    );
+
+    expect(afterAgentMessage["agent-a"]).toMatchObject({ unreadCount: 2, lastUnreadSeq: 11 });
+  });
+
+  it("does not count unread for the currently open agent or operator messages", async () => {
+    const { touchRosterActivityFromEvent } = await import("./runtime-store");
+    const afterSelectedBrief = touchRosterActivityFromEvent(
+      {},
+      "agent-a",
+      { agent_id: "agent-a", event_seq: 10, ts: "2026-01-01T00:00:00.000Z", type: "brief_created", payload: {} },
+      "agent-a",
+    );
+    const afterOperatorMessage = touchRosterActivityFromEvent(
+      afterSelectedBrief,
+      "agent-a",
+      {
+        agent_id: "agent-a",
+        event_seq: 11,
+        ts: "2026-01-01T00:00:01.000Z",
+        type: "message_enqueued",
+        payload: { origin: { kind: "operator" }, created_at: "2026-01-01T00:00:01.000Z" },
+      },
+      "agent-b",
+    );
+
+    expect(afterOperatorMessage["agent-a"]?.unreadCount).toBeUndefined();
+    expect(afterOperatorMessage["agent-a"]?.operatorAt).toBe("2026-01-01T00:00:01.000Z");
+  });
+});
+
+describe("brief projection and hydration", () => {
+  afterEach(() => {
+    useRuntimeStore.setState({
+      sessionsByAgentId: {},
+      globalStreamStatus: "idle",
+      selectedAgentId: "",
+    });
+    vi.unstubAllGlobals();
+  });
+
+  it("prefetches a brief for a non-selected agent without hydrating its messages or transcripts", async () => {
+    const localStorage = new MemoryStorage();
+    const sessionStorage = new MemoryStorage();
+    vi.stubGlobal("window", {
+      localStorage,
+      sessionStorage,
+      setTimeout,
+      clearTimeout,
+      location: { hostname: "localhost", protocol: "http:" },
+    });
+    const fetchMock = vi.fn((input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/agents/agent-b/briefs:batchGet")) {
+        return Promise.resolve(jsonResponse({
+          briefs: [{ id: "brief-b", text: "Background hydrated brief." }],
+          missing_brief_ids: [],
+        }));
+      }
+      if (url.endsWith("/handshake")) return Promise.resolve(jsonResponse({}));
+      if (url.endsWith("/agents/list")) return Promise.resolve(jsonResponse([]));
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await useRuntimeStore.getState().setRuntimeConnection({ mode: "local" });
+    fetchMock.mockClear();
+    useRuntimeStore.setState({
+      selectedAgentId: "agent-a",
+      sessionsByAgentId: {
+        "agent-a": sessionState(),
+        "agent-b": sessionState(),
+      },
+    });
+
+    const briefEvent: StreamEventEnvelopeDto = {
+      id: "event-brief-b",
+      event_seq: 1,
+      event_log_epoch: "epoch-b",
+      contract_version: 1,
+      ts: "2026-07-24T00:00:00Z",
+      agent_id: "agent-b",
+      type: "brief_created",
+      payload_schema: "holon.runtime_event.brief_created",
+      payload_schema_version: 1,
+      provenance: {},
+      payload: { brief_id: "brief-b" },
+    };
+
+    applyStreamEvents(useRuntimeStore.setState, "agent-b", [briefEvent]);
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/agents/agent-b/briefs:batchGet");
+    await vi.waitFor(() => {
+      expect(useRuntimeStore.getState().sessionsByAgentId["agent-b"]?.briefRecordsById["brief-b"]?.text)
+        .toBe("Background hydrated brief.");
+    });
+
+    applyStreamEvents(useRuntimeStore.setState, "agent-b", [briefEvent]);
+    await Promise.resolve();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses persisted brief text for roster patches", () => {
+    const patch = agentBriefPatchFromEvents(
+      [
+        {
+          agent_id: "agent-a",
+          event_seq: 23,
+          ts: "2026-07-10T00:00:00Z",
+          type: "brief_created",
+          payload: {
+            brief_id: "brief-123",
+            finalizes_assistant_round_id: "round-123",
+          },
+        },
+      ],
+      {
+        "brief-123": {
+          id: "brief-123",
+          text: "Canonical persisted brief.",
+        },
+      },
+    );
+
+    expect(patch).toEqual(
+      expect.objectContaining({
+        lastBrief: "Canonical persisted brief.",
+      }),
+    );
+  });
+
+  it("hydrates a missing brief even when its associated transcript is loaded", () => {
+    const session: AgentSessionState = {
+      ...createSessionProjectionState(),
+      loading: false,
+      loadingOlder: false,
+      liveStatus: "idle",
+      cacheStatus: "unchecked",
+      contentStatus: "unknown",
+      syncStatus: "idle",
+      sendingPrompt: false,
+      detail: null,
+      eventsBySeq: {
+        23: {
+          agent_id: "agent-a",
+          event_seq: 23,
+          ts: "2026-07-10T00:00:00Z",
+          type: "brief_created",
+          payload: {
+            brief_id: "brief-123",
+            finalizes_assistant_round_id: "round-123",
+          },
+        },
+      },
+      eventSeqs: [23],
+      referencedBriefIds: { "brief-123": true },
+      transcriptEntriesById: {
+        "round-123": {
+          id: "round-123",
+          data: {
+            blocks: [
+              { type: "thinking", text: "Internal reasoning must not be visible." },
+              { type: "text", text: "Transcript final text." },
+            ],
+          },
+        },
+      },
+      workItemDetailsById: {},
+      taskDetailsById: {},
+      toolExecutionDetailsById: {},
+    };
+
+    expect(missingBriefIdsForHydration(session)).toEqual(["brief-123"]);
+  });
+
+  it("tracks loading, transient failure, manual retry, and not found brief states", () => {
+    let projection = reduceSessionProjection(createSessionProjectionState(), {
+      type: "briefs_hydration_started",
+      briefIds: ["brief-123"],
+    });
+    expect(projection.briefHydrationById["brief-123"]).toEqual({
+      briefId: "brief-123",
+      status: "loading",
+      attempt: 1,
+    });
+
+    projection = reduceSessionProjection(projection, {
+      type: "briefs_hydration_failed",
+      briefIds: ["brief-123"],
+      errorKind: "request_failed",
+    });
+    expect(projection.briefHydrationById["brief-123"]).toEqual({
+      briefId: "brief-123",
+      status: "failed",
+      attempt: 1,
+      errorKind: "request_failed",
+    });
+
+    projection = reduceSessionProjection(projection, {
+      type: "briefs_hydration_started",
+      briefIds: ["brief-123"],
+    });
+    expect(projection.briefHydrationById["brief-123"]?.attempt).toBe(2);
+
+    projection = reduceSessionProjection(projection, {
+      type: "briefs_hydrated",
+      recordsById: {},
+      missingIds: ["brief-123"],
+    });
+    expect(projection.briefHydrationById["brief-123"]).toEqual({
+      briefId: "brief-123",
+      status: "not_found",
+      attempt: 2,
+    });
+  });
+});
+
+describe("optimistic operator prompt reconciliation", () => {
+  it("removes a confirmed optimistic item when its canonical message is projected", () => {
+    const projection = reduceSessionProjection(createSessionProjectionState(), {
+      type: "events_received",
+      eventLogEpoch: "epoch-1",
+      events: [{
+        id: "message-event",
+        event_seq: 1,
+        event_log_epoch: "epoch-1",
+        ts: "2026-07-17T00:00:01Z",
+        type: "message_enqueued",
+        payload: {
+          message_id: "message-123",
+          origin: { kind: "operator" },
+          body: "Run the checks",
+        },
+      }],
+    });
+    const detail = materializeProjectionDetail({
+      agent: { id: "agent-1" } as NonNullable<AgentSessionState["detail"]>["agent"],
+      source: "http",
+      timeline: [{
+        id: "operator-prompt:pending:client-123",
+        kind: "operator",
+        label: "Operator input",
+        body: "Run the checks",
+        timestamp: "2026-07-17T00:00:00Z",
+        meta: "Sent",
+        minDisplayLevel: "info",
+        sourceIds: [
+          "pending-operator-prompt",
+          "operator-prompt-client:client-123",
+          "operator-prompt-message:message-123",
+        ],
+      }, {
+        id: "operator-prompt:pending:client-456",
+        kind: "operator",
+        label: "Operator input",
+        body: "Run different checks",
+        timestamp: "2026-07-17T00:00:00Z",
+        meta: "Sent",
+        minDisplayLevel: "info",
+        sourceIds: [
+          "pending-operator-prompt",
+          "operator-prompt-client:client-456",
+          "operator-prompt-message:message-456",
+        ],
+      }],
+    }, projection, "info");
+
+    expect(detail?.timeline).toHaveLength(2);
+    expect(detail?.timeline).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "message:message-123",
+      }),
+      expect.objectContaining({
+      id: "operator-prompt:pending:client-456",
+      body: "Run different checks",
+      }),
+    ]));
+    expect(detail?.timeline).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "operator-prompt:pending:client-123",
+      }),
+    ]));
+  });
+});
+
+describe("runtime client generation", () => {
+  it("drops an old work-item response after switching clients with the same agent id", async () => {
+    const localStorage = new MemoryStorage();
+    const sessionStorage = new MemoryStorage();
+    vi.stubGlobal("window", {
+      localStorage,
+      sessionStorage,
+      setTimeout,
+      clearTimeout,
+      location: { hostname: "localhost", protocol: "http:" },
+    });
+
+    let resolveOldWorkItems!: (response: Response) => void;
+    const oldWorkItems = new Promise<Response>((resolve) => {
+      resolveOldWorkItems = resolve;
+    });
+    const fetchMock = vi.fn((input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/agents/agent-a/work-items")) return oldWorkItems;
+      if (url.endsWith("/handshake")) return Promise.resolve(jsonResponse({}));
+      if (url.endsWith("/agents/list")) {
+        return Promise.resolve(jsonResponse([{ id: "agent-a", lifecycle: "asleep" }]));
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      await useRuntimeStore.getState().setRuntimeConnection({ mode: "local" });
+      const staleRefresh = useRuntimeStore.getState().refreshAgentWorkItems("agent-a");
+      await vi.waitFor(() => {
+        expect(fetchMock).toHaveBeenCalledWith(
+          expect.stringContaining("/agents/agent-a/work-items"),
+          expect.anything(),
+        );
+      });
+
+      await useRuntimeStore.getState().setRuntimeConnection({ mode: "local" });
+      resolveOldWorkItems(jsonResponse([{ id: "old-work", objective: "old remote", state: "open" }]));
+      await staleRefresh;
+
+      expect(useRuntimeStore.getState().bootstrap.agents[0]?.workItems).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("agent event catch-up", () => {
+  afterEach(() => {
+    useRuntimeStore.setState({
+      sessionsByAgentId: {},
+      globalStreamStatus: "idle",
+      selectedAgentId: "",
+    });
+    vi.unstubAllGlobals();
+  });
+
+  it("loads every newer page without treating the server high watermark as consumed", async () => {
+    const localStorage = new MemoryStorage();
+    const sessionStorage = new MemoryStorage();
+    vi.stubGlobal("window", {
+      localStorage,
+      sessionStorage,
+      setTimeout,
+      clearTimeout,
+      location: { hostname: "localhost", protocol: "http:" },
+    });
+    const event = (eventSeq: number) => ({
+      id: `event-${eventSeq}`,
+      event_seq: eventSeq,
+      event_log_epoch: "epoch-1",
+      contract_version: 1,
+      ts: "2026-07-24T00:00:00Z",
+      agent_id: "agent-a",
+      type: "legacy_event",
+      payload_schema: "holon.runtime_event.legacy",
+      payload_schema_version: 1,
+      provenance: {},
+      payload: {},
+    });
+    const fetchMock = vi.fn((input: string | URL | Request) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname.endsWith("/handshake")) return Promise.resolve(jsonResponse({}));
+      if (url.pathname.endsWith("/agents/list")) return Promise.resolve(jsonResponse([]));
+      if (url.pathname.endsWith("/agents/agent-a/events")) {
+        const afterSeq = Number(url.searchParams.get("after_seq"));
+        const order = url.searchParams.get("order");
+        // Phase 1: tail-first descending fetch returns newest 100 events (51-150)
+        if (order === "desc") {
+          return Promise.resolve(jsonResponse({
+            events: Array.from({ length: 100 }, (_, index) => event(150 - index)),
+            event_log_epoch: "epoch-1",
+            cursor_seq: 1428,
+            newest_seq: 150,
+            oldest_seq: 51,
+            has_older: true,
+            has_newer: false,
+            order: "desc",
+            limit: 100,
+          }));
+        }
+        // Phase 2: ascending backfill from cached cursor
+        if (afterSeq === 1) {
+          return Promise.resolve(jsonResponse({
+            events: Array.from({ length: 100 }, (_, index) => event(index + 2)),
+            event_log_epoch: "epoch-1",
+            cursor_seq: 1428,
+            newest_seq: 101,
+            oldest_seq: 2,
+            has_older: false,
+            has_newer: true,
+            order: "asc",
+            limit: 100,
+          }));
+        }
+        if (afterSeq === 101) {
+          return Promise.resolve(jsonResponse({
+            events: Array.from({ length: 49 }, (_, index) => event(index + 102)),
+            event_log_epoch: "epoch-1",
+            cursor_seq: 1428,
+            newest_seq: 150,
+            oldest_seq: 102,
+            has_older: false,
+            has_newer: false,
+            order: "asc",
+            limit: 100,
+          }));
+        }
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await useRuntimeStore.getState().setRuntimeConnection({ mode: "local" });
+    fetchMock.mockClear();
+    const now = Date.now();
+    useRuntimeStore.setState({
+      globalStreamStatus: "idle",
+      sessionsByAgentId: {
+        "agent-a": sessionState({
+          cacheStatus: "hit",
+          contentStatus: "available",
+          syncStatus: "stale",
+          detailValidatedAt: now,
+          eventsValidatedAt: now,
+          detail: {
+            agent: agentSummary({ id: "agent-a" }),
+            source: "http",
+            timeline: [],
+          },
+          eventsBySeq: { 1: event(1) },
+          eventSeqs: [1],
+          newestSeq: 1,
+          oldestSeq: 1,
+          eventLogEpoch: "epoch-1",
+        }),
+      },
+    });
+
+    await useRuntimeStore.getState().ensureAgentSession("agent-a", "info");
+
+    const eventRequests = fetchMock.mock.calls
+      .map(([input]) => new URL(String(input), "http://localhost"))
+      .filter((url) => url.pathname.endsWith("/agents/agent-a/events"));
+    // Phase 1: descending tail fetch, Phase 2: ascending backfill from cached cursor
+    expect(eventRequests.map((url) => url.searchParams.get("order"))).toEqual(["desc", "asc"]);
+    expect(eventRequests.map((url) => url.searchParams.get("after_seq"))).toEqual([null, "1"]);
+    expect(useRuntimeStore.getState().sessionsByAgentId["agent-a"]).toMatchObject({
+      eventSeqs: Array.from({ length: 150 }, (_, index) => index + 1),
+      newestSeq: 150,
+      syncStatus: "idle",
+    });
+  });
+
+  it("does not advance the consumed cursor from an empty newer page", async () => {
+    const localStorage = new MemoryStorage();
+    const sessionStorage = new MemoryStorage();
+    vi.stubGlobal("window", {
+      localStorage,
+      sessionStorage,
+      setTimeout,
+      clearTimeout,
+      location: { hostname: "localhost", protocol: "http:" },
+    });
+    const event = {
+      id: "event-1",
+      event_seq: 1,
+      event_log_epoch: "epoch-1",
+      contract_version: 1,
+      ts: "2026-07-24T00:00:00Z",
+      agent_id: "agent-a",
+      type: "legacy_event",
+      payload_schema: "holon.runtime_event.legacy",
+      payload_schema_version: 1,
+      provenance: {},
+      payload: {},
+    };
+    const fetchMock = vi.fn((input: string | URL | Request) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname.endsWith("/handshake")) return Promise.resolve(jsonResponse({}));
+      if (url.pathname.endsWith("/agents/list")) return Promise.resolve(jsonResponse([]));
+      if (url.pathname.endsWith("/agents/agent-a/events")) {
+        const order = url.searchParams.get("order");
+        // Phase 1: descending tail returns events 10-20, creating a gap
+        if (order === "desc") {
+          return Promise.resolve(jsonResponse({
+            events: Array.from({ length: 11 }, (_, index) => ({
+              ...event,
+              id: `event-${20 - index}`,
+              event_seq: 20 - index,
+            })),
+            event_log_epoch: "epoch-1",
+            cursor_seq: 1428,
+            newest_seq: 20,
+            oldest_seq: 10,
+            has_older: true,
+            has_newer: false,
+            order: "desc",
+            limit: 100,
+          }));
+        }
+        // Phase 2: ascending backfill returns empty page with has_newer: true
+        return Promise.resolve(jsonResponse({
+          events: [],
+          event_log_epoch: "epoch-1",
+          cursor_seq: 1428,
+          newest_seq: 1428,
+          oldest_seq: null,
+          has_older: false,
+          has_newer: true,
+          order: "asc",
+          limit: 100,
+        }));
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await useRuntimeStore.getState().setRuntimeConnection({ mode: "local" });
+    fetchMock.mockClear();
+    const now = Date.now();
+    useRuntimeStore.setState({
+      globalStreamStatus: "idle",
+      sessionsByAgentId: {
+        "agent-a": sessionState({
+          cacheStatus: "hit",
+          contentStatus: "available",
+          syncStatus: "stale",
+          detailValidatedAt: now,
+          eventsValidatedAt: now,
+          detail: {
+            agent: agentSummary({ id: "agent-a" }),
+            source: "http",
+            timeline: [],
+          },
+          eventsBySeq: { 1: event },
+          eventSeqs: [1],
+          newestSeq: 1,
+          oldestSeq: 1,
+          eventLogEpoch: "epoch-1",
+        }),
+      },
+    });
+
+    await useRuntimeStore.getState().ensureAgentSession("agent-a", "info");
+
+    expect(useRuntimeStore.getState().sessionsByAgentId["agent-a"]).toMatchObject({
+      // Tail events 10-20 merged before backfill error
+      eventSeqs: [1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+      newestSeq: 20,
+      syncStatus: "error",
+      error: "Agent event catch-up page did not advance its consumed cursor.",
+    });
+  });
+
+  it("recovers missed events by fetching from the gap cursor instead of newestSeq", async () => {
+    const localStorage = new MemoryStorage();
+    const sessionStorage = new MemoryStorage();
+    vi.stubGlobal("window", {
+      localStorage,
+      sessionStorage,
+      setTimeout,
+      clearTimeout,
+      location: { hostname: "localhost", protocol: "http:" },
+    });
+    const event = (seq: number) => ({
+      id: `event-${seq}`,
+      event_seq: seq,
+      event_log_epoch: "epoch-1",
+      contract_version: 1,
+      ts: "2026-07-24T00:00:00Z",
+      agent_id: "agent-a",
+      type: "legacy_event",
+      payload_schema: "holon.runtime_event.legacy",
+      payload_schema_version: 1,
+      provenance: {},
+      payload: {},
+    });
+    const fetchMock = vi.fn((input: string | URL | Request) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname.endsWith("/handshake")) return Promise.resolve(jsonResponse({}));
+      if (url.pathname.endsWith("/agents/list")) return Promise.resolve(jsonResponse([]));
+      if (url.pathname.endsWith("/agents/agent-a/events")) {
+        const order = url.searchParams.get("order");
+        // Phase 1: descending tail returns the newest event (5)
+        if (order === "desc") {
+          return Promise.resolve(jsonResponse({
+            events: [event(5)],
+            event_log_epoch: "epoch-1",
+            cursor_seq: 5,
+            newest_seq: 5,
+            oldest_seq: 5,
+            has_older: true,
+            has_newer: false,
+            order: "desc",
+            limit: 100,
+          }));
+        }
+        // Phase 2: ascending backfill should query from gaps[0].afterSeq (1), not newestSeq (5).
+        const afterSeq = Number(url.searchParams.get("after_seq"));
+        expect(afterSeq).toBe(1);
+        return Promise.resolve(jsonResponse({
+          events: [event(2), event(3), event(4), event(5)],
+          event_log_epoch: "epoch-1",
+          cursor_seq: 5,
+          newest_seq: 5,
+          oldest_seq: 2,
+          has_older: false,
+          has_newer: false,
+          order: "asc",
+          limit: 100,
+        }));
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await useRuntimeStore.getState().setRuntimeConnection({ mode: "local" });
+    fetchMock.mockClear();
+    const now = Date.now();
+    // Session has events 1 and 5, with a gap (2-4 missing).
+    // newestSeq is 5 (inflated by a streaming event), but gaps[0].afterSeq is 1.
+    useRuntimeStore.setState({
+      globalStreamStatus: "idle",
+      sessionsByAgentId: {
+        "agent-a": sessionState({
+          cacheStatus: "hit",
+          contentStatus: "available",
+          syncStatus: "stale",
+          detailValidatedAt: now,
+          eventsValidatedAt: now,
+          detail: {
+            agent: agentSummary({ id: "agent-a" }),
+            source: "http",
+            timeline: [],
+          },
+          eventsBySeq: { 1: event(1), 5: event(5) },
+          eventSeqs: [1, 5],
+          newestSeq: 5,
+          oldestSeq: 1,
+          gaps: [{ afterSeq: 1, beforeSeq: 5 }],
+          eventLogEpoch: "epoch-1",
+        }),
+      },
+    });
+
+    await useRuntimeStore.getState().ensureAgentSession("agent-a", "info");
+
+    const session = useRuntimeStore.getState().sessionsByAgentId["agent-a"];
+    // Gap should be filled: events 1-5 all present, no gaps.
+    expect(session.eventSeqs).toEqual([1, 2, 3, 4, 5]);
+    expect(session.gaps).toEqual([]);
+    expect(session.newestSeq).toBe(5);
+    expect(session.syncStatus).toBe("idle");
+  });
+});
+
+describe("brief hydration retry limits", () => {
+  afterEach(() => {
+    useRuntimeStore.setState({
+      sessionsByAgentId: {},
+      globalStreamStatus: "idle",
+      selectedAgentId: "",
+    });
+    vi.unstubAllGlobals();
+  });
+
+  it("stops automatic hydration after five attempts but still allows manual retry", async () => {
+    const localStorage = new MemoryStorage();
+    const sessionStorage = new MemoryStorage();
+    vi.stubGlobal("window", {
+      localStorage,
+      sessionStorage,
+      setTimeout,
+      clearTimeout,
+      location: { hostname: "localhost", protocol: "http:" },
+    });
+    const fetchMock = vi.fn((input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/agents/agent-a/briefs:batchGet")) {
+        return Promise.resolve(jsonResponse({
+          briefs: [{ id: "brief-123", text: "Hydrated after manual retry." }],
+          missing_brief_ids: [],
+        }));
+      }
+      if (url.endsWith("/handshake")) return Promise.resolve(jsonResponse({}));
+      if (url.endsWith("/agents/list")) return Promise.resolve(jsonResponse([]));
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await useRuntimeStore.getState().setRuntimeConnection({ mode: "local" });
+    fetchMock.mockClear();
+
+    const now = Date.now();
+    useRuntimeStore.setState({
+      globalStreamStatus: "streaming",
+      sessionsByAgentId: {
+        "agent-a": sessionState({
+          cacheStatus: "hit",
+          contentStatus: "available",
+          syncStatus: "streaming",
+          detailValidatedAt: now,
+          eventsValidatedAt: now,
+          detail: {
+            agent: agentSummary({ id: "agent-a" }),
+            source: "http",
+            timeline: [],
+          },
+          eventsBySeq: {
+            1: {
+              agent_id: "agent-a",
+              event_seq: 1,
+              ts: "2026-07-23T00:00:00Z",
+              type: "brief_created",
+              payload: { brief_id: "brief-123" },
+            },
+          },
+          eventSeqs: [1],
+          referencedBriefIds: { "brief-123": true },
+          briefHydrationById: {
+            "brief-123": {
+              briefId: "brief-123",
+              status: "failed",
+              attempt: 5,
+              errorKind: "request_failed",
+            },
+          },
+        }),
+      },
+    });
+
+    await useRuntimeStore.getState().ensureAgentSession("agent-a", "info");
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    useRuntimeStore.getState().retryBriefHydration("agent-a", "brief-123");
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => {
+      expect(useRuntimeStore.getState().sessionsByAgentId["agent-a"]?.briefRecordsById["brief-123"]?.text)
+        .toBe("Hydrated after manual retry.");
+    });
+  });
+});
+
+describe("projection saturation refresh handling", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps the current roster when a best-effort bootstrap refresh is rejected", async () => {
+    const localStorage = new MemoryStorage();
+    const sessionStorage = new MemoryStorage();
+    vi.stubGlobal("window", {
+      localStorage,
+      sessionStorage,
+      setTimeout,
+      clearTimeout,
+      location: { hostname: "localhost", protocol: "http:" },
+    });
+
+    let saturated = false;
+    vi.stubGlobal("fetch", vi.fn((input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/handshake")) return Promise.resolve(jsonResponse({}));
+      if (url.endsWith("/agents/list")) {
+        return Promise.resolve(
+          saturated
+            ? new Response(
+                JSON.stringify({
+                  ok: false,
+                  error: "projection capacity is busy; retry later",
+                  code: "projection_busy",
+                  retryable: true,
+                }),
+                {
+                  status: 429,
+                  headers: {
+                    "content-type": "application/json",
+                    "retry-after": "1",
+                  },
+                },
+              )
+            : jsonResponse([{ id: "agent-a", lifecycle: "asleep" }]),
+        );
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+
+    await useRuntimeStore.getState().setRuntimeConnection({ mode: "local" });
+    await Promise.resolve();
+    const currentRoster = useRuntimeStore.getState().bootstrap.agents;
+
+    saturated = true;
+    await useRuntimeStore.getState().refreshBootstrap({ syncEvents: false });
+
+    expect(useRuntimeStore.getState()).toMatchObject({
+      bootstrap: { agents: currentRoster },
+      bootstrapLoading: false,
+      bootstrapError: undefined,
+    });
+  });
+});
+
+describe("bounded resume refresh scheduling", () => {
+  it("only schedules a detail refresh for the selected agent", () => {
+    expect(buildResumeRefreshes(["agent-a", "agent-b", "agent-c"], "agent-b")).toEqual([
+      { agentId: "agent-b", detail: true },
+    ]);
+  });
+
+  it("schedules no resume refresh when the selected agent is absent from the refreshed roster", () => {
+    expect(buildResumeRefreshes(["agent-a", "agent-c"], "agent-b")).toEqual([]);
+  });
+
+  it("limits concurrent refreshes", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const releases: Array<() => void> = [];
+
+    const scheduled = runWithConcurrencyLimit(
+      Array.from({ length: 10 }, (_, index) => index),
+      4,
+      async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise<void>((resolve) => releases.push(resolve));
+        active -= 1;
+      },
+    );
+
+    await vi.waitFor(() => expect(active).toBe(4));
+    while (releases.length) {
+      releases.shift()?.();
+      await Promise.resolve();
+    }
+    await scheduled;
+
+    expect(maxActive).toBe(4);
+  });
+
+  it("stops starting queued refreshes after the generation becomes stale", async () => {
+    let current = true;
+    const started: number[] = [];
+
+    await runWithConcurrencyLimit(
+      [1, 2, 3, 4, 5],
+      1,
+      async (value) => {
+        started.push(value);
+        current = false;
+      },
+      () => current,
+    );
+
+    expect(started).toEqual([1]);
+  });
+});
+
+describe("agentDetailErrorKind", () => {
+  it("classifies AbortError as timeout", () => {
+    expect(agentDetailErrorKind(new DOMException("aborted", "AbortError"))).toBe("timeout");
+  });
+
+  it("classifies error with timeout message as timeout", () => {
+    const err = new Error("Request timed out after 8000ms");
+    expect(agentDetailErrorKind(err)).toBe("timeout");
+  });
+
+  it("classifies RuntimeHttpError name as http_error", () => {
+    const err = new Error("GET /agents/x failed with 500");
+    err.name = "RuntimeHttpError";
+    expect(agentDetailErrorKind(err)).toBe("http_error");
+  });
+
+  it("classifies TypeError as network_error", () => {
+    expect(agentDetailErrorKind(new TypeError("fetch failed"))).toBe("network_error");
+  });
+
+  it("classifies SyntaxError as parse_error", () => {
+    expect(agentDetailErrorKind(new SyntaxError("Unexpected token in JSON"))).toBe("parse_error");
+  });
+
+  it("returns unknown for unclassified errors", () => {
+    expect(agentDetailErrorKind(new Error("something broke"))).toBe("unknown");
+    expect(agentDetailErrorKind("string error")).toBe("unknown");
+  });
+});
+
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}

@@ -1,0 +1,501 @@
+{
+  "version": 2,
+  "cases": [
+    {
+      "id": "runtime-auth-model-delivery",
+      "tier": "core",
+      "tags": ["runtime", "auth", "model", "delivery"],
+      "timeout_seconds": 600,
+      "description": "Verify control authentication, the exact real model route, provider evidence, canonical tools, transcript, and brief delivery.",
+      "phases": [
+        {
+          "id": "delivery",
+          "required_tools": [
+            "AgentGet",
+            "ListModelProviders",
+            "ListProviderModels"
+          ],
+          "forbidden_tools": [
+            "ApplyPatch",
+            "ExecCommand",
+            "CreateWorkItem"
+          ],
+          "prompt": "Release Docker E2E case {case_id}. Call AgentGet for the current agent. Call ListModelProviders, then call ListProviderModels for provider {provider} using a small limit. Do not call mutation or shell tools. After all three tools succeed, answer with one concise sentence containing the literal marker {marker}."
+        }
+      ]
+    },
+    {
+      "id": "memory-agent-home-persistence",
+      "tier": "core",
+      "tags": ["memory", "agent-home", "restart", "persistence"],
+      "timeout_seconds": 600,
+      "description": "Search exact AgentHome memory through the real model, fetch the returned source_ref, restart, and fetch the same durable source again.",
+      "phases": [
+        {
+          "id": "search",
+          "required_tools": [
+            "MemorySearch",
+            "MemoryGet"
+          ],
+          "forbidden_tools": [
+            "ApplyPatch",
+            "ExecCommand",
+            "CreateWorkItem"
+          ],
+          "prompt": "Release Docker E2E case {case_id}. Call MemorySearch with the exact query {marker} and a small limit. From the returned results, copy the real source_ref whose content contains the exact marker. Call MemoryGet with that source_ref and enough max_chars to include the marker. Do not invent a source_ref and do not modify files."
+        },
+        {
+          "id": "recover",
+          "required_tools": [
+            "MemoryGet"
+          ],
+          "forbidden_tools": [
+            "ApplyPatch",
+            "ExecCommand",
+            "CreateWorkItem"
+          ],
+          "prompt": "Continue release Docker E2E case {case_id} after a real holon serve restart. Call MemoryGet with the exact persisted source_ref {source_ref} and enough max_chars to include the marker {marker}. Do not search for or substitute another source_ref. Do not modify files."
+        }
+      ]
+    },
+    {
+      "id": "workspace-restart-lifecycle",
+      "tier": "core",
+      "tags": ["workspace", "worktree", "restart", "persistence"],
+      "timeout_seconds": 600,
+      "description": "Create a managed worktree through a real model, restart holon serve, then recover and remove the persisted worktree.",
+      "phases": [
+        {
+          "id": "create",
+          "required_tools": [
+            "GetWorkspaceState",
+            "SwitchWorkspace",
+            "CreateWorktree"
+          ],
+          "forbidden_tools": ["ApplyPatch"],
+          "prompt": "Live Docker acceptance case {case_id}. Use the named Holon tools, not shell git/worktree commands. First call GetWorkspaceState. Switch to workspace_id {workspace_id}. Create a linked worktree from base_ref main with branch {branch}, activate=true, and keep the returned execution_root_id. Call GetWorkspaceState while that worktree is active. Switch back to workspace_id {workspace_id}, call GetWorkspaceState again, and finish without removing the worktree. Do not modify files and do not create a WorkItem."
+        },
+        {
+          "id": "recover",
+          "required_tools": [
+            "GetWorkspaceState",
+            "SwitchWorkspace",
+            "RemoveWorktree"
+          ],
+          "forbidden_tools": ["ApplyPatch"],
+          "prompt": "Continue live Docker acceptance case {case_id} after a real holon serve restart. Call GetWorkspaceState and confirm execution_root_id {execution_root_id} is still registered. Switch to that exact execution_root_id and call GetWorkspaceState. Switch back to canonical workspace_id {workspace_id}. Remove execution_root_id {execution_root_id} with branch_policy keep. Call GetWorkspaceState one final time and only then report completion. Do not use shell git/worktree commands and do not create a WorkItem."
+        }
+      ]
+    },
+    {
+      "id": "workitem-wait-restart-complete",
+      "tier": "core",
+      "tags": ["workitem", "wait", "restart", "persistence", "delivery"],
+      "timeout_seconds": 600,
+      "description": "Create and focus a durable WorkItem through a real model, wait for operator input, restart holon serve, then resume and complete the same item.",
+      "phases": [
+        {
+          "id": "wait",
+          "required_tools": [
+            "CreateWorkItem",
+            "PickWorkItem",
+            "WaitFor"
+          ],
+          "forbidden_tools": ["ApplyPatch"],
+          "prompt": "Live Docker acceptance case {case_id}. Create exactly one WorkItem with objective {objective}. Seed its plan with the literal marker {plan_marker}, set plan_status needs_input, and use exactly these todos: phase-one completed, phase-two in_progress, phase-three pending. Pick the new WorkItem so it is current. Then call WaitFor with wake operator_input and a concrete reason that includes {plan_marker}. Do not modify project files and do not complete the WorkItem in this turn."
+        },
+        {
+          "id": "complete",
+          "required_tools": [
+            "ListWorkItems",
+            "GetWorkItem",
+            "UpdateWorkItem",
+            "CompleteWorkItem"
+          ],
+          "forbidden_tools": ["ApplyPatch"],
+          "prompt": "Resume live Docker acceptance case {case_id} after a real holon serve restart. Call ListWorkItems with filter current and include_todo_list=true, then GetWorkItem for {work_item_id} with include_todo_list=true. Confirm it is the same item whose plan contains {plan_marker}. Update that WorkItem to plan_status ready with all three existing todos completed. After UpdateWorkItem succeeds, your very next assistant response must contain an operator-facing text block with a concise completion result and the literal marker {completion_marker}, immediately followed by the CompleteWorkItem tool call for exactly WorkItem {work_item_id} in that same response. The completion text must precede CompleteWorkItem; calling CompleteWorkItem alone and reporting the marker in a later response is a contract failure. Do not place the completion text before UpdateWorkItem, do not put another tool between the completion text and CompleteWorkItem, and do not use transitional text such as \"Now complete it\". Do not create another WorkItem and do not modify project files."
+        }
+      ]
+    },
+    {
+      "id": "scheduler-autonomous-legacy",
+      "tier": "extended",
+      "tags": ["scheduler", "workitem", "legacy", "restart", "persistence"],
+      "timeout_seconds": 600,
+      "description": "Verify real-LLM autonomous WorkItem scheduling with canonical production commands explicitly disabled.",
+      "scheduler_protocol_commands_enabled": false,
+      "runtime_env": {
+        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "false"
+      },
+      "phases": [
+        {
+          "id": "autonomous-complete",
+          "required_tools": [
+            "CreateWorkItem",
+            "ListWorkItems",
+            "UpdateWorkItem",
+            "CompleteWorkItem"
+          ],
+          "forbidden_tools": [
+            "ApplyPatch",
+            "ExecCommand",
+            "WaitFor"
+          ],
+          "prompt": "Scheduler Docker E2E case {case_id}. Create exactly one WorkItem whose objective is {objective}, with plan_status ready and exactly these todos: scheduler-seed completed, autonomous-completion pending. Do not PickWorkItem, UpdateWorkItem, CompleteWorkItem, or WaitFor in this operator-triggered turn. After CreateWorkItem succeeds, end this response with a concise acknowledgement. The objective governs the later autonomous work_queue turn. Do not modify files. The expected completion marker is {completion_marker}."
+        }
+      ]
+    },
+    {
+      "id": "scheduler-rollout-authoritative-autonomous",
+      "tier": "extended",
+      "tags": ["scheduler", "workitem", "rollout", "shadow", "authoritative", "task-result", "wait", "restart", "rollback", "delivery"],
+      "timeout_seconds": 900,
+      "description": "Verify shadow evidence, per-scenario authoritative cutover, autonomous/task-result/external-wait continuation settlements, exact completion delivery binding, restart persistence, and rollback.",
+      "runtime_env": {
+        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true",
+        "HOLON_SCHEDULER_ACCEPTANCE_FIXTURES": "true"
+      },
+      "phases": [
+        {
+          "id": "shadow-wait-resume",
+          "required_tools": [
+            "CreateWorkItem",
+            "PickWorkItem",
+            "WaitFor",
+            "GetWorkItem",
+            "UpdateWorkItem",
+            "CompleteWorkItem"
+          ],
+          "forbidden_tools": [
+            "ApplyPatch",
+            "ExecCommand"
+          ],
+          "prompt": "Scheduler rollout Docker E2E case {case_id}, shadow phase. Create exactly one WorkItem whose objective is {objective}, with plan_status ready and exactly these todos: shadow-wait pending, shadow-complete pending. Pick that WorkItem, then call WaitFor with wake=external, resource=docker-e2e-shadow, and a concrete reason. Do not complete it in this turn. When the external wake later resumes this exact WorkItem, call GetWorkItem, update both todos to completed, then emit a concise completion result containing {completion_marker} immediately followed by CompleteWorkItem for the exact current item. Do not create another WorkItem and do not modify files."
+        },
+        {
+          "id": "authoritative-continuations",
+          "required_tools": [
+            "CreateWorkItem",
+            "ExecCommand",
+            "WaitFor",
+            "GetWorkItem",
+            "UpdateWorkItem",
+            "CompleteWorkItem"
+          ],
+          "forbidden_tools": [
+            "ApplyPatch",
+            "TaskStatus",
+            "TaskOutput"
+          ],
+          "prompt": "Scheduler rollout Docker E2E case {case_id}, authoritative phase. Create exactly one WorkItem whose objective is {objective}, with plan_status ready and exactly these todos: task-continuation pending, external-continuation pending. Do not PickWorkItem, ExecCommand, WaitFor, UpdateWorkItem, or CompleteWorkItem in this operator-triggered turn. After CreateWorkItem succeeds, end this response with a concise acknowledgement. The objective governs all later autonomous continuation turns. Do not create another WorkItem and do not modify files. The expected final completion marker is {completion_marker}."
+        }
+      ]
+    },
+    {
+      "id": "scheduler-terminal-before-settlement-restart",
+      "tier": "extended",
+      "tags": ["scheduler", "rollout", "authoritative", "fault", "restart", "recovery", "settlement"],
+      "timeout_seconds": 600,
+      "requires_model": false,
+      "description": "Construct a controlled terminal-before-settlement crash cut through the hidden acceptance fixture and verify real serve bootstrap reconciliation plus second-restart idempotence.",
+      "runtime_env": {
+        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true",
+        "HOLON_SCHEDULER_ACCEPTANCE_FIXTURES": "true"
+      },
+      "phases": [
+        {
+          "id": "offline-fixture-and-restart-recovery",
+          "required_tools": [],
+          "forbidden_tools": [],
+          "prompt": "This phase is driven by the checked-in offline acceptance fixture and real holon serve restart path; no model prompt is issued."
+        }
+      ]
+    },
+    {
+      "id": "scheduler-provider-failure-work-queue-retry",
+      "tier": "extended",
+      "tags": ["scheduler", "provider", "failure", "retry", "workitem", "restart"],
+      "timeout_seconds": 600,
+      "description": "Force a real provider transport failure for a current WorkItem, restore the provider endpoint across a serve restart, and verify the same continue-active idempotency key is retried to successful completion.",
+      "phases": [
+        {
+          "id": "provider-failure-and-retry",
+          "required_tools": [
+            "ListWorkItems",
+            "CompleteWorkItem"
+          ],
+          "forbidden_tools": [
+            "CreateWorkItem",
+            "WaitFor"
+          ],
+          "prompt": "This case creates and focuses the WorkItem through the public control API. The first autonomous turn uses an intentionally unreachable provider endpoint. After a real serve restart with the normal endpoint restored, the WorkItem objective requires ListWorkItems and CompleteWorkItem."
+        }
+      ]
+    },
+    {
+      "id": "scheduler-multi-workitem-scheduling",
+      "tier": "extended",
+      "tags": ["scheduler", "workitem", "multi", "priority", "e2e-tier-1"],
+      "timeout_seconds": 600,
+      "description": "Verify real-LLM multi-WorkItem scheduling: two WorkItems created in one turn both complete autonomously without conflicts or duplicate settlements.",
+      "scheduler_protocol_commands_enabled": true,
+      "runtime_env": {
+        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true"
+      },
+      "phases": [
+        {
+          "id": "create-and-complete",
+          "required_tools": [
+            "CreateWorkItem",
+            "ListWorkItems"
+          ],
+          "forbidden_tools": [
+            "ApplyPatch",
+            "ExecCommand",
+            "WaitFor",
+            "PickWorkItem",
+            "UpdateWorkItem",
+            "CompleteWorkItem"
+          ],
+          "prompt": "Scheduler Docker E2E case {case_id}. Create exactly two WorkItems. For the first, use objective {objective_a}, plan_status ready, and todos: seed-a completed, complete-a pending. For the second, use objective {objective_b}, plan_status ready, and todos: seed-b completed, complete-b pending. Do not PickWorkItem, UpdateWorkItem, CompleteWorkItem, or WaitFor in this operator-triggered turn. After both CreateWorkItem calls succeed, end this response with a concise acknowledgement. The objectives govern the later autonomous work_queue turns. Do not modify files. The expected completion markers are {completion_a} and {completion_b}."
+        }
+      ]
+    },
+    {
+      "id": "scheduler-external-wait-resume",
+      "tier": "extended",
+      "tags": ["scheduler", "workitem", "external", "wait", "resume", "e2e-tier-1"],
+      "timeout_seconds": 600,
+      "description": "Verify real-LLM WaitFor(external) + external trigger callback + autonomous resume and completion.",
+      "scheduler_protocol_commands_enabled": true,
+      "runtime_env": {
+        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true"
+      },
+      "phases": [
+        {
+          "id": "wait-and-complete",
+          "required_tools": [
+            "CreateWorkItem",
+            "PickWorkItem",
+            "WaitFor",
+            "GetWorkItem",
+            "UpdateWorkItem",
+            "CompleteWorkItem"
+          ],
+          "forbidden_tools": [
+            "ApplyPatch",
+            "ExecCommand"
+          ],
+          "prompt": "Scheduler Docker E2E case {case_id}. Create exactly one WorkItem whose objective is {objective}, with plan_status ready and exactly these todos: external-wait pending, external-complete pending. Pick that WorkItem, then call WaitFor with wake=external, resource=docker-e2e:{marker}, and a concrete reason. Do not complete it in this turn. When the external wake later resumes this exact WorkItem, call GetWorkItem, update both todos to completed, then emit a concise completion result containing {completion_marker} immediately followed by CompleteWorkItem for the exact current item. Do not create another WorkItem and do not modify files."
+        }
+      ]
+    },
+    {
+      "id": "scheduler-operator-wait-resume",
+      "tier": "extended",
+      "tags": ["scheduler", "workitem", "operator", "wait", "resume", "e2e-tier-1"],
+      "timeout_seconds": 600,
+      "description": "Verify real-LLM WaitFor(operator_input) + operator message + autonomous resume and completion.",
+      "scheduler_protocol_commands_enabled": true,
+      "runtime_env": {
+        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true"
+      },
+      "phases": [
+        {
+          "id": "wait-and-complete",
+          "required_tools": [
+            "CreateWorkItem",
+            "PickWorkItem",
+            "WaitFor",
+            "GetWorkItem",
+            "UpdateWorkItem",
+            "CompleteWorkItem"
+          ],
+          "forbidden_tools": [
+            "ApplyPatch",
+            "ExecCommand"
+          ],
+          "prompt": "Scheduler Docker E2E case {case_id}. Create exactly one WorkItem whose objective is {objective}, with plan_status ready and exactly these todos: operator-wait pending, operator-complete pending. Pick that WorkItem, then call WaitFor with wake=operator_input and a concrete reason. Do not complete it in this turn. When the operator message later resumes this exact WorkItem, call GetWorkItem, update both todos to completed, then emit a concise completion result containing {completion_marker} immediately followed by CompleteWorkItem for the exact current item. Do not create another WorkItem and do not modify files."
+        }
+      ]
+    },
+    {
+      "id": "scheduler-concurrent-claim-fencing",
+      "tier": "extended",
+      "tags": ["scheduler", "workitem", "concurrent", "claim", "interject", "e2e-tier-2"],
+      "timeout_seconds": 600,
+      "description": "Verify interject prompt during external wait creates a new WorkItem without disrupting the waiting WorkItem; both complete correctly.",
+      "scheduler_protocol_commands_enabled": true,
+      "runtime_env": {
+        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true"
+      },
+      "phases": [
+        {
+          "id": "wait-and-interject",
+          "required_tools": [
+            "CreateWorkItem",
+            "PickWorkItem",
+            "WaitFor",
+            "GetWorkItem",
+            "UpdateWorkItem",
+            "CompleteWorkItem"
+          ],
+          "forbidden_tools": [
+            "ApplyPatch",
+            "ExecCommand"
+          ],
+          "prompt": "Scheduler Docker E2E case {case_id}. Create exactly one WorkItem whose objective is {objective_a}, with plan_status ready and exactly these todos: concurrent-wait pending, concurrent-complete pending. Pick that WorkItem, then call WaitFor with wake=external, resource=docker-e2e:{marker}, and a concrete reason. Do not complete it in this turn. When the external wake later resumes this exact WorkItem, call GetWorkItem, update both todos to completed, then emit a concise completion result containing {completion_a} immediately followed by CompleteWorkItem for the exact current item. Do not create another WorkItem and do not modify files."
+        }
+      ]
+    },
+    {
+      "id": "scheduler-operator-interject-during-wait",
+      "tier": "extended",
+      "tags": ["scheduler", "workitem", "operator", "interject", "e2e-tier-2"],
+      "timeout_seconds": 600,
+      "description": "Verify operator interject during operator wait creates a new WorkItem; original resumes correctly after interject completes.",
+      "scheduler_protocol_commands_enabled": true,
+      "runtime_env": {
+        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true"
+      },
+      "phases": [
+        {
+          "id": "wait-and-interject",
+          "required_tools": [
+            "CreateWorkItem",
+            "PickWorkItem",
+            "WaitFor",
+            "GetWorkItem",
+            "UpdateWorkItem",
+            "CompleteWorkItem"
+          ],
+          "forbidden_tools": [
+            "ApplyPatch",
+            "ExecCommand"
+          ],
+          "prompt": "Scheduler Docker E2E case {case_id}. Create exactly one WorkItem whose objective is {objective_a}, with plan_status ready and exactly these todos: interject-wait pending, interject-complete pending. Pick that WorkItem, then call WaitFor with wake=operator_input and a concrete reason. Do not complete it in this turn. When the operator message later resumes this exact WorkItem, call GetWorkItem, update both todos to completed, then emit a concise completion result containing {completion_a} immediately followed by CompleteWorkItem for the exact current item. Do not create another WorkItem and do not modify files."
+        }
+      ]
+    },
+    {
+      "id": "scheduler-compaction-continuity",
+      "tier": "extended",
+      "tags": ["scheduler", "workitem", "compaction", "continuity", "e2e-tier-2"],
+      "timeout_seconds": 600,
+      "description": "Verify WorkItem state survives compaction triggered during a multi-turn lifecycle and persists across restart.",
+      "scheduler_protocol_commands_enabled": true,
+      "runtime_env": {
+        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true",
+        "HOLON_COMPACTION_TRIGGER_MESSAGES": "3",
+        "HOLON_COMPACTION_KEEP_RECENT_MESSAGES": "2"
+      },
+      "phases": [
+        {
+          "id": "wait-and-complete",
+          "required_tools": [
+            "CreateWorkItem",
+            "PickWorkItem",
+            "WaitFor",
+            "GetWorkItem",
+            "UpdateWorkItem",
+            "CompleteWorkItem"
+          ],
+          "forbidden_tools": [
+            "ApplyPatch",
+            "ExecCommand"
+          ],
+          "prompt": "Scheduler Docker E2E case {case_id}. Create exactly one WorkItem whose objective is {objective}, with plan_status ready and exactly these todos: compaction-wait pending, compaction-complete pending. Pick that WorkItem, then call WaitFor with wake=operator_input and a concrete reason. Do not complete it in this turn. When the operator message later resumes this exact WorkItem, call GetWorkItem, update both todos to completed, then emit a concise completion result containing {completion_marker} immediately followed by CompleteWorkItem for the exact current item. Do not create another WorkItem and do not modify files."
+        }
+      ]
+    },
+    {
+      "id": "scheduler-worktree-isolation",
+      "tier": "extended",
+      "tags": ["scheduler", "workitem", "worktree", "isolation", "e2e-tier-2"],
+      "timeout_seconds": 600,
+      "description": "Verify agent creates, inspects, and removes a worktree through real model tool calls with correct execution binding.",
+      "scheduler_protocol_commands_enabled": true,
+      "runtime_env": {
+        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true"
+      },
+      "phases": [
+        {
+          "id": "worktree-lifecycle",
+          "required_tools": [
+            "CreateWorkItem",
+            "PickWorkItem",
+            "GetWorkspaceState",
+            "CreateWorktree",
+            "SwitchWorkspace",
+            "RemoveWorktree",
+            "UpdateWorkItem",
+            "CompleteWorkItem"
+          ],
+          "forbidden_tools": [
+            "ApplyPatch",
+            "ExecCommand"
+          ],
+          "prompt": "Scheduler Docker E2E case {case_id}. Create exactly one WorkItem whose objective is {objective}, with plan_status ready and exactly these todos: worktree-create pending, worktree-cleanup pending. Pick that WorkItem, then call GetWorkspaceState to discover the current workspace. Create a linked worktree from base_ref main with branch {branch}, activate=true, and keep the returned execution_root_id. Call GetWorkspaceState again to confirm the worktree is active. Switch back to workspace_id {workspace_id}. Call GetWorkspaceState to confirm you are back on the canonical root. Remove the worktree using the execution_root_id you kept, with branch_policy keep. Call GetWorkspaceState one final time. Then update both todos to completed and emit a concise completion result containing {completion_marker} immediately followed by CompleteWorkItem for the exact current item. Do not modify project files."
+        }
+      ]
+    },
+    {
+      "id": "scheduler-spawn-agent-supervision",
+      "tier": "extended",
+      "tags": ["scheduler", "workitem", "spawn", "agent", "supervision", "e2e-tier-2"],
+      "timeout_seconds": 600,
+      "description": "Verify agent spawns a private_child agent, inspects task status, and completes the parent WorkItem.",
+      "scheduler_protocol_commands_enabled": true,
+      "runtime_env": {
+        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true"
+      },
+      "phases": [
+        {
+          "id": "spawn-and-complete",
+          "required_tools": [
+            "CreateWorkItem",
+            "PickWorkItem",
+            "SpawnAgent",
+            "TaskStatus",
+            "UpdateWorkItem",
+            "CompleteWorkItem"
+          ],
+          "forbidden_tools": [
+            "ApplyPatch",
+            "ExecCommand"
+          ],
+          "prompt": "Scheduler Docker E2E case {case_id}. Create exactly one WorkItem whose objective is {objective}, with plan_status ready and exactly these todos: spawn-child pending, verify-child pending. Pick that WorkItem, then call SpawnAgent with preset private_child and the initial_message: 'Respond with one sentence containing the marker {child_marker} and then stop.' Do not specify a model. After SpawnAgent returns, call TaskStatus with the returned task_id to inspect the child status. Then update both todos to completed and emit a concise completion result containing {completion_marker} immediately followed by CompleteWorkItem for the exact current item. Do not modify files."
+        }
+      ]
+    },
+    {
+      "id": "scheduler-checkpoint-replay",
+      "tier": "extended",
+      "tags": ["scheduler", "workitem", "checkpoint", "replay", "restart", "e2e-tier-2"],
+      "timeout_seconds": 600,
+      "description": "Verify multiple WorkItems in different states survive restart and converge correctly with exactly-once settlement.",
+      "scheduler_protocol_commands_enabled": true,
+      "runtime_env": {
+        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true"
+      },
+      "phases": [
+        {
+          "id": "create-and-wait",
+          "required_tools": [
+            "CreateWorkItem",
+            "ListWorkItems"
+          ],
+          "forbidden_tools": [
+            "ApplyPatch",
+            "ExecCommand",
+            "WaitFor",
+            "PickWorkItem",
+            "UpdateWorkItem",
+            "CompleteWorkItem"
+          ],
+          "prompt": "Scheduler Docker E2E case {case_id}. Create exactly two WorkItems. For the first, use objective {objective_a}, plan_status ready, and todos: replay-wait pending, replay-complete pending. For the second, use objective {objective_b}, plan_status ready, and todos: replay-seed completed, replay-complete pending. Do not PickWorkItem, UpdateWorkItem, CompleteWorkItem, or WaitFor in this operator-triggered turn. After both CreateWorkItem calls succeed, end this response with a concise acknowledgement. The objectives govern the later autonomous work_queue turns. Do not modify files. The expected completion markers are {completion_a} and {completion_b}."
+        }
+      ]
+    }
+  ]
+}

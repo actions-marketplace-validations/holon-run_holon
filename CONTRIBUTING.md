@@ -7,67 +7,64 @@ Thanks for contributing to Holon. This file captures the baseline expectations f
 - Link the relevant issue or clearly describe the motivation.
 - Summarize behavior changes and highlight any user-visible impact.
 - Validation:
-  - Required: `make test`
-  - Run `make test-integration` when you change CLI flags/output, runner/runtime behavior, or `tests/integration/` fixtures.
+  - Required: `make ci`
+  - Web GUI changes: `make web-ci` for the focused Vitest and production-build
+    check used by the main CI job.
+  - Runtime lifecycle, task, wait, SSE, or HTTP task changes:
+    `make test-concurrent`
+  - CLI, HTTP, OpenAPI, or model tool contract changes:
+    `make snapshots-refresh`, review the diff, then run `make snapshots-check`.
+  - Run focused `cargo test ...` commands for the Rust modules or integration
+    tests touched by the change when a full test run is too broad.
   - If you cannot run a required check, state why in the PR description.
-- If CLI flags or output change, update the integration fixtures under `tests/integration/testdata/*.txtar`.
 - If automation changes, mention the workflows touched under `.github/workflows/`.
 
 ## Development Commands
 
+Web GUI development and validation require Node.js 24 LTS. The root `.nvmrc`
+selects the supported version.
+
 ```bash
+# Run the full local CI suite, including Web GUI tests and build
+make ci
+
 # Build main CLI
 make build
 
-# Run all tests (agent + Go)
+# Run Web GUI Vitest and the production build after one clean install
+make web-ci
+
+# Run Rust tests
 make test
 
-# Run Go tests only (with structured output)
-make test-go
+# Run selected runtime lifecycle integration tests with Rust's default threads
+make test-concurrent
 
-# Run integration tests (requires Docker)
-make test-integration
+# Stress the core concurrent lifecycle suite; stops at the first failure
+make test-concurrent-repeat CONCURRENT_REPEATS=3
 
-# Build the Claude agent bundle
-cd agents/claude && npm run bundle
-```
+# Check all checked-in Rust-generated snapshots
+make snapshots-check
 
-## Structured Test Output
+# Refresh all checked-in Rust-generated snapshots after an intentional change
+make snapshots-refresh
 
-Holon uses [gotestfmt](https://github.com/gotesttools/gotestfmt) for structured, readable test output. The test targets automatically detect and use gotestfmt if available.
+# Run the baseline and configured-provider live smoke tests
+make test-live
 
-### Installation
+# Run focused provider/runtime live suites when their credentials are configured
+make test-live-openai
+make test-live-anthropic
+make test-live-codex
+make test-live-xai
+make test-live-images
+make test-live-runtime
 
-```bash
-# Install gotestfmt
-go install github.com/gotesttools/gotestfmt/v2/cmd/gotestfmt@latest
+# Check formatting
+make fmt
 
-# Or use the Makefile target
-make install-gotestfmt
-```
-
-### Test Behavior
-
-- **With gotestfmt**: Tests run with `go test -json` and pipe to gotestfmt for formatted output
-- **Without gotestfmt**: Falls back to plain `go test -v` output
-- **Exit codes**: Properly preserved in both modes for CI/CD integration
-
-### Manual Testing
-
-When you use the Makefile test targets or `./scripts/test.sh`, stderr is already redirected into the formatter, so you do not need to add `2>&1` yourself. When running go test directly, you'll need to redirect stderr to capture all test output.
-
-```bash
-# Run tests directly with gotestfmt (requires stderr redirection)
-go test ./... -json -v 2>&1 | gotestfmt
-
-# Test specific packages
-go test ./pkg/... -json -v 2>&1 | gotestfmt
-
-# Use the test wrapper script (handles redirection automatically)
-./scripts/test.sh ./pkg/...
-
-# Or use flags directly (wrapper auto-detects them as test args)
-./scripts/test.sh -run TestMyFunc
+# Type-check without producing binaries
+make check
 ```
 
 ## Reference Docs

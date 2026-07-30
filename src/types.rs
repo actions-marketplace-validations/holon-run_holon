@@ -1,0 +1,6090 @@
+use chrono::{DateTime, Utc};
+use clap::ValueEnum;
+use schemars::JsonSchema;
+use serde::{de, Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use crate::config::ModelRouteRef;
+use crate::domain::scheduler_protocol::{ScenarioMode, SchedulerScenarioClass};
+pub use crate::domain::{agent_home_workspace_id, work_item::*, AGENT_HOME_WORKSPACE_ID};
+use crate::ids;
+use crate::model_catalog::ResolvedRuntimeModelPolicy;
+use crate::runtime_error::{RuntimeErrorContext, RuntimeErrorDomain};
+use crate::system::{
+    ExecutionProfile, ExecutionSnapshot, WorkspaceAccessMode, WorkspaceProjectionKind,
+};
+use crate::tool::ToolError;
+
+impl<'de> Deserialize<'de> for MessageEnvelope {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct MessageEnvelopeCompat {
+            id: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            message_seq: Option<u64>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            turn_id: Option<String>,
+            #[serde(alias = "session_id")]
+            agent_id: String,
+            created_at: DateTime<Utc>,
+            kind: MessageKind,
+            origin: MessageOrigin,
+            #[serde(default)]
+            authority_class: Option<AuthorityClass>,
+            #[serde(default, rename = "trust")]
+            legacy_trust: Option<AuthorityClass>,
+            priority: Priority,
+            #[serde(default)]
+            trigger_kind: Option<ContinuationTriggerKind>,
+            #[serde(default)]
+            work_item_id: Option<String>,
+            #[serde(default)]
+            task_id: Option<String>,
+            #[serde(default)]
+            source_refs: BTreeMap<String, String>,
+            body: MessageBody,
+            #[serde(default)]
+            delivery_surface: Option<MessageDeliverySurface>,
+            #[serde(default)]
+            admission_context: Option<AdmissionContext>,
+            metadata: Option<Value>,
+            correlation_id: Option<String>,
+            causation_id: Option<String>,
+        }
+
+        let compat = MessageEnvelopeCompat::deserialize(deserializer)?;
+        let authority_class = compat
+            .authority_class
+            .or(compat.legacy_trust)
+            .ok_or_else(|| serde::de::Error::missing_field("authority_class"))?;
+        Ok(Self {
+            id: compat.id,
+            message_seq: compat.message_seq,
+            turn_id: compat.turn_id,
+            agent_id: compat.agent_id,
+            created_at: compat.created_at,
+            kind: compat.kind,
+            origin: compat.origin,
+            authority_class,
+            priority: compat.priority,
+            trigger_kind: compat.trigger_kind,
+            work_item_id: compat.work_item_id,
+            task_id: compat.task_id,
+            source_refs: compat.source_refs,
+            body: compat.body,
+            delivery_surface: compat.delivery_surface,
+            admission_context: compat.admission_context,
+            metadata: compat.metadata,
+            correlation_id: compat.correlation_id,
+            causation_id: compat.causation_id,
+        })
+    }
+}
+
+fn default_agent_home_workspace_id() -> String {
+    AGENT_HOME_WORKSPACE_ID.to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceEntry {
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<String>,
+    pub workspace_anchor: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl WorkspaceEntry {
+    pub fn new(
+        workspace_id: impl Into<String>,
+        workspace_anchor: PathBuf,
+        repo_name: Option<String>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            workspace_id: workspace_id.into(),
+            workspace_alias: None,
+            workspace_kind: None,
+            owner_agent_id: None,
+            workspace_anchor,
+            repo_name,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+/// Typed metadata for workspace projections, replacing untyped `serde_json::Value`.
+/// Uses `untagged` serde for backward compatibility with previously serialized JSON.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum WorkspaceProjectionMetadata {
+    ManagedWorktree {
+        original_cwd: PathBuf,
+        original_branch: String,
+        worktree_path: PathBuf,
+        worktree_branch: String,
+    },
+    ExistingGitWorktree {
+        worktree_root: PathBuf,
+    },
+}
+
+/// Unified per-workspace info returned by the workspace state snapshot.
+/// Replaces the previous fragmented fields (`attached_workspaces`,
+/// `workspace_entries`, `active_workspace_entry`, `worktree_session`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentWorkspaceInfo {
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_anchor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
+    pub is_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_root_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_kind: Option<WorkspaceProjectionKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_mode: Option<WorkspaceAccessMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeInfo>,
+}
+
+/// Worktree details merged from `projection_metadata` and `worktree_session`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveWorkspaceEntry {
+    pub workspace_id: String,
+    pub workspace_anchor: PathBuf,
+    pub execution_root_id: String,
+    pub execution_root: PathBuf,
+    pub projection_kind: WorkspaceProjectionKind,
+    pub access_mode: WorkspaceAccessMode,
+    pub cwd: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occupancy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_metadata: Option<WorkspaceProjectionMetadata>,
+}
+
+impl ActiveWorkspaceEntry {
+    pub fn without_projection_metadata(mut self) -> Self {
+        self.projection_metadata = None;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceOccupancyRecord {
+    pub occupancy_id: String,
+    pub execution_root_id: String,
+    pub workspace_id: String,
+    pub holder_agent_id: String,
+    pub access_mode: WorkspaceAccessMode,
+    pub acquired_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<DateTime<Utc>>,
+}
+
+/// Durable registry entry mapping an `execution_root_id` to its filesystem
+/// path. Independent of any agent's `active_workspace_entry`, so links
+/// remain resolvable after the agent switches roots.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionRootEntry {
+    pub execution_root_id: String,
+    pub workspace_id: String,
+    pub filesystem_path: PathBuf,
+    pub root_kind: WorkspaceProjectionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeArtifactMetadata>,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeProvenance {
+    RuntimeCreated,
+    Discovered,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeCleanupEvidence {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub inspected_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeArtifactMetadata {
+    pub provenance: WorktreeProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered_by_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorized_agent_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_commit: Option<String>,
+    #[serde(default)]
+    pub detached: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_base_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_base_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_common_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cleanup: Option<WorktreeCleanupEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    Default,
+    Named,
+    Child,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentVisibility {
+    Public,
+    Private,
+}
+
+impl AgentVisibility {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentOwnership {
+    ParentSupervised,
+    SelfOwned,
+}
+
+impl AgentOwnership {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ParentSupervised => "parent_supervised",
+            Self::SelfOwned => "self_owned",
+        }
+    }
+
+    pub fn phrase(self) -> &'static str {
+        match self {
+            Self::ParentSupervised => "parent-supervised",
+            Self::SelfOwned => "self-owned",
+        }
+    }
+
+    pub fn cleanup_summary(self) -> &'static str {
+        match self {
+            Self::ParentSupervised => "cleanup is owned by the parent supervision tree",
+            Self::SelfOwned => "cleanup is owned by the agent's own lifecycle surface",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProfilePreset {
+    PrivateChild,
+    PublicNamed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ToolCapabilityFamily {
+    CoreAgent,
+    LocalEnvironment,
+    Web,
+    AgentCreation,
+    AuthorityExpanding,
+    ExternalTrigger,
+}
+
+impl ToolCapabilityFamily {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::CoreAgent => "core_agent",
+            Self::LocalEnvironment => "local_environment",
+            Self::Web => "web",
+            Self::AgentCreation => "agent_creation",
+            Self::AuthorityExpanding => "authority_expanding",
+            Self::ExternalTrigger => "external_trigger",
+        }
+    }
+}
+
+impl AgentProfilePreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PrivateChild => "private_child",
+            Self::PublicNamed => "public_named",
+        }
+    }
+
+    pub fn spawn_surface_summary(self) -> &'static str {
+        match self {
+            Self::PrivateChild => {
+                "SpawnAgent returns both `agent_id` and a supervising `task_handle`"
+            }
+            Self::PublicNamed => "SpawnAgent returns `agent_id` only",
+        }
+    }
+
+    pub(crate) fn allows_tool_capability_family(self, family: ToolCapabilityFamily) -> bool {
+        match self {
+            Self::PrivateChild => matches!(
+                family,
+                ToolCapabilityFamily::CoreAgent
+                    | ToolCapabilityFamily::LocalEnvironment
+                    | ToolCapabilityFamily::Web
+                    | ToolCapabilityFamily::ExternalTrigger
+            ),
+            Self::PublicNamed => matches!(
+                family,
+                ToolCapabilityFamily::CoreAgent
+                    | ToolCapabilityFamily::LocalEnvironment
+                    | ToolCapabilityFamily::Web
+                    | ToolCapabilityFamily::AgentCreation
+                    | ToolCapabilityFamily::AuthorityExpanding
+                    | ToolCapabilityFamily::ExternalTrigger
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDurability {
+    Persistent,
+    Ephemeral,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRegistryStatus {
+    Active,
+    Deleting,
+    #[serde(alias = "archived")]
+    Deleted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentIdentityRecord {
+    pub agent_id: String,
+    pub kind: AgentKind,
+    pub visibility: AgentVisibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership: Option<AgentOwnership>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_preset: Option<AgentProfilePreset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durability: Option<AgentDurability>,
+    pub status: AgentRegistryStatus,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage_parent_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_from_task_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(
+        default,
+        alias = "archived_at",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub deleted_at: Option<DateTime<Utc>>,
+}
+
+impl AgentIdentityRecord {
+    pub fn new(
+        agent_id: impl Into<String>,
+        kind: AgentKind,
+        visibility: AgentVisibility,
+        ownership: AgentOwnership,
+        profile_preset: AgentProfilePreset,
+        parent_agent_id: Option<String>,
+        delegated_from_task_id: Option<String>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            agent_id: agent_id.into(),
+            kind,
+            visibility,
+            ownership: Some(ownership),
+            profile_preset: Some(profile_preset),
+            durability: None,
+            status: AgentRegistryStatus::Active,
+            revision: 0,
+            parent_agent_id,
+            lineage_parent_agent_id: None,
+            delegated_from_task_id,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        }
+    }
+
+    pub fn with_lineage_parent_agent_id(mut self, lineage_parent_agent_id: Option<String>) -> Self {
+        self.lineage_parent_agent_id = lineage_parent_agent_id;
+        self
+    }
+
+    pub fn ownership(&self) -> AgentOwnership {
+        self.ownership
+            .or_else(|| {
+                self.durability.map(|durability| match durability {
+                    AgentDurability::Persistent => AgentOwnership::SelfOwned,
+                    AgentDurability::Ephemeral => AgentOwnership::ParentSupervised,
+                })
+            })
+            .unwrap_or_else(|| {
+                if self.kind == AgentKind::Child
+                    || self.parent_agent_id.is_some()
+                    || self.delegated_from_task_id.is_some()
+                {
+                    AgentOwnership::ParentSupervised
+                } else {
+                    AgentOwnership::SelfOwned
+                }
+            })
+    }
+
+    pub fn profile_preset(&self) -> AgentProfilePreset {
+        self.profile_preset.unwrap_or_else(|| {
+            match (self.kind, self.visibility, self.ownership()) {
+                (_, AgentVisibility::Public, AgentOwnership::SelfOwned) => {
+                    AgentProfilePreset::PublicNamed
+                }
+                _ => AgentProfilePreset::PrivateChild,
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDeletionStatus {
+    Pending,
+    Running,
+    RetryableFailed,
+    Completed,
+}
+
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDeletionPhase {
+    Fence,
+    Quiesce,
+    Ingress,
+    Scheduler,
+    Workspace,
+    Index,
+    Home,
+    Finalize,
+}
+
+impl AgentDeletionPhase {
+    /// All phases in execution order.
+    pub const ALL: [Self; 8] = [
+        Self::Fence,
+        Self::Quiesce,
+        Self::Ingress,
+        Self::Scheduler,
+        Self::Workspace,
+        Self::Index,
+        Self::Home,
+        Self::Finalize,
+    ];
+
+    /// The next phase in execution order, or `None` after `Finalize`.
+    pub fn next(self) -> Option<Self> {
+        let idx = Self::ALL.iter().position(|p| *p == self)?;
+        Self::ALL.get(idx + 1).copied()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AgentDeletionJob {
+    pub deletion_id: String,
+    pub agent_id: String,
+    pub status: AgentDeletionStatus,
+    pub phase: AgentDeletionPhase,
+    pub requested_by: String,
+    pub expected_identity_revision: u64,
+    pub cascade_private_children: bool,
+    pub attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AgentIdentityView {
+    pub agent_id: String,
+    pub kind: AgentKind,
+    pub visibility: AgentVisibility,
+    pub ownership: AgentOwnership,
+    pub profile_preset: AgentProfilePreset,
+    pub status: AgentRegistryStatus,
+    pub is_default_agent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage_parent_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_from_task_id: Option<String>,
+}
+
+impl AgentIdentityView {
+    pub fn from_record(record: &AgentIdentityRecord, default_agent_id: &str) -> Self {
+        Self {
+            agent_id: record.agent_id.clone(),
+            kind: record.kind,
+            visibility: record.visibility,
+            ownership: record.ownership(),
+            profile_preset: record.profile_preset(),
+            status: record.status,
+            is_default_agent: record.agent_id == default_agent_id,
+            parent_agent_id: record.parent_agent_id.clone(),
+            lineage_parent_agent_id: record.lineage_parent_agent_id.clone(),
+            delegated_from_task_id: record.delegated_from_task_id.clone(),
+        }
+    }
+
+    pub fn contract_badge(&self) -> String {
+        format!(
+            "{}/{} ({})",
+            self.visibility.label(),
+            self.ownership.label(),
+            self.profile_preset.label()
+        )
+    }
+
+    pub fn contract_summary(&self) -> String {
+        match (
+            self.visibility,
+            self.ownership,
+            self.profile_preset,
+            self.kind,
+        ) {
+            (
+                AgentVisibility::Public,
+                AgentOwnership::SelfOwned,
+                AgentProfilePreset::PublicNamed,
+                _,
+            ) => "public self-owned agent addressed directly by `agent_id`".into(),
+            (
+                AgentVisibility::Private,
+                AgentOwnership::ParentSupervised,
+                AgentProfilePreset::PrivateChild,
+                AgentKind::Child,
+            ) => "private parent-supervised child that remains under a parent task handle".into(),
+            _ => format!(
+                "{} {} agent with `{}` profile",
+                self.visibility.label(),
+                self.ownership.phrase(),
+                self.profile_preset.label()
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChildAgentSummary {
+    pub identity: AgentIdentityView,
+    pub status: AgentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_run_id: Option<String>,
+    pub pending: usize,
+    pub active_task_count: usize,
+    pub observability: ChildAgentObservabilitySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentsMdScope {
+    #[serde(alias = "global")]
+    UserGlobal,
+    Agent,
+    Workspace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentsMdKind {
+    AgentsMd,
+    ClaudeMdFallback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentsMdSource {
+    pub scope: AgentsMdScope,
+    pub kind: AgentsMdKind,
+    pub path: PathBuf,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LoadedAgentsMd {
+    #[serde(
+        default,
+        alias = "global_source",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub user_global_source: Option<AgentsMdSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_source: Option<AgentsMdSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_source: Option<AgentsMdSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentsMdSourceView {
+    pub scope: AgentsMdScope,
+    pub kind: AgentsMdKind,
+    pub path: PathBuf,
+}
+
+impl From<&AgentsMdSource> for AgentsMdSourceView {
+    fn from(value: &AgentsMdSource) -> Self {
+        Self {
+            scope: value.scope.clone(),
+            kind: value.kind.clone(),
+            path: value.path.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LoadedAgentsMdView {
+    #[serde(
+        default,
+        alias = "global_source",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub user_global_source: Option<AgentsMdSourceView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_source: Option<AgentsMdSourceView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_source: Option<AgentsMdSourceView>,
+}
+
+impl From<&LoadedAgentsMd> for LoadedAgentsMdView {
+    fn from(value: &LoadedAgentsMd) -> Self {
+        Self {
+            user_global_source: value
+                .user_global_source
+                .as_ref()
+                .map(AgentsMdSourceView::from),
+            agent_source: value.agent_source.as_ref().map(AgentsMdSourceView::from),
+            workspace_source: value
+                .workspace_source
+                .as_ref()
+                .map(AgentsMdSourceView::from),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentMemorySource {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub content: String,
+    pub truncated: bool,
+    pub total_chars: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentMemorySourceView {
+    pub path: PathBuf,
+    pub truncated: bool,
+    pub total_chars: usize,
+}
+
+impl From<&AgentMemorySource> for AgentMemorySourceView {
+    fn from(value: &AgentMemorySource) -> Self {
+        Self {
+            path: value.path.clone(),
+            truncated: value.truncated,
+            total_chars: value.total_chars,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LoadedAgentMemory {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_source: Option<AgentMemorySource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_source: Option<AgentMemorySource>,
+    #[serde(default)]
+    pub budget_chars: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LoadedAgentMemoryView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_source: Option<AgentMemorySourceView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_source: Option<AgentMemorySourceView>,
+    #[serde(default)]
+    pub budget_chars: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillScope {
+    #[serde(alias = "user")]
+    UserGlobal,
+    Agent,
+    Workspace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillCatalogEntry {
+    pub skill_id: String,
+    pub root_id: String,
+    pub skill_dir: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    pub path: PathBuf,
+    pub scope: SkillScope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillRootView {
+    pub scope: SkillScope,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTemplateSourceKind {
+    Builtin,
+    UserGlobal,
+    AgentHome,
+    Remote,
+}
+
+impl AgentTemplateSourceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::UserGlobal => "user_global",
+            Self::AgentHome => "agent_home",
+            Self::Remote => "remote",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "builtin" => Some(Self::Builtin),
+            "user_global" | "user" => Some(Self::UserGlobal),
+            "agent_home" | "agent" => Some(Self::AgentHome),
+            "remote" => Some(Self::Remote),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentTemplateCatalogEntry {
+    /// Stable source-scoped catalog identifier, such as `user:holon-reviewer`.
+    pub catalog_id: String,
+    /// Preferred selector accepted by SpawnAgent.template.
+    ///
+    /// `catalog_id` is also accepted, along with source aliases such as
+    /// `user:`, `agent:`, and `remote:`.
+    pub template: String,
+    /// Human-readable local id after precedence is applied.
+    pub template_id: String,
+    pub source: AgentTemplateSourceKind,
+    /// Filesystem location for local templates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    /// Human-readable name from `template.toml`, fallback to template_id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Schema identifier from `template.toml` (e.g. `holon.agent_template.v1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
+    /// Short display summary derived from the template AGENTS.md.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Skill names declared by the template manifest, if any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub included_skills: Vec<String>,
+    /// Configured remote source id for remote templates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    /// Branch, tag, or commit used for this catalog entry after source
+    /// configuration/default-branch resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_ref: Option<String>,
+    /// Immutable provider revision when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_revision: Option<String>,
+    /// Full template tree URL for Remote templates (e.g.
+    /// `https://github.com/owner/repo/tree/ref/agent_templates/worker`).
+    /// `None` for local and builtin sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+}
+
+/// Detailed template information for a single catalog entry.
+///
+/// Returned by the template detail resolution path, this model includes
+/// the full AGENTS.md content and parsed skill dependencies, suitable for
+/// a GUI detail view or daemon API response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentTemplateDetail {
+    /// Stable source-scoped catalog identifier, such as `user:holon-reviewer`.
+    pub catalog_id: String,
+    /// Preferred selector accepted by SpawnAgent.template.
+    pub template: String,
+    /// Human-readable local id after precedence is applied.
+    pub template_id: String,
+    pub source: AgentTemplateSourceKind,
+    /// Filesystem path or repository URL, depending on source kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_location: Option<String>,
+    /// Human-readable name from `template.toml`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Summary from `template.toml` or AGENTS.md fallback.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    /// Schema identifier from `template.toml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
+    /// Full AGENTS.md content.
+    pub agents_md: String,
+    /// Skill dependencies declared by the template.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<AgentTemplateSkillDependency>,
+}
+
+/// Skill dependency information within a template detail view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentTemplateSkillDependency {
+    /// Skill kind: `local`, `github`, or `builtin`.
+    pub kind: String,
+    /// Skill reference: filesystem path, GitHub package, or builtin name.
+    pub reference: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillActivationSource {
+    Explicit,
+    ImplicitFromCatalog,
+    Restored,
+    Inherited,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillActivationState {
+    TurnActive,
+    SessionActive,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillLoadReason {
+    ReadSkillMd,
+    RunSkillScript,
+    PromptInjection,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClosureOutcome {
+    Completed,
+    Continuable,
+    Failed,
+    Waiting,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkReactivationMode {
+    ContinueActive,
+    ActivateQueued,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkReactivationSignal {
+    pub work_item_id: String,
+    pub state: WorkItemState,
+    pub reactivation_mode: WorkReactivationMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitingReason {
+    AwaitingOperatorInput,
+    AwaitingExternalChange,
+    AwaitingTaskResult,
+    AwaitingTimer,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePosture {
+    Awake,
+    Sleeping,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationTriggerKind {
+    OperatorInput,
+    TaskResult,
+    ExternalEvent,
+    TimerFire,
+    InternalFollowup,
+    SystemTick,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationClass {
+    ResumeExpectedWait,
+    ResumeOverride,
+    LocalContinuation,
+    LivenessOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContinuationResolution {
+    pub trigger_kind: ContinuationTriggerKind,
+    pub class: ContinuationClass,
+    // TODO: remove `model_visible` alias after one persisted-state upgrade window.
+    #[serde(alias = "model_visible")]
+    pub model_reentry: bool,
+    pub prior_closure_outcome: ClosureOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_waiting_reason: Option<WaitingReason>,
+    pub matched_waiting_reason: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClosureDecision {
+    pub outcome: ClosureOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_reason: Option<WaitingReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_signal: Option<WorkReactivationSignal>,
+    pub runtime_posture: RuntimePosture,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskWaitPolicy {
+    Background,
+}
+
+pub const CHILD_AGENT_TASK_KIND: &str = "child_agent_task";
+pub const LEGACY_SUBAGENT_TASK_KIND: &str = "subagent_task";
+pub const LEGACY_WORKTREE_SUBAGENT_TASK_KIND: &str = "worktree_subagent_task";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    CommandTask,
+    ChildAgentTask,
+    SleepJob,
+    SubagentTask,
+    WorktreeSubagentTask,
+}
+
+impl TaskKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CommandTask => "command_task",
+            Self::ChildAgentTask => CHILD_AGENT_TASK_KIND,
+            Self::SleepJob => "sleep_job",
+            Self::SubagentTask => LEGACY_SUBAGENT_TASK_KIND,
+            Self::WorktreeSubagentTask => LEGACY_WORKTREE_SUBAGENT_TASK_KIND,
+        }
+    }
+
+    pub fn is_child_agent(self) -> bool {
+        matches!(
+            self,
+            Self::ChildAgentTask | Self::SubagentTask | Self::WorktreeSubagentTask
+        )
+    }
+
+    pub fn is_legacy_child_agent_compat(self) -> bool {
+        matches!(self, Self::SubagentTask | Self::WorktreeSubagentTask)
+    }
+}
+
+impl std::fmt::Display for TaskKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildAgentWorkspaceMode {
+    Inherit,
+    Worktree,
+}
+
+impl ChildAgentWorkspaceMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::Worktree => "worktree",
+        }
+    }
+
+    pub fn is_worktree(self) -> bool {
+        self == Self::Worktree
+    }
+
+    pub fn from_label(value: &str) -> Option<Self> {
+        match value {
+            "inherit" => Some(Self::Inherit),
+            "worktree" => Some(Self::Worktree),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveSkillRecord {
+    pub skill_id: String,
+    pub name: String,
+    pub path: PathBuf,
+    pub scope: SkillScope,
+    pub agent_id: String,
+    pub activation_source: SkillActivationSource,
+    pub activation_state: SkillActivationState,
+    pub activated_at_turn: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SkillsRuntimeView {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_templates_catalog: Vec<AgentTemplateCatalogEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovered_roots: Vec<SkillRootView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discoverable_skills: Vec<SkillCatalogEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attached_skills: Vec<SkillCatalogEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_skills: Vec<ActiveSkillRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillInstallMode {
+    Linked,
+    Copied,
+}
+
+impl Default for SkillInstallMode {
+    fn default() -> Self {
+        Self::Linked
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SkillInstallKind {
+    Named {
+        name: String,
+        #[serde(default)]
+        mode: SkillInstallMode,
+    },
+    Local {
+        path: PathBuf,
+        #[serde(default)]
+        mode: SkillInstallMode,
+    },
+    Remote {
+        package: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skill: Option<String>,
+        #[serde(default)]
+        mode: SkillInstallMode,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct InstallSkillRequest {
+    pub kind: SkillInstallKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AddSkillRequest {
+    pub kind: SkillInstallKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoveSkillRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ReconcileSkillRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct RefreshCatalogRequest {}
+
+pub type UpdateSkillRequest = ReconcileSkillRequest;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CheckSkillRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnableSkillRequest {
+    pub name: String,
+    #[serde(default)]
+    pub mode: SkillInstallMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisableSkillRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UninstallSkillRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckTemplateRequest {
+    /// Local filesystem path to a template directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// GitHub tree URL for a template package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstallTemplateRequest {
+    /// GitHub tree URL for the template package to install.
+    pub github_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoveTemplateRequest {
+    /// Template id within the user global library.
+    pub template_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+pub struct SyncTemplateRemoteSourcesRequest {
+    /// Optional configured source id. When omitted, all enabled remote sources
+    /// are synchronized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    /// Force a refresh even if a later TTL policy would consider the cache
+    /// fresh. Currently accepted for forward compatibility.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillOperationResponse {
+    pub ok: bool,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageKind {
+    OperatorPrompt,
+    ChannelEvent,
+    WebhookEvent,
+    CallbackEvent,
+    TimerTick,
+    SystemTick,
+    TaskResult,
+    TaskStatus,
+    Control,
+    BriefAck,
+    BriefResult,
+    InternalFollowup,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    // TODO: remove `interrupt` alias after older ledgers and request clients have migrated.
+    #[serde(alias = "interrupt")]
+    Interject,
+    Next,
+    Normal,
+    Background,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MessageOrigin {
+    Operator {
+        actor_id: Option<String>,
+    },
+    Channel {
+        channel_id: String,
+        sender_id: Option<String>,
+    },
+    Webhook {
+        source: String,
+        event_type: Option<String>,
+    },
+    Callback {
+        descriptor_id: String,
+        source: Option<String>,
+    },
+    Timer {
+        timer_id: String,
+    },
+    System {
+        subsystem: String,
+    },
+    Task {
+        task_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MessageBody {
+    Text {
+        text: String,
+    },
+    Json {
+        value: Value,
+    },
+    Brief {
+        title: Option<String>,
+        text: String,
+        attachments: Option<Vec<BriefAttachment>>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct BriefAttachment {
+    pub kind: String,
+    pub name: String,
+    pub uri: Option<String>,
+    pub value: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorityClass {
+    #[serde(alias = "trusted_operator")]
+    #[value(alias = "trusted-operator")]
+    OperatorInstruction,
+    #[serde(alias = "trusted_system")]
+    #[value(alias = "trusted-system")]
+    RuntimeInstruction,
+    #[serde(alias = "trusted_integration")]
+    #[value(alias = "trusted-integration")]
+    IntegrationSignal,
+    #[serde(alias = "untrusted_external")]
+    #[value(alias = "untrusted-external")]
+    ExternalEvidence,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MessageEnvelope {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(alias = "session_id")]
+    pub agent_id: String,
+    pub created_at: DateTime<Utc>,
+    pub kind: MessageKind,
+    pub origin: MessageOrigin,
+    pub authority_class: AuthorityClass,
+    pub priority: Priority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_kind: Option<ContinuationTriggerKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_refs: BTreeMap<String, String>,
+    pub body: MessageBody,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_surface: Option<MessageDeliverySurface>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_context: Option<AdmissionContext>,
+    pub metadata: Option<Value>,
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
+}
+
+impl MessageEnvelope {
+    pub fn new(
+        agent_id: impl Into<String>,
+        kind: MessageKind,
+        origin: MessageOrigin,
+        authority_class: AuthorityClass,
+        priority: Priority,
+        body: MessageBody,
+    ) -> Self {
+        Self {
+            id: ids::message_id(),
+            message_seq: None,
+            turn_id: None,
+            agent_id: agent_id.into(),
+            created_at: Utc::now(),
+            kind,
+            origin,
+            authority_class,
+            priority,
+            trigger_kind: None,
+            work_item_id: None,
+            task_id: None,
+            source_refs: BTreeMap::new(),
+            body,
+            delivery_surface: None,
+            admission_context: None,
+            metadata: None,
+            correlation_id: None,
+            causation_id: None,
+        }
+    }
+
+    pub fn with_admission(
+        mut self,
+        delivery_surface: MessageDeliverySurface,
+        admission_context: AdmissionContext,
+    ) -> Self {
+        self.delivery_surface = Some(delivery_surface);
+        self.admission_context = Some(admission_context);
+        self
+    }
+
+    pub fn normalize_admission_fields(&mut self) {
+        if self.trigger_kind.is_none() {
+            self.trigger_kind = Some(admission_trigger_kind_for_message_kind(&self.kind));
+        }
+
+        if self.task_id.is_none() {
+            if let MessageOrigin::Task { task_id } = &self.origin {
+                self.task_id = Some(task_id.clone());
+            }
+        }
+
+        let metadata_binding_trusted = self.metadata_binding_fields_are_trusted();
+        if let Some(metadata) = self.metadata.as_ref() {
+            if metadata_binding_trusted && self.work_item_id.is_none() {
+                self.work_item_id = metadata_string(metadata, "work_item_id")
+                    .or_else(|| metadata_string(metadata, "child_work_item_id"));
+            }
+            if metadata_binding_trusted && self.task_id.is_none() {
+                self.task_id = metadata_string(metadata, "task_id");
+            }
+            collect_source_ref(metadata, &mut self.source_refs, "queued_event_id");
+            collect_source_ref(metadata, &mut self.source_refs, "task_result_id");
+            collect_source_ref(metadata, &mut self.source_refs, "external_trigger_id");
+            collect_source_ref(metadata, &mut self.source_refs, "callback_delivery_id");
+            collect_source_ref(metadata, &mut self.source_refs, "timer_id");
+            collect_source_ref(metadata, &mut self.source_refs, "wait_id");
+            collect_source_ref(metadata, &mut self.source_refs, "wait_generation");
+            if let Some(wake_hint) = metadata.get("wake_hint") {
+                collect_source_ref(wake_hint, &mut self.source_refs, "external_trigger_id");
+                collect_source_ref(wake_hint, &mut self.source_refs, "resource");
+                collect_source_ref(wake_hint, &mut self.source_refs, "wait_id");
+                collect_source_ref(wake_hint, &mut self.source_refs, "wait_generation");
+            }
+        }
+
+        match &self.origin {
+            MessageOrigin::Callback { descriptor_id, .. } => {
+                self.source_refs
+                    .entry("external_trigger_id".into())
+                    .or_insert_with(|| descriptor_id.clone());
+            }
+            MessageOrigin::Timer { timer_id } => {
+                self.source_refs
+                    .entry("timer_id".into())
+                    .or_insert_with(|| timer_id.clone());
+            }
+            MessageOrigin::Task { task_id } => {
+                self.source_refs
+                    .entry("task_id".into())
+                    .or_insert_with(|| task_id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    fn metadata_binding_fields_are_trusted(&self) -> bool {
+        self.authority_class == AuthorityClass::RuntimeInstruction
+            && matches!(self.admission_context, Some(AdmissionContext::RuntimeOwned))
+            && matches!(
+                self.delivery_surface,
+                Some(MessageDeliverySurface::RuntimeSystem | MessageDeliverySurface::TaskRejoin)
+            )
+    }
+}
+
+pub fn admission_trigger_kind_for_message_kind(kind: &MessageKind) -> ContinuationTriggerKind {
+    match kind {
+        MessageKind::OperatorPrompt => ContinuationTriggerKind::OperatorInput,
+        MessageKind::ChannelEvent | MessageKind::WebhookEvent | MessageKind::CallbackEvent => {
+            ContinuationTriggerKind::ExternalEvent
+        }
+        MessageKind::TimerTick => ContinuationTriggerKind::TimerFire,
+        MessageKind::SystemTick => ContinuationTriggerKind::SystemTick,
+        MessageKind::TaskResult | MessageKind::TaskStatus => ContinuationTriggerKind::TaskResult,
+        MessageKind::InternalFollowup => ContinuationTriggerKind::InternalFollowup,
+        MessageKind::Control | MessageKind::BriefAck | MessageKind::BriefResult => {
+            ContinuationTriggerKind::SystemTick
+        }
+    }
+}
+
+fn metadata_string(metadata: &Value, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn collect_source_ref(metadata: &Value, refs: &mut BTreeMap<String, String>, key: &str) {
+    let Some(value) = metadata_string(metadata, key) else {
+        return;
+    };
+    refs.entry(key.to_string()).or_insert(value);
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDeliverySurface {
+    CliPrompt,
+    RunOnce,
+    HttpPublicEnqueue,
+    HttpWebhook,
+    HttpCallbackEnqueue,
+    HttpCallbackWake,
+    HttpControlPrompt,
+    RemoteOperatorTransport,
+    TimerScheduler,
+    RuntimeSystem,
+    TaskRejoin,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionContext {
+    PublicUnauthenticated,
+    ControlAuthenticated,
+    OperatorTransportAuthenticated,
+    ExternalTriggerCapability,
+    LocalProcess,
+    RuntimeOwned,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatus {
+    Booting,
+    AwakeIdle,
+    AwakeRunning,
+    AwaitingTask,
+    Asleep,
+    #[serde(alias = "paused")]
+    Stopped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeFailurePhase {
+    Startup,
+    Shutdown,
+    RuntimeTurn,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureArtifactCategory {
+    Transport,
+    Protocol,
+    Runtime,
+    Task,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct FailureArtifact {
+    pub category: FailureArtifactCategory,
+    pub kind: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<RuntimeErrorDomain>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_status: Option<i32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_chain: Vec<String>,
+    #[serde(default, skip_serializing_if = "RuntimeErrorContext::is_empty")]
+    pub context: Box<RuntimeErrorContext>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct RuntimeFailureSummary {
+    pub occurred_at: DateTime<Utc>,
+    pub summary: String,
+    pub phase: RuntimeFailurePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_artifact: Option<FailureArtifact>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnTerminalKind {
+    Completed,
+    Aborted,
+    BaselineOverBudget,
+    DeferredToFallback,
+    ProviderFailedNeedsRecovery,
+}
+
+impl TurnTerminalKind {
+    pub fn is_failure(self) -> bool {
+        !matches!(self, Self::Completed)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct TurnTerminalRecord {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub turn_id: String,
+    pub turn_index: u64,
+    pub kind: TurnTerminalKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_assistant_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<TurnTerminalCheckpointRecord>,
+    pub completed_at: DateTime<Utc>,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TurnTriggerSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    pub kind: MessageKind,
+    pub origin: MessageOrigin,
+    pub authority_class: AuthorityClass,
+    pub priority: Priority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_kind: Option<ContinuationTriggerKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+}
+
+impl TurnTriggerSummary {
+    pub fn from_message(message: &MessageEnvelope) -> Self {
+        Self {
+            message_id: Some(message.id.clone()),
+            kind: message.kind.clone(),
+            origin: message.origin.clone(),
+            authority_class: message.authority_class,
+            priority: message.priority.clone(),
+            trigger_kind: message.trigger_kind,
+            task_id: message.task_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnTerminalSummary {
+    pub kind: TurnTerminalKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub completed_at: DateTime<Utc>,
+    pub duration_ms: u64,
+}
+
+impl TurnTerminalSummary {
+    pub fn from_terminal(record: &TurnTerminalRecord) -> Self {
+        Self {
+            kind: record.kind,
+            reason: record.reason.clone(),
+            completed_at: record.completed_at,
+            duration_ms: record.duration_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TurnRecord {
+    pub turn_id: String,
+    pub turn_index: u64,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<TurnTriggerSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_message_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_execution_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub produced_brief_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivery_summary_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_work_item_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_condition_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<TurnTerminalSummary>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TurnRecord {
+    pub fn new(agent_id: impl Into<String>, turn_id: impl Into<String>, turn_index: u64) -> Self {
+        Self {
+            turn_id: turn_id.into().trim().to_string(),
+            turn_index,
+            agent_id: agent_id.into(),
+            run_id: None,
+            current_work_item_id: None,
+            trigger: None,
+            input_message_ids: Vec::new(),
+            tool_execution_ids: Vec::new(),
+            produced_brief_ids: Vec::new(),
+            delivery_summary_ids: Vec::new(),
+            completed_work_item_ids: Vec::new(),
+            waiting_condition_ids: Vec::new(),
+            terminal: None,
+            created_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct TurnTerminalCheckpointRecord {
+    pub request_id: String,
+    pub requested_at_round: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_round: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_turn_index: Option<u64>,
+    pub text: String,
+    pub checkpoint_anchor_generation: u64,
+    pub current_anchor_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WorkingMemorySnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_hints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todo_list: Vec<TodoItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_set_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_decisions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_followups: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_on: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeBoundaryReason {
+    ActiveWorkSwitched,
+    WaitBoundary,
+    #[serde(rename = "result_checkpoint")]
+    LegacyResultCheckpoint,
+    TaskRejoined,
+    HardTurnCap,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveEpisodeBuilder {
+    pub id: String,
+    pub started_at: DateTime<Utc>,
+    pub start_turn_index: u64,
+    pub latest_turn_index: u64,
+    pub start_message_count: usize,
+    pub latest_message_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_hints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_set_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carry_forward: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_turn_ids: Vec<String>,
+}
+
+impl ActiveEpisodeBuilder {
+    pub fn new(agent: &AgentState, snapshot: &WorkingMemorySnapshot, message_count: usize) -> Self {
+        Self::new_with_start(
+            agent.id.clone(),
+            snapshot,
+            message_count,
+            agent.turn_index.max(1),
+        )
+    }
+
+    pub fn new_with_start(
+        _agent_id: impl Into<String>,
+        snapshot: &WorkingMemorySnapshot,
+        message_count: usize,
+        start_turn_index: u64,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: ids::episode_id(),
+            started_at: now,
+            start_turn_index,
+            latest_turn_index: start_turn_index,
+            start_message_count: message_count,
+            latest_message_count: message_count,
+            current_work_item_id: snapshot.current_work_item_id.clone(),
+            objective: snapshot.objective.clone(),
+            work_summary: snapshot.work_summary.clone(),
+            scope_hints: snapshot.scope_hints.clone(),
+            working_set_files: snapshot.working_set_files.clone(),
+            carry_forward: snapshot.pending_followups.clone(),
+            waiting_on: snapshot.waiting_on.clone(),
+            source_turn_ids: Vec::new(),
+        }
+    }
+}
+
+fn deserialize_source_turn_ids<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|value| match value {
+            Value::String(value) => Some(value),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextEpisodeGeneratedBy {
+    pub component: String,
+    pub reason: EpisodeBoundaryReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextEpisodeRecord {
+    pub id: String,
+    pub agent_id: String,
+    #[serde(default = "default_agent_home_workspace_id")]
+    pub workspace_id: String,
+    pub created_at: DateTime<Utc>,
+    pub finalized_at: DateTime<Utc>,
+    pub start_turn_index: u64,
+    pub end_turn_index: u64,
+    pub start_message_count: usize,
+    pub end_message_count: usize,
+    pub boundary_reason: EpisodeBoundaryReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_hints: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_source_turn_ids",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub source_turn_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_by: Option<ContextEpisodeGeneratedBy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_set_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carry_forward: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_on: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WorkingMemoryState {
+    #[serde(default)]
+    pub compression_epoch: u64,
+    #[serde(default)]
+    pub current_working_memory: WorkingMemorySnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_episode_id: Option<String>,
+    #[serde(default)]
+    pub archived_episode_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_episode_builder: Option<ActiveEpisodeBuilder>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutionAdmissionProvenance {
+    Canonical {
+        scenario_class: SchedulerScenarioClass,
+        activation_id: String,
+    },
+    LegacyCompat {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scenario_class: Option<SchedulerScenarioClass>,
+        effective_mode: ScenarioMode,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkItemExecutionBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_provenance: Option<ExecutionAdmissionProvenance>,
+    pub source_message_id: String,
+    pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_work_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentState {
+    pub id: String,
+    pub status: AgentStatus,
+    pub sleeping_until: Option<DateTime<Utc>>,
+    pub current_run_id: Option<String>,
+    pub pending: usize,
+    pub last_wake_reason: Option<String>,
+    pub last_brief_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub working_memory: WorkingMemoryState,
+    pub total_message_count: usize,
+    #[serde(default)]
+    pub total_input_tokens: u64,
+    #[serde(default)]
+    pub total_output_tokens: u64,
+    #[serde(default)]
+    pub total_model_rounds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_token_usage: Option<TokenUsage>,
+    #[serde(default)]
+    pub tool_latency: Vec<ToolLatencyMetrics>,
+    #[serde(default)]
+    pub execution_profile: ExecutionProfile,
+    #[serde(default)]
+    pub pending_wake_hint: Option<PendingWakeHint>,
+    #[serde(default)]
+    pub attached_workspaces: Vec<String>,
+    #[serde(default)]
+    pub active_workspace_entry: Option<ActiveWorkspaceEntry>,
+    #[serde(default)]
+    pub worktree_session: Option<WorktreeSession>,
+    #[serde(default)]
+    pub turn_index: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_turn_work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_execution_binding: Option<WorkItemExecutionBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_turn_operator_binding_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_turn_operator_reply_route_id: Option<String>,
+    #[serde(default)]
+    pub active_skills: Vec<ActiveSkillRecord>,
+    #[serde(default)]
+    pub last_continuation: Option<ContinuationResolution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<ModelRouteRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_fallback_model: Option<ModelRouteRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_requested_model: Option<ModelRouteRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active_model: Option<ModelRouteRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_terminal: Option<TurnTerminalRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_runtime_failure: Option<RuntimeFailureSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_budget: Option<TurnBudget>,
+}
+
+/// Turn budget set by `run_once` to signal the maximum number of turns
+/// for the current run. The turn execution pipeline reads this to inject
+/// a budget warning when the agent is on the last allowed turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnBudget {
+    pub max_turns: u64,
+    pub run_start_turn_index: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentStateChangedEvent {
+    pub agent_id: String,
+    pub status: AgentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleeping_until: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_run_id: Option<String>,
+    pub pending: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_wake_reason: Option<String>,
+    pub turn_index: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_turn_work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_terminal: Option<TurnTerminalSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attached_workspace_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_execution_root_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_workspace_occupancy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub worktree_active: bool,
+}
+
+impl AgentStateChangedEvent {
+    pub fn from_state(state: &AgentState) -> Self {
+        let active_workspace = state.active_workspace_entry.as_ref();
+        Self {
+            agent_id: state.id.clone(),
+            status: state.status.clone(),
+            sleeping_until: state.sleeping_until,
+            current_run_id: state.current_run_id.clone(),
+            pending: state.pending,
+            last_wake_reason: state.last_wake_reason.clone(),
+            turn_index: state.turn_index,
+            current_turn_id: state.current_turn_id.clone(),
+            current_turn_work_item_id: state.current_turn_work_item_id.clone(),
+            current_work_item_id: state.current_work_item_id.clone(),
+            last_turn_terminal: state
+                .last_turn_terminal
+                .as_ref()
+                .map(TurnTerminalSummary::from_terminal),
+            attached_workspace_ids: state.attached_workspaces.clone(),
+            active_workspace_id: active_workspace.map(|entry| entry.workspace_id.clone()),
+            active_execution_root_id: active_workspace.map(|entry| entry.execution_root_id.clone()),
+            active_workspace_occupancy_id: active_workspace
+                .and_then(|entry| entry.occupancy_id.clone()),
+            worktree_active: state.worktree_session.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens.saturating_add(output_tokens),
+        }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.input_tokens == 0 && self.output_tokens == 0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct AgentTokenUsageSummary {
+    pub total: TokenUsage,
+    pub total_model_rounds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn: Option<TokenUsage>,
+}
+
+impl AgentState {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            status: AgentStatus::Booting,
+            sleeping_until: None,
+            current_run_id: None,
+            pending: 0,
+            last_wake_reason: None,
+            last_brief_at: None,
+            working_memory: WorkingMemoryState::default(),
+            total_message_count: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_model_rounds: 0,
+            last_turn_token_usage: None,
+            tool_latency: Vec::new(),
+            execution_profile: ExecutionProfile::default(),
+            pending_wake_hint: None,
+            attached_workspaces: Vec::new(),
+            active_workspace_entry: None,
+            worktree_session: None,
+            turn_index: 0,
+            current_turn_id: None,
+            current_turn_work_item_id: None,
+            current_execution_binding: None,
+            current_work_item_id: None,
+            current_turn_operator_binding_id: None,
+            current_turn_operator_reply_route_id: None,
+            active_skills: Vec::new(),
+            last_continuation: None,
+            model_override: None,
+            model_override_reasoning_effort: None,
+            pending_fallback_model: None,
+            last_requested_model: None,
+            last_active_model: None,
+            last_turn_terminal: None,
+            last_runtime_failure: None,
+            turn_budget: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PendingWakeHint {
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ExternalTriggerScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_trigger_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+    pub body: Option<MessageBody>,
+    pub content_type: Option<String>,
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CallbackDeliveryMode {
+    EnqueueMessage,
+    #[serde(alias = "wake_only")]
+    WakeHint,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalTriggerScope {
+    Agent,
+}
+
+impl<'de> Deserialize<'de> for ExternalTriggerScope {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "agent" | "work_item" => Ok(Self::Agent),
+            other => Err(de::Error::unknown_variant(other, &["agent"])),
+        }
+    }
+}
+
+fn default_external_trigger_scope() -> ExternalTriggerScope {
+    ExternalTriggerScope::Agent
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitConditionStatus {
+    Active,
+    Resolved,
+    Cancelled,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitConditionKind {
+    Task,
+    External,
+    Operator,
+    Timer,
+    System,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WakeSource {
+    TaskResult {
+        task_id: String,
+    },
+    ExternalIngress {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_trigger_id: Option<String>,
+    },
+    Timer {
+        wake_at: DateTime<Utc>,
+    },
+    OperatorInput,
+    SystemTick,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalWaitRecoverability {
+    Recoverable,
+    Weak,
+    ExplicitNoFallback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct WaitConditionRecord {
+    pub id: String,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    pub status: WaitConditionStatus,
+    pub kind: WaitConditionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_ref: Option<String>,
+    pub waiting_for: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wake_sources: Vec<WakeSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+}
+
+impl WaitConditionRecord {
+    pub fn external_recoverability(&self) -> Option<ExternalWaitRecoverability> {
+        if self.kind != WaitConditionKind::External || self.status != WaitConditionStatus::Active {
+            return None;
+        }
+        if explicit_no_fallback_reason(self.continuation.as_ref()).is_some() {
+            return Some(ExternalWaitRecoverability::ExplicitNoFallback);
+        }
+        if self.wake_sources.iter().any(recoverable_wake_source)
+            || continuation_declares_recovery(self.continuation.as_ref())
+        {
+            return Some(ExternalWaitRecoverability::Recoverable);
+        }
+        Some(ExternalWaitRecoverability::Weak)
+    }
+
+    pub fn no_fallback_reason(&self) -> Option<String> {
+        explicit_no_fallback_reason(self.continuation.as_ref()).map(ToString::to_string)
+    }
+}
+
+fn recoverable_wake_source(source: &WakeSource) -> bool {
+    matches!(source, WakeSource::Timer { .. } | WakeSource::SystemTick)
+}
+
+fn continuation_declares_recovery(continuation: Option<&Value>) -> bool {
+    let Some(value) = continuation else {
+        return false;
+    };
+    [
+        "durable_queue",
+        "durable_queue_ref",
+        "recheck_source",
+        "recheck_after",
+        "recheck_at",
+        "fallback",
+        "fallback_source",
+    ]
+    .into_iter()
+    .any(|key| value.get(key).is_some_and(json_truthy))
+        || value
+            .get("recoverability")
+            .or_else(|| value.get("recovery"))
+            .is_some_and(|value| {
+                value
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind == "recoverable")
+                    || value
+                        .get("durable_queue")
+                        .or_else(|| value.get("recheck_source"))
+                        .or_else(|| value.get("fallback_source"))
+                        .is_some_and(json_truthy)
+            })
+}
+
+fn explicit_no_fallback_reason(continuation: Option<&Value>) -> Option<&str> {
+    let value = continuation?;
+    value
+        .get("no_fallback_reason")
+        .or_else(|| value.get("explicit_no_fallback_reason"))
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.trim().is_empty())
+        .or_else(|| {
+            value
+                .get("recoverability")
+                .or_else(|| value.get("recovery"))
+                .and_then(|value| {
+                    let kind = value.get("kind").and_then(Value::as_str)?;
+                    (kind == "explicit_no_fallback" || kind == "no_fallback")
+                        .then(|| value.get("reason").and_then(Value::as_str))
+                        .flatten()
+                })
+                .filter(|reason| !reason.trim().is_empty())
+        })
+}
+
+fn json_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+        Value::Number(_) => true,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalTriggerStatus {
+    Active,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalTriggerRecord {
+    pub external_trigger_id: String,
+    pub target_agent_id: String,
+    #[serde(default = "default_external_trigger_scope")]
+    pub scope: ExternalTriggerScope,
+    pub delivery_mode: CallbackDeliveryMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub token_hash: String,
+    pub status: ExternalTriggerStatus,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_delivered_at: Option<DateTime<Utc>>,
+    pub delivery_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ExternalTriggerStateSnapshot {
+    pub external_trigger_id: String,
+    pub target_agent_id: String,
+    pub scope: ExternalTriggerScope,
+    pub delivery_mode: CallbackDeliveryMode,
+    pub status: ExternalTriggerStatus,
+    pub delivery_count: u64,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_delivered_at: Option<DateTime<Utc>>,
+}
+
+impl From<ExternalTriggerRecord> for ExternalTriggerStateSnapshot {
+    fn from(record: ExternalTriggerRecord) -> Self {
+        Self {
+            external_trigger_id: record.external_trigger_id,
+            target_agent_id: record.target_agent_id,
+            scope: record.scope,
+            delivery_mode: record.delivery_mode,
+            status: record.status,
+            delivery_count: record.delivery_count,
+            created_at: record.created_at,
+            revoked_at: record.revoked_at,
+            last_delivered_at: record.last_delivered_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaitConditionSummary {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    pub status: WaitConditionStatus,
+    pub kind: WaitConditionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_ref: Option<String>,
+    pub waiting_for: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wake_sources: Vec<WakeSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_recoverability: Option<ExternalWaitRecoverability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<WaitConditionRecord> for WaitConditionSummary {
+    fn from(record: WaitConditionRecord) -> Self {
+        let external_recoverability = record.external_recoverability();
+        let no_fallback_reason = record.no_fallback_reason();
+        Self {
+            id: record.id,
+            work_item_id: record.work_item_id,
+            status: record.status,
+            kind: record.kind,
+            source: record.source,
+            subject_ref: record.subject_ref,
+            waiting_for: record.waiting_for,
+            wake_sources: record.wake_sources,
+            external_recoverability,
+            no_fallback_reason,
+            continuation: record.continuation,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalTriggerSummary {
+    pub external_trigger_id: String,
+    pub target_agent_id: String,
+    pub scope: ExternalTriggerScope,
+    pub delivery_mode: CallbackDeliveryMode,
+    pub status: ExternalTriggerStatus,
+    pub delivery_count: u64,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_delivered_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalTriggerCapability {
+    pub external_trigger_id: String,
+    pub trigger_url: String,
+    pub target_agent_id: String,
+    pub delivery_mode: CallbackDeliveryMode,
+    pub status: ExternalTriggerStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CallbackIngressDisposition {
+    Enqueued,
+    Triggered,
+    Coalesced,
+    Ignored,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CallbackDeliveryResult {
+    pub agent_id: String,
+    pub external_trigger_id: String,
+    pub scope: ExternalTriggerScope,
+    pub delivery_mode: CallbackDeliveryMode,
+    pub disposition: CallbackIngressDisposition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CallbackDeliveryPayload {
+    pub body: Option<MessageBody>,
+    pub content_type: Option<String>,
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorNotificationBoundary {
+    PrimaryOperator,
+    ParentSupervisor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorNotificationRecord {
+    pub notification_id: String,
+    pub agent_id: String,
+    pub requested_by_agent_id: String,
+    pub target_operator_boundary: OperatorNotificationBoundary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_parent_agent_id: Option<String>,
+    pub message: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct EnqueueResult {
+    pub enqueued: bool,
+    pub priority: Priority,
+    pub follow_up_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorTransportBindingStatus {
+    Active,
+    Revoked,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorTransportDeliveryAuthKind {
+    Bearer,
+    Hmac,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorTransportDeliveryAuth {
+    pub kind: OperatorTransportDeliveryAuthKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorTransportCapabilities {
+    pub text: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OperatorTransportBinding {
+    pub binding_id: String,
+    pub transport: String,
+    pub operator_actor_id: String,
+    pub target_agent_id: String,
+    pub default_route_id: String,
+    pub delivery_callback_url: String,
+    pub delivery_auth: OperatorTransportDeliveryAuth,
+    pub capabilities: OperatorTransportCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_identity_ref: Option<String>,
+    pub status: OperatorTransportBindingStatus,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorDeliveryStatus {
+    Pending,
+    AcceptedByTransport,
+    FailedToSubmit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorDeliveryTriggerKind {
+    OperatorNotification,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OperatorDeliveryRecord {
+    pub delivery_intent_id: String,
+    pub output_event_id: String,
+    pub agent_id: String,
+    pub route_id: String,
+    pub binding_id: String,
+    pub trigger_kind: OperatorDeliveryTriggerKind,
+    pub status: OperatorDeliveryStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_delivery_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_summary: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Queued,
+    Running,
+    Cancelling,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct TaskHandle {
+    pub task_id: String,
+    pub task_kind: String,
+    pub status: TaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_output: Option<String>,
+}
+
+impl TaskHandle {
+    pub fn new(
+        task_id: impl Into<String>,
+        task_kind: impl Into<String>,
+        status: TaskStatus,
+        initial_output: Option<String>,
+    ) -> Self {
+        Self {
+            task_id: task_id.into(),
+            task_kind: task_kind.into(),
+            status,
+            initial_output,
+        }
+    }
+
+    pub fn from_task_record(task: &TaskRecord, initial_output: Option<String>) -> Self {
+        Self::new(
+            task.id.clone(),
+            task.kind.as_str(),
+            task.status.clone(),
+            initial_output,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildAgentPhase {
+    Running,
+    Blocked,
+    Waiting,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildAgentBlockedReason {
+    ManagedTaskQueued,
+    ManagedTaskRunning,
+    ManagedTaskCancelling,
+    AwaitingManagedTask,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct ChildAgentObservabilitySnapshot {
+    pub phase: ChildAgentPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<ChildAgentBlockedReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_reason: Option<WaitingReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_brief: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_result_brief: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskRecord {
+    pub id: String,
+    #[serde(alias = "session_id")]
+    pub agent_id: String,
+    pub kind: TaskKind,
+    pub status: TaskStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub parent_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub detail: Option<Value>,
+    #[serde(default)]
+    pub recovery: Option<TaskRecoverySpec>,
+}
+
+impl TaskRecord {
+    pub fn wait_policy(&self) -> TaskWaitPolicy {
+        // Active tasks are never scheduler-blocking; terminal results drive re-entry.
+        TaskWaitPolicy::Background
+    }
+
+    pub fn is_blocking(&self) -> bool {
+        false
+    }
+
+    pub fn terminal_reentry(&self) -> bool {
+        self.detail
+            .as_ref()
+            .and_then(|detail| detail.get("terminal_reentry"))
+            .and_then(Value::as_bool)
+            .or_else(|| {
+                self.detail
+                    .as_ref()
+                    .and_then(|detail| detail.get("continue_on_result"))
+                    .and_then(Value::as_bool)
+            })
+            .or_else(|| {
+                self.recovery
+                    .as_ref()
+                    .map(TaskRecoverySpec::terminal_reentry)
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn is_child_agent_task(&self) -> bool {
+        self.kind.is_child_agent()
+    }
+
+    pub fn effective_work_item_id(&self) -> Option<&str> {
+        self.work_item_id.as_deref().or_else(|| {
+            self.detail
+                .as_ref()
+                .and_then(|detail| detail.get("work_item_id"))
+                .and_then(Value::as_str)
+        })
+    }
+
+    pub fn child_agent_workspace_mode(&self) -> Option<ChildAgentWorkspaceMode> {
+        self.detail
+            .as_ref()
+            .and_then(|detail| detail.get("workspace_mode"))
+            .and_then(Value::as_str)
+            .and_then(ChildAgentWorkspaceMode::from_label)
+            .or_else(|| {
+                self.recovery
+                    .as_ref()
+                    .and_then(TaskRecoverySpec::child_agent_workspace_mode)
+            })
+            .or_else(|| match self.kind {
+                TaskKind::SubagentTask => Some(ChildAgentWorkspaceMode::Inherit),
+                TaskKind::WorktreeSubagentTask => Some(ChildAgentWorkspaceMode::Worktree),
+                _ => None,
+            })
+    }
+
+    pub fn is_worktree_child_agent_task(&self) -> bool {
+        self.is_child_agent_task()
+            && self
+                .child_agent_workspace_mode()
+                .is_some_and(ChildAgentWorkspaceMode::is_worktree)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct TaskListEntry {
+    pub id: String,
+    pub kind: String,
+    pub status: TaskStatus,
+    pub summary: Option<String>,
+    #[schemars(schema_with = "datetime_schema")]
+    pub updated_at: DateTime<Utc>,
+    pub wait_policy: TaskWaitPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<CommandTaskStatusSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct CommandTaskStatusSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmd_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tty: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_status: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reentry: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_from_exec_command: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepts_input: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_target: Option<String>,
+}
+
+impl CommandTaskStatusSnapshot {
+    pub(crate) fn from_task_record(task: &TaskRecord) -> Option<Self> {
+        Self::from_task_record_with_runtime_fields(task, true)
+    }
+
+    pub(crate) fn identity_from_task_record(task: &TaskRecord) -> Option<Self> {
+        Self::from_task_record_with_runtime_fields(task, false)
+    }
+
+    fn from_task_record_with_runtime_fields(
+        task: &TaskRecord,
+        include_runtime_fields: bool,
+    ) -> Option<Self> {
+        if task.kind != TaskKind::CommandTask {
+            return None;
+        }
+
+        let recovery_command = match task.recovery.as_ref() {
+            Some(TaskRecoverySpec::CommandTask {
+                spec,
+                promoted_from_exec_command,
+                ..
+            }) => Some((spec, *promoted_from_exec_command)),
+            _ => None,
+        };
+
+        let cmd = task_detail_string(&task.detail, "cmd")
+            .or_else(|| recovery_command.map(|(spec, _)| spec.cmd.clone()));
+        let cmd_digest = task_detail_string(&task.detail, "cmd_digest").or_else(|| {
+            cmd.as_ref()
+                .map(|cmd| crate::tool::helpers::command_digest(cmd))
+        });
+        let workdir = task_detail_string(&task.detail, "workdir").or_else(|| {
+            recovery_command.and_then(|(spec, _)| spec.workdir.as_ref().map(ToString::to_string))
+        });
+        let shell = task_detail_string(&task.detail, "shell").or_else(|| {
+            recovery_command.and_then(|(spec, _)| spec.shell.as_ref().map(ToString::to_string))
+        });
+        let login = task_detail_bool(&task.detail, "login")
+            .or_else(|| recovery_command.map(|(spec, _)| spec.login));
+        let tty = task_detail_bool(&task.detail, "tty")
+            .or_else(|| recovery_command.map(|(spec, _)| spec.tty));
+        let promoted_from_exec_command =
+            task_detail_bool(&task.detail, "promoted_from_exec_command")
+                .or_else(|| recovery_command.map(|(_, promoted)| promoted));
+
+        Some(Self {
+            cmd,
+            cmd_digest,
+            workdir,
+            shell,
+            login,
+            tty,
+            output_path: include_runtime_fields
+                .then(|| task_detail_string(&task.detail, "output_path"))
+                .flatten(),
+            result_summary: include_runtime_fields
+                .then(|| task_detail_string(&task.detail, "output_summary"))
+                .flatten(),
+            exit_status: include_runtime_fields
+                .then(|| task_detail_i32(&task.detail, "exit_status"))
+                .flatten(),
+            terminal_reentry: include_runtime_fields
+                .then(|| task.terminal_reentry().then_some(true))
+                .flatten(),
+            promoted_from_exec_command,
+            accepts_input: include_runtime_fields
+                .then(|| task_detail_bool(&task.detail, "accepts_input"))
+                .flatten(),
+            input_target: include_runtime_fields
+                .then(|| task_detail_string(&task.detail, "input_target"))
+                .flatten(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct ChildSupervisionProjection {
+    pub parent_agent_id: String,
+    pub child_agent_id: String,
+    pub supervision_task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_mode: Option<ChildAgentWorkspaceMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<ChildSupervisionWorktreeProjection>,
+    pub cleanup_owner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_status: Option<String>,
+    pub followup_target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
+pub struct ChildSupervisionWorktreeProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_cleaned_up: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_for_review: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_cleanup_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_cleanup_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_branch: Option<String>,
+}
+
+impl ChildSupervisionWorktreeProjection {
+    fn from_value(value: &Value) -> Self {
+        Self {
+            worktree_path: value_string(value, "worktree_path"),
+            worktree_branch: value_string(value, "worktree_branch"),
+            projection_kind: value_string(value, "projection_kind"),
+            original_cwd: value_string(value, "original_cwd"),
+            original_branch: value_string(value, "original_branch"),
+            changed_files: value
+                .get("changed_files")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect(),
+            cleanup_status: value_string(value, "cleanup_status"),
+            cleanup_reason: value_string(value, "cleanup_reason"),
+            cleanup_error: value_string(value, "cleanup_error"),
+            auto_cleaned_up: value.get("auto_cleaned_up").and_then(Value::as_bool),
+            retained_for_review: value.get("retained_for_review").and_then(Value::as_bool),
+            branch_cleanup_status: value_string(value, "branch_cleanup_status"),
+            branch_cleanup_error: value_string(value, "branch_cleanup_error"),
+            actual_branch: value_string(value, "actual_branch"),
+        }
+    }
+}
+
+impl ChildSupervisionProjection {
+    pub fn from_task_record(task: &TaskRecord) -> Option<Self> {
+        if !task.is_child_agent_task() {
+            return None;
+        }
+        let child_agent_id = task_detail_string(&task.detail, "child_agent_id")?;
+        let worktree = task_detail_value(&task.detail, "worktree").cloned();
+        let cleanup_status = worktree
+            .as_ref()
+            .and_then(|worktree| worktree.get("cleanup_status"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+
+        Some(Self {
+            parent_agent_id: task.agent_id.clone(),
+            child_agent_id,
+            supervision_task_id: task.id.clone(),
+            parent_work_item_id: None,
+            child_work_item_id: None,
+            delegation_id: None,
+            workspace_mode: task.child_agent_workspace_mode(),
+            worktree: worktree
+                .as_ref()
+                .map(ChildSupervisionWorktreeProjection::from_value),
+            cleanup_owner: "supervision_task".into(),
+            cleanup_status,
+            followup_target: "parent_supervisor".into(),
+        })
+    }
+
+    pub fn with_work_item_delegation(mut self, delegation: &WorkItemDelegationRecord) -> Self {
+        self.parent_work_item_id = Some(delegation.parent_work_item_id.clone());
+        self.child_work_item_id = Some(delegation.child_work_item_id.clone());
+        self.delegation_id = Some(delegation.delegation_id.clone());
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct TaskStatusSnapshot {
+    pub task_id: String,
+    pub kind: String,
+    pub status: TaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[schemars(schema_with = "datetime_schema")]
+    pub created_at: DateTime<Utc>,
+    #[schemars(schema_with = "datetime_schema")]
+    pub updated_at: DateTime<Utc>,
+    pub wait_policy: TaskWaitPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<CommandTaskStatusSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_observability: Option<ChildAgentObservabilitySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_supervision: Option<ChildSupervisionProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<AgentTokenUsageSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_resolution: Option<SpawnAgentModelResolution>,
+}
+
+impl TaskStatusSnapshot {
+    pub fn from_task_record(task: &TaskRecord) -> Self {
+        let command = CommandTaskStatusSnapshot::from_task_record(task);
+        let child_agent_id = task_detail_string(&task.detail, "child_agent_id");
+        let child_observability = task_detail_value(&task.detail, "child_observability")
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
+        let child_supervision = ChildSupervisionProjection::from_task_record(task);
+        let token_usage = task_detail_value(&task.detail, "token_usage")
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
+        let model_resolution = task_detail_value(&task.detail, "model_resolution")
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
+
+        Self {
+            task_id: task.id.clone(),
+            kind: task.kind.as_str().to_string(),
+            status: task.status.clone(),
+            summary: task.summary.clone(),
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+            wait_policy: task.wait_policy(),
+            parent_message_id: task.parent_message_id.clone(),
+            command,
+            child_agent_id,
+            child_observability,
+            child_supervision,
+            token_usage,
+            model_resolution,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskOutputRetrievalStatus {
+    Success,
+    Timeout,
+    NotReady,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct TaskOutputSnapshot {
+    pub task_id: String,
+    pub kind: String,
+    pub status: TaskStatus,
+    pub summary: Option<String>,
+    pub output_preview: String,
+    pub output_truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ToolArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_artifact: Option<usize>,
+    pub result_summary: Option<String>,
+    pub exit_status: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_artifact: Option<FailureArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_supervision: Option<ChildSupervisionProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<AgentTokenUsageSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct TaskOutputResult {
+    pub retrieval_status: TaskOutputRetrievalStatus,
+    pub task: TaskOutputSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommandCostDiagnostics {
+    pub cmd_preview: String,
+    pub cmd_char_count: usize,
+    pub cmd_estimated_tokens: usize,
+    pub contains_heredoc: bool,
+    pub contains_inline_script: bool,
+    pub exceeds_soft_threshold: bool,
+    pub effective_max_output_tokens: u64,
+    pub output_char_budget: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "disposition", rename_all = "snake_case")]
+pub enum ExecCommandOutcome {
+    Completed {
+        exit_status: Option<i32>,
+        stdout_preview: Option<String>,
+        stderr_preview: Option<String>,
+        truncated: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifacts: Vec<ToolArtifactRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdout_artifact: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stderr_artifact: Option<usize>,
+    },
+    PromotedToTask {
+        task_handle: TaskHandle,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_output_preview: Option<String>,
+        initial_output_truncated: bool,
+    },
+    AlreadyRunning {
+        task_handle: TaskHandle,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<CommandTaskStatusSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecCommandDuplicatePolicy {
+    ReuseRunning,
+    StartNew,
+}
+
+impl Default for ExecCommandDuplicatePolicy {
+    fn default() -> Self {
+        Self::ReuseRunning
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecCommandResult {
+    #[serde(flatten)]
+    pub outcome: ExecCommandOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_diagnostics: Option<CommandCostDiagnostics>,
+    pub summary_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecCommandBatchItemStatus {
+    Completed,
+    Failed,
+    Rejected,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecCommandBatchItemResult {
+    pub index: usize,
+    pub cmd: String,
+    pub status: ExecCommandBatchItemStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<ExecCommandResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecCommandBatchResult {
+    pub item_count: usize,
+    pub completed_count: usize,
+    pub failed_count: usize,
+    pub rejected_count: usize,
+    pub skipped_count: usize,
+    pub stop_on_error: bool,
+    pub items: Vec<ExecCommandBatchItemResult>,
+    pub summary_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ToolArtifactRef {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct TaskStatusResult {
+    pub task: TaskStatusSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct TaskInputResult {
+    pub task: TaskStatusSnapshot,
+    pub accepted_input: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_written: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentGetResult {
+    pub agent: AgentSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpawnAgentResult {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_handle: Option<TaskHandle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervision_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_supervision: Option<ChildSupervisionProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_resolution: Option<SpawnAgentModelResolution>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnAgentModelRequest {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_fallback: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnAgentModelResolutionStatus {
+    Inherited,
+    Accepted,
+    Normalized,
+    FallbackUsed,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct SpawnAgentModelResolution {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested: Option<SpawnAgentModelRequest>,
+    pub resolved_provider: String,
+    pub resolved_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_parameters: Option<serde_json::Map<String, serde_json::Value>>,
+    pub resolution_status: SpawnAgentModelResolutionStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyPatchAction {
+    Add,
+    Modify,
+    Delete,
+    Move,
+}
+
+impl ApplyPatchAction {
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::Add => "A",
+            Self::Modify => "M",
+            Self::Delete => "D",
+            Self::Move => "R",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApplyPatchHunkSummary {
+    pub old_start: u32,
+    pub old_count: u32,
+    pub new_start: u32,
+    pub new_count: u32,
+    pub added_count: u32,
+    pub removed_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApplyPatchChangedFile {
+    pub action: ApplyPatchAction,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hunks: Vec<ApplyPatchHunkSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub diff_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApplyPatchIgnoredMetadata {
+    pub path: String,
+    pub kind: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApplyPatchDiagnostic {
+    pub path: String,
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApplyPatchResult {
+    #[serde(default)]
+    pub changed_files: Vec<ApplyPatchChangedFile>,
+    pub changed_paths: Vec<String>,
+    pub changed_file_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_metadata: Vec<ApplyPatchIgnoredMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<ApplyPatchDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewImageSelectedMode {
+    Unavailable,
+    NativeImageWithObservation,
+    VisionAdapter,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ViewImageReferenceSize {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ViewImageVisualReference {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub id: String,
+    pub path: PathBuf,
+    pub sha256: String,
+    pub mime: String,
+    pub byte_count: u64,
+    pub size: ViewImageReferenceSize,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ViewImageGeneratedBy {
+    pub mode: ViewImageSelectedMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ViewImageObservation {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub schema: String,
+    pub visual_reference_id: String,
+    pub prompt: String,
+    pub generated_by: ViewImageGeneratedBy,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ocr: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub elements: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relations: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<Value>,
+    pub uncertainties: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_sources: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ViewImageResult {
+    pub visual_reference: ViewImageVisualReference,
+    pub observation: ViewImageObservation,
+    pub selected_mode: ViewImageSelectedMode,
+    pub vision_selection: ViewImageVisionSelection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct GenerateImageSize {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct GeneratedImageReference {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub id: String,
+    pub workspace_id: String,
+    pub path: PathBuf,
+    pub uri: String,
+    pub sha256: String,
+    pub mime: String,
+    pub byte_count: u64,
+    pub size: GenerateImageSize,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct GenerateImageParameters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct GenerateImageResult {
+    pub images: Vec<GeneratedImageReference>,
+    pub provider: String,
+    pub model: String,
+    pub prompt: String,
+    pub parameters: GenerateImageParameters,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ViewImageVisionCandidate {
+    pub provider: String,
+    pub model: String,
+    pub model_ref: String,
+    pub image_input: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ViewImageVisionSelection {
+    pub selected_mode: ViewImageSelectedMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_model: Option<String>,
+    pub selection_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<ViewImageVisionCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UseWorkspaceResult {
+    pub workspace_id: String,
+    pub workspace_anchor: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_root_id: Option<String>,
+    pub execution_root: PathBuf,
+    pub cwd: PathBuf,
+    pub mode: String,
+    pub projection_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceStateResult {
+    pub agent_id: String,
+    pub attached_workspace_ids: Vec<String>,
+    pub workspaces: Vec<WorkspaceEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<ActiveWorkspaceEntry>,
+    pub execution_roots: Vec<ExecutionRootEntry>,
+    pub occupancies: Vec<WorkspaceOccupancyRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachWorkspaceResult {
+    pub workspace: WorkspaceEntry,
+    pub already_attached: bool,
+    pub active_unchanged: bool,
+    pub discovered_projection_kind: WorkspaceProjectionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovered_execution_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DetachWorkspaceResult {
+    pub workspace_id: String,
+    pub detached: bool,
+    pub switched_to_agent_home: bool,
+    pub retained_execution_roots: Vec<ExecutionRootEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwitchWorkspaceResult {
+    pub disposition: String,
+    pub workspace_id: String,
+    pub workspace_anchor: PathBuf,
+    pub execution_root_id: String,
+    pub execution_root: PathBuf,
+    pub cwd: PathBuf,
+    pub projection_kind: WorkspaceProjectionKind,
+    pub access_mode: WorkspaceAccessMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateWorktreeResult {
+    pub disposition: String,
+    pub created: bool,
+    pub reused: bool,
+    pub activated: bool,
+    pub base_ref_applied: bool,
+    pub requested_base_ref: String,
+    pub resolved_base_commit: String,
+    pub branch: String,
+    pub branch_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_tip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_root_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<ExecutionRootEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoveWorktreeResult {
+    pub execution_root_id: String,
+    pub disposition: String,
+    pub switched: bool,
+    pub removed: bool,
+    pub branch_deleted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_tip: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct TaskStopResult {
+    pub task: TaskStatusSnapshot,
+    pub stop_requested: bool,
+    pub force_stop_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
+}
+
+fn datetime_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "format": "date-time"
+    })
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskRecoverySpec {
+    ChildAgentTask {
+        summary: String,
+        prompt: String,
+        #[serde(alias = "trust")]
+        authority_class: AuthorityClass,
+        workspace_mode: ChildAgentWorkspaceMode,
+    },
+    SubagentTask {
+        summary: String,
+        prompt: String,
+        #[serde(alias = "trust")]
+        authority_class: AuthorityClass,
+    },
+    WorktreeSubagentTask {
+        summary: String,
+        prompt: String,
+        #[serde(alias = "trust")]
+        authority_class: AuthorityClass,
+    },
+    CommandTask {
+        summary: String,
+        spec: CommandTaskSpec,
+        #[serde(alias = "trust")]
+        authority_class: AuthorityClass,
+        promoted_from_exec_command: bool,
+    },
+}
+
+fn task_detail_string(detail: &Option<Value>, key: &str) -> Option<String> {
+    detail
+        .as_ref()
+        .and_then(|detail| detail.get(key))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn task_detail_bool(detail: &Option<Value>, key: &str) -> Option<bool> {
+    detail
+        .as_ref()
+        .and_then(|detail| detail.get(key))
+        .and_then(Value::as_bool)
+}
+
+fn task_detail_i32(detail: &Option<Value>, key: &str) -> Option<i32> {
+    detail
+        .as_ref()
+        .and_then(|detail| detail.get(key))
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+fn task_detail_value<'a>(detail: &'a Option<Value>, key: &str) -> Option<&'a Value> {
+    detail.as_ref().and_then(|detail| detail.get(key))
+}
+
+fn value_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+impl TaskRecoverySpec {
+    pub fn is_legacy_child_agent_compat(&self) -> bool {
+        matches!(
+            self,
+            TaskRecoverySpec::SubagentTask { .. } | TaskRecoverySpec::WorktreeSubagentTask { .. }
+        )
+    }
+
+    pub fn child_agent_workspace_mode(&self) -> Option<ChildAgentWorkspaceMode> {
+        match self {
+            TaskRecoverySpec::ChildAgentTask { workspace_mode, .. } => Some(*workspace_mode),
+            TaskRecoverySpec::SubagentTask { .. } => Some(ChildAgentWorkspaceMode::Inherit),
+            TaskRecoverySpec::WorktreeSubagentTask { .. } => {
+                Some(ChildAgentWorkspaceMode::Worktree)
+            }
+            TaskRecoverySpec::CommandTask { .. } => None,
+        }
+    }
+
+    pub fn wait_policy(&self) -> TaskWaitPolicy {
+        match self {
+            TaskRecoverySpec::ChildAgentTask { .. } => TaskWaitPolicy::Background,
+            TaskRecoverySpec::SubagentTask { .. } => TaskWaitPolicy::Background,
+            TaskRecoverySpec::WorktreeSubagentTask { .. } => TaskWaitPolicy::Background,
+            TaskRecoverySpec::CommandTask { .. } => TaskWaitPolicy::Background,
+        }
+    }
+
+    pub fn terminal_reentry(&self) -> bool {
+        match self {
+            TaskRecoverySpec::CommandTask { spec, .. } => spec.terminal_reentry,
+            TaskRecoverySpec::ChildAgentTask { .. }
+            | TaskRecoverySpec::SubagentTask { .. }
+            | TaskRecoverySpec::WorktreeSubagentTask { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommandTaskSpec {
+    pub cmd: String,
+    #[serde(default)]
+    pub workdir: Option<String>,
+    #[serde(default)]
+    pub shell: Option<String>,
+    pub login: bool,
+    #[serde(default)]
+    pub tty: bool,
+    pub yield_time_ms: u64,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub accepts_input: bool,
+    #[serde(default, alias = "continue_on_result")]
+    pub terminal_reentry: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSchedulingPosture {
+    Unknown,
+    #[serde(alias = "archived")]
+    Stopped,
+    ActiveTurn,
+    HasQueuedInput,
+    HasRunnableWork,
+    WaitingForTask,
+    WaitingForExternal,
+    WaitingForOperator,
+    Blocked,
+    Idle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AgentPostureProjection {
+    pub posture: AgentSchedulingPosture,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+impl Default for AgentPostureProjection {
+    fn default() -> Self {
+        Self {
+            posture: AgentSchedulingPosture::Unknown,
+            reason: "posture projection unavailable".into(),
+            work_item_id: None,
+            task_id: None,
+            run_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliverySummaryRecord {
+    pub id: String,
+    #[serde(alias = "session_id")]
+    pub agent_id: String,
+    pub work_item_id: String,
+    pub created_at: DateTime<Utc>,
+    pub text: String,
+    #[serde(
+        default,
+        alias = "source_turn_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_turn_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Value>,
+}
+
+impl DeliverySummaryRecord {
+    pub fn new(
+        agent_id: impl Into<String>,
+        work_item_id: impl Into<String>,
+        text: impl Into<String>,
+        source_turn_index: Option<u64>,
+        evidence: Option<Value>,
+    ) -> Self {
+        Self {
+            id: ids::delivery_summary_id(),
+            agent_id: agent_id.into(),
+            work_item_id: work_item_id.into(),
+            created_at: Utc::now(),
+            text: text.into(),
+            turn_id: None,
+            source_turn_index,
+            evidence,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+pub struct TimerRecord {
+    pub id: String,
+    #[serde(alias = "session_id")]
+    pub agent_id: String,
+    pub created_at: DateTime<Utc>,
+    pub duration_ms: u64,
+    pub interval_ms: Option<u64>,
+    pub repeat: bool,
+    #[serde(default)]
+    pub status: TimerStatus,
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub next_fire_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_fired_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub fire_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TimerStatus {
+    #[serde(alias = "scheduled")]
+    Active,
+    Completed,
+    Cancelled,
+}
+
+impl Default for TimerStatus {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueEntryStatus {
+    Queued,
+    Dequeued,
+    Processed,
+    Interjected,
+    /// Daemon shutdown interrupted processing; replay on recovery.
+    Interrupted,
+    Aborted,
+    Dropped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorMessageStatus {
+    Sending,
+    Queued,
+    WaitingForSafePoint,
+    Processing,
+    Processed,
+    Failed,
+    Dropped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OperatorMessageRecord {
+    pub message_id: String,
+    pub agent_id: String,
+    pub status: OperatorMessageStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub body: MessageBody,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct QueueEntryRecord {
+    pub message_id: String,
+    #[serde(alias = "session_id")]
+    pub agent_id: String,
+    pub priority: Priority,
+    pub status: QueueEntryStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExecutionStatus {
+    Success,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct ToolExecutionRecord {
+    pub id: String,
+    #[serde(alias = "session_id")]
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    #[serde(default)]
+    pub turn_index: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub tool_name: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(alias = "trust")]
+    pub authority_class: AuthorityClass,
+    pub status: ToolExecutionStatus,
+    pub input: Value,
+    pub output: Value,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_surface: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MessageLifecycleAuditEvent {
+    pub message_id: String,
+    #[serde(alias = "session_id")]
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub kind: MessageKind,
+    pub origin: MessageOrigin,
+    pub authority_class: AuthorityClass,
+    pub priority: Priority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_kind: Option<ContinuationTriggerKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_refs: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_surface: Option<MessageDeliverySurface>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_context: Option<AdmissionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<String>,
+}
+
+impl MessageLifecycleAuditEvent {
+    pub fn from_message(message: &MessageEnvelope) -> Self {
+        Self {
+            message_id: message.id.clone(),
+            agent_id: message.agent_id.clone(),
+            message_seq: message.message_seq,
+            turn_id: message.turn_id.clone(),
+            kind: message.kind.clone(),
+            origin: message.origin.clone(),
+            authority_class: message.authority_class,
+            priority: message.priority.clone(),
+            trigger_kind: message.trigger_kind,
+            work_item_id: message.work_item_id.clone(),
+            task_id: message.task_id.clone(),
+            source_refs: message.source_refs.clone(),
+            delivery_surface: message.delivery_surface,
+            admission_context: message.admission_context,
+            correlation_id: message.correlation_id.clone(),
+            causation_id: message.causation_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BriefCreatedAuditEvent {
+    pub brief_id: String,
+    #[serde(alias = "session_id")]
+    pub agent_id: String,
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub kind: BriefKind,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalizes_assistant_round_id: Option<String>,
+    #[serde(default)]
+    pub content_source: BriefContentSource,
+    #[serde(default)]
+    pub content_char_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_task_id: Option<String>,
+}
+
+impl BriefCreatedAuditEvent {
+    pub fn from_brief(brief: &BriefRecord) -> Self {
+        Self {
+            brief_id: brief.id.clone(),
+            agent_id: brief.agent_id.clone(),
+            workspace_id: brief.workspace_id.clone(),
+            work_item_id: brief.work_item_id.clone(),
+            turn_index: brief.turn_index,
+            turn_id: brief.turn_id.clone(),
+            kind: brief.kind,
+            created_at: brief.created_at,
+            finalizes_assistant_round_id: brief.finalizes_assistant_round_id.clone(),
+            content_source: brief.content_source.clone(),
+            content_char_count: brief.text.chars().count(),
+            related_message_id: brief.related_message_id.clone(),
+            related_task_id: brief.related_task_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BriefContentSourceRelation {
+    DerivedFrom,
+    Finalizes,
+    Excerpt,
+}
+
+impl Default for BriefContentSourceRelation {
+    fn default() -> Self {
+        Self::DerivedFrom
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BriefContentSource {
+    TranscriptEntry {
+        entry_id: String,
+        #[serde(default)]
+        relation: BriefContentSourceRelation,
+    },
+    Inline,
+}
+
+impl Default for BriefContentSource {
+    fn default() -> Self {
+        Self::Inline
+    }
+}
+
+impl BriefContentSource {
+    pub fn transcript_entry_id(&self) -> Option<&str> {
+        match self {
+            Self::TranscriptEntry { entry_id, .. } => Some(entry_id),
+            Self::Inline => None,
+        }
+    }
+
+    pub fn relation(&self) -> Option<BriefContentSourceRelation> {
+        match self {
+            Self::TranscriptEntry { relation, .. } => Some(*relation),
+            Self::Inline => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkItemLifecycleAuditEvent {
+    #[serde(alias = "session_id")]
+    pub agent_id: String,
+    pub work_item_id: String,
+    pub workspace_id: String,
+    pub revision: u64,
+    pub action: String,
+    pub state: WorkItemState,
+    pub plan_status: WorkItemPlanStatus,
+    pub readiness: WorkItemReadiness,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub objective_preview: String,
+    pub objective_len: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_brief_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_summary_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_by_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recheck_at: Option<DateTime<Utc>>,
+}
+
+impl WorkItemLifecycleAuditEvent {
+    pub fn from_work_item(action: impl Into<String>, record: &WorkItemRecord) -> Self {
+        Self {
+            agent_id: record.agent_id.clone(),
+            work_item_id: record.id.clone(),
+            workspace_id: record.workspace_id.clone(),
+            revision: record.revision,
+            action: action.into(),
+            state: record.state.clone(),
+            plan_status: record.plan_status,
+            readiness: record.readiness(),
+            updated_at: record.updated_at,
+            turn_id: record.turn_id.clone(),
+            objective_preview: truncate_audit_preview(&record.objective, 600),
+            objective_len: record.objective.chars().count(),
+            result_brief_id: record.result_brief_id.clone(),
+            result_summary_preview: record
+                .result_summary
+                .as_deref()
+                .map(|value| truncate_audit_preview(value, 600)),
+            blocked_by_preview: record
+                .blocked_by
+                .as_deref()
+                .map(|value| truncate_audit_preview(value, 600)),
+            recheck_at: record.recheck_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskLifecycleAuditEvent {
+    pub task_id: String,
+    #[serde(alias = "session_id")]
+    pub agent_id: String,
+    pub kind: TaskKind,
+    pub status: TaskStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_status: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_summary_preview: Option<String>,
+}
+
+impl TaskLifecycleAuditEvent {
+    pub fn from_task(task: &TaskRecord) -> Self {
+        let detail = task.detail.as_ref();
+        Self {
+            task_id: task.id.clone(),
+            agent_id: task.agent_id.clone(),
+            kind: task.kind.clone(),
+            status: task.status.clone(),
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+            parent_message_id: task.parent_message_id.clone(),
+            work_item_id: task.work_item_id.clone(),
+            summary: task.summary.clone(),
+            task_status: detail_string(detail, "task_status"),
+            exit_status: detail_i64(detail, "exit_status"),
+            error: detail_string(detail, "error").map(|value| truncate_audit_preview(&value, 512)),
+            output_path: detail_string(detail, "output_path"),
+            output_summary_preview: detail_string(detail, "output_summary")
+                .map(|value| truncate_audit_preview(&value, 512)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolExecutionAuditEvent {
+    pub tool_call_id: String,
+    pub tool_execution_id: String,
+    #[serde(alias = "session_id")]
+    pub agent_id: String,
+    pub tool_name: String,
+    pub turn_index: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    pub status: ToolExecutionStatus,
+    pub duration_ms: u64,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_command_cmd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_command_display: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_command_batch_items: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_command_cost: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_command_disposition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_status: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_handle: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_error: Option<ToolError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentModelOverrideAuditEvent {
+    #[serde(alias = "session_id")]
+    pub agent_id: String,
+    pub source: AgentModelSource,
+    pub effective_model: ModelRouteRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<ModelRouteRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_model: Option<ModelRouteRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_model: Option<ModelRouteRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub fallback_active: bool,
+    #[serde(default)]
+    pub pending_next_turn: bool,
+}
+
+impl AgentModelOverrideAuditEvent {
+    pub fn from_model_state(
+        agent_id: impl Into<String>,
+        model: &AgentModelState,
+        pending_next_turn: bool,
+    ) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            source: model.source.clone(),
+            effective_model: model.effective_model.clone(),
+            requested_model: model.requested_model.clone(),
+            active_model: model.active_model.clone(),
+            override_model: model.override_model.clone(),
+            override_reasoning_effort: model.override_reasoning_effort.clone(),
+            fallback_active: model.fallback_active,
+            pending_next_turn,
+        }
+    }
+}
+
+/// Public diagnostic event for scheduler decisions and invariant violations.
+///
+/// Extends scheduler observability from internal audit-only records to a typed,
+/// publicly addressable event stream.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchedulerDiagnosticAuditEvent {
+    #[serde(alias = "session_id")]
+    pub agent_id: String,
+    pub decision: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
+fn detail_string(detail: Option<&Value>, field: &str) -> Option<String> {
+    detail
+        .and_then(|value| value.get(field))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn detail_i64(detail: Option<&Value>, field: &str) -> Option<i64> {
+    detail
+        .and_then(|value| value.get(field))
+        .and_then(Value::as_i64)
+}
+
+pub(crate) fn truncate_audit_preview(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut preview = value.chars().take(max_chars).collect::<String>();
+    preview.push_str("...");
+    preview
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolLatencyMetrics {
+    pub tool_name: String,
+    pub total_calls: u64,
+    pub total_duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorktreeSession {
+    pub original_cwd: PathBuf,
+    pub original_branch: String,
+    pub worktree_path: PathBuf,
+    pub worktree_branch: String,
+}
+
+/// Ref-backed tool result metadata for transcript storage.
+/// Stores stable identifiers and bounded provider-visible content rather than full tool output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolResultRef {
+    /// Stable tool call id from assistant tool use block
+    pub tool_call_id: String,
+    /// Stable tool execution record id for full content resolution
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_execution_id: Option<String>,
+    /// Provider-visible bounded content (truncated or summary)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_visible_text: Option<String>,
+    /// Whether the full content was truncated from provider view
+    #[serde(default)]
+    pub content_truncated: bool,
+    /// Error marker
+    #[serde(default)]
+    pub is_error: bool,
+}
+
+/// Legacy tool result block format for backward compatibility.
+/// Used when reading old transcripts that store full content directly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LegacyToolResultBlock {
+    pub tool_use_id: String,
+    pub content: String,
+    #[serde(default)]
+    pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ToolError>,
+}
+
+/// Unified tool result data format in transcript.
+/// Supports both new ref-backed format and legacy full-content format.
+///
+/// # Serialization formats
+///
+/// ## New ref-backed format
+/// ```json
+/// {
+///   "refs": [
+///     {
+///       "tool_call_id": "...",
+///       "tool_execution_id": "...",
+///       "provider_visible_text": "...",
+///       "content_truncated": false,
+///       "is_error": false
+///     }
+///   ]
+/// }
+/// ```
+///
+/// ## Legacy format
+/// ```json
+/// {
+///   "results": [
+///     { "tool_use_id": "...", "content": "...", "is_error": false }
+///   ]
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ToolResultData {
+    /// New ref-backed format with explicit wrapper
+    RefsWithWrapper { refs: Vec<ToolResultRef> },
+    /// Legacy format with explicit wrapper
+    LegacyWithWrapper { results: Vec<LegacyToolResultBlock> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptEntryKind {
+    IncomingMessage,
+    AssistantRound,
+    ToolResults,
+    RuntimeFailure,
+    ContinuationPrompt,
+    SubagentPrompt,
+    SubagentAssistantRound,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantRoundPurpose {
+    AgentResponse,
+    RuntimeCheckpoint,
+}
+
+impl AssistantRoundPurpose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentResponse => "agent_response",
+            Self::RuntimeCheckpoint => "runtime_checkpoint",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TranscriptEntry {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_seq: Option<u64>,
+    #[serde(alias = "session_id")]
+    pub agent_id: String,
+    pub created_at: DateTime<Utc>,
+    pub kind: TranscriptEntryKind,
+    pub round: Option<usize>,
+    pub related_message_id: Option<String>,
+    pub stop_reason: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub data: Value,
+}
+
+impl TranscriptEntry {
+    pub fn new(
+        agent_id: impl Into<String>,
+        kind: TranscriptEntryKind,
+        round: Option<usize>,
+        related_message_id: Option<String>,
+        data: Value,
+    ) -> Self {
+        Self {
+            id: ids::transcript_entry_id(),
+            transcript_seq: None,
+            agent_id: agent_id.into(),
+            created_at: Utc::now(),
+            kind,
+            round,
+            related_message_id,
+            stop_reason: None,
+            input_tokens: None,
+            output_tokens: None,
+            data,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BriefKind {
+    Ack,
+    Result,
+    Failure,
+}
+
+impl BriefKind {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Result | Self::Failure)
+    }
+
+    pub fn is_success(self) -> bool {
+        matches!(self, Self::Result)
+    }
+
+    pub fn is_failure(self) -> bool {
+        matches!(self, Self::Failure)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct BriefRecord {
+    pub id: String,
+    #[serde(alias = "session_id")]
+    pub agent_id: String,
+    #[serde(default = "default_agent_home_workspace_id")]
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub kind: BriefKind,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub content_source: BriefContentSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalizes_assistant_round_id: Option<String>,
+    pub text: String,
+    pub attachments: Option<Vec<BriefAttachment>>,
+    pub related_message_id: Option<String>,
+    pub related_task_id: Option<String>,
+}
+
+impl BriefRecord {
+    pub fn new(
+        agent_id: impl Into<String>,
+        kind: BriefKind,
+        text: impl Into<String>,
+        related_message_id: Option<String>,
+        related_task_id: Option<String>,
+    ) -> Self {
+        let agent_id = agent_id.into();
+        Self {
+            id: ids::brief_id(),
+            workspace_id: agent_home_workspace_id(&agent_id),
+            agent_id,
+            work_item_id: None,
+            turn_index: None,
+            turn_id: None,
+            kind,
+            created_at: Utc::now(),
+            content_source: BriefContentSource::Inline,
+            finalizes_assistant_round_id: None,
+            text: text.into(),
+            attachments: None,
+            related_message_id,
+            related_task_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuditEvent {
+    pub id: String,
+    #[serde(default)]
+    pub event_seq: u64,
+    #[serde(default)]
+    pub event_log_epoch: String,
+    pub created_at: DateTime<Utc>,
+    pub kind: String,
+    #[serde(default = "crate::runtime_event::legacy_contract_version")]
+    pub contract_version: u32,
+    #[serde(default = "crate::runtime_event::legacy_payload_schema")]
+    pub payload_schema: String,
+    #[serde(default = "crate::runtime_event::legacy_payload_schema_version")]
+    pub payload_schema_version: u32,
+    pub data: Value,
+}
+
+impl AuditEvent {
+    pub fn legacy(kind: impl Into<String>, data: Value) -> Self {
+        Self {
+            id: ids::audit_event_id(),
+            event_seq: 0,
+            event_log_epoch: String::new(),
+            created_at: Utc::now(),
+            kind: kind.into(),
+            contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
+            payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.to_string(),
+            payload_schema_version: 1,
+            data,
+        }
+    }
+
+    pub fn typed<P>(
+        kind: crate::runtime_event::RuntimeEventKind,
+        payload: &P,
+    ) -> anyhow::Result<Self>
+    where
+        P: crate::runtime_event::RuntimeEventPayload,
+    {
+        let descriptor = kind.descriptor();
+        anyhow::ensure!(
+            descriptor.payload_schema == P::SCHEMA_ID
+                && descriptor.payload_schema_version == P::SCHEMA_VERSION,
+            "runtime event kind {} requires payload schema {}@{}, got {}@{}",
+            descriptor.wire_name,
+            descriptor.payload_schema,
+            descriptor.payload_schema_version,
+            P::SCHEMA_ID,
+            P::SCHEMA_VERSION
+        );
+        Ok(Self {
+            id: ids::audit_event_id(),
+            event_seq: 0,
+            event_log_epoch: String::new(),
+            created_at: Utc::now(),
+            kind: descriptor.wire_name.to_string(),
+            contract_version: crate::runtime_event::RUNTIME_EVENT_CONTRACT_VERSION,
+            payload_schema: descriptor.payload_schema.to_string(),
+            payload_schema_version: descriptor.payload_schema_version,
+            data: serde_json::to_value(payload)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlAction {
+    Start,
+    Stop,
+}
+
+impl ControlAction {
+    pub fn canonical(&self) -> Self {
+        self.clone()
+    }
+
+    pub fn is_start(&self) -> bool {
+        matches!(self, Self::Start)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentModelSource {
+    RuntimeDefault,
+    AgentOverride,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentModelState {
+    pub source: AgentModelSource,
+    pub runtime_default_model: ModelRouteRef,
+    pub effective_model: ModelRouteRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<ModelRouteRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_model: Option<ModelRouteRef>,
+    #[serde(default)]
+    pub fallback_active: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effective_fallback_models: Vec<ModelRouteRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_model: Option<ModelRouteRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub resolved_policy: ResolvedRuntimeModelPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedModelAvailability {
+    pub model: String,
+    pub provider: String,
+    pub provider_family: String,
+    pub endpoint: String,
+    pub route_provider: String,
+    pub display_name: String,
+    pub metadata_source: String,
+    pub provider_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_kind: Option<String>,
+    pub credential_configured: bool,
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+    pub policy: ResolvedRuntimeModelPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_capabilities: Option<crate::config::ResolvedModelCapabilities>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelProviderAvailability {
+    Available,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAvailability {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelProviderEntry {
+    pub id: String,
+    pub provider_family: String,
+    pub endpoint: String,
+    pub route_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub availability: ModelProviderAvailability,
+    pub provider_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_kind: Option<String>,
+    pub credential_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    pub model_count: usize,
+    pub discovered_model_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderModelEntry {
+    pub provider: String,
+    pub provider_family: String,
+    pub endpoint: String,
+    pub route_provider: String,
+    pub id: String,
+    pub model_ref: String,
+    pub display_name: String,
+    pub availability: ModelAvailability,
+    pub selectable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+    pub metadata_source: String,
+    pub policy: ResolvedRuntimeModelPolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameter_contracts: Vec<crate::model_catalog::ModelParameterSupport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_parameters: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AgentLifecycleHint {
+    pub accepts_external_messages: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_hint: Option<String>,
+}
+
+impl Default for AgentLifecycleHint {
+    fn default() -> Self {
+        Self {
+            accepts_external_messages: true,
+            operator_hint: None,
+        }
+    }
+}
+
+impl AgentLifecycleHint {
+    #[allow(unused_variables)]
+    pub fn from_status(agent_id: &str, status: AgentStatus) -> Self {
+        if status == AgentStatus::Stopped {
+            return Self {
+                accepts_external_messages: false,
+                operator_hint: Some(
+                    "agent is administratively stopped; start before new prompts or wakes".into(),
+                ),
+            };
+        }
+        Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentSummary {
+    pub identity: AgentIdentityView,
+    pub agent: AgentState,
+    #[serde(default)]
+    pub scheduling_posture: AgentPostureProjection,
+    #[serde(default)]
+    pub active_task_count: usize,
+    #[serde(default)]
+    pub lifecycle: AgentLifecycleHint,
+    pub model: AgentModelState,
+    pub token_usage: AgentTokenUsageSummary,
+    pub closure: ClosureDecision,
+    pub execution: ExecutionSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_workspace_occupancy: Option<WorkspaceOccupancyRecord>,
+    pub loaded_agents_md: LoadedAgentsMdView,
+    pub skills: SkillsRuntimeView,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_children: Vec<ChildAgentSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_wait_conditions: Vec<WaitConditionSummary>,
+    #[serde(default)]
+    pub active_external_triggers: Vec<ExternalTriggerSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_operator_notifications: Vec<OperatorNotificationRecord>,
+    pub recent_brief_count: usize,
+    pub recent_event_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentListModelSummary {
+    pub source: AgentModelSource,
+    pub runtime_default_model: ModelRouteRef,
+    pub effective_model: ModelRouteRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<ModelRouteRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_model: Option<ModelRouteRef>,
+    #[serde(default)]
+    pub fallback_active: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effective_fallback_models: Vec<ModelRouteRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_model: Option<ModelRouteRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_reasoning_effort: Option<String>,
+}
+
+impl From<&AgentModelState> for AgentListModelSummary {
+    fn from(value: &AgentModelState) -> Self {
+        Self {
+            source: value.source.clone(),
+            runtime_default_model: value.runtime_default_model.clone(),
+            effective_model: value.effective_model.clone(),
+            requested_model: value.requested_model.clone(),
+            active_model: value.active_model.clone(),
+            fallback_active: value.fallback_active,
+            effective_fallback_models: value.effective_fallback_models.clone(),
+            override_model: value.override_model.clone(),
+            override_reasoning_effort: value.override_reasoning_effort.clone(),
+        }
+    }
+}
+
+impl AgentListModelSummary {
+    pub fn into_model_state(self) -> AgentModelState {
+        AgentModelState {
+            source: self.source,
+            runtime_default_model: self.runtime_default_model,
+            effective_model: self.effective_model,
+            requested_model: self.requested_model,
+            active_model: self.active_model,
+            fallback_active: self.fallback_active,
+            effective_fallback_models: self.effective_fallback_models,
+            override_model: self.override_model,
+            override_reasoning_effort: self.override_reasoning_effort,
+            resolved_policy: ResolvedRuntimeModelPolicy::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentListEntry {
+    pub identity: AgentIdentityView,
+    pub status: AgentStatus,
+    #[serde(default)]
+    pub scheduling_posture: AgentPostureProjection,
+    #[serde(default)]
+    pub lifecycle: AgentLifecycleHint,
+    #[serde(default)]
+    pub pending: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_reason: Option<WaitingReason>,
+    pub model: AgentListModelSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_workspace_entry: Option<ActiveWorkspaceEntry>,
+}
+
+impl AgentListEntry {
+    pub fn from_summary(summary: &AgentSummary) -> Self {
+        Self {
+            identity: summary.identity.clone(),
+            status: summary.agent.status.clone(),
+            scheduling_posture: summary.scheduling_posture.clone(),
+            lifecycle: summary.lifecycle.clone(),
+            pending: summary.agent.pending,
+            current_run_id: summary.agent.current_run_id.clone(),
+            waiting_reason: summary.closure.waiting_reason,
+            model: (&summary.model).into(),
+            active_workspace_entry: summary
+                .agent
+                .active_workspace_entry
+                .clone()
+                .map(ActiveWorkspaceEntry::without_projection_metadata),
+        }
+    }
+
+    pub fn into_agent_summary_placeholder(self) -> AgentSummary {
+        let mut agent = AgentState::new(self.identity.agent_id.clone());
+        agent.status = self.status;
+        agent.pending = self.pending;
+        agent.current_run_id = self.current_run_id;
+        agent.active_workspace_entry = self.active_workspace_entry.clone();
+        agent.model_override = self.model.override_model.clone();
+        agent.model_override_reasoning_effort = self.model.override_reasoning_effort.clone();
+
+        let runtime_posture = if agent.status == AgentStatus::Asleep {
+            RuntimePosture::Sleeping
+        } else {
+            RuntimePosture::Awake
+        };
+        let closure = ClosureDecision {
+            outcome: if self.waiting_reason.is_some() {
+                ClosureOutcome::Waiting
+            } else {
+                ClosureOutcome::Completed
+            },
+            waiting_reason: self.waiting_reason,
+            work_signal: None,
+            runtime_posture,
+            evidence: Vec::new(),
+        };
+        let execution = if let Some(entry) = agent.active_workspace_entry.as_ref() {
+            ExecutionSnapshot {
+                profile: ExecutionProfile::default(),
+                policy: ExecutionProfile::default().policy_snapshot(),
+                attached_workspaces: Vec::new(),
+                workspace_id: Some(entry.workspace_id.clone()),
+                workspace_anchor: entry.workspace_anchor.clone(),
+                execution_root: entry.execution_root.clone(),
+                cwd: entry.cwd.clone(),
+                execution_root_id: Some(entry.execution_root_id.clone()),
+                projection_kind: Some(entry.projection_kind),
+                access_mode: Some(entry.access_mode),
+                worktree_root: None,
+                execution_roots: Vec::new(),
+            }
+        } else {
+            ExecutionSnapshot {
+                profile: ExecutionProfile::default(),
+                policy: ExecutionProfile::default().policy_snapshot(),
+                attached_workspaces: Vec::new(),
+                workspace_id: None,
+                workspace_anchor: PathBuf::new(),
+                execution_root: PathBuf::new(),
+                cwd: PathBuf::new(),
+                execution_root_id: None,
+                projection_kind: None,
+                access_mode: None,
+                worktree_root: None,
+                execution_roots: Vec::new(),
+            }
+        };
+
+        AgentSummary {
+            identity: self.identity,
+            lifecycle: self.lifecycle,
+            scheduling_posture: self.scheduling_posture,
+            model: self.model.into_model_state(),
+            token_usage: AgentTokenUsageSummary {
+                total: TokenUsage::new(0, 0),
+                total_model_rounds: 0,
+                last_turn: None,
+            },
+            closure,
+            execution,
+            agent,
+            active_task_count: 0,
+            active_workspace_occupancy: None,
+            loaded_agents_md: LoadedAgentsMdView::default(),
+            skills: SkillsRuntimeView::default(),
+            active_children: Vec::new(),
+            active_wait_conditions: Vec::new(),
+            active_external_triggers: Vec::new(),
+            recent_operator_notifications: Vec::new(),
+            recent_brief_count: 0,
+            recent_event_count: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_scheduler_contract_names_deserialize_as_current_terms() {
+        let continuation: ContinuationResolution = serde_json::from_value(serde_json::json!({
+            "trigger_kind": "task_result",
+            "class": "local_continuation",
+            "model_visible": true,
+            "prior_closure_outcome": "continuable",
+            "prior_waiting_reason": null,
+            "matched_waiting_reason": false,
+            "evidence": []
+        }))
+        .unwrap();
+        assert!(continuation.model_reentry);
+
+        let priority: Priority = serde_json::from_value(serde_json::json!("interrupt")).unwrap();
+        assert_eq!(priority, Priority::Interject);
+        assert_eq!(
+            serde_json::to_value(priority).unwrap(),
+            serde_json::json!("interject")
+        );
+
+        let status: QueueEntryStatus =
+            serde_json::from_value(serde_json::json!("interrupted")).unwrap();
+        assert_eq!(status, QueueEntryStatus::Interrupted);
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::json!("interrupted")
+        );
+    }
+
+    #[test]
+    fn agent_state_changed_event_is_bounded_state_summary() {
+        let mut state = AgentState::new("agent-a");
+        state.status = AgentStatus::AwakeRunning;
+        state.current_run_id = Some("run-1".into());
+        state.pending = 3;
+        state.last_wake_reason = Some("operator_message".into());
+        state.turn_index = 42;
+        state.current_turn_id = Some("turn-42".into());
+        state.current_turn_work_item_id = Some("turn-work".into());
+        state.current_work_item_id = Some("work-current".into());
+        state.working_memory.archived_episode_count = 9;
+        state.attached_workspaces = vec!["ws-a".into(), "ws-b".into()];
+        state.active_workspace_entry = Some(ActiveWorkspaceEntry {
+            workspace_id: "ws-b".into(),
+            workspace_anchor: PathBuf::from("/tmp/ws-b"),
+            execution_root_id: "root-b".into(),
+            execution_root: PathBuf::from("/tmp/ws-b"),
+            projection_kind: WorkspaceProjectionKind::CanonicalRoot,
+            access_mode: WorkspaceAccessMode::ExclusiveWrite,
+            cwd: PathBuf::from("/tmp/ws-b"),
+            occupancy_id: Some("occupancy-b".into()),
+            projection_metadata: Some(WorkspaceProjectionMetadata::ManagedWorktree {
+                original_cwd: PathBuf::from("/tmp/ws-b"),
+                original_branch: "main".into(),
+                worktree_path: PathBuf::from("/tmp/ws-b-worktree"),
+                worktree_branch: "feature/metadata-test".into(),
+            }),
+        });
+        state.worktree_session = Some(WorktreeSession {
+            original_cwd: PathBuf::from("/tmp/ws-b"),
+            original_branch: "main".into(),
+            worktree_path: PathBuf::from("/tmp/ws-b-worktree"),
+            worktree_branch: "feature/state-event".into(),
+        });
+        state.last_turn_terminal = Some(TurnTerminalRecord {
+            turn_id: "turn-41".into(),
+            turn_index: 41,
+            kind: TurnTerminalKind::Completed,
+            reason: None,
+            last_assistant_message: Some("assistant output that must stay out of the event".into()),
+            checkpoint: None,
+            completed_at: Utc::now(),
+            duration_ms: 123,
+        });
+
+        let payload = serde_json::to_value(AgentStateChangedEvent::from_state(&state)).unwrap();
+
+        assert_eq!(payload["agent_id"], "agent-a");
+        assert_eq!(payload["status"], "awake_running");
+        assert_eq!(payload["current_run_id"], "run-1");
+        assert_eq!(payload["pending"], 3);
+        assert_eq!(payload["turn_index"], 42);
+        assert_eq!(payload["active_workspace_id"], "ws-b");
+        assert_eq!(payload["active_execution_root_id"], "root-b");
+        assert_eq!(payload["active_workspace_occupancy_id"], "occupancy-b");
+        assert_eq!(payload["worktree_active"], true);
+        assert_eq!(payload["last_turn_terminal"]["kind"], "completed");
+
+        assert!(payload.get("working_memory").is_none());
+        assert!(payload.get("context_summary").is_none());
+        assert!(payload.get("active_workspace_entry").is_none());
+        assert!(payload.get("worktree_session").is_none());
+        assert!(payload["last_turn_terminal"]
+            .get("last_assistant_message")
+            .is_none());
+    }
+
+    #[test]
+    fn legacy_agents_md_global_names_deserialize_to_user_global() {
+        let loaded: LoadedAgentsMd = serde_json::from_value(serde_json::json!({
+            "global_source": {
+                "scope": "global",
+                "kind": "agents_md",
+                "path": "/tmp/user/.agents/AGENTS.md"
+            }
+        }))
+        .unwrap();
+        let source = loaded
+            .user_global_source
+            .as_ref()
+            .expect("legacy global_source should map to user_global_source");
+        assert_eq!(source.scope, AgentsMdScope::UserGlobal);
+        assert_eq!(source.path, PathBuf::from("/tmp/user/.agents/AGENTS.md"));
+
+        let encoded = serde_json::to_value(&loaded).unwrap();
+        assert!(encoded.get("global_source").is_none());
+        assert_eq!(
+            encoded["user_global_source"]["scope"],
+            serde_json::json!("user_global")
+        );
+
+        let view: LoadedAgentsMdView = serde_json::from_value(serde_json::json!({
+            "global_source": {
+                "scope": "global",
+                "kind": "agents_md",
+                "path": "/tmp/user/.agents/AGENTS.md"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            view.user_global_source
+                .expect("legacy view global_source should map to user_global_source")
+                .scope,
+            AgentsMdScope::UserGlobal
+        );
+    }
+
+    #[test]
+    fn new_messages_carry_authority_class() {
+        let message = MessageEnvelope::new(
+            "default",
+            MessageKind::OperatorPrompt,
+            MessageOrigin::Operator {
+                actor_id: Some("operator:jolestar".into()),
+            },
+            AuthorityClass::OperatorInstruction,
+            Priority::Normal,
+            MessageBody::Text {
+                text: "ship it".into(),
+            },
+        );
+
+        assert_eq!(message.authority_class, AuthorityClass::OperatorInstruction);
+        let serialized = serde_json::to_value(&message).unwrap();
+        assert_eq!(serialized["authority_class"], "operator_instruction");
+    }
+
+    #[test]
+    fn legacy_messages_without_authority_class_deserialize_from_trust_alias() {
+        let legacy = serde_json::json!({
+            "id": "msg-legacy",
+            "agent_id": "default",
+            "created_at": "2026-04-22T00:00:00Z",
+            "kind": "system_tick",
+            "origin": {
+                "kind": "system",
+                "subsystem": "runtime"
+            },
+            "trust": "trusted_system",
+            "priority": "normal",
+            "body": {
+                "type": "text",
+                "text": "resume"
+            }
+        });
+
+        let message: MessageEnvelope = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(message.authority_class, AuthorityClass::RuntimeInstruction);
+    }
+
+    #[test]
+    fn message_with_both_trust_and_authority_class_deserializes_authority_class_first() {
+        // When both "trust" and "authority_class" exist, the explicit
+        // authority_class field takes precedence.
+        let dual = serde_json::json!({
+            "id": "msg-dual",
+            "agent_id": "default",
+            "created_at": "2026-05-27T11:11:59Z",
+            "kind": "operator_prompt",
+            "origin": {
+                "kind": "operator",
+                "actor_id": "control"
+            },
+            "trust": "trusted_operator",
+            "authority_class": "operator_instruction",
+            "priority": "interject",
+            "body": {
+                "type": "text",
+                "text": "hello"
+            }
+        });
+
+        let message: MessageEnvelope = serde_json::from_value(dual).unwrap();
+        assert_eq!(message.authority_class, AuthorityClass::OperatorInstruction);
+    }
+
+    #[test]
+    fn legacy_trust_helper_field_is_not_wire_compatible() {
+        let helper_field = serde_json::json!({
+            "id": "msg-helper-field",
+            "agent_id": "default",
+            "created_at": "2026-05-27T11:11:59Z",
+            "kind": "system_tick",
+            "origin": {
+                "kind": "system",
+                "subsystem": "runtime"
+            },
+            "legacy_trust": "trusted_system",
+            "priority": "normal",
+            "body": {
+                "type": "text",
+                "text": "hello"
+            }
+        });
+
+        let err = serde_json::from_value::<MessageEnvelope>(helper_field).unwrap_err();
+        assert!(
+            err.to_string().contains("authority_class"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn legacy_task_recovery_spec_deserializes_from_trust_alias() {
+        let legacy = serde_json::json!({
+            "kind": "child_agent_task",
+            "summary": "run sub-agent",
+            "prompt": "do work",
+            "trust": "trusted_operator",
+            "workspace_mode": "inherit"
+        });
+
+        let spec: TaskRecoverySpec = serde_json::from_value(legacy).unwrap();
+
+        match spec {
+            TaskRecoverySpec::ChildAgentTask {
+                authority_class, ..
+            } => {
+                assert_eq!(authority_class, AuthorityClass::OperatorInstruction);
+            }
+            other => panic!("expected ChildAgentTask, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn legacy_tool_execution_record_deserializes_from_trust_alias() {
+        let legacy = serde_json::json!({
+            "id": "tool-1",
+            "agent_id": "default",
+            "tool_name": "exec_command",
+            "created_at": "2026-04-22T00:00:00Z",
+            "duration_ms": 100,
+            "trust": "trusted_system",
+            "status": "success",
+            "input": {},
+            "output": {},
+            "summary": "ran command"
+        });
+
+        let record: ToolExecutionRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(record.authority_class, AuthorityClass::RuntimeInstruction);
+    }
+
+    #[test]
+    fn legacy_agent_model_state_deserializes_without_resolved_policy_fields() {
+        let legacy = serde_json::json!({
+            "source": "runtime_default",
+            "runtime_default_model": "anthropic/claude-sonnet-4-6",
+            "effective_model": "anthropic/claude-sonnet-4-6",
+            "effective_fallback_models": [],
+            "override_model": null
+        });
+
+        let model: AgentModelState = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(
+            model.effective_model,
+            ModelRouteRef::parse("anthropic@default/claude-sonnet-4-6").unwrap()
+        );
+        assert_eq!(
+            model.resolved_policy.source,
+            crate::model_catalog::ModelMetadataSource::UnknownFallback
+        );
+    }
+
+    #[test]
+    fn task_kind_serializes_as_stable_snake_case_string() {
+        assert_eq!(
+            serde_json::to_value(TaskKind::CommandTask).unwrap(),
+            serde_json::json!("command_task")
+        );
+        assert_eq!(
+            serde_json::to_value(TaskKind::ChildAgentTask).unwrap(),
+            serde_json::json!("child_agent_task")
+        );
+        assert_eq!(
+            serde_json::to_value(TaskKind::SleepJob).unwrap(),
+            serde_json::json!("sleep_job")
+        );
+    }
+
+    #[test]
+    fn legacy_task_kind_records_deserialize_without_losing_workspace_mode() {
+        let legacy = serde_json::json!({
+            "id": "task-legacy",
+            "agent_id": "default",
+            "kind": "worktree_subagent_task",
+            "status": "running",
+            "created_at": "2026-04-22T00:00:00Z",
+            "updated_at": "2026-04-22T00:00:00Z",
+            "parent_message_id": null,
+            "summary": "legacy worktree child",
+            "detail": null,
+            "recovery": null
+        });
+
+        let task: TaskRecord = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(task.kind, TaskKind::WorktreeSubagentTask);
+        assert!(task.is_child_agent_task());
+        assert_eq!(
+            task.child_agent_workspace_mode(),
+            Some(ChildAgentWorkspaceMode::Worktree)
+        );
+        assert_eq!(task.wait_policy(), TaskWaitPolicy::Background);
+        assert!(!task.is_blocking());
+    }
+
+    #[test]
+    fn legacy_child_agent_compat_records_do_not_block_scheduler() {
+        let now = Utc::now();
+        for (kind, recovery) in [
+            (
+                TaskKind::SubagentTask,
+                TaskRecoverySpec::SubagentTask {
+                    summary: "legacy inherited".into(),
+                    prompt: "resume".into(),
+                    authority_class: AuthorityClass::OperatorInstruction,
+                },
+            ),
+            (
+                TaskKind::WorktreeSubagentTask,
+                TaskRecoverySpec::WorktreeSubagentTask {
+                    summary: "legacy worktree".into(),
+                    prompt: "resume".into(),
+                    authority_class: AuthorityClass::OperatorInstruction,
+                },
+            ),
+        ] {
+            let task = TaskRecord {
+                id: format!("task-{kind}"),
+                agent_id: "default".into(),
+                kind,
+                status: TaskStatus::Running,
+                created_at: now,
+                updated_at: now,
+                parent_message_id: None,
+                work_item_id: None,
+                summary: None,
+                detail: Some(serde_json::json!({ "wait_policy": "blocking" })),
+                recovery: Some(recovery),
+            };
+            assert_eq!(task.wait_policy(), TaskWaitPolicy::Background);
+            assert!(!task.is_blocking());
+        }
+    }
+
+    #[test]
+    fn legacy_command_continue_on_result_recovery_is_terminal_reentry_not_blocking() {
+        let recovery = TaskRecoverySpec::CommandTask {
+            summary: "long command".into(),
+            spec: serde_json::from_value(serde_json::json!({
+                "cmd": "sleep 10",
+                "workdir": null,
+                "shell": null,
+                "login": true,
+                "tty": false,
+                "yield_time_ms": 100,
+                "max_output_tokens": null,
+                "accepts_input": false,
+                "continue_on_result": true
+            }))
+            .expect("legacy command task spec"),
+            authority_class: AuthorityClass::OperatorInstruction,
+            promoted_from_exec_command: true,
+        };
+        let task = TaskRecord {
+            id: "task-command".into(),
+            agent_id: "default".into(),
+            kind: TaskKind::CommandTask,
+            status: TaskStatus::Running,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            parent_message_id: None,
+            work_item_id: None,
+            summary: Some("long command".into()),
+            detail: Some(serde_json::json!({
+                "continue_on_result": true,
+                "terminal_reentry": true
+            })),
+            recovery: Some(recovery),
+        };
+
+        assert_eq!(task.wait_policy(), TaskWaitPolicy::Background);
+        assert!(!task.is_blocking());
+        assert!(task.terminal_reentry());
+
+        let snapshot = TaskStatusSnapshot::from_task_record(&task);
+        let command = snapshot.command.expect("command task snapshot");
+        assert_eq!(command.terminal_reentry, Some(true));
+
+        let recovered_task = TaskRecord {
+            detail: None,
+            ..task
+        };
+        assert_eq!(recovered_task.wait_policy(), TaskWaitPolicy::Background);
+        assert!(!recovered_task.is_blocking());
+        assert!(recovered_task.terminal_reentry());
+        assert_eq!(
+            TaskStatusSnapshot::from_task_record(&recovered_task)
+                .command
+                .expect("command task snapshot")
+                .terminal_reentry,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn task_status_snapshot_includes_command_identity_fields() {
+        let cmd = "git status --short";
+        let digest = crate::tool::helpers::command_digest(cmd);
+        let task = TaskRecord {
+            id: "task-command".into(),
+            agent_id: "default".into(),
+            kind: TaskKind::CommandTask,
+            status: TaskStatus::Completed,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            parent_message_id: None,
+            work_item_id: None,
+            summary: Some("check git".into()),
+            detail: Some(serde_json::json!({
+                "cmd": cmd,
+                "cmd_digest": digest.clone(),
+                "workdir": "/tmp/repo",
+                "shell": "/bin/bash",
+                "login": true,
+                "tty": false,
+                "output_path": "/tmp/command-output.txt",
+            })),
+            recovery: Some(TaskRecoverySpec::CommandTask {
+                summary: "check git".into(),
+                spec: CommandTaskSpec {
+                    cmd: cmd.into(),
+                    workdir: Some("/tmp/repo".into()),
+                    shell: Some("/bin/bash".into()),
+                    login: true,
+                    tty: false,
+                    yield_time_ms: 10_000,
+                    max_output_tokens: None,
+                    accepts_input: false,
+                    terminal_reentry: false,
+                },
+                authority_class: AuthorityClass::OperatorInstruction,
+                promoted_from_exec_command: false,
+            }),
+        };
+
+        let snapshot = TaskStatusSnapshot::from_task_record(&task);
+        let command = snapshot.command.expect("command task snapshot");
+
+        assert_eq!(command.cmd.as_deref(), Some(cmd));
+        assert_eq!(command.cmd_digest.as_deref(), Some(digest.as_str()));
+        assert_eq!(command.workdir.as_deref(), Some("/tmp/repo"));
+        assert_eq!(command.shell.as_deref(), Some("/bin/bash"));
+        assert_eq!(command.login, Some(true));
+        assert_eq!(command.tty, Some(false));
+        assert_eq!(
+            command.output_path.as_deref(),
+            Some("/tmp/command-output.txt")
+        );
+    }
+
+    #[test]
+    fn command_snapshot_falls_back_to_recovery_identity() {
+        let cmd = "cargo test --quiet";
+        let task = TaskRecord {
+            id: "task-command".into(),
+            agent_id: "default".into(),
+            kind: TaskKind::CommandTask,
+            status: TaskStatus::Running,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            parent_message_id: None,
+            work_item_id: None,
+            summary: Some("run tests".into()),
+            detail: Some(serde_json::json!({
+                "output_summary": "still running"
+            })),
+            recovery: Some(TaskRecoverySpec::CommandTask {
+                summary: "run tests".into(),
+                spec: CommandTaskSpec {
+                    cmd: cmd.into(),
+                    workdir: Some("/tmp/repo".into()),
+                    shell: Some("/bin/zsh".into()),
+                    login: false,
+                    tty: true,
+                    yield_time_ms: 1_000,
+                    max_output_tokens: None,
+                    accepts_input: false,
+                    terminal_reentry: false,
+                },
+                authority_class: AuthorityClass::OperatorInstruction,
+                promoted_from_exec_command: true,
+            }),
+        };
+
+        let snapshot = TaskStatusSnapshot::from_task_record(&task);
+        let command = snapshot.command.expect("command task snapshot");
+
+        assert_eq!(command.cmd.as_deref(), Some(cmd));
+        assert_eq!(
+            command.cmd_digest,
+            Some(crate::tool::helpers::command_digest(cmd))
+        );
+        assert_eq!(command.workdir.as_deref(), Some("/tmp/repo"));
+        assert_eq!(command.shell.as_deref(), Some("/bin/zsh"));
+        assert_eq!(command.login, Some(false));
+        assert_eq!(command.tty, Some(true));
+        assert_eq!(command.promoted_from_exec_command, Some(true));
+        assert_eq!(command.result_summary.as_deref(), Some("still running"));
+
+        let list_command =
+            CommandTaskStatusSnapshot::identity_from_task_record(&task).expect("list projection");
+        assert_eq!(list_command.cmd.as_deref(), Some(cmd));
+        assert_eq!(
+            list_command.cmd_digest,
+            Some(crate::tool::helpers::command_digest(cmd))
+        );
+        assert_eq!(list_command.promoted_from_exec_command, Some(true));
+        assert_eq!(list_command.result_summary, None);
+        assert_eq!(list_command.output_path, None);
+        assert_eq!(list_command.exit_status, None);
+    }
+
+    #[test]
+    fn child_agent_recovery_is_supervision_not_scheduler_blocking() {
+        let task = TaskRecord {
+            id: "task-child".into(),
+            agent_id: "default".into(),
+            kind: TaskKind::ChildAgentTask,
+            status: TaskStatus::Running,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            parent_message_id: None,
+            work_item_id: None,
+            summary: Some("delegate child".into()),
+            detail: Some(serde_json::json!({ "wait_policy": "blocking" })),
+            recovery: Some(TaskRecoverySpec::ChildAgentTask {
+                summary: "delegate child".into(),
+                prompt: "finish child work".into(),
+                authority_class: AuthorityClass::OperatorInstruction,
+                workspace_mode: ChildAgentWorkspaceMode::Inherit,
+            }),
+        };
+
+        assert_eq!(task.wait_policy(), TaskWaitPolicy::Background);
+        assert!(!task.is_blocking());
+        assert_eq!(
+            task.child_agent_workspace_mode(),
+            Some(ChildAgentWorkspaceMode::Inherit)
+        );
+    }
+
+    #[test]
+    fn runtime_memory_records_default_missing_workspace_id_to_agent_home() {
+        let mut brief = serde_json::to_value(BriefRecord::new(
+            "default",
+            BriefKind::Result,
+            "done",
+            None,
+            None,
+        ))
+        .unwrap();
+        brief.as_object_mut().unwrap().remove("workspace_id");
+        let brief: BriefRecord = serde_json::from_value(brief).unwrap();
+        assert_eq!(brief.workspace_id, AGENT_HOME_WORKSPACE_ID);
+        assert_eq!(brief.turn_index, None);
+
+        let mut work_item =
+            serde_json::to_value(WorkItemRecord::new("default", "ship", WorkItemState::Open))
+                .unwrap();
+        work_item.as_object_mut().unwrap().remove("workspace_id");
+        let work_item: WorkItemRecord = serde_json::from_value(work_item).unwrap();
+        assert_eq!(work_item.workspace_id, AGENT_HOME_WORKSPACE_ID);
+
+        let legacy_work_item = serde_json::json!({
+            "id": "work_legacy",
+            "agent_id": "default",
+            "objective": "ship",
+            "state": "open",
+            "plan_status": "ready",
+            "plan_artifact": {
+                "path": "/tmp/plan.md",
+                "hash": "sha256:abc",
+                "bytes": 12,
+                "updated_at": "2026-04-20T00:00:00Z",
+                "preview": "plan",
+                "preview_complete": true
+            },
+            "created_at": "2026-04-20T00:00:00Z",
+            "updated_at": "2026-04-20T00:00:00Z"
+        });
+        let legacy_work_item: WorkItemRecord = serde_json::from_value(legacy_work_item).unwrap();
+        let legacy_artifact = legacy_work_item.plan_artifact.unwrap();
+        assert_eq!(legacy_artifact.owner_agent_id, "");
+        assert_eq!(legacy_artifact.workspace_id, AGENT_HOME_WORKSPACE_ID);
+        assert_eq!(legacy_artifact.relative_path, PathBuf::new());
+
+        let episode = serde_json::json!({
+            "id": "episode-1",
+            "agent_id": "default",
+            "created_at": "2026-04-20T00:00:00Z",
+            "finalized_at": "2026-04-20T00:01:00Z",
+            "start_turn_index": 1,
+            "end_turn_index": 2,
+            "start_message_count": 1,
+            "end_message_count": 2,
+            "boundary_reason": "hard_turn_cap",
+            "work_summary": "summary",
+            "scope_hints": [],
+            "summary": "episode summary",
+            "working_set_files": [],
+            "commands": [],
+            "verification": [],
+            "decisions": [],
+            "carry_forward": [],
+            "waiting_on": []
+        });
+        let episode: ContextEpisodeRecord = serde_json::from_value(episode).unwrap();
+        assert_eq!(episode.workspace_id, AGENT_HOME_WORKSPACE_ID);
+    }
+
+    #[test]
+    fn legacy_persistent_identity_maps_to_self_owned_public_named() {
+        let legacy = serde_json::json!({
+            "agent_id": "default",
+            "kind": "default",
+            "visibility": "public",
+            "durability": "persistent",
+            "status": "active",
+            "created_at": "2026-04-22T00:00:00Z",
+            "updated_at": "2026-04-22T00:00:00Z"
+        });
+        let record: AgentIdentityRecord = serde_json::from_value(legacy).unwrap();
+        let view = AgentIdentityView::from_record(&record, "default");
+
+        assert_eq!(view.ownership, AgentOwnership::SelfOwned);
+        assert_eq!(view.profile_preset, AgentProfilePreset::PublicNamed);
+        assert!(record.durability.is_some());
+    }
+
+    #[test]
+    fn legacy_ephemeral_child_identity_maps_to_parent_supervised_private_child() {
+        let legacy = serde_json::json!({
+            "agent_id": "tmp_child_demo",
+            "kind": "child",
+            "visibility": "private",
+            "durability": "ephemeral",
+            "status": "active",
+            "parent_agent_id": "default",
+            "delegated_from_task_id": "task-1",
+            "created_at": "2026-04-22T00:00:00Z",
+            "updated_at": "2026-04-22T00:00:00Z"
+        });
+        let record: AgentIdentityRecord = serde_json::from_value(legacy).unwrap();
+        let view = AgentIdentityView::from_record(&record, "default");
+
+        assert_eq!(view.ownership, AgentOwnership::ParentSupervised);
+        assert_eq!(view.profile_preset, AgentProfilePreset::PrivateChild);
+    }
+
+    #[test]
+    fn identity_view_preserves_lineage_separately_from_supervision() {
+        let record = AgentIdentityRecord::new(
+            "release-bot",
+            AgentKind::Named,
+            AgentVisibility::Public,
+            AgentOwnership::SelfOwned,
+            AgentProfilePreset::PublicNamed,
+            None,
+            None,
+        )
+        .with_lineage_parent_agent_id(Some("default".into()));
+        let view = AgentIdentityView::from_record(&record, "default");
+
+        assert_eq!(view.parent_agent_id, None);
+        assert_eq!(view.delegated_from_task_id, None);
+        assert_eq!(view.lineage_parent_agent_id.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn private_child_disables_agent_creation_and_authority_expansion_families() {
+        assert!(!AgentProfilePreset::PrivateChild
+            .allows_tool_capability_family(ToolCapabilityFamily::AgentCreation));
+        assert!(!AgentProfilePreset::PrivateChild
+            .allows_tool_capability_family(ToolCapabilityFamily::AuthorityExpanding));
+        assert!(AgentProfilePreset::PrivateChild
+            .allows_tool_capability_family(ToolCapabilityFamily::LocalEnvironment));
+        assert!(AgentProfilePreset::PrivateChild
+            .allows_tool_capability_family(ToolCapabilityFamily::ExternalTrigger));
+    }
+
+    #[test]
+    fn public_named_keeps_operator_notification_policy_owned_by_runtime() {
+        for family in [
+            ToolCapabilityFamily::CoreAgent,
+            ToolCapabilityFamily::LocalEnvironment,
+            ToolCapabilityFamily::AgentCreation,
+            ToolCapabilityFamily::AuthorityExpanding,
+            ToolCapabilityFamily::ExternalTrigger,
+        ] {
+            assert!(AgentProfilePreset::PublicNamed.allows_tool_capability_family(family));
+        }
+    }
+
+    #[test]
+    fn message_lifecycle_audit_event_omits_body_and_metadata() {
+        let mut message = MessageEnvelope::new(
+            "default",
+            MessageKind::OperatorPrompt,
+            MessageOrigin::Operator { actor_id: None },
+            AuthorityClass::OperatorInstruction,
+            Priority::Normal,
+            MessageBody::Text {
+                text: "large-message-body".repeat(1024),
+            },
+        );
+        message.metadata = Some(serde_json::json!({
+            "large_metadata": "large-message-metadata".repeat(1024)
+        }));
+
+        let payload =
+            serde_json::to_value(MessageLifecycleAuditEvent::from_message(&message)).unwrap();
+
+        assert_eq!(payload["message_id"], message.id);
+        assert!(payload.get("body").is_none());
+        assert!(payload.get("metadata").is_none());
+        assert!(!payload.to_string().contains("large-message-body"));
+        assert!(!payload.to_string().contains("large-message-metadata"));
+    }
+
+    #[test]
+    fn brief_created_audit_event_omits_full_text_and_attachments() {
+        let mut brief = BriefRecord::new(
+            "default",
+            BriefKind::Result,
+            "large-brief-text".repeat(1024),
+            Some("msg-1".into()),
+            Some("task-1".into()),
+        );
+        brief.work_item_id = Some("wi-1".into());
+        brief.attachments = Some(vec![BriefAttachment {
+            kind: "json".into(),
+            name: "large".into(),
+            uri: None,
+            value: Some(serde_json::json!({
+                "large_attachment": "large-attachment-value".repeat(1024)
+            })),
+        }]);
+
+        let payload = serde_json::to_value(BriefCreatedAuditEvent::from_brief(&brief)).unwrap();
+
+        assert_eq!(payload["brief_id"], brief.id);
+        assert_eq!(payload["work_item_id"], "wi-1");
+        assert!(payload.get("text").is_none());
+        assert!(payload.get("text_preview").is_none());
+        assert!(payload.get("attachments").is_none());
+        assert_eq!(
+            payload["content_char_count"].as_u64().unwrap(),
+            brief.text.chars().count() as u64
+        );
+        assert!(!payload.to_string().contains("large-attachment-value"));
+    }
+
+    #[test]
+    fn work_item_lifecycle_audit_event_omits_full_record_payload() {
+        let mut record = WorkItemRecord::new(
+            "default",
+            "large-work-item-objective".repeat(1024),
+            WorkItemState::Open,
+        );
+        record.plan_artifact = Some(WorkItemPlanArtifact {
+            owner_agent_id: "default".into(),
+            workspace_id: AGENT_HOME_WORKSPACE_ID.into(),
+            workspace_alias: None,
+            relative_path: PathBuf::from("plans/wi.md"),
+            path: PathBuf::from("/tmp/plans/wi.md"),
+            hash: "hash".into(),
+            bytes: 42,
+            updated_at: Utc::now(),
+            preview: "large-plan-preview".repeat(1024),
+            preview_complete: true,
+        });
+        record.todo_list.push(TodoItem {
+            text: "large-todo".repeat(1024),
+            state: TodoItemState::Pending,
+        });
+        record.result_summary = Some("result-summary".into());
+
+        let payload = serde_json::to_value(WorkItemLifecycleAuditEvent::from_work_item(
+            "updated", &record,
+        ))
+        .unwrap();
+
+        assert_eq!(payload["work_item_id"], record.id);
+        assert_eq!(payload["action"], "updated");
+        assert!(payload.get("record").is_none());
+        assert!(payload.get("plan_artifact").is_none());
+        assert!(payload.get("todo_list").is_none());
+        assert!(payload["objective_preview"].as_str().unwrap().len() < record.objective.len());
+        assert!(!payload.to_string().contains("large-plan-preview"));
+        assert!(!payload.to_string().contains("large-todo"));
+    }
+
+    #[test]
+    fn task_lifecycle_audit_event_omits_detail_and_recovery() {
+        let long_output = "large-task-output".repeat(1024);
+        let task = TaskRecord {
+            id: "task-large".into(),
+            agent_id: "default".into(),
+            kind: TaskKind::CommandTask,
+            status: TaskStatus::Completed,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            parent_message_id: None,
+            work_item_id: Some("work-1".into()),
+            summary: Some("run command".into()),
+            detail: Some(serde_json::json!({
+                "task_status": "completed",
+                "exit_status": 0,
+                "output_path": "/tmp/task-large.log",
+                "output_summary": long_output,
+                "initial_output": "large-initial-output".repeat(1024)
+            })),
+            recovery: Some(TaskRecoverySpec::CommandTask {
+                summary: "run command".into(),
+                spec: CommandTaskSpec {
+                    cmd: "cargo test".into(),
+                    workdir: None,
+                    shell: None,
+                    login: false,
+                    tty: false,
+                    yield_time_ms: 10_000,
+                    max_output_tokens: None,
+                    accepts_input: false,
+                    terminal_reentry: false,
+                },
+                authority_class: AuthorityClass::OperatorInstruction,
+                promoted_from_exec_command: false,
+            }),
+        };
+
+        let payload = serde_json::to_value(TaskLifecycleAuditEvent::from_task(&task)).unwrap();
+
+        assert_eq!(payload["task_id"], "task-large");
+        assert_eq!(payload["output_path"], "/tmp/task-large.log");
+        assert!(payload.get("detail").is_none());
+        assert!(payload.get("recovery").is_none());
+        assert!(!payload.to_string().contains("large-initial-output"));
+        assert!(payload.to_string().contains("large-task-output"));
+        assert!(
+            payload["output_summary_preview"].as_str().unwrap().len()
+                < "large-task-output".repeat(1024).len()
+        );
+    }
+
+    #[test]
+    fn failure_artifact_deserializes_legacy_shape_with_taxonomy_defaults() {
+        let artifact: FailureArtifact = serde_json::from_value(serde_json::json!({
+            "category": "runtime",
+            "kind": "runtime_error",
+            "summary": "legacy failure",
+            "source_chain": [],
+            "metadata": {}
+        }))
+        .unwrap();
+
+        assert_eq!(artifact.category, FailureArtifactCategory::Runtime);
+        assert_eq!(artifact.kind, "runtime_error");
+        assert_eq!(artifact.domain, None);
+        assert_eq!(artifact.retryable, None);
+        assert_eq!(artifact.recovery_hint, None);
+        assert!(artifact.context.is_empty());
+    }
+
+    #[test]
+    fn tool_execution_audit_event_references_canonical_record_without_output() {
+        let payload = serde_json::to_value(ToolExecutionAuditEvent {
+            tool_call_id: "call-1".into(),
+            tool_execution_id: "tool-1".into(),
+            agent_id: "default".into(),
+            tool_name: "ExecCommand".into(),
+            turn_index: 7,
+            turn_id: Some("turn-1".into()),
+            run_id: Some("run-1".into()),
+            work_item_id: Some("work-1".into()),
+            status: ToolExecutionStatus::Success,
+            duration_ms: 42,
+            summary: "command completed".into(),
+            input: Some(serde_json::json!({"cmd": "cargo test"})),
+            exec_command_cmd: Some("cargo test".into()),
+            exec_command_display: Some("cargo test".into()),
+            exec_command_batch_items: None,
+            exec_command_cost: None,
+            exec_command_disposition: Some("completed".into()),
+            exit_status: Some(0),
+            task_handle: None,
+            error: None,
+            error_kind: None,
+            tool_error: None,
+            reason: None,
+        })
+        .unwrap();
+
+        assert_eq!(payload["tool_execution_id"], "tool-1");
+        assert_eq!(payload["input"]["cmd"], "cargo test");
+        assert!(payload.get("output").is_none());
+        assert!(payload.get("tool_result").is_none());
+        assert!(payload.get("exec_command_result").is_none());
+        assert!(payload.get("apply_patch_result").is_none());
+    }
+}
+
+/// Source kind of a skill root registration.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillRootSourceKind {
+    /// Global user library (~/.agents/skills).
+    UserGlobal,
+    /// Agent-local skills (agent_home/skills).
+    AgentHome,
+    /// Workspace-local skills (workspace/.agents/skills or workspace/.codex/skills).
+    Workspace,
+}
+
+/// Last scan status of a registered skill root.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SkillRootScanStatus {
+    /// Root has never been scanned.
+    NeverScanned,
+    /// Last scan succeeded at the given timestamp.
+    Scanned { at: i64 },
+    /// Last scan failed with an error message.
+    Failed { error: String },
+}
+
+impl Default for SkillRootScanStatus {
+    fn default() -> Self {
+        Self::NeverScanned
+    }
+}
+
+/// Filesystem watcher status for a registered skill root.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SkillRootWatchStatus {
+    /// No watcher has been started for this root.
+    NotWatched,
+    /// A watcher is active for this root.
+    Watching,
+    /// Watcher setup or delivery failed; manual rescan remains available.
+    Failed { error: String },
+}
+
+impl Default for SkillRootWatchStatus {
+    fn default() -> Self {
+        Self::NotWatched
+    }
+}
+/// A registered skill root with metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillRootRegistration {
+    pub source_kind: SkillRootSourceKind,
+    /// Owner agent id for agent-local roots; None for user-global or workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<String>,
+    /// Root path on disk.
+    pub root_path: PathBuf,
+    /// Last scan status.
+    #[serde(default)]
+    pub scan_status: SkillRootScanStatus,
+    /// Filesystem watcher status. Watch failures must not make catalog reads fail.
+    #[serde(default)]
+    pub watch_status: SkillRootWatchStatus,
+}

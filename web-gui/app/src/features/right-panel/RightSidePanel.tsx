@@ -1,0 +1,280 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+
+import type { AgentSummary, RightPanelView, RuntimeConnection, SkillCatalogState, TaskDetailState, ToolExecutionDetailState, WorkItemDetailState, WorkItemSummary } from "../../runtime/types";
+import type { AgentControlAction, AgentDeletionStatus } from "../../runtime/types";
+import type { AgentSessionState, TimelineEventsState } from "../../runtime/runtime-store";
+import type { TaskSummary } from "../../runtime/types";
+import { ActivityInspectorPanel, activityInspectorTitle } from "../inspector/ActivityInspectorPanel";
+import { AgentOverviewPanel, AgentSkillManagerPanel, ToolExecutionDetailPanel, WorkItemDetailPanel } from "./AgentOverviewPanel";
+import { TaskDetailPanel } from "./TaskDetailPanel";
+import { FileBrowserPanel } from "./FileBrowserPanel";
+import { RuntimeTracePanel } from "./RuntimeTracePanel";
+import { TimelineEventsPanel } from "./TimelineEventsPanel";
+import { useTranslation } from "react-i18next";
+
+interface RightSidePanelProps {
+  agent: AgentSummary;
+  deletionStatus?: AgentDeletionStatus | null;
+  connection: RuntimeConnection;
+  skillCatalog?: SkillCatalogState;
+  availableSkillCatalog?: SkillCatalogState;
+  skillCatalogLoading?: boolean;
+  availableSkillCatalogLoading?: boolean;
+  skillCatalogError?: string;
+  workItemDetailsById?: Record<string, WorkItemDetailState>;
+  taskDetailsById?: Record<string, TaskDetailState>;
+  toolExecutionDetailsById?: Record<string, ToolExecutionDetailState>;
+  timelineEvents?: TimelineEventsState;
+  session?: AgentSessionState;
+  view?: RightPanelView;
+  open: boolean;
+  onLoadWorkItemDetail: (workItemId: string) => void;
+  onOpenWorkItemDetail: (workItem: WorkItemSummary) => void;
+  onOpenTask: (task: TaskSummary) => void;
+  onRefreshAgentSkills: () => void;
+  onRefreshAvailableSkills: () => void;
+  onEnableAgentSkill: (name: string) => void;
+  onDisableAgentSkill: (name: string) => void;
+  onOpenSkill: (skillId: string) => void;
+  onShowAgentOverview: () => void;
+  onRefreshTimelineEvents: () => void;
+  onLoadOlderTimelineEvents: () => void;
+  onNavigateBack: () => void;
+  onBrowseFiles: (workspaceId: string, executionRootId?: string) => void;
+  onOpenPlanFile?: (workspaceId: string, filePath: string) => void;
+  onControlAgent?: (action: AgentControlAction) => Promise<void>;
+  onDeleteAgent?: (cascadePrivateChildren: boolean) => Promise<void>;
+  onClose: () => void;
+}
+
+export function RightSidePanel({
+  agent,
+  deletionStatus,
+  connection,
+  skillCatalog,
+  availableSkillCatalog,
+  skillCatalogLoading,
+  availableSkillCatalogLoading,
+  skillCatalogError,
+  workItemDetailsById = {},
+  taskDetailsById = {},
+  toolExecutionDetailsById = {},
+  timelineEvents,
+  session,
+  view,
+  open,
+  onLoadWorkItemDetail,
+  onOpenWorkItemDetail,
+  onOpenTask,
+  onRefreshAgentSkills,
+  onRefreshAvailableSkills,
+  onEnableAgentSkill,
+  onDisableAgentSkill,
+  onOpenSkill,
+  onShowAgentOverview,
+  onRefreshTimelineEvents,
+  onLoadOlderTimelineEvents,
+  onNavigateBack,
+  onBrowseFiles,
+  onOpenPlanFile,
+  onControlAgent,
+  onDeleteAgent,
+  onClose,
+}: RightSidePanelProps) {
+  const { t } = useTranslation();
+  const PANEL_MIN = 320;
+  const PANEL_MAX = typeof window !== "undefined" ? Math.floor(window.innerWidth * 0.7) : 900;
+  const PANEL_KEY = "holon:panelWidth";
+  const panelRef = useRef<HTMLElement>(null);
+  const [dragging, setDragging] = useState(false);
+
+  const applyPanelWidth = useCallback((w: number) => {
+    document.documentElement.style.setProperty("--panel-w", `${w}px`);
+  }, []);
+
+  useEffect(() => {
+    const stored = localStorage.getItem(PANEL_KEY);
+    if (stored) {
+      const w = parseInt(stored, 10);
+      if (!Number.isNaN(w) && w >= PANEL_MIN && w <= PANEL_MAX) {
+        applyPanelWidth(w);
+      }
+    }
+  }, [applyPanelWidth]);
+
+  const startResize = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      setDragging(true);
+      const startX = e.clientX;
+      const startWidth = panelRef.current?.offsetWidth ?? 420;
+      const onMove = (ev: MouseEvent) => {
+        const delta = startX - ev.clientX;
+        const newWidth = Math.max(PANEL_MIN, Math.min(PANEL_MAX, startWidth + delta));
+        applyPanelWidth(newWidth);
+      };
+      const onUp = () => {
+        setDragging(false);
+        const finalWidth = panelRef.current?.offsetWidth ?? 420;
+        localStorage.setItem(PANEL_KEY, String(finalWidth));
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    },
+    [applyPanelWidth],
+  );
+
+  const [showSkillManager, setShowSkillManager] = useState(false);
+  const [showRuntimeTrace, setShowRuntimeTrace] = useState(false);
+  const activeView = view?.agentId === agent.id ? view : { kind: "agent_overview" as const, agentId: agent.id };
+  const skillManagerActive = activeView.kind === "agent_overview" && showSkillManager;
+  const runtimeTraceActive = activeView.kind === "agent_overview" && showRuntimeTrace;
+  const title =
+    runtimeTraceActive
+      ? t("runtimeTrace.title")
+      : skillManagerActive
+      ? t("rightPanel.manageSkills")
+      : activeView.kind === "timeline_events"
+      ? t("timelineEvents.title")
+      : activeView.kind === "activity_inspector"
+      ? activityInspectorTitle(activeView.activity)
+      : activeView.kind === "work_item_detail"
+        ? t("rightPanel.workItemDetail")
+        : activeView.kind === "task_detail"
+          ? t("rightPanel.taskDetail")
+          : activeView.kind === "tool_execution_detail"
+            ? t("inspector.toolExecution")
+          : activeView.kind === "file_browser"
+            ? t("rightPanel.fileBrowser")
+          : t("panel.agentOverview");
+  const detailState = activeView.kind === "work_item_detail" ? workItemDetailsById[activeView.workItem.id] : undefined;
+  const detailWorkItem = activeView.kind === "work_item_detail"
+    ? agent.workItems?.find((wi) => wi.id === activeView.workItem.id)
+      ?? detailState?.workItem
+      ?? activeView.workItem
+    : undefined;
+  const taskDetailState = activeView.kind === "task_detail" ? activeView.detailState ?? taskDetailsById[activeView.task.id] : undefined;
+  const toolExecutionDetailState = activeView.kind === "tool_execution_detail"
+    ? activeView.detailState ?? toolExecutionDetailsById[activeView.toolExecutionId]
+    : undefined;
+
+  useEffect(() => {
+    setShowSkillManager(false);
+    setShowRuntimeTrace(false);
+  }, [agent.id, activeView.kind]);
+
+  const openSkillManager = () => {
+    setShowSkillManager(true);
+    if (!availableSkillCatalogLoading && (availableSkillCatalog?.catalog.length ?? 0) === 0) {
+      onRefreshAvailableSkills();
+    }
+  };
+
+  return (
+    <aside className="side-panel" aria-label={t("rightPanel.contextPanel")} hidden={!open} ref={panelRef}>
+      {open ? (
+        <div className="panel-resizer" data-dragging={dragging} onMouseDown={startResize} />
+      ) : null}
+      <div className="panel-header">
+        <div>
+          <span className="eyebrow">{t("rightPanel.contextPanel")}</span>
+          <strong>{title}</strong>
+        </div>
+        <div className="panel-actions">
+          {activeView.kind !== "agent_overview" || skillManagerActive ? (
+            <button
+              type="button"
+              aria-label={t("rightPanel.showOverview")}
+              onClick={() => {
+                setShowSkillManager(false);
+                setShowRuntimeTrace(false);
+                onShowAgentOverview();
+              }}
+            >
+              {t("rightPanel.agentOverview")}
+            </button>
+          ) : null}
+          {activeView.kind === "agent_overview" ? (
+            <button
+              type="button"
+              aria-label={t("runtimeTrace.open")}
+              onClick={() => {
+                setShowSkillManager(false);
+                setShowRuntimeTrace((current) => !current);
+              }}
+            >
+              {runtimeTraceActive ? t("rightPanel.agentOverview") : t("runtimeTrace.shortTitle")}
+            </button>
+          ) : null}
+          <button type="button" aria-label={t("panel.closePanel")} onClick={onClose}>
+            ×
+          </button>
+        </div>
+      </div>
+      <div className="panel-body">
+        {runtimeTraceActive ? (
+          <RuntimeTracePanel agentId={agent.id} connection={connection} />
+        ) : skillManagerActive ? (
+          <AgentSkillManagerPanel
+            skillCatalog={skillCatalog}
+            availableSkillCatalog={availableSkillCatalog}
+            skillCatalogLoading={skillCatalogLoading}
+            availableSkillCatalogLoading={availableSkillCatalogLoading}
+            onRefreshAvailableSkills={onRefreshAvailableSkills}
+            onEnableAgentSkill={onEnableAgentSkill}
+          />
+        ) : activeView.kind === "timeline_events" ? (
+          <TimelineEventsPanel
+            agentId={agent.id}
+            timelineEvents={timelineEvents}
+            projection={session}
+            onRefresh={onRefreshTimelineEvents}
+            onLoadOlder={onLoadOlderTimelineEvents}
+          />
+        ) : activeView.kind === "activity_inspector" ? (
+          <ActivityInspectorPanel activity={activeView.activity} detailState={activeView.detailState} />
+        ) : activeView.kind === "work_item_detail" && detailWorkItem ? (
+          <div className="inspector-stack">
+            <WorkItemDetailPanel workItem={detailWorkItem} detailState={detailState} onOpenPlanFile={onOpenPlanFile} />
+          </div>
+        ) : activeView.kind === "task_detail" ? (
+          <div className="inspector-stack">
+            <TaskDetailPanel
+              task={activeView.task}
+              detailState={taskDetailState}
+              agentId={agent.id}
+              onOpenWorkItem={onOpenWorkItemDetail}
+            />
+          </div>
+        ) : activeView.kind === "tool_execution_detail" ? (
+          <div className="inspector-stack">
+            <ToolExecutionDetailPanel toolExecutionId={activeView.toolExecutionId} toolName={activeView.toolName} detailState={toolExecutionDetailState} relatedStateObjectRef={activeView.relatedStateObjectRef} onOpenWorkItem={onOpenWorkItemDetail} onOpenTask={onOpenTask} onBrowseFiles={onBrowseFiles} />
+          </div>
+        ) : activeView.kind === "file_browser" ? (
+          <FileBrowserPanel key={`${activeView.workspaceId}:${activeView.initialFilePath ?? ""}`} workspaceId={activeView.workspaceId} executionRootId={activeView.executionRootId} initialPath={activeView.initialPath} initialFilePath={activeView.initialFilePath} workspaceLabel={agent.attachedWorkspaces?.find((ws) => ws.workspaceId === activeView.workspaceId)?.name} onClose={onNavigateBack} />
+        ) : (
+          <AgentOverviewPanel
+            agent={agent}
+            deletionStatus={deletionStatus}
+            skillCatalog={skillCatalog}
+            availableSkillCatalog={availableSkillCatalog}
+            skillCatalogLoading={skillCatalogLoading}
+            skillCatalogError={skillCatalogError}
+            onLoadWorkItemDetail={onLoadWorkItemDetail}
+            onOpenWorkItemDetail={onOpenWorkItemDetail}
+            onOpenTask={onOpenTask}
+            onRefreshAgentSkills={onRefreshAgentSkills}
+            onDisableAgentSkill={onDisableAgentSkill}
+            onOpenSkill={onOpenSkill}
+            onOpenSkillManager={openSkillManager}
+            onBrowseFiles={onBrowseFiles}
+            onControlAgent={onControlAgent}
+            onDeleteAgent={onDeleteAgent}
+          />
+        )}
+      </div>
+    </aside>
+  );
+}

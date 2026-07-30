@@ -1,212 +1,180 @@
-.PHONY: build build-host test test-all clean run-example test-agent help release-build validate-schema test-contract build-agent-bundle build-skills-package validate-skills-package test-run-safety
+.PHONY: help web web-ci transport-types transport-types-check snapshots-check snapshots-refresh build all test test-resource-lint test-concurrent test-concurrent-repeat test-live test-live-openai test-live-anthropic test-live-codex test-live-xai test-live-images test-live-runtime docker-build docker-smoke docker-e2e docker-e2e-validate docker-live-acceptance fmt fmt-check lint check ci run clean
 
-# Project variables
-BINARY_NAME=holon
-BIN_DIR=bin
-GO_FILES=$(shell find . -type f -name '*.go')
-AGENT_DIR=agents/claude
+WEB_DIR := web-gui/app
+OPENAPI_TOOLS_DIR := web-gui/openapi-tools
+CONCURRENT_REPEATS ?= 3
+DOCKER_IMAGE ?= holon:dev
+CONCURRENT_LIFECYCLE_TESTS := \
+	runtime_tasks \
+	runtime_waiting_and_reactivation \
+	runtime_waiting_and_delivery_regressions \
+	http_events \
+	http_tasks
+CONCURRENT_TESTS := $(CONCURRENT_LIFECYCLE_TESTS) wt204_parallel_worktree_workflow
+ANTHROPIC_COMPATIBLE_LIVE_TESTS := \
+	live_deepseek_anthropic_accepts_context_management \
+	live_xiaomi_token_plan_accepts_context_management \
+	live_xiaomi_anthropic_accepts_context_management \
+	live_xiaomi_token_plan_anthropic_accepts_context_management \
+	live_zai_anthropic_accepts_context_management \
+	live_zai_anthropic_builtin_web_search_reports_prime_backend \
+	live_bigmodel_anthropic_accepts_context_management \
+	live_bigmodel_anthropic_builtin_web_search_reports_backend \
+	live_minimax_anthropic_accepts_context_management
 
-# Version variables (injected via ldflags)
-VERSION?=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
-COMMIT?=$(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-BUILD_DATE?=$(shell date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown")
-LDFLAGS=-ldflags "-X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildDate=$(BUILD_DATE)"
+help: ## Show this help message
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'
 
-# Default target
-all: build
+web: ## Build the web GUI (requires Node.js 24). Produces web-gui/app/dist
+	@if [ -s "$$HOME/.nvm/nvm.sh" ]; then . "$$HOME/.nvm/nvm.sh" && nvm use; fi; \
+	cd $(WEB_DIR) && npm ci && npm run build
 
-## build: Build the holon runner CLI
-build: build-host
+web-ci: ## Test and build the web GUI with one clean dependency install
+	@if [ -s "$$HOME/.nvm/nvm.sh" ]; then . "$$HOME/.nvm/nvm.sh" && nvm use; fi; \
+	cd $(OPENAPI_TOOLS_DIR) && npm ci && npm run check && \
+	cd ../../$(WEB_DIR) && npm ci && npm test && npm run build
 
-## build-host: Build runner CLI for current OS/Arch with version info
-build-host:
-	@echo "Building runner CLI (Version: $(VERSION), Commit: $(COMMIT))..."
-	@echo "Generating builtin skills..."
-	@go generate ./pkg/builtin
-	@mkdir -p $(BIN_DIR)
-	go build $(LDFLAGS) -o $(BIN_DIR)/$(BINARY_NAME) ./cmd/holon
+transport-types: ## Refresh OpenAPI and generated TypeScript transport types
+	cargo test --test openapi_snapshot refresh_openapi_snapshot -- --ignored
+	@if [ -s "$$HOME/.nvm/nvm.sh" ]; then . "$$HOME/.nvm/nvm.sh" && nvm use; fi; \
+	cd $(OPENAPI_TOOLS_DIR) && npm ci && npm run generate
 
-## release-build: Build binaries for multiple platforms
-release-build:
-	@echo "Building release binaries..."
-	@echo "Generating builtin skills..."
-	@go generate ./pkg/builtin
-	@mkdir -p $(BIN_DIR)
-	@echo "Building for linux/amd64..."
-	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o $(BIN_DIR)/$(BINARY_NAME)-linux-amd64 ./cmd/holon
-	@echo "Building for darwin/amd64..."
-	GOOS=darwin GOARCH=amd64 go build $(LDFLAGS) -o $(BIN_DIR)/$(BINARY_NAME)-darwin-amd64 ./cmd/holon
-	@echo "Building for darwin/arm64..."
-	GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o $(BIN_DIR)/$(BINARY_NAME)-darwin-arm64 ./cmd/holon
-	@echo "Release binaries built successfully"
+transport-types-check: ## Check OpenAPI and generated TypeScript transport type drift
+	cargo test --test openapi_snapshot
+	@if [ -s "$$HOME/.nvm/nvm.sh" ]; then . "$$HOME/.nvm/nvm.sh" && nvm use; fi; \
+	cd $(OPENAPI_TOOLS_DIR) && npm ci && npm run check
 
-## test: Run all project tests with structured output
-test: test-go
+snapshots-check: ## Check CLI, OpenAPI, HTTP route, runtime status, and model tool schema snapshots
+	cargo test --test cli_snapshot
+	cargo test --test openapi_snapshot
+	cargo test --test http_route_snapshot
+	cargo test --test runtime_status_inventory_snapshot
+	cargo test --test tool_schema_inventory_snapshot
 
-## test-go: Run Go tests with structured output
-test-go:
-	@echo "Running Go tests..."
-	@echo "Generating builtin skills..."
-	@go generate ./pkg/builtin
-	@echo "Checking embedded skills drift..."
-	@diff -qr --exclude=".git-commit" skills pkg/builtin/skills > /dev/null 2>&1 || (echo "ERROR: Embedded skills (pkg/builtin/skills) differ from source (skills/)"; echo "This means pkg/builtin/skills is not up to date."; echo "Please run 'go generate ./pkg/builtin' to regenerate."; exit 1)
-	@if command -v gotestfmt > /dev/null 2>&1; then \
-		go test ./... -json -v 2>&1 | gotestfmt; \
-	else \
-		echo "gotestfmt not found, using plain output (install: go install github.com/gotesttools/gotestfmt/v2/cmd/gotestfmt@latest)"; \
-		go test ./... -v; \
-	fi
+snapshots-refresh: ## Refresh CLI, OpenAPI, HTTP route, runtime status, and model tool schema snapshots
+	cargo test --test cli_snapshot refresh_cli_snapshot -- --ignored
+	cargo test --test openapi_snapshot refresh_openapi_snapshot -- --ignored
+	cargo test --test http_route_snapshot refresh_http_route_inventory_snapshot -- --ignored
+	cargo test --test runtime_status_inventory_snapshot refresh_runtime_status_enum_inventory_snapshot -- --ignored
+	cargo test --test tool_schema_inventory_snapshot refresh_tool_schema_inventory_snapshot -- --ignored
 
-## test-raw: Run Go tests without gotestfmt (plain output)
-test-raw:
-	@echo "Running Go tests with plain output..."
-	@echo "Generating builtin skills..."
-	@go generate ./pkg/builtin
-	@echo "Checking embedded skills drift..."
-	@diff -qr --exclude=".git-commit" skills pkg/builtin/skills > /dev/null 2>&1 || (echo "ERROR: Embedded skills (pkg/builtin/skills) differ from source (skills/)"; echo "This means pkg/builtin/skills is not up to date."; echo "Please run 'go generate ./pkg/builtin' to regenerate."; exit 1)
-	go test ./... -v
+build: ## Build all Rust targets (cargo build --all-targets)
+	cargo build --all-targets
 
-## test-unit: Run unit tests (non-integration) with structured output
-test-unit:
-	@echo "Running unit tests..."
-	@echo "Generating builtin skills..."
-	@go generate ./pkg/builtin
-	@echo "Checking embedded skills drift..."
-	@diff -qr --exclude=".git-commit" skills pkg/builtin/skills > /dev/null 2>&1 || (echo "ERROR: Embedded skills (pkg/builtin/skills) differ from source (skills/)"; echo "This means pkg/builtin/skills is not up to date."; echo "Please run 'go generate ./pkg/builtin' to regenerate."; exit 1)
-	@if command -v gotestfmt > /dev/null 2>&1; then \
-		go test $$(go list ./... | grep -v '^github.com/holon-run/holon/tests/') -short -json -v 2>&1 | gotestfmt; \
-	else \
-		echo "gotestfmt not found, using plain output (install: go install github.com/gotesttools/gotestfmt/v2/cmd/gotestfmt@latest)"; \
-		go test $$(go list ./... | grep -v '^github.com/holon-run/holon/tests/') -short -v; \
-	fi
+all: web build ## Build everything: web GUI then Rust
 
-## test-unit-raw: Run unit tests (non-integration) without gotestfmt
-test-unit-raw:
-	@echo "Running unit tests with plain output..."
-	@echo "Generating builtin skills..."
-	@go generate ./pkg/builtin
-	@echo "Checking embedded skills drift..."
-	@diff -qr --exclude=".git-commit" skills pkg/builtin/skills > /dev/null 2>&1 || (echo "ERROR: Embedded skills (pkg/builtin/skills) differ from source (skills/)"; echo "This means pkg/builtin/skills is not up to date."; echo "Please run 'go generate ./pkg/builtin' to regenerate."; exit 1)
-	go test $$(go list ./... | grep -v '^github.com/holon-run/holon/tests/') -short -v
+test: ## Run the full Rust test suite serially
+	cargo test --all-targets -- --test-threads=1
 
-## test-agent: Run agent TypeScript tests
-test-agent:
-	@echo "Running TypeScript agent tests..."
-	cd $(AGENT_DIR) && npm install && npm run build && npm test
+test-resource-lint: ## Audit permanent test temp directories against the reasoned allowlist
+	python3 scripts/check-test-temp-resources.py
 
-## build-agent-bundle: Build agent bundle from repo sources
-build-agent-bundle:
-	@echo "Building agent bundle from repo sources..."
-	@cd $(AGENT_DIR) && npm ci && npm run bundle
+test-concurrent: ## Run runtime lifecycle integration tests with Rust's default test threads
+	@set -eu; \
+	for test_target in $(CONCURRENT_TESTS); do \
+		cargo test --test "$$test_target"; \
+	done
 
-## test-all: Run all project tests (Go + agent)
-test-all: test-agent test-go
+test-concurrent-repeat: ## Repeat core concurrent lifecycle tests (CONCURRENT_REPEATS=3)
+	@set -eu; \
+	repeat=1; \
+	while [ "$$repeat" -le "$(CONCURRENT_REPEATS)" ]; do \
+		echo "Concurrent lifecycle test pass $$repeat/$(CONCURRENT_REPEATS)"; \
+		for test_target in $(CONCURRENT_LIFECYCLE_TESTS); do \
+			cargo test --test "$$test_target"; \
+		done; \
+		repeat=$$((repeat + 1)); \
+	done
 
-## validate-schema: Validate JSON schema syntax
-validate-schema:
-	@echo "Validating run manifest JSON schema..."
-	@which ajv > /dev/null 2>&1 || (echo "ajv not found. Install with: npm install -g ajv-cli" && exit 1)
-	@ajv compile -s schemas/run.manifest.schema.json
-	@echo "Schema validation passed"
+test-live: ## Run the baseline and configured-provider live smoke tests
+	@printf '%s\n' \
+		'Requires configured provider credentials and network access.' \
+		'Runs two configured-chain baseline probes plus one smoke request per configured provider.' \
+		'Test binaries: live_llm_baseline (selected tests), live_provider_smoke'
+	cargo test --test live_llm_baseline live_llm_baseline_configured_chain_smoke -- --ignored --nocapture
+	cargo test --test live_llm_baseline live_llm_baseline_tool_roundtrip -- --ignored --nocapture
+	cargo test --test live_provider_smoke -- --ignored --nocapture
 
-## test-contract: Run manifest contract tests (backward compatibility)
-test-contract:
-	@echo "Running manifest contract tests..."
-	@go test ./pkg/api/v1/... -v -run TestHolonManifest
+test-live-openai: ## Run OpenAI Responses and Chat Completions live tests
+	@printf '%s\n' \
+		'Requires configured OpenAI credentials and network access.' \
+		'Test binaries: live_openai, live_openai_chat_completions'
+	cargo test --test live_openai -- --ignored --nocapture
+	cargo test --test live_openai_chat_completions -- --ignored --nocapture
 
-## test-run-safety: Run runtime sandbox safety regression tests
-test-run-safety:
-	@echo "Running runtime sandbox safety tests..."
-	@echo "Generating builtin skills..."
-	@go generate ./pkg/builtin
-	@echo "Checking embedded skills drift..."
-	@diff -qr --exclude=".git-commit" skills pkg/builtin/skills > /dev/null 2>&1 || (echo "ERROR: Embedded skills (pkg/builtin/skills) differ from source (skills/)"; echo "This means pkg/builtin/skills is not up to date."; echo "Please run 'go generate ./pkg/builtin' to regenerate."; exit 1)
-	@go test ./pkg/runtime/docker -v -run 'Test(BuildContainerHostConfig|InputMountReadOnly|WorkspaceAndOutputMountsReadWrite|ValidateMountTargets|ValidateRequiredArtifacts|RedactLogs_)'
+test-live-anthropic: ## Run Anthropic and Anthropic-compatible live tests
+	@printf '%s\n' \
+		'Requires Anthropic/Claude auth plus any provider-specific credentials exercised by the compatible suite.' \
+		'Compatible probes include DeepSeek, Xiaomi, Z.ai, BigModel, and MiniMax; the cache matrix may be high cost.' \
+		'Test binaries: live_llm_baseline (Anthropic cache test), live_anthropic, live_anthropic_cache, live_anthropic_compatible'
+	cargo test --test live_llm_baseline live_llm_baseline_anthropic_prompt_cache_hit -- --ignored --nocapture
+	cargo test --test live_anthropic -- --ignored --nocapture
+	cargo test --test live_anthropic_cache -- --ignored --nocapture
+	@set -eu; \
+	for live_test in $(ANTHROPIC_COMPATIBLE_LIVE_TESTS); do \
+		cargo test --test live_anthropic_compatible "$$live_test" -- --exact --ignored --nocapture; \
+	done
 
-## install-gotestfmt: Install gotestfmt tool for structured test output
-install-gotestfmt:
-	@echo "Installing gotestfmt..."
-	@go install github.com/gotesttools/gotestfmt/v2/cmd/gotestfmt@latest
-	@echo "gotestfmt installed successfully"
+test-live-codex: ## Run OpenAI Codex live tests
+	@printf '%s\n' \
+		'Requires Codex CLI ChatGPT auth state, network access, and image support for the image probe.' \
+		'Test binaries: live_codex, live_openai_codex_compact'
+	cargo test --test live_codex -- --ignored --nocapture
+	cargo test --test live_openai_codex_compact -- --ignored --nocapture
 
-## clean: Remove build artifacts
-clean:
-	@echo "Cleaning up..."
-	rm -rf $(BIN_DIR)
-	rm -rf holon-output*
-	rm -rf _testwork
-	rm -rf $(AGENT_DIR)/dist
+test-live-xai: ## Run xAI live tests
+	@printf '%s\n' \
+		'Requires configured xAI credentials and network access.' \
+		'Test binary: live_xai'
+	cargo test --test live_xai -- --ignored --nocapture
 
-## test-integration: Run integration tests with structured output (requires Docker)
-test-integration: build build-agent-bundle
-	@echo "Running integration tests..."
-	@if command -v gotestfmt > /dev/null 2>&1; then \
-		go test ./tests/integration/... -json -v 2>&1 | gotestfmt; \
-	else \
-		echo "gotestfmt not found, using plain output (install: go install github.com/gotesttools/gotestfmt/v2/cmd/gotestfmt@latest)"; \
-		go test ./tests/integration/... -v; \
-	fi
+test-live-images: ## Run provider-backed image and vision live tests
+	@printf '%s\n' \
+		'Requires an OpenAI-compatible vision credential and a Volcengine Ark image credential, plus network access.' \
+		'Test binaries: live_view_image, live_volcengine_image'
+	cargo test --test live_view_image -- --ignored --nocapture
+	cargo test --test live_volcengine_image -- --ignored --nocapture
 
-## test-integration-raw: Run integration tests without gotestfmt (plain output)
-test-integration-raw: build build-agent-bundle
-	@echo "Running integration tests with plain output..."
-	go test ./tests/integration/... -v
+test-live-runtime: ## Run end-to-end runtime and workspace-tool live tests
+	@printf '%s\n' \
+		'Requires the selected continuity/workspace model credentials, network access, and git.' \
+		'Defaults: deepseek-anthropic/deepseek-v4-pro for continuity; configured default model for workspace tools.' \
+		'Test binaries: live_prompt_continuity, live_workspace_tools'
+	cargo test --test live_prompt_continuity -- --ignored --nocapture
+	cargo test --test live_workspace_tools -- --ignored --nocapture
 
-## test-integration-artifacts: Run integration tests and capture artifacts on failure
-test-integration-artifacts: build build-agent-bundle
-	@echo "Running integration tests with artifact capture..."
-	@mkdir -p _testwork
-	@go test ./tests/integration/... -v -work
+docker-build: ## Build the local Holon runtime image
+	docker build --tag "$(DOCKER_IMAGE)" .
 
-## test-serve-tui-smoke: Run serve TUI/RPC smoke tests
-test-serve-tui-smoke:
-	@echo "Running serve TUI/RPC smoke tests..."
-	go test ./pkg/tui -run '^TestTUISmoke_' -v
+docker-smoke: docker-build ## Start the image and verify the real service readiness boundary
+	scripts/docker-smoke.sh "$(DOCKER_IMAGE)"
 
-## run-example: Run the fix-bug example (requires ANTHROPIC_API_KEY)
-run-example: build
-	@echo "Running fix-bug example..."
-	cd agents/claude && npm install && npm run build
-	./$(BIN_DIR)/$(BINARY_NAME) run --spec examples/fix-bug.yaml --image golang:1.22 --workspace . --output ./holon-output-fix --runtime-mode dev --runtime-dev-agent-source ./agents/claude
+docker-e2e: docker-build ## Run the release core Docker E2E suite with a real LLM
+	python3 scripts/docker-e2e.py --image "$(DOCKER_IMAGE)" --skip-build --suite core
 
-## help: Display help information
-help:
-	@echo "Usage: make [target]"
-	@echo ""
-	@echo "Targets:"
-	@grep -E '^##' Makefile | sed -e 's/## //'
+docker-e2e-validate: ## Validate the Docker E2E manifest and runner unit tests
+	python3 scripts/docker-e2e.py --validate-manifest
+	python3 -m unittest tests.test_docker_e2e_runner tests.test_scheduler_drill
 
-## test-skill-mode: Run skill-mode shell tests (no network/LLM required)
-test-skill-mode:
-	@echo "Running skill-mode shell tests..."
-	@./tests/skill-mode/test_helper_drift.sh
-	@./tests/skill-mode/test_collector.sh
-	@./tests/skill-mode/test_publisher.sh
+docker-live-acceptance: docker-e2e ## Compatibility alias for docker-e2e
 
-## test-skill-mode-collector: Run collector script tests only
-test-skill-mode-collector:
-	@echo "Running collector script tests..."
-	@./tests/skill-mode/test_collector.sh
+fmt:
+	cargo fmt
 
-## test-skill-mode-publisher: Run publisher script tests only
-test-skill-mode-publisher:
-	@echo "Running publisher script tests..."
-	@./tests/skill-mode/test_publisher.sh
+fmt-check: ## Check formatting without modifying files
+	cargo fmt --all -- --check
 
-## build-skills-package: Build skill package for distribution
-build-skills-package:
-	@echo "Building skill package..."
-	@./scripts/build-skills-package.sh
+lint: ## Run clippy
+	cargo clippy --all-targets
 
-## build-skills-package-release: Build skill package for release (uses git tag)
-build-skills-package-release:
-	@echo "Building skill package for release..."
-	@VERSION=$$(git describe --tags --exact-match 2>/dev/null || echo "v0.0.0-dev") \
-		./scripts/build-skills-package.sh
+check: ## Quick local check (formatting + clippy + compile check)
+	RUSTFLAGS="-D warnings" cargo check --all-targets
 
-## validate-skills-package: Validate skill package format
-validate-skills-package:
-	@echo "Validating skill package schema..."
-	@which ajv > /dev/null 2>&1 || (echo "ajv not found. Install with: npm install -g ajv-cli" && exit 1)
-	@ajv compile -s schemas/skill-package.schema.json
-	@echo "Skill package schema validation passed"
+ci: web-ci fmt-check lint build snapshots-check test-resource-lint test ## Run the full CI checks locally
+
+run:
+	cargo run -- serve
+
+clean: ## Remove Rust build artifacts
+	cargo clean

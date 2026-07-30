@@ -2,32 +2,32 @@
 
 This directory stores manual end-to-end test cases for Holon.
 
-Each subdirectory under `e2e-manual/` is one test case.
+These cases are documentation-style tests: they define the setup, trigger,
+expected behavior, and evidence to collect for workflows that depend on live
+GitHub repositories, tokens, external model providers, and hosted services.
 
 ## Structure
 
 - `CASE.md`: Human-readable test case definition and pass/fail criteria.
-- `run.sh`: Optional script to execute the test flow.
-- `collect.sh`: Optional script to collect logs and evidence.
-- `artifacts/`: Optional local output directory for collected evidence (gitignored).
+- `run.sh`: Optional helper script for the live flow.
+- `collect.sh`: Optional helper script to collect logs and artifacts.
+- `artifacts/`: Optional local evidence directory, ignored by git.
 
-## Case List
+## Current Cases
 
-- `serve-github-issue-solve`: Validate `holon serve` issue-comment trigger flow end-to-end.
-- `serve-autonomous-project-drive`: Validate `holon serve` + `message send` for autonomous milestone decomposition and `@holonbot` execution trigger.
-- `run-pptx-remote-skill`: Validate `holon run` auto-init + remote `pptx` skill + local agent bundle.
-- `solve-holon-test-issue`: Validate `holon solve issue` against `holon-run/holon-test` (default workspace prepare path).
-- `solve-holon-test-review-pr`: Validate `holon solve pr --skills github-review` from within a local `holon-test` clone.
-- `solve-holon-test-fix-pr`: Validate `holon solve pr --skills github-pr-fix` with explicit `--workspace`.
-
-## Add a New Case
-
-1. Copy `e2e-manual/_template` to a new case directory.
-2. Fill `CASE.md` with concrete repo, trigger, and expectations.
-3. Implement or adjust `run.sh` and `collect.sh` if automation is useful.
-4. Ensure generated outputs are written to `artifacts/`.
+- `holon-test-issue-resolve`: Validate `holon solve` can resolve a live
+  `holon-run/holon-test` issue through the GitHub Actions reusable workflow and
+  publish a PR.
+- `holon-test-review-pr`: Validate `holon solve` can review a live
+  `holon-run/holon-test` PR through the GitHub Actions reusable workflow and
+  publish a review/comment.
+- `holon-test-fix-pr`: Validate `holon solve` can fix a live
+  `holon-run/holon-test` PR through the GitHub Actions reusable workflow and
+  push a follow-up commit.
 
 ## Failure Classification
 
-- `infra-fail`: Event or runtime pipeline is broken (webhook, channel, runtime startup).
-- `agent-fail`: Pipeline works but agent behavior misses expected outcome.
+- `infra-fail`: GitHub Actions, auth, checkout, token broker, model provider,
+  or runtime startup failed.
+- `agent-fail`: The workflow and runtime completed, but the agent missed the
+  expected GitHub side effect.

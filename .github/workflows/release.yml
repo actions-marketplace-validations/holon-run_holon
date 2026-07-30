@@ -1,3 +1,4 @@
+
 name: Release
 
 on:
@@ -6,164 +7,299 @@ on:
       - 'v*.*.*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  e2e-gate:
+    name: Verify Release E2E gate
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      candidate_image: ${{ steps.gate.outputs.candidate_image }}
+      e2e_run_id: ${{ steps.gate.outputs.e2e_run_id }}
     steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+      - name: Verify matching Release E2E attestation
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          sha="${GITHUB_SHA}"
+          artifact_name="release-e2e-attestation-${sha}-${tag}"
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          mkdir -p release-e2e-gate
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.24'
+          runs_json="$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${api}/actions/workflows/release-e2e.yml/runs?event=workflow_dispatch&status=success&per_page=100")"
 
-    - name: Set up Node
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20'
+          artifact_url=""
+          e2e_run_id=""
+          for run_id in $(jq -r --arg sha "${sha}" '.workflow_runs[] | select(.head_sha == $sha and .conclusion == "success") | .id' <<<"${runs_json}"); do
+            artifacts_json="$(curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${api}/actions/runs/${run_id}/artifacts?per_page=100")"
+            artifact_url="$(jq -r --arg name "${artifact_name}" '.artifacts[] | select(.name == $name and .expired == false) | .archive_download_url' <<<"${artifacts_json}" | head -n1)"
+            if [ -n "${artifact_url}" ]; then
+              e2e_run_id="${run_id}"
+              break
+            fi
+          done
 
-    - name: Build Agent Bundle
-      run: |
-        cd agents/claude
-        npm ci
-        npm run bundle
+          if [ -z "${artifact_url}" ]; then
+            echo "No successful Release E2E attestation artifact named ${artifact_name} was found for ${sha}." >&2
+            exit 1
+          fi
 
-    - name: Extract version info
-      id: version
-      run: |
-        VERSION=${GITHUB_REF#refs/tags/}
-        echo "version=${VERSION}" >> $GITHUB_OUTPUT
-        echo "commit=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-        echo "build_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_OUTPUT
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -o release-e2e-gate/attestation.zip \
+            "${artifact_url}"
+          unzip -p release-e2e-gate/attestation.zip release-e2e-attestation.json \
+            > release-e2e-gate/release-e2e-attestation.json
 
-    - name: Build for Linux amd64
-      run: |
-        make release-build
-      env:
-        VERSION: ${{ steps.version.outputs.version }}
-        COMMIT: ${{ steps.version.outputs.commit }}
-        BUILD_DATE: ${{ steps.version.outputs.build_date }}
+          jq -e \
+            --arg tag "${tag}" \
+            --arg sha "${sha}" \
+            --arg run_id "${e2e_run_id}" \
+            '.schema_version == 1
+             and .release_tag == $tag
+             and .git_sha == $sha
+             and (.workflow_run_id | tostring) == $run_id
+             and .status == "pass"
+             and (.image.ref | contains("@sha256:"))
+             and (.model_route | length > 0)' \
+            release-e2e-gate/release-e2e-attestation.json >/dev/null
 
-    - name: Create release archives
-      run: |
-        cd bin
-        for binary in holon-*; do
-          # Create a temporary directory for the tarball
-          tmpdir=$(mktemp -d)
-          # Copy the binary as 'holon' (no platform suffix)
-          cp "${binary}" "$tmpdir/holon"
-          # Create the tarball with the binary named 'holon' inside
-          tar -czf "${binary}.tar.gz" -C "$tmpdir" holon
-          # Clean up
-          rm -rf "$tmpdir"
-        done
+          candidate_image="$(jq -r '.image.ref' release-e2e-gate/release-e2e-attestation.json)"
+          echo "candidate_image=${candidate_image}" >> "$GITHUB_OUTPUT"
+          echo "e2e_run_id=${e2e_run_id}" >> "$GITHUB_OUTPUT"
 
-    - name: Generate checksums
-      run: |
-        cd bin
-        sha256sum *.tar.gz > checksums.txt
+      - name: Upload verified release E2E attestation
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-release-e2e-attestation
+          path: release-e2e-gate/release-e2e-attestation.json
+          if-no-files-found: error
 
-    - name: Update Homebrew Formula
-      run: |
-        bash ./scripts/update-homebrew-formula.sh "${{ steps.version.outputs.version }}"
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    needs: e2e-gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: holon-linux-amd64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: holon-darwin-amd64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: holon-darwin-arm64
 
-    - name: Push to Homebrew tap repository
-      if: env.HOMEBREW_TAP_TOKEN != ''
-      env:
-        HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-      run: |
-        # Configure Git credentials using the token from the environment
-        git config --global credential.helper store
-        echo "https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com" > ~/.git-credentials
+    steps:
+      - uses: actions/checkout@v4
 
-        # Clone the tap repository
-        cd /tmp
-        git clone https://github.com/holon-run/homebrew-tap.git
-        mkdir -p /tmp/homebrew-tap/Formula
-        cp /home/runner/work/holon/holon/homebrew-tap/Formula/holon.rb /tmp/homebrew-tap/Formula/holon.rb
-        cd /tmp/homebrew-tap
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
 
-        # Configure git
-        git config user.name "holon-bot"
-        git config user.email "holon-bot@holon-run.github.io"
+      - name: Build web GUI
+        run: make web
 
-        # Commit and push changes
-        git add Formula/holon.rb
-        git diff --staged --quiet || git commit -m "Update formula for Holon ${{ steps.version.outputs.version }}"
-        git push origin main
-      continue-on-error: true
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-    - name: Upload Homebrew formula as artifact
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: homebrew-formula
-        path: homebrew-tap/Formula/holon.rb
-        retention-days: 90
-      continue-on-error: true
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
 
-    - name: Create GitHub Release
-      uses: softprops/action-gh-release@v2
-      with:
-        files: |
-          bin/*.tar.gz
-          bin/checksums.txt
-        generate_release_notes: true
-        body: |
-          ## Holon CLI ${{ steps.version.outputs.version }}
+      - name: Package release archive
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tmpdir="$(mktemp -d)"
+          cp "target/${{ matrix.target }}/release/holon" "$tmpdir/holon"
+          tar -czf "dist/${{ matrix.asset }}.tar.gz" -C "$tmpdir" holon
+          shasum -a 256 "dist/${{ matrix.asset }}.tar.gz" > "dist/${{ matrix.asset }}.tar.gz.sha256"
 
-          ### Installation
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
 
-          **Homebrew (Recommended for macOS and Linux):**
-          ```bash
-          brew install holon-run/tap/holon
-          ```
+  release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - e2e-gate
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
 
-          **Download Binary:**
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-artifacts
+          pattern: release-*
+          merge-multiple: true
 
-          Download the binary for your platform:
+      - name: Validate release version
+        run: |
+          set -euo pipefail
+          crate_version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$crate_version" != "$tag_version" ]; then
+            echo "Cargo.toml version ($crate_version) must match tag version ($tag_version)." >&2
+            exit 1
+          fi
 
-          **Linux (amd64):**
-          ```bash
-          curl -fsSL https://github.com/holon-run/holon/releases/download/${{ steps.version.outputs.version }}/holon-linux-amd64.tar.gz | tar -xz
+      - name: Prepare checksums and Homebrew formula
+        run: |
+          set -euo pipefail
+          (
+            cd dist-artifacts
+            rm -f ./*.sha256
+            shasum -a 256 ./*.tar.gz | sort -k2 > checksums.txt
+          )
+          bash scripts/generate-homebrew-formula.sh \
+            "$GITHUB_REF_NAME" \
+            dist-artifacts/checksums.txt \
+            homebrew-tap/Formula/holon.rb
+
+      - name: Upload Homebrew formula artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-formula
+          path: homebrew-tap/Formula/holon.rb
+          if-no-files-found: error
+
+      - name: Prepare release notes
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<EOF
+          ## Runtime line
+
+          Holon ${GITHUB_REF_NAME} is part of the Rust runtime line. The Rust runtime is now the main \`holon\` binary.
+
+          This minor release expands web search provider metadata and configuration, fixes Gemini prompt projection and model capability routing, and strengthens runtime lifecycle consistency, continuation recovery, and Web GUI event handling. It also retires the legacy random workspace ID compatibility path after its migration window.
+
+          Supported binary assets for this release are Linux amd64, macOS amd64, and macOS arm64.
+
+          ## Changes
+
+          - Expose web search provider metadata, complete built-in search provider coverage, and align provider selection and settings behavior for non-default endpoints ([#2292](https://github.com/holon-run/holon/pull/2292), [#2297](https://github.com/holon-run/holon/pull/2297), [#2300](https://github.com/holon-run/holon/pull/2300)).
+          - Deduplicate Gemini system and context prompt sections while preserving the structured GenerateContent request contract ([#2296](https://github.com/holon-run/holon/pull/2296)).
+          - Validate reasoning effort against the resolved model route and capability metadata, including fallback diagnostics ([#2281](https://github.com/holon-run/holon/pull/2281), [#2283](https://github.com/holon-run/holon/pull/2283), [#2285](https://github.com/holon-run/holon/pull/2285)).
+          - Strengthen persisted runtime lifecycle transitions by publishing audit events after persistence, requiring turn ownership, preserving queue/wait terminal states, and enforcing first-writer-wins task completion ([#2276](https://github.com/holon-run/holon/pull/2276), [#2289](https://github.com/holon-run/holon/pull/2289), [#2290](https://github.com/holon-run/holon/pull/2290), [#2293](https://github.com/holon-run/holon/pull/2293)).
+          - Recover oversized continuations by shrinking projected recent turns instead of abandoning resumable work ([#2295](https://github.com/holon-run/holon/pull/2295)).
+          - Close lagged SSE streams, recover Web GUI event gaps from a contiguous cursor, and keep WorkItem detail state visible during refreshes ([#2247](https://github.com/holon-run/holon/pull/2247), [#2287](https://github.com/holon-run/holon/pull/2287), [#2288](https://github.com/holon-run/holon/pull/2288)).
+          - Retire lazy migration and alias resolution for unsupported legacy random workspace IDs while preserving canonical workspace behavior ([#2298](https://github.com/holon-run/holon/pull/2298)).
+          - Expand mainline CI coverage for runtime lifecycle concurrency and the Web GUI test suite, and refresh onboarding-focused project documentation ([#2242](https://github.com/holon-run/holon/pull/2242), [#2277](https://github.com/holon-run/holon/pull/2277), [#2280](https://github.com/holon-run/holon/pull/2280)).
+
+          ## Install
+
+          Homebrew:
+
+          \`\`\`bash
+          brew tap holon-run/tap
+          brew install holon
+          \`\`\`
+
+          Direct binary:
+
+          \`\`\`bash
+          curl -L "https://github.com/holon-run/holon/releases/download/${GITHUB_REF_NAME}/holon-linux-amd64.tar.gz" | tar -xz
           chmod +x holon
-          sudo mv holon /usr/local/bin/holon
-          ```
+          ./holon --help
+          \`\`\`
 
-          **macOS (Intel):**
-          ```bash
-          curl -fsSL https://github.com/holon-run/holon/releases/download/${{ steps.version.outputs.version }}/holon-darwin-amd64.tar.gz | tar -xz
-          chmod +x holon
-          sudo mv holon /usr/local/bin/holon
-          ```
+          Replace \`holon-linux-amd64.tar.gz\` with \`holon-darwin-amd64.tar.gz\` or \`holon-darwin-arm64.tar.gz\` on macOS.
 
-          **macOS (Apple Silicon):**
-          ```bash
-          curl -fsSL https://github.com/holon-run/holon/releases/download/${{ steps.version.outputs.version }}/holon-darwin-arm64.tar.gz | tar -xz
-          chmod +x holon
-          sudo mv holon /usr/local/bin/holon
-          ```
+          Docker:
 
-          ### Verify Checksum
-          ```bash
-          sha256sum -c checksums.txt
-          ```
+          \`\`\`bash
+          docker pull ghcr.io/holon-run/holon:${GITHUB_REF_NAME#v}
+          \`\`\`
+          EOF
 
-          ### Upgrading
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          files: |
+            dist-artifacts/*.tar.gz
+            dist-artifacts/checksums.txt
 
-          **Homebrew:**
-          ```bash
-          brew update && brew upgrade holon-run/tap/holon
-          ```
+      - name: Push Homebrew formula
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HOMEBREW_TAP_TOKEN}" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not configured; formula was generated as an artifact only."
+            exit 0
+          fi
 
-          **Binary:**
-          Re-download the latest binary and replace the existing one.
+          tap_dir="$(mktemp -d)"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/holon-run/homebrew-tap.git" "$tap_dir"
+          mkdir -p "$tap_dir/Formula"
+          cp homebrew-tap/Formula/holon.rb "$tap_dir/Formula/holon.rb"
 
-          ---
-          **For maintainers:** The updated Homebrew formula is available as a workflow artifact. Download it and commit to [holon-run/homebrew-tap](https://github.com/holon-run/homebrew-tap).
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          cd "$tap_dir"
+          git config user.name "holon-bot"
+          git config user.email "holon-bot@holon.run"
+          git add Formula/holon.rb
+          if git diff --staged --quiet; then
+            echo "Homebrew formula is already up to date."
+            exit 0
+          fi
+          git commit -m "Update Holon formula for ${GITHUB_REF_NAME}"
+          git push origin main
+
+  container:
+    name: Publish container image
+    runs-on: ubuntu-latest
+    needs:
+      - release
+      - e2e-gate
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote verified candidate image
+        env:
+          SOURCE_IMAGE: ${{ needs.e2e-gate.outputs.candidate_image }}
+        run: |
+          set -euo pipefail
+          repository="$(printf '%s' "ghcr.io/${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          version="${GITHUB_REF_NAME#v}"
+          docker buildx imagetools create \
+            --tag "${repository}:${version}" \
+            --tag "${repository}:latest" \
+            "${SOURCE_IMAGE}"

@@ -1,0 +1,65 @@
+pub mod agent_memory;
+pub mod agent_template;
+pub mod agents_md;
+mod auth;
+mod callbacks;
+pub mod ids;
+
+pub mod brief;
+pub mod cli;
+pub mod client;
+pub mod config;
+pub mod context;
+pub mod contract_inventory;
+pub mod daemon;
+pub mod deletion;
+pub mod diagnostics;
+pub mod domain;
+pub mod fd_limit;
+pub mod host;
+mod host_registry;
+pub mod http;
+pub mod http_dto;
+pub mod ingress;
+pub mod memory;
+pub mod model_catalog;
+pub mod model_config_migration;
+pub mod model_discovery;
+pub mod notes_catalog;
+pub mod object_query_cache;
+pub mod object_resolver;
+pub mod onboarding;
+pub mod onboarding_tui;
+pub mod openapi;
+pub mod operator_event;
+pub mod policy;
+pub mod presentation;
+pub mod prompt;
+pub mod provider;
+pub mod queue;
+pub mod run_once;
+pub mod runtime;
+pub mod runtime_db;
+pub mod runtime_error;
+pub mod runtime_event;
+pub mod skills;
+pub mod solve;
+pub mod storage;
+pub mod system;
+mod token_estimate;
+pub mod tool;
+pub mod tui;
+mod tui_markdown;
+pub mod types;
+mod utf8;
+pub mod web;
+pub mod work_item_plan;
+pub mod work_item_refs;
+pub mod work_item_scheduling;
+pub mod x_search;
+
+#[cfg(test)]
+mod test_env;
+
+#[cfg(test)]
+mod worktree_tests;

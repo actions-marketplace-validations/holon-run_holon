@@ -1,0 +1,4151 @@
+{
+  "source_of_truth": {
+    "covered_result_schemas": "typed stable result structs deriving schemars::JsonSchema",
+    "input_schemas": "typed Rust argument structs deriving schemars::JsonSchema",
+    "model_rendering": "src/tool/tools/mod.rs render_tool_result_for_model()",
+    "result_envelope": "src/tool/spec.rs ToolResultEnvelope",
+    "tool_definitions": "src/tool/tools/mod.rs builtin_tool_definitions()"
+  },
+  "stability_policy": {
+    "deprecated": "Surface remains for compatibility but should not be introduced into new workflows.",
+    "experimental": "Surface is available but may change while the runtime contract is still settling.",
+    "stable": "Name, input schema, result envelope family, and documented model rendering are intended to be compatibility-preserving."
+  },
+  "tools": [
+    {
+      "description": "Record an explicit wait condition and yield the current turn. Use wake=task_result with resource=<task_id> when waiting for a background task, wake=external with optional resource=<external object such as a URL or github:owner/repo#id> when waiting for outside state, or wake=operator_input when waiting for the operator. Optional work_item_id explicitly selects an open WorkItem owned by this agent. Otherwise WaitFor uses the current execution-bound WorkItem, then the turn-bound WorkItem, then current focus; if none exists it records an agent-lifecycle wait. Optional recheck_after_ms records a fallback recheck deadline.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "type": "string"
+          },
+          "recheck_after_ms": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "resource": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wake": {
+            "enum": [
+              "operator_input",
+              "task_result",
+              "external",
+              "timer",
+              "system"
+            ],
+            "type": "string"
+          },
+          "work_item_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "reason",
+          "wake"
+        ],
+        "type": "object"
+      },
+      "name": "WaitFor",
+      "related_surfaces": [
+        "runtime agent lifecycle APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "WaitForResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Read the current agent-plane summary, including identity visibility, ownership, profile preset, lifecycle, active work focus, waiting state, and visible child-agent lineage.\n\nWhen called without arguments, returns the current agent's summary (unchanged behavior).\nWhen called with `agent_id`, returns the summary of the requested agent through the local trusted control boundary. This allows inspecting private child agents without exposing them to remote/multi-user access.\n\nRemote/multi-user authorization is deferred to future work; the current behavior relies on the local trusted control API boundary.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "AgentGet",
+      "related_surfaces": [
+        "runtime agent lifecycle APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "AgentGetResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Enqueue a follow-up message into the current agent.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "priority": {
+            "enum": [
+              "interject",
+              "next",
+              "normal",
+              "background",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
+      "name": "Enqueue",
+      "related_surfaces": [
+        "runtime agent lifecycle APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "EnqueueResult",
+        "success_result_schema": {
+          "properties": {
+            "enqueued": {
+              "type": "boolean"
+            },
+            "follow_up_text": {
+              "type": "string"
+            },
+            "priority": {
+              "enum": [
+                "interject",
+                "next",
+                "normal",
+                "background"
+              ],
+              "type": "string"
+            },
+            "summary_text": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "enqueued",
+            "priority",
+            "follow_up_text"
+          ],
+          "type": "object"
+        }
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Spawn a delegated agent from a small preset surface. Use `initial_message` as the single caller text field: it is required for the default `private_child` preset and optional for `public_named`. Legacy caller text fields such as `summary`, `prompt`, `task_summary`, and `work_item` are not accepted. The default `private_child` preset returns `agent_id` plus a supervising `task_handle`; `public_named` requires `agent_id` and returns only `agent_id`.\n",
+      "family": "agent_creation",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "preset": {
+                  "const": "public_named"
+                }
+              },
+              "required": [
+                "preset"
+              ]
+            },
+            "then": {
+              "properties": {
+                "workspace_mode": {
+                  "enum": [
+                    "inherit"
+                  ]
+                }
+              },
+              "required": [
+                "agent_id"
+              ]
+            }
+          },
+          {
+            "if": {
+              "not": {
+                "properties": {
+                  "preset": {
+                    "const": "public_named"
+                  }
+                },
+                "required": [
+                  "preset"
+                ]
+              }
+            },
+            "then": {
+              "not": {
+                "required": [
+                  "agent_id"
+                ]
+              },
+              "required": [
+                "initial_message"
+              ]
+            }
+          }
+        ],
+        "properties": {
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "initial_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "additionalProperties": false,
+            "properties": {
+              "allow_fallback": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "max_output_tokens": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "model": {
+                "type": "string"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "reasoning_effort": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "temperature": {
+                "format": "double",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider",
+              "model"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "preset": {
+            "enum": [
+              "private_child",
+              "public_named",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "template": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_mode": {
+            "enum": [
+              "inherit",
+              "worktree",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "SpawnAgent",
+      "related_surfaces": [
+        "runtime agent lifecycle APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "SpawnAgentResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "List active tasks with bounded output.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "ListTasks",
+      "related_surfaces": [
+        "CLI task/process wrappers",
+        "HTTP control-plane task APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "ListTasksResult",
+        "success_result_schema": {
+          "properties": {
+            "limit": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "returned": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "tasks": {
+              "items": {
+                "properties": {
+                  "command": {
+                    "properties": {
+                      "accepts_input": {
+                        "type": [
+                          "boolean",
+                          "null"
+                        ]
+                      },
+                      "cmd": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "cmd_digest": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "exit_status": {
+                        "format": "int32",
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "input_target": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "login": {
+                        "type": [
+                          "boolean",
+                          "null"
+                        ]
+                      },
+                      "output_path": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "promoted_from_exec_command": {
+                        "type": [
+                          "boolean",
+                          "null"
+                        ]
+                      },
+                      "result_summary": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "shell": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "terminal_reentry": {
+                        "type": [
+                          "boolean",
+                          "null"
+                        ]
+                      },
+                      "tty": {
+                        "type": [
+                          "boolean",
+                          "null"
+                        ]
+                      },
+                      "workdir": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "enum": [
+                      "queued",
+                      "running",
+                      "cancelling",
+                      "completed",
+                      "failed",
+                      "cancelled",
+                      "interrupted"
+                    ],
+                    "type": "string"
+                  },
+                  "summary": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "updated_at": {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "wait_policy": {
+                    "enum": [
+                      "background"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "kind",
+                  "status",
+                  "updated_at",
+                  "wait_policy"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "total_active": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "total_active",
+            "returned",
+            "limit",
+            "tasks"
+          ],
+          "type": "object"
+        }
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Read a specific task lifecycle snapshot by id.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "type": "object"
+      },
+      "name": "TaskStatus",
+      "related_surfaces": [
+        "CLI task/process wrappers",
+        "HTTP control-plane task APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "TaskStatusResult",
+        "success_result_schema": {
+          "properties": {
+            "summary_text": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "task": {
+              "properties": {
+                "child_agent_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "child_observability": {
+                  "properties": {
+                    "blocked_reason": {
+                      "enum": [
+                        "managed_task_queued",
+                        "managed_task_running",
+                        "managed_task_cancelling",
+                        "awaiting_managed_task",
+                        null
+                      ],
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "current_work_item_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "last_progress_brief": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "last_result_brief": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "phase": {
+                      "enum": [
+                        "running",
+                        "blocked",
+                        "waiting",
+                        "terminal"
+                      ],
+                      "type": "string"
+                    },
+                    "waiting_reason": {
+                      "enum": [
+                        "awaiting_operator_input",
+                        "awaiting_external_change",
+                        "awaiting_task_result",
+                        "awaiting_timer",
+                        null
+                      ],
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "work_summary": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "phase"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "child_supervision": {
+                  "properties": {
+                    "child_agent_id": {
+                      "type": "string"
+                    },
+                    "child_work_item_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "cleanup_owner": {
+                      "type": "string"
+                    },
+                    "cleanup_status": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "delegation_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "followup_target": {
+                      "type": "string"
+                    },
+                    "parent_agent_id": {
+                      "type": "string"
+                    },
+                    "parent_work_item_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "supervision_task_id": {
+                      "type": "string"
+                    },
+                    "workspace_mode": {
+                      "enum": [
+                        "inherit",
+                        "worktree",
+                        null
+                      ],
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "worktree": {
+                      "properties": {
+                        "actual_branch": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "auto_cleaned_up": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "branch_cleanup_error": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "branch_cleanup_status": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "changed_files": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "cleanup_error": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "cleanup_reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "cleanup_status": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "original_branch": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "original_cwd": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "projection_kind": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "retained_for_review": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "worktree_branch": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "worktree_path": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "parent_agent_id",
+                    "child_agent_id",
+                    "supervision_task_id",
+                    "cleanup_owner",
+                    "followup_target"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "command": {
+                  "properties": {
+                    "accepts_input": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "cmd": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "cmd_digest": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "exit_status": {
+                      "format": "int32",
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "input_target": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "login": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "output_path": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "promoted_from_exec_command": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "result_summary": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "shell": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "terminal_reentry": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "tty": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "workdir": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "model_resolution": {
+                  "properties": {
+                    "policy_notes": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "requested": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "allow_fallback": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "max_output_tokens": {
+                          "format": "uint32",
+                          "minimum": 0.0,
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "model": {
+                          "type": "string"
+                        },
+                        "provider": {
+                          "type": "string"
+                        },
+                        "reasoning_effort": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "temperature": {
+                          "format": "double",
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "provider",
+                        "model"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "resolution_status": {
+                      "enum": [
+                        "inherited",
+                        "accepted",
+                        "normalized",
+                        "fallback_used",
+                        "rejected"
+                      ],
+                      "type": "string"
+                    },
+                    "resolved_model": {
+                      "type": "string"
+                    },
+                    "resolved_parameters": {
+                      "additionalProperties": true,
+                      "properties": {},
+                      "required": [],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "resolved_provider": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "resolved_provider",
+                    "resolved_model",
+                    "resolution_status"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "parent_message_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "enum": [
+                    "queued",
+                    "running",
+                    "cancelling",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "interrupted"
+                  ],
+                  "type": "string"
+                },
+                "summary": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "task_id": {
+                  "type": "string"
+                },
+                "token_usage": {
+                  "properties": {
+                    "last_turn": {
+                      "properties": {
+                        "input_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "output_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "total_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "total": {
+                      "properties": {
+                        "input_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "output_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "total_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens"
+                      ],
+                      "type": "object"
+                    },
+                    "total_model_rounds": {
+                      "format": "uint64",
+                      "minimum": 0.0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "total",
+                    "total_model_rounds"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "updated_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "wait_policy": {
+                  "enum": [
+                    "background"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "task_id",
+                "kind",
+                "status",
+                "created_at",
+                "updated_at",
+                "wait_policy"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "task"
+          ],
+          "type": "object"
+        }
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Send input to a managed task handle. Command tasks accept stdin or tty text here when they were created for interactive continuation, and parent-supervised child handles accept bounded follow-up input on the same surface.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "input": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "input"
+        ],
+        "type": "object"
+      },
+      "name": "TaskInput",
+      "related_surfaces": [
+        "CLI task/process wrappers",
+        "HTTP control-plane task APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "TaskInputResult",
+        "success_result_schema": {
+          "properties": {
+            "accepted_input": {
+              "type": "boolean"
+            },
+            "bytes_written": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "input_target": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "summary_text": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "task": {
+              "properties": {
+                "child_agent_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "child_observability": {
+                  "properties": {
+                    "blocked_reason": {
+                      "enum": [
+                        "managed_task_queued",
+                        "managed_task_running",
+                        "managed_task_cancelling",
+                        "awaiting_managed_task",
+                        null
+                      ],
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "current_work_item_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "last_progress_brief": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "last_result_brief": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "phase": {
+                      "enum": [
+                        "running",
+                        "blocked",
+                        "waiting",
+                        "terminal"
+                      ],
+                      "type": "string"
+                    },
+                    "waiting_reason": {
+                      "enum": [
+                        "awaiting_operator_input",
+                        "awaiting_external_change",
+                        "awaiting_task_result",
+                        "awaiting_timer",
+                        null
+                      ],
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "work_summary": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "phase"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "child_supervision": {
+                  "properties": {
+                    "child_agent_id": {
+                      "type": "string"
+                    },
+                    "child_work_item_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "cleanup_owner": {
+                      "type": "string"
+                    },
+                    "cleanup_status": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "delegation_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "followup_target": {
+                      "type": "string"
+                    },
+                    "parent_agent_id": {
+                      "type": "string"
+                    },
+                    "parent_work_item_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "supervision_task_id": {
+                      "type": "string"
+                    },
+                    "workspace_mode": {
+                      "enum": [
+                        "inherit",
+                        "worktree",
+                        null
+                      ],
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "worktree": {
+                      "properties": {
+                        "actual_branch": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "auto_cleaned_up": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "branch_cleanup_error": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "branch_cleanup_status": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "changed_files": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "cleanup_error": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "cleanup_reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "cleanup_status": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "original_branch": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "original_cwd": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "projection_kind": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "retained_for_review": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "worktree_branch": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "worktree_path": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "parent_agent_id",
+                    "child_agent_id",
+                    "supervision_task_id",
+                    "cleanup_owner",
+                    "followup_target"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "command": {
+                  "properties": {
+                    "accepts_input": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "cmd": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "cmd_digest": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "exit_status": {
+                      "format": "int32",
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "input_target": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "login": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "output_path": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "promoted_from_exec_command": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "result_summary": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "shell": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "terminal_reentry": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "tty": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "workdir": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "model_resolution": {
+                  "properties": {
+                    "policy_notes": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "requested": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "allow_fallback": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "max_output_tokens": {
+                          "format": "uint32",
+                          "minimum": 0.0,
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "model": {
+                          "type": "string"
+                        },
+                        "provider": {
+                          "type": "string"
+                        },
+                        "reasoning_effort": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "temperature": {
+                          "format": "double",
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "provider",
+                        "model"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "resolution_status": {
+                      "enum": [
+                        "inherited",
+                        "accepted",
+                        "normalized",
+                        "fallback_used",
+                        "rejected"
+                      ],
+                      "type": "string"
+                    },
+                    "resolved_model": {
+                      "type": "string"
+                    },
+                    "resolved_parameters": {
+                      "additionalProperties": true,
+                      "properties": {},
+                      "required": [],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "resolved_provider": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "resolved_provider",
+                    "resolved_model",
+                    "resolution_status"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "parent_message_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "enum": [
+                    "queued",
+                    "running",
+                    "cancelling",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "interrupted"
+                  ],
+                  "type": "string"
+                },
+                "summary": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "task_id": {
+                  "type": "string"
+                },
+                "token_usage": {
+                  "properties": {
+                    "last_turn": {
+                      "properties": {
+                        "input_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "output_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "total_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "total": {
+                      "properties": {
+                        "input_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "output_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "total_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens"
+                      ],
+                      "type": "object"
+                    },
+                    "total_model_rounds": {
+                      "format": "uint64",
+                      "minimum": 0.0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "total",
+                    "total_model_rounds"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "updated_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "wait_policy": {
+                  "enum": [
+                    "background"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "task_id",
+                "kind",
+                "status",
+                "created_at",
+                "updated_at",
+                "wait_policy"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "task",
+            "accepted_input"
+          ],
+          "type": "object"
+        }
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Read background task output and optionally wait for task completion.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "block": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "task_id": {
+            "type": "string"
+          },
+          "timeout_ms": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "type": "object"
+      },
+      "name": "TaskOutput",
+      "related_surfaces": [
+        "CLI task/process wrappers",
+        "HTTP control-plane task APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "custom_text_receipt",
+        "success_result": "TaskOutputResult",
+        "success_result_schema": {
+          "properties": {
+            "retrieval_status": {
+              "enum": [
+                "success",
+                "timeout",
+                "not_ready"
+              ],
+              "type": "string"
+            },
+            "task": {
+              "properties": {
+                "artifacts": {
+                  "items": {
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "child_supervision": {
+                  "properties": {
+                    "child_agent_id": {
+                      "type": "string"
+                    },
+                    "child_work_item_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "cleanup_owner": {
+                      "type": "string"
+                    },
+                    "cleanup_status": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "delegation_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "followup_target": {
+                      "type": "string"
+                    },
+                    "parent_agent_id": {
+                      "type": "string"
+                    },
+                    "parent_work_item_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "supervision_task_id": {
+                      "type": "string"
+                    },
+                    "workspace_mode": {
+                      "enum": [
+                        "inherit",
+                        "worktree",
+                        null
+                      ],
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "worktree": {
+                      "properties": {
+                        "actual_branch": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "auto_cleaned_up": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "branch_cleanup_error": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "branch_cleanup_status": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "changed_files": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "cleanup_error": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "cleanup_reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "cleanup_status": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "original_branch": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "original_cwd": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "projection_kind": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "retained_for_review": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "worktree_branch": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "worktree_path": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "parent_agent_id",
+                    "child_agent_id",
+                    "supervision_task_id",
+                    "cleanup_owner",
+                    "followup_target"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "exit_status": {
+                  "format": "int32",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "failure_artifact": {
+                  "properties": {
+                    "category": {
+                      "enum": [
+                        "transport",
+                        "protocol",
+                        "runtime",
+                        "task",
+                        "unknown"
+                      ],
+                      "type": "string"
+                    },
+                    "context": {
+                      "properties": {
+                        "causation_id": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "correlation_id": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "message_id": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "model_ref": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "provider": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "run_id": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "task_id": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "tool_execution_id": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "turn_id": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "work_item_id": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [],
+                      "type": "object"
+                    },
+                    "domain": {
+                      "enum": [
+                        "runtime",
+                        "storage",
+                        "policy",
+                        "io",
+                        "conflict",
+                        "not_found",
+                        "validation",
+                        "provider",
+                        "tool",
+                        "task",
+                        "http",
+                        "unknown",
+                        null
+                      ],
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "exit_status": {
+                      "format": "int32",
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "kind": {
+                      "type": "string"
+                    },
+                    "metadata": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "properties": {},
+                      "required": [],
+                      "type": "object"
+                    },
+                    "model_ref": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "provider": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "recovery_hint": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "retryable": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "source_chain": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "status": {
+                      "format": "uint16",
+                      "maximum": 65535.0,
+                      "minimum": 0.0,
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "summary": {
+                      "type": "string"
+                    },
+                    "task_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "category",
+                    "kind",
+                    "summary"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "output_artifact": {
+                  "format": "uint",
+                  "minimum": 0.0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "output_preview": {
+                  "type": "string"
+                },
+                "output_truncated": {
+                  "type": "boolean"
+                },
+                "result_summary": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "enum": [
+                    "queued",
+                    "running",
+                    "cancelling",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "interrupted"
+                  ],
+                  "type": "string"
+                },
+                "summary": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "task_id": {
+                  "type": "string"
+                },
+                "token_usage": {
+                  "properties": {
+                    "last_turn": {
+                      "properties": {
+                        "input_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "output_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "total_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "total": {
+                      "properties": {
+                        "input_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "output_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "total_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens"
+                      ],
+                      "type": "object"
+                    },
+                    "total_model_rounds": {
+                      "format": "uint64",
+                      "minimum": 0.0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "total",
+                    "total_model_rounds"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "task_id",
+                "kind",
+                "status",
+                "output_preview",
+                "output_truncated"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "retrieval_status",
+            "task"
+          ],
+          "type": "object"
+        }
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Stop a currently running background task by id. command_task may first enter cancelling before the final cancelled result arrives.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "type": "object"
+      },
+      "name": "TaskStop",
+      "related_surfaces": [
+        "CLI task/process wrappers",
+        "HTTP control-plane task APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "TaskStopResult",
+        "success_result_schema": {
+          "properties": {
+            "force_stop_requested": {
+              "type": "boolean"
+            },
+            "stop_requested": {
+              "type": "boolean"
+            },
+            "summary_text": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "task": {
+              "properties": {
+                "child_agent_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "child_observability": {
+                  "properties": {
+                    "blocked_reason": {
+                      "enum": [
+                        "managed_task_queued",
+                        "managed_task_running",
+                        "managed_task_cancelling",
+                        "awaiting_managed_task",
+                        null
+                      ],
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "current_work_item_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "last_progress_brief": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "last_result_brief": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "phase": {
+                      "enum": [
+                        "running",
+                        "blocked",
+                        "waiting",
+                        "terminal"
+                      ],
+                      "type": "string"
+                    },
+                    "waiting_reason": {
+                      "enum": [
+                        "awaiting_operator_input",
+                        "awaiting_external_change",
+                        "awaiting_task_result",
+                        "awaiting_timer",
+                        null
+                      ],
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "work_summary": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "phase"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "child_supervision": {
+                  "properties": {
+                    "child_agent_id": {
+                      "type": "string"
+                    },
+                    "child_work_item_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "cleanup_owner": {
+                      "type": "string"
+                    },
+                    "cleanup_status": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "delegation_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "followup_target": {
+                      "type": "string"
+                    },
+                    "parent_agent_id": {
+                      "type": "string"
+                    },
+                    "parent_work_item_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "supervision_task_id": {
+                      "type": "string"
+                    },
+                    "workspace_mode": {
+                      "enum": [
+                        "inherit",
+                        "worktree",
+                        null
+                      ],
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "worktree": {
+                      "properties": {
+                        "actual_branch": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "auto_cleaned_up": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "branch_cleanup_error": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "branch_cleanup_status": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "changed_files": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "cleanup_error": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "cleanup_reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "cleanup_status": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "original_branch": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "original_cwd": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "projection_kind": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "retained_for_review": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "worktree_branch": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "worktree_path": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "parent_agent_id",
+                    "child_agent_id",
+                    "supervision_task_id",
+                    "cleanup_owner",
+                    "followup_target"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "command": {
+                  "properties": {
+                    "accepts_input": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "cmd": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "cmd_digest": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "exit_status": {
+                      "format": "int32",
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "input_target": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "login": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "output_path": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "promoted_from_exec_command": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "result_summary": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "shell": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "terminal_reentry": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "tty": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "workdir": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "model_resolution": {
+                  "properties": {
+                    "policy_notes": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "requested": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "allow_fallback": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "max_output_tokens": {
+                          "format": "uint32",
+                          "minimum": 0.0,
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "model": {
+                          "type": "string"
+                        },
+                        "provider": {
+                          "type": "string"
+                        },
+                        "reasoning_effort": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "temperature": {
+                          "format": "double",
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "provider",
+                        "model"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "resolution_status": {
+                      "enum": [
+                        "inherited",
+                        "accepted",
+                        "normalized",
+                        "fallback_used",
+                        "rejected"
+                      ],
+                      "type": "string"
+                    },
+                    "resolved_model": {
+                      "type": "string"
+                    },
+                    "resolved_parameters": {
+                      "additionalProperties": true,
+                      "properties": {},
+                      "required": [],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "resolved_provider": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "resolved_provider",
+                    "resolved_model",
+                    "resolution_status"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "parent_message_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "enum": [
+                    "queued",
+                    "running",
+                    "cancelling",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "interrupted"
+                  ],
+                  "type": "string"
+                },
+                "summary": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "task_id": {
+                  "type": "string"
+                },
+                "token_usage": {
+                  "properties": {
+                    "last_turn": {
+                      "properties": {
+                        "input_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "output_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "total_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "total": {
+                      "properties": {
+                        "input_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "output_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "total_tokens": {
+                          "format": "uint64",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens"
+                      ],
+                      "type": "object"
+                    },
+                    "total_model_rounds": {
+                      "format": "uint64",
+                      "minimum": 0.0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "total",
+                    "total_model_rounds"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "updated_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "wait_policy": {
+                  "enum": [
+                    "background"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "task_id",
+                "kind",
+                "status",
+                "created_at",
+                "updated_at",
+                "wait_policy"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "task",
+            "stop_requested",
+            "force_stop_requested"
+          ],
+          "type": "object"
+        }
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "List configured/discovered model providers. By default unavailable providers are omitted; set include_unavailable=true to inspect blocked options.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "include_unavailable": {
+            "default": false,
+            "description": "Diagnostic-only. Defaults to false so normal selection paths only see usable providers; set true only to inspect blocked provider options and unavailable reasons.",
+            "type": "boolean"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "ListModelProviders",
+      "related_surfaces": [],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "ListModelProvidersResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "List selectable models for a provider. By default unavailable models are omitted; set include_unavailable=true only to inspect blocked models and unavailability reasons. Use provider from ListModelProviders; cursor is a model_ref returned by a previous page.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_unavailable": {
+            "default": false,
+            "description": "Diagnostic-only. Defaults to false so normal selection paths only see usable models; set true only to inspect blocked models and unavailable reasons.",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "provider": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider"
+        ],
+        "type": "object"
+      },
+      "name": "ListProviderModels",
+      "related_surfaces": [],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "ListProviderModelsResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Create a new open work item for a genuinely separate objective with an independent lifecycle. Optional plan seeds the work item's AgentHome plan.md artifact; edit that file directly for later plan changes. Use todo_list only for progress checklist items. Continuous discussion, planning, candidate screening, and option comparison should usually update the current work item instead. Do not create a new work item just to refine, narrow, or switch candidates inside the current task; use UpdateWorkItem.objective, UpdateWorkItem.plan_status, and UpdateWorkItem.todo_list for state updates.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "objective": {
+            "type": "string"
+          },
+          "plan": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "plan_status": {
+            "enum": [
+              "draft",
+              "ready",
+              "needs_input",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "todo_list": {
+            "default": null,
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "state": {
+                  "enum": [
+                    "pending",
+                    "in_progress",
+                    "completed"
+                  ],
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "text",
+                "state"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "objective"
+        ],
+        "type": "object"
+      },
+      "name": "CreateWorkItem",
+      "related_surfaces": [
+        "CLI work-item wrappers",
+        "HTTP control-plane WorkItem APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "WorkItemMutationResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Make an existing open work item the current work-item focus for this agent. When an execution-bound activation switches from a different runnable current work item, the runtime records a terminal yield, ends the current turn, and runs the target work item in a later activation; the caller resumes when the target completes. Blocked work items may be picked for inspection but remain non-runnable by default. Set clear_blocker=true only after inspecting the blocker and confirming it is resolved; include a non-empty reason. This clears the WorkItem blocker/recheck state and active WorkItem-scoped waits so the picked item can resume as runnable. Use WaitFor, not PickWorkItem, to create or replace waits.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "clear_blocker": {
+            "default": false,
+            "type": "boolean"
+          },
+          "reason": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "work_item_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id"
+        ],
+        "type": "object"
+      },
+      "name": "PickWorkItem",
+      "related_surfaces": [
+        "CLI work-item wrappers",
+        "HTTP control-plane WorkItem APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "PickWorkItemResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Read one work item by id, including its lifecycle view, current focus flag, plan artifact descriptor, bounded plan preview, and optional todo_list.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "include_todo_list": {
+            "default": false,
+            "type": "boolean"
+          },
+          "work_item_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id"
+        ],
+        "type": "object"
+      },
+      "name": "GetWorkItem",
+      "related_surfaces": [
+        "CLI work-item wrappers",
+        "HTTP control-plane WorkItem APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "GetWorkItemResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Generate one image from a text prompt using a configured image-generation model.\n\nThe runtime saves the generated image under `agent_home/media/generated` and returns\na `workspace://...` URI plus metadata. Do not request multiple images in one call;\ncall this tool multiple times when distinct images are needed.\n\nInputs:\n- `prompt` (required): detailed image-generation prompt.\n- `size` (optional): one of `1024x1024`, `1536x1024`, or `1024x1536`.\n- `background` (optional): one of `auto`, `transparent`, or `opaque`.\n- `output_format` (optional): one of `png`, `jpeg`, or `webp`.\n- `name` (optional): filename stem used for the saved image.\n",
+      "family": "local_environment",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "background": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "output_format": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "size": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "name": "GenerateImage",
+      "related_surfaces": [],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "custom_text_receipt",
+        "success_result": "GenerateImageResult",
+        "success_result_schema": {
+          "properties": {
+            "images": {
+              "items": {
+                "properties": {
+                  "byte_count": {
+                    "format": "uint64",
+                    "minimum": 0.0,
+                    "type": "integer"
+                  },
+                  "created_at": {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "mime": {
+                    "type": "string"
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "sha256": {
+                    "type": "string"
+                  },
+                  "size": {
+                    "properties": {
+                      "height": {
+                        "format": "uint32",
+                        "minimum": 0.0,
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "width": {
+                        "format": "uint32",
+                        "minimum": 0.0,
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [],
+                    "type": "object"
+                  },
+                  "type": {
+                    "type": "string"
+                  },
+                  "uri": {
+                    "type": "string"
+                  },
+                  "workspace_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "id",
+                  "workspace_id",
+                  "path",
+                  "uri",
+                  "sha256",
+                  "mime",
+                  "byte_count",
+                  "size",
+                  "created_at"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "model": {
+              "type": "string"
+            },
+            "parameters": {
+              "properties": {
+                "background": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "output_format": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "size": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [],
+              "type": "object"
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "provider": {
+              "type": "string"
+            },
+            "summary_text": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "images",
+            "provider",
+            "model",
+            "prompt",
+            "parameters"
+          ],
+          "type": "object"
+        }
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "List recent work items with explicit current, open, completed, queued, yielded, blocked, waiting_for_operator, and runnable views. Use this before relying on memory briefs for work-item focus.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "filter": {
+            "default": null,
+            "enum": [
+              "all",
+              "open",
+              "completed",
+              "current",
+              "queued",
+              "yielded",
+              "blocked",
+              "waiting_for_operator",
+              "runnable",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_todo_list": {
+            "default": false,
+            "type": "boolean"
+          },
+          "limit": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "ListWorkItems",
+      "related_surfaces": [
+        "CLI work-item wrappers",
+        "HTTP control-plane WorkItem APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "ListWorkItemsResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Update mutable state fields for an existing work item. Use objective to refine the short target, plan_status for planning state, and todo_list to replace the full progress checklist snapshot. Use WaitFor, not UpdateWorkItem, to mark task, external, or operator waits. Edit the plan_artifact.path file directly for plan body changes.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "objective": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "plan_status": {
+            "enum": [
+              "draft",
+              "ready",
+              "needs_input",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "todo_list": {
+            "default": null,
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "state": {
+                  "enum": [
+                    "pending",
+                    "in_progress",
+                    "completed"
+                  ],
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "text",
+                "state"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "work_item_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id"
+        ],
+        "type": "object"
+      },
+      "name": "UpdateWorkItem",
+      "related_surfaces": [
+        "CLI work-item wrappers",
+        "HTTP control-plane WorkItem APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "WorkItemMutationResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Mark an open work item completed. Write the operator-facing completion report as assistant text in the same round; the runtime promotes that text after this tool succeeds. If this work item has a yielded direct caller, completion resumes that caller as current and the turn closes for scheduler continuation.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "work_item_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id"
+        ],
+        "type": "object"
+      },
+      "name": "CompleteWorkItem",
+      "related_surfaces": [
+        "CLI work-item wrappers",
+        "HTTP control-plane WorkItem APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "WorkItemMutationResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Search Holon memory sources, including agent memory markdown and runtime evidence. Normal workspace markdown is not included. Each result includes an opaque source_ref that can be copied verbatim to MemoryGet.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "include_all_workspaces": {
+            "default": false,
+            "type": "boolean"
+          },
+          "limit": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "MemorySearch",
+      "related_surfaces": [
+        "memory/runtime APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "MemorySearchResponse",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Fetch exact bounded Holon memory content by a source_ref copied verbatim from MemorySearch results or from runtime prompt refs such as brief_ref/turn_ref/cmd_ref/stdout_ref/stderr_ref/output_ref. Do not invent source_ref values or use MemoryGet for skill paths, file paths, or URLs.\n",
+      "family": "core_agent",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_chars": {
+            "format": "uint",
+            "maximum": 50000.0,
+            "minimum": 1.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source_ref": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_ref"
+        ],
+        "type": "object"
+      },
+      "name": "MemoryGet",
+      "related_surfaces": [
+        "memory/runtime APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "MemoryGetResponse",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Read the current agent's workspace lifecycle state. Returns attached workspace\nbindings, the active projection and cwd, durable execution-root/worktree\nrecords (including retained or removed artifacts), and active occupancy.\n",
+      "family": "local_environment",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "GetWorkspaceState",
+      "related_surfaces": [
+        "workspace/runtime file APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "WorkspaceStateResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Attach a workspace binding without switching the active projection. Git\nsubdirectories normalize to the repository worktree root; linked worktrees\nattach their canonical origin workspace. This expands the agent's workspace\nauthority and does not create or remove worktrees.\n",
+      "family": "authority_expanding",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "AttachWorkspace",
+      "related_surfaces": [
+        "workspace binding control APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "AttachWorkspaceResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Detach one agent-local workspace binding without deleting directories,\nbranches, or worktrees. If the target is active, the runtime first switches to\nagent_home. AgentHome is protected and retained artifacts remain discoverable.\n",
+      "family": "authority_expanding",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id"
+        ],
+        "type": "object"
+      },
+      "name": "DetachWorkspace",
+      "related_surfaces": [
+        "workspace binding control APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "DetachWorkspaceResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Switch the active execution context to an existing attached workspace or\nregistered projection. Provide exactly one of workspace_id, execution_root_id,\nor path. This operation never attaches a new repository and never creates or\nremoves a worktree.\n",
+      "family": "local_environment",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "execution_root_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "SwitchWorkspace",
+      "related_surfaces": [
+        "workspace/runtime file APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "SwitchWorkspaceResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Create a linked Git worktree for an attached workspace from an explicit branch\nand base_ref. By default the runtime activates it. If exactly one live\nworktree already checks out the branch, on_existing=reuse safely reuses it\nwithout applying base_ref, reset, force, or checkout; conflicts are returned\nwithout changing Git or active state.\n",
+      "family": "local_environment",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "activate": {
+            "default": true,
+            "type": "boolean"
+          },
+          "base_ref": {
+            "type": "string"
+          },
+          "branch": {
+            "type": "string"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "on_existing": {
+            "enum": [
+              "reuse",
+              "error",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "branch",
+          "base_ref"
+        ],
+        "type": "object"
+      },
+      "name": "CreateWorktree",
+      "related_surfaces": [
+        "workspace/runtime file APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "CreateWorktreeResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Safely remove a registered linked Git worktree. The runtime refuses arbitrary\npaths, canonical roots, dirty or locked worktrees, and roots occupied by\nanother agent/task. An active target requires return_to. Branch deletion is\noptional and only occurs when merge ancestry is proven.\n",
+      "family": "authority_expanding",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "branch_policy": {
+            "enum": [
+              "keep",
+              "delete_if_merged",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "execution_root_id": {
+            "type": "string"
+          },
+          "merged_into": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "return_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "execution_root_id"
+        ],
+        "type": "object"
+      },
+      "name": "RemoveWorktree",
+      "related_surfaces": [
+        "workspace/runtime file APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "RemoveWorktreeResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Apply a unified diff patch across one or more files. Call the JSON/function tool with exactly {\"patch\":\"--- a/path\\n+++ b/path\\n@@ ...\"}; do not use the Codex *** Begin Patch DSL as the advertised format.\nRelative paths: write `\"--- a/src/foo.rs\"` (with `a/` prefix). Absolute paths: write `\"--- /home/foo.rs\"` directly (no `a/` prefix). Do not prefix absolute paths with `a/`.\n",
+      "family": "local_environment",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "patch": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "patch"
+        ],
+        "type": "object"
+      },
+      "name": "ApplyPatch",
+      "related_surfaces": [
+        "workspace/runtime file APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "custom_text_receipt",
+        "success_result": "ApplyPatchResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Start a shell command inside the workspace. Valid startup input uses `cmd` plus optional `workdir`, `shell`, `login`, `tty`, `duplicate_policy`, `accepts_input`, `yield_time_ms`, and `max_output_tokens`; do not pass result or task metadata such as `status` or `task_handle`. `duplicate_policy` defaults to `reuse_running` and `yield_time_ms` defaults to 10_000 ms when omitted; set it only when intentionally changing the foreground wait window. Short commands return immediately; long non-interactive commands become command_task automatically.\n\n> ⚠ ripgrep note: `-r` means `--replace`, not recursive. Recursion is the default. `rg -rn \"x\"` is parsed as `--replace n`; use `rg -n \"x\"` instead.\n",
+      "family": "local_environment",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "accepts_input": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "cmd": {
+            "type": "string"
+          },
+          "duplicate_policy": {
+            "default": "reuse_running",
+            "enum": [
+              "reuse_running",
+              "start_new"
+            ],
+            "type": "string"
+          },
+          "login": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "max_output_tokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "shell": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tty": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "workdir": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "yield_time_ms": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "cmd"
+        ],
+        "type": "object"
+      },
+      "name": "ExecCommand",
+      "related_surfaces": [
+        "CLI task/process wrappers",
+        "HTTP control-plane task APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "custom_text_receipt",
+        "success_result": "ExecCommandResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Run a bounded sequential batch of short ExecCommand-like startup requests and return one grouped receipt. Use ExecCommandBatch for short, predictable commands only; use ExecCommand directly for long or uncertain runtime so it can promote into a managed command_task. Each item supports cmd plus optional workdir, shell, login, yield_time_ms, and max_output_tokens. Top-level workdir, shell, login, yield_time_ms, and max_output_tokens act as defaults for items that omit those fields. Per-item yield_time_ms defaults to 30_000 ms when no item or top-level value is provided; set it only when intentionally changing that item's foreground wait window. Do not use non-command tools inside the batch.\n\n> ⚠ ripgrep note: `-r` means `--replace`, not recursive. Recursion is the default. `rg -rn \"x\"` is parsed as `--replace n`; use `rg -n \"x\"` instead.\n",
+      "family": "local_environment",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "cmd": {
+                  "type": "string"
+                },
+                "login": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "max_output_tokens": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "shell": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "workdir": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "yield_time_ms": {
+                  "format": "uint64",
+                  "minimum": 0.0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "cmd"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "login": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "max_output_tokens": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "shell": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stop_on_error": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "workdir": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "yield_time_ms": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "name": "ExecCommandBatch",
+      "related_surfaces": [
+        "CLI task/process wrappers",
+        "HTTP control-plane task APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "custom_text_receipt",
+        "success_result": "ExecCommandBatchResult",
+        "success_result_schema": null
+      },
+      "stability": "stable"
+    },
+    {
+      "description": "Validate and record durable metadata for a local image file.\n\n`ViewImage` accepts a workspace-relative or absolute image path plus a required\nprompt describing what to inspect. It records provider-neutral evidence such as\nmedia type, byte count, SHA-256, and dimensions when they can be read from the\nfile header.\n\n`ViewImage` selects an explicit `vision.default` provider/model when configured.\nOtherwise it auto-discovers an authenticated provider/model that advertises\n`image_input` support and whose transport can generate visual observations.\nConversation `model.fallbacks` remain only a compatibility candidate source, not\nthe primary ViewImage selection mechanism. The result includes structured\nselection diagnostics. If no configured model supports image input, the tool\nreturns a `vision_adapter_unavailable` error with the evaluated candidates.\n\nWhen the selected vision model is served by a provider whose transport supports\nimage observation generation (OpenAI-compatible APIs or Anthropic Messages),\n`ViewImage` sends the image and prompt to that model and returns a generated\n`visual_observation` alongside the durable image metadata and selection\ndiagnostics. If the selected model or provider cannot be used for image\nobservation, the tool returns\n`vision_adapter_unavailable` with structured diagnostics.\n",
+      "family": "local_environment",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "name": "ViewImage",
+      "related_surfaces": [],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "custom_text_receipt",
+        "success_result": "tool-specific JSON payload",
+        "success_result_schema": null
+      },
+      "stability": "experimental"
+    },
+    {
+      "description": "Fetch a specific http or https URL through Holon's web policy, extract readable text, wrap it as untrusted external content, and return provenance including final URL, status, content type, truncation, and hash.\n",
+      "family": "web",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "extract_mode": {
+            "default": "auto",
+            "enum": [
+              "auto",
+              "text",
+              "raw"
+            ],
+            "type": "string"
+          },
+          "max_chars": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "name": "WebFetch",
+      "related_surfaces": [
+        "web adapter APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "WebFetchResult",
+        "success_result_schema": null
+      },
+      "stability": "experimental"
+    },
+    {
+      "description": "Search the web through Holon's web provider registry and return structured results and citations. Use WebFetch after search when full page content is needed.\n",
+      "family": "web",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_results": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "WebSearch",
+      "related_surfaces": [
+        "web adapter APIs"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "WebSearchResult",
+        "success_result_schema": null
+      },
+      "stability": "experimental"
+    },
+    {
+      "description": "Search public X posts using xAI's hosted `x_search` in an isolated provider request. Use this for X-specific content, accounts, or discussions; use `WebSearch` for the general web. Results contain durable text and citations and do not depend on the main model conversation's provider state.\n",
+      "family": "web",
+      "freeform_grammar": null,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "allowed_x_handles": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "excluded_x_handles": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "from_date": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query": {
+            "type": "string"
+          },
+          "to_date": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "XSearch",
+      "related_surfaces": [
+        "xAI hosted search adapter"
+      ],
+      "result_envelope": {
+        "canonical": "ToolResultEnvelope",
+        "error_result": "ToolError",
+        "model_rendering": "canonical_json_envelope",
+        "success_result": "XSearchResult",
+        "success_result_schema": null
+      },
+      "stability": "experimental"
+    }
+  ],
+  "version": 2
+}

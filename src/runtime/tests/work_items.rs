@@ -1,0 +1,5482 @@
+use super::super::*;
+use super::support::*;
+use crate::types::{
+    CompletionReportState, WaitConditionKind, WaitConditionRecord, WaitConditionStatus, WakeSource,
+    WorkItemContinuationState, WorkItemPlanStatus, WorkItemReadiness, WorkItemSchedulingState,
+    AGENT_HOME_WORKSPACE_ID,
+};
+
+fn legacy_blocking_payload_task_for_work_item(
+    task_id: &str,
+    work_item_id: Option<&str>,
+) -> TaskRecord {
+    TaskRecord {
+        id: task_id.into(),
+        agent_id: "default".into(),
+        kind: TaskKind::CommandTask,
+        status: TaskStatus::Running,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        parent_message_id: None,
+        work_item_id: work_item_id.map(ToString::to_string),
+        summary: Some("legacy blocking command".into()),
+        detail: Some(serde_json::json!({
+            "wait_policy": "blocking",
+            "work_item_id": work_item_id
+        })),
+        recovery: None,
+    }
+}
+
+fn continuation_context_config() -> ContextConfig {
+    ContextConfig {
+        prompt_budget_estimated_tokens: 32768,
+        turn_projection_budget_ratio: 1.0,
+        compaction_keep_recent_estimated_tokens: 2048,
+        ..context_config()
+    }
+}
+
+struct CompleteWorkItemReportProvider {
+    work_item_id: String,
+    report_text: Option<String>,
+    calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl AgentProvider for CompleteWorkItemReportProvider {
+    async fn complete_turn(&self, _request: ProviderTurnRequest) -> Result<ProviderTurnResponse> {
+        let mut calls = self.calls.lock().await;
+        *calls += 1;
+        let blocks = if *calls == 1 {
+            let mut blocks = Vec::new();
+            if let Some(report_text) = &self.report_text {
+                blocks.push(ModelBlock::Text {
+                    text: report_text.clone(),
+                });
+            }
+            blocks.push(ModelBlock::ToolUse {
+                id: "complete-work".into(),
+                name: "CompleteWorkItem".into(),
+                input: serde_json::json!({
+                    "work_item_id": self.work_item_id.clone()
+                }),
+                kind: crate::provider::ModelToolCallKind::Function,
+            });
+            blocks
+        } else {
+            vec![ModelBlock::Text {
+                text: "done".into(),
+            }]
+        };
+        Ok(ProviderTurnResponse {
+            blocks,
+            stop_reason: None,
+            input_tokens: 10,
+            output_tokens: 10,
+            cache_usage: None,
+            provider_message_id: None,
+            provider_request_id: None,
+            request_diagnostics: None,
+        })
+    }
+}
+
+struct CompleteThenExecProvider {
+    work_item_id: String,
+    calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl AgentProvider for CompleteThenExecProvider {
+    async fn complete_turn(&self, _request: ProviderTurnRequest) -> Result<ProviderTurnResponse> {
+        let mut calls = self.calls.lock().await;
+        *calls += 1;
+        let blocks = if *calls == 1 {
+            vec![
+                ModelBlock::Text {
+                    text: "Finished the tracked work.".into(),
+                },
+                ModelBlock::ToolUse {
+                    id: "complete-work".into(),
+                    name: "CompleteWorkItem".into(),
+                    input: serde_json::json!({
+                        "work_item_id": self.work_item_id.clone()
+                    }),
+                    kind: crate::provider::ModelToolCallKind::Function,
+                },
+                ModelBlock::ToolUse {
+                    id: "verify".into(),
+                    name: "ExecCommand".into(),
+                    input: serde_json::json!({
+                        "cmd": "printf 'verified'",
+                        "shell": "sh"
+                    }),
+                    kind: crate::provider::ModelToolCallKind::Function,
+                },
+            ]
+        } else {
+            vec![ModelBlock::Text {
+                text: "Verified after completion.".into(),
+            }]
+        };
+        Ok(ProviderTurnResponse {
+            blocks,
+            stop_reason: None,
+            input_tokens: 10,
+            output_tokens: 10,
+            cache_usage: None,
+            provider_message_id: None,
+            provider_request_id: None,
+            request_diagnostics: None,
+        })
+    }
+}
+
+struct StaleTextThenCompleteProvider {
+    work_item_id: String,
+    calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl AgentProvider for StaleTextThenCompleteProvider {
+    async fn complete_turn(&self, _request: ProviderTurnRequest) -> Result<ProviderTurnResponse> {
+        let mut calls = self.calls.lock().await;
+        *calls += 1;
+        let blocks = if *calls == 1 {
+            vec![
+                ModelBlock::Text {
+                    text: "This text belongs to the ExecCommand tool call.".into(),
+                },
+                ModelBlock::ToolUse {
+                    id: "inspect".into(),
+                    name: "ExecCommand".into(),
+                    input: serde_json::json!({
+                        "cmd": "printf 'inspected'",
+                        "shell": "sh"
+                    }),
+                    kind: crate::provider::ModelToolCallKind::Function,
+                },
+                ModelBlock::ToolUse {
+                    id: "complete-work".into(),
+                    name: "CompleteWorkItem".into(),
+                    input: serde_json::json!({
+                        "work_item_id": self.work_item_id.clone()
+                    }),
+                    kind: crate::provider::ModelToolCallKind::Function,
+                },
+            ]
+        } else {
+            vec![ModelBlock::Text {
+                text: "No completion report was provided.".into(),
+            }]
+        };
+        Ok(ProviderTurnResponse {
+            blocks,
+            stop_reason: None,
+            input_tokens: 10,
+            output_tokens: 10,
+            cache_usage: None,
+            provider_message_id: None,
+            provider_request_id: None,
+            request_diagnostics: None,
+        })
+    }
+}
+
+struct MultiCompleteWorkItemReportProvider {
+    work_item_ids: Vec<String>,
+    report_texts: Vec<String>,
+    calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl AgentProvider for MultiCompleteWorkItemReportProvider {
+    async fn complete_turn(&self, _request: ProviderTurnRequest) -> Result<ProviderTurnResponse> {
+        let mut calls = self.calls.lock().await;
+        *calls += 1;
+        let blocks = if *calls == 1 {
+            let mut blocks = Vec::new();
+            for (index, work_item_id) in self.work_item_ids.iter().enumerate() {
+                if let Some(report_text) = self.report_texts.get(index) {
+                    blocks.push(ModelBlock::Text {
+                        text: report_text.clone(),
+                    });
+                }
+                blocks.push(ModelBlock::ToolUse {
+                    id: format!("complete-work-{index}"),
+                    name: "CompleteWorkItem".into(),
+                    input: serde_json::json!({
+                        "work_item_id": work_item_id
+                    }),
+                    kind: crate::provider::ModelToolCallKind::Function,
+                });
+            }
+            blocks
+        } else {
+            vec![ModelBlock::Text {
+                text: "done".into(),
+            }]
+        };
+        Ok(ProviderTurnResponse {
+            blocks,
+            stop_reason: None,
+            input_tokens: 10,
+            output_tokens: 10,
+            cache_usage: None,
+            provider_message_id: None,
+            provider_request_id: None,
+            request_diagnostics: None,
+        })
+    }
+}
+
+#[test]
+fn work_item_record_revision_defaults_for_old_records() {
+    let value = serde_json::json!({
+        "id": "work-old",
+        "agent_id": "default",
+        "workspace_id": "agent_home",
+        "objective": "old record",
+        "state": "open",
+        "plan_status": "draft",
+        "created_at": Utc::now(),
+        "updated_at": Utc::now()
+    });
+    let record: WorkItemRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(record.revision, 1);
+    assert!(record.plan_artifact.is_none());
+    assert!(record.recheck_at.is_none());
+    assert!(record.recheck_consumed_at.is_none());
+}
+
+#[tokio::test]
+async fn update_work_item_sets_and_preserves_blocked_recheck_deadline() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let clock = controlled_clock();
+    let runtime = RuntimeHandle::new_with_clock(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+        clock.clone(),
+    )
+    .unwrap();
+
+    let work = runtime
+        .create_work_item("wait with fallback".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let blocked = runtime
+        .update_work_item_fields_with_recheck(
+            work.id.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(Some("waiting for CI".into())),
+            Some(25),
+        )
+        .await
+        .unwrap();
+    let recheck_at = blocked.recheck_at.expect("blocked item has recheck_at");
+    assert_eq!(recheck_at, clock.now() + chrono::Duration::milliseconds(25));
+    assert!(blocked.recheck_consumed_at.is_none());
+
+    let updated = runtime
+        .update_work_item_fields(
+            work.id.clone(),
+            Some("wait with unchanged fallback".into()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.recheck_at, Some(recheck_at));
+
+    let cleared = runtime
+        .update_work_item_fields(work.id.clone(), None, None, None, None, Some(None))
+        .await
+        .unwrap();
+    assert!(cleared.blocked_by.is_none());
+    assert!(cleared.recheck_at.is_none());
+    assert!(cleared.recheck_consumed_at.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn runtime_wakes_itself_for_blocked_work_item_recheck_deadline() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let clock = controlled_clock();
+    let storage = AppStorage::new_for_test(dir.path()).unwrap();
+    let mut blocked = WorkItemRecord::new(
+        "default",
+        "blocked work with fallback recheck",
+        WorkItemState::Open,
+    );
+    blocked.blocked_by = Some("waiting for external wake".into());
+    blocked.recheck_at = Some(clock.now() + chrono::Duration::milliseconds(50));
+    storage.append_work_item(&blocked).unwrap();
+
+    let runtime = RuntimeHandle::new_with_clock(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("recheck observed")),
+        "default".into(),
+        context_config(),
+        clock.clone(),
+    )
+    .unwrap();
+    let runtime_task = tokio::spawn(runtime.clone().run());
+    advance_lifecycle_time(&clock, std::time::Duration::from_millis(50)).await;
+    wait_for_audit_events(
+        &runtime,
+        200,
+        |events| {
+            events.iter().any(|event| {
+                event.kind == "system_tick_emitted"
+                    && event.data.get("subsystem").and_then(|value| value.as_str())
+                        == Some("work_item_recheck")
+            })
+        },
+        "work item recheck tick",
+    )
+    .await;
+
+    let events = runtime.storage().read_recent_events(usize::MAX).unwrap();
+    assert!(
+        events.iter().any(|event| {
+            event.kind == "system_tick_emitted"
+                && event.data.get("subsystem").and_then(|value| value.as_str())
+                    == Some("work_item_recheck")
+        }),
+        "runtime should emit a work_item_recheck tick without external input"
+    );
+    let latest = runtime
+        .storage()
+        .latest_work_item(&blocked.id)
+        .unwrap()
+        .expect("blocked work item exists");
+    assert!(
+        latest
+            .recheck_consumed_at
+            .zip(latest.recheck_at)
+            .is_some_and(|(consumed_at, recheck_at)| consumed_at >= recheck_at),
+        "deadline wake should consume the due blocked recheck"
+    );
+    runtime_task.abort();
+}
+
+#[tokio::test]
+async fn work_queue_projection_derives_scheduling_state_per_work_item() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let runnable = runtime
+        .create_work_item("runnable".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let external = runtime
+        .create_work_item("external wait".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let task_wait = runtime
+        .create_work_item("task wait".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let now = Utc::now();
+    runtime
+        .storage()
+        .append_wait_condition(&WaitConditionRecord {
+            id: "wait-external".into(),
+            agent_id: "default".into(),
+            work_item_id: Some(external.id.clone()),
+            status: WaitConditionStatus::Active,
+            kind: WaitConditionKind::External,
+            source: Some("github".into()),
+            subject_ref: Some("pull_request:1".into()),
+            waiting_for: "checks".into(),
+            wake_sources: vec![WakeSource::ExternalIngress {
+                external_trigger_id: Some("trigger-external".into()),
+            }],
+            continuation: None,
+            created_at: now,
+            updated_at: now,
+            expires_at: None,
+            resolved_at: None,
+            cancelled_at: None,
+            turn_id: None,
+        })
+        .unwrap();
+    runtime
+        .storage()
+        .append_task(&legacy_blocking_payload_task_for_work_item(
+            "task-wait",
+            Some(&task_wait.id),
+        ))
+        .unwrap();
+
+    let projection = runtime.storage().work_queue_prompt_projection().unwrap();
+    let state_for = |id: &str| {
+        projection
+            .items
+            .iter()
+            .find(|item| item.work_item.id == id)
+            .map(|item| item.scheduling_state)
+            .unwrap()
+    };
+    assert_eq!(state_for(&runnable.id), WorkItemSchedulingState::Runnable);
+    assert_eq!(
+        state_for(&external.id),
+        WorkItemSchedulingState::WaitingExternal
+    );
+    assert_eq!(state_for(&task_wait.id), WorkItemSchedulingState::Runnable);
+    assert!(projection
+        .queued_runnable
+        .iter()
+        .any(|item| item.work_item.id == runnable.id));
+    assert!(!projection
+        .queued_runnable
+        .iter()
+        .any(|item| item.work_item.id == external.id));
+}
+
+#[tokio::test]
+async fn work_item_query_tools_return_current_open_done_views() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let active = runtime
+        .create_work_item("finish active delivery".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime.pick_work_item(active.id.clone()).await.unwrap();
+    std::fs::write(
+        crate::work_item_plan::plan_path(runtime.agent_home().as_path(), &active.id),
+        "Inspect query surface behavior.",
+    )
+    .unwrap();
+    runtime
+        .update_work_item_fields(
+            active.id.clone(),
+            None,
+            None,
+            None,
+            Some(vec![crate::types::TodoItem {
+                text: "inspect query surface".into(),
+                state: crate::types::TodoItemState::InProgress,
+            }]),
+            None,
+        )
+        .await
+        .unwrap();
+    let queued = runtime
+        .create_work_item("queued delivery".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let completed = runtime
+        .create_work_item("completed delivery".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let completed = runtime
+        .complete_work_item(completed.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    let completed = runtime
+        .promote_work_item_completion_report(
+            completed.id.clone(),
+            "Completed delivery report.".into(),
+            Some(7),
+            Some(0),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    bind_turn_to_work_item(&runtime, &active.id).await;
+
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+    let (active_result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "active".into(),
+                name: "ListWorkItems".into(),
+                input: serde_json::json!({"filter": "current", "include_todo_list": true}),
+            },
+        )
+        .await
+        .unwrap();
+    let active_payload = active_result.envelope.result.unwrap();
+    let active_item = &active_payload["work_items"][0];
+    assert_eq!(
+        active_payload["context"]["current_work_item_id"].as_str(),
+        Some(active.id.as_str())
+    );
+    assert_eq!(active_item["state"].as_str(), Some("open"));
+    assert_eq!(active_item["focus"].as_str(), Some("current"));
+    assert_eq!(active_item["readiness"].as_str(), Some("runnable"));
+    assert_eq!(active_item["is_current"].as_bool(), Some(true));
+    assert_eq!(active_item["is_runnable"].as_bool(), Some(true));
+    assert_eq!(
+        active_item["plan_artifact"]["preview"].as_str(),
+        Some("Inspect query surface behavior.")
+    );
+    assert_eq!(
+        active_item["plan_artifact"]["preview_complete"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(active_item["todo_list"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        active_item["todo_list"][0]["state"].as_str(),
+        Some("in_progress")
+    );
+
+    let now = Utc::now();
+    runtime
+        .storage()
+        .append_wait_condition(&WaitConditionRecord {
+            id: "weak-external-wait".into(),
+            agent_id: "default".into(),
+            work_item_id: Some(active.id.clone()),
+            status: WaitConditionStatus::Active,
+            kind: WaitConditionKind::External,
+            source: Some("github".into()),
+            subject_ref: Some("pull_request:1313".into()),
+            waiting_for: "PR merged".into(),
+            wake_sources: vec![WakeSource::ExternalIngress {
+                external_trigger_id: Some("trigger-weak".into()),
+            }],
+            continuation: Some(serde_json::json!({
+                "provider": "github",
+                "subscription_id": "sub_1"
+            })),
+            created_at: now,
+            updated_at: now,
+            expires_at: None,
+            resolved_at: None,
+            cancelled_at: None,
+
+            turn_id: None,
+        })
+        .unwrap();
+
+    let (active_wait_result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "active-wait".into(),
+                name: "ListWorkItems".into(),
+                input: serde_json::json!({"filter": "current"}),
+            },
+        )
+        .await
+        .unwrap();
+    let active_wait_payload = active_wait_result.envelope.result.unwrap();
+    let wait = &active_wait_payload["work_items"][0]["active_wait_conditions"][0];
+    assert_eq!(wait["id"].as_str(), Some("weak-external-wait"));
+    assert_eq!(wait["external_recoverability"].as_str(), Some("weak"));
+    assert_eq!(
+        wait["continuation"]["subscription_id"].as_str(),
+        Some("sub_1")
+    );
+
+    let (agent_result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "agent-get".into(),
+                name: "AgentGet".into(),
+                input: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    let agent_payload = agent_result.envelope.result.unwrap();
+    let agent_wait = &agent_payload["agent"]["active_wait_conditions"][0];
+    assert_eq!(agent_wait["id"].as_str(), Some("weak-external-wait"));
+    assert_eq!(agent_wait["external_recoverability"].as_str(), Some("weak"));
+
+    let (list_result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "list".into(),
+                name: "ListWorkItems".into(),
+                input: serde_json::json!({"filter": "open", "limit": 10}),
+            },
+        )
+        .await
+        .unwrap();
+    let list_payload = list_result.envelope.result.unwrap();
+    let items = list_payload["work_items"].as_array().unwrap();
+    assert_eq!(list_payload["total_matching"].as_u64(), Some(2));
+    assert!(items
+        .iter()
+        .any(|item| item["id"].as_str() == Some(active.id.as_str())));
+    assert!(items
+        .iter()
+        .any(|item| item["id"].as_str() == Some(queued.id.as_str())));
+    assert!(!items
+        .iter()
+        .any(|item| item["id"].as_str() == Some(completed.id.as_str())));
+
+    let (completed_result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "completed".into(),
+                name: "GetWorkItem".into(),
+                input: serde_json::json!({"work_item_id": completed.id}),
+            },
+        )
+        .await
+        .unwrap();
+    let completed_payload = completed_result.envelope.result.unwrap();
+    assert_eq!(
+        completed_payload["work_item"]["state"].as_str(),
+        Some("completed")
+    );
+    assert_eq!(
+        completed_payload["work_item"]["focus"].as_str(),
+        Some("completed")
+    );
+    assert_eq!(
+        completed_payload["work_item"]["readiness"].as_str(),
+        Some("completed")
+    );
+    assert_eq!(
+        completed_payload["work_item"]["completion_report"]["text"].as_str(),
+        Some("Completed delivery report.")
+    );
+    assert_eq!(
+        completed_payload["work_item"]["completion_report"]["source"].as_str(),
+        Some("result_brief")
+    );
+    assert_eq!(
+        completed_payload["work_item"]["completion_report"]["brief_id"].as_str(),
+        completed.result_brief_id.as_deref()
+    );
+    assert_eq!(
+        completed_payload["work_item"]["completion_report"]["source_turn_index"].as_u64(),
+        Some(7)
+    );
+
+    bind_turn_to_work_item(&runtime, completed.id.as_str()).await;
+    let (fallback_result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "fallback-active".into(),
+                name: "ListWorkItems".into(),
+                input: serde_json::json!({"filter": "current"}),
+            },
+        )
+        .await
+        .unwrap();
+    let fallback_payload = fallback_result.envelope.result.unwrap();
+    assert_eq!(
+        fallback_payload["context"]["current_work_item_id"].as_str(),
+        Some(active.id.as_str())
+    );
+    assert_eq!(
+        fallback_payload["work_items"][0]["id"].as_str(),
+        Some(active.id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn work_item_query_tools_fall_back_to_delivery_summary_report() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work = runtime
+        .create_work_item(
+            "legacy delivery summary fallback".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let completed = runtime
+        .complete_work_item(work.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    let summary = DeliverySummaryRecord::new(
+        "default",
+        completed.id.clone(),
+        "Legacy delivery summary report.",
+        Some(11),
+        None,
+    );
+    let summary_id = summary.id.clone();
+    runtime.storage().append_delivery_summary(&summary).unwrap();
+
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+    let (result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "completed".into(),
+                name: "GetWorkItem".into(),
+                input: serde_json::json!({"work_item_id": completed.id}),
+            },
+        )
+        .await
+        .unwrap();
+    let payload = result.envelope.result.unwrap();
+    let report = &payload["work_item"]["completion_report"];
+    assert_eq!(
+        report["text"].as_str(),
+        Some("Legacy delivery summary report.")
+    );
+    assert_eq!(report["source"].as_str(), Some("delivery_summary"));
+    assert_eq!(
+        report["delivery_summary_id"].as_str(),
+        Some(summary_id.as_str())
+    );
+    assert_eq!(report["source_turn_index"].as_u64(), Some(11));
+}
+
+#[tokio::test]
+async fn work_item_revision_increments_on_updates_and_completion() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let created = runtime
+        .create_work_item("revision contract".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(created.revision, 1);
+
+    let updated = runtime
+        .update_work_item_fields(
+            created.id.clone(),
+            None,
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.revision, 2);
+
+    let completed = runtime
+        .complete_work_item(updated.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(completed.revision, 3);
+}
+
+#[tokio::test]
+async fn work_item_completion_ignores_running_tasks_and_clears_explicit_waits() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let target = runtime
+        .create_work_item("target".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let other = runtime
+        .create_work_item("other".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let related_task = legacy_blocking_payload_task_for_work_item("task-target", Some(&target.id));
+    runtime.storage().append_task(&related_task).unwrap();
+    let unrelated_task = legacy_blocking_payload_task_for_work_item("task-other", Some(&other.id));
+    runtime.storage().append_task(&unrelated_task).unwrap();
+    let unscoped_task = legacy_blocking_payload_task_for_work_item("task-unscoped", None);
+    runtime.storage().append_task(&unscoped_task).unwrap();
+
+    let completed = runtime
+        .complete_work_item(target.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(completed.id, target.id);
+    assert_eq!(completed.result_summary, None);
+
+    let explicit_wait = runtime
+        .create_work_item("explicit wait".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime
+        .update_work_item_fields(
+            explicit_wait.id.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(Some("review the external result".into())),
+        )
+        .await
+        .unwrap();
+
+    let completed_wait = runtime
+        .complete_work_item(explicit_wait.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(completed_wait.state, WorkItemState::Completed);
+    assert!(completed_wait.blocked_by.is_none());
+}
+
+#[tokio::test]
+async fn work_item_query_tools_return_readiness_views() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let runnable = runtime
+        .create_work_item("runnable work".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let waiting = runtime
+        .create_work_item(
+            "waiting work".into(),
+            Some(WorkItemPlanStatus::NeedsInput),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let blocked = runtime
+        .create_work_item("blocked work".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime
+        .update_work_item_fields(
+            blocked.id.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(Some("waiting for CI".into())),
+        )
+        .await
+        .unwrap();
+    let wait_condition_blocked = runtime
+        .create_work_item("wait condition blocked".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let now = Utc::now();
+    runtime
+        .storage()
+        .append_wait_condition(&WaitConditionRecord {
+            id: "wait-external-only".into(),
+            agent_id: "default".into(),
+            work_item_id: Some(wait_condition_blocked.id.clone()),
+            status: WaitConditionStatus::Active,
+            kind: WaitConditionKind::External,
+            source: Some("test".into()),
+            subject_ref: Some("github:holon-run/holon#1459".into()),
+            waiting_for: "waiting for follow-up review".into(),
+            wake_sources: vec![WakeSource::ExternalIngress {
+                external_trigger_id: None,
+            }],
+            continuation: None,
+            created_at: now,
+            updated_at: now,
+            expires_at: None,
+            resolved_at: None,
+            cancelled_at: None,
+
+            turn_id: None,
+        })
+        .unwrap();
+
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+    let list = |filter: &'static str| {
+        let registry = &registry;
+        let runtime = &runtime;
+        async move {
+            let (result, _) = registry
+                .execute(
+                    runtime,
+                    "default",
+                    &AuthorityClass::OperatorInstruction,
+                    &crate::tool::ToolCall {
+                        id: format!("list-{filter}"),
+                        name: "ListWorkItems".into(),
+                        input: serde_json::json!({"filter": filter}),
+                    },
+                )
+                .await
+                .unwrap();
+            result.envelope.result.unwrap()
+        }
+    };
+
+    let runnable_payload = list("runnable").await;
+    assert_eq!(runnable_payload["total_matching"].as_u64(), Some(1));
+    assert_eq!(
+        runnable_payload["work_items"][0]["id"].as_str(),
+        Some(runnable.id.as_str())
+    );
+    assert_eq!(
+        runnable_payload["work_items"][0]["readiness"].as_str(),
+        Some("runnable")
+    );
+
+    let waiting_payload = list("waiting_for_operator").await;
+    assert_eq!(waiting_payload["total_matching"].as_u64(), Some(1));
+    assert_eq!(
+        waiting_payload["work_items"][0]["id"].as_str(),
+        Some(waiting.id.as_str())
+    );
+    assert_eq!(
+        waiting_payload["work_items"][0]["readiness"].as_str(),
+        Some("waiting_for_operator")
+    );
+    assert_eq!(
+        waiting_payload["work_items"][0]["is_runnable"].as_bool(),
+        Some(false)
+    );
+
+    let queued_payload = list("queued").await;
+    assert_eq!(queued_payload["total_matching"].as_u64(), Some(1));
+    let queued_ids = queued_payload["work_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["id"].as_str())
+        .collect::<Vec<_>>();
+    assert!(queued_ids.contains(&runnable.id.as_str()));
+    assert!(!queued_ids.contains(&waiting.id.as_str()));
+    assert!(!queued_ids.contains(&wait_condition_blocked.id.as_str()));
+
+    let blocked_payload = list("blocked").await;
+    assert_eq!(blocked_payload["total_matching"].as_u64(), Some(2));
+    let blocked_items = blocked_payload["work_items"].as_array().unwrap();
+    let blocked_ids = blocked_items
+        .iter()
+        .filter_map(|item| item["id"].as_str())
+        .collect::<Vec<_>>();
+    assert!(blocked_ids.contains(&blocked.id.as_str()));
+    assert!(blocked_ids.contains(&wait_condition_blocked.id.as_str()));
+    let wait_condition_view = blocked_items
+        .iter()
+        .find(|item| item["id"].as_str() == Some(wait_condition_blocked.id.as_str()))
+        .expect("wait condition blocked item should be listed");
+    assert_eq!(wait_condition_view["readiness"].as_str(), Some("blocked"));
+}
+
+#[tokio::test]
+async fn work_item_tools_use_objective_plan_and_todo_list_shape() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+
+    let (create_result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "create".into(),
+                name: "CreateWorkItem".into(),
+                input: serde_json::json!({
+                    "objective": "ship work item objective contract",
+                    "plan_status": "ready",
+                    "plan": "1. Inspect current contract\n2. Update tool shape\n3. Verify regression",
+                    "todo_list": [
+                        { "text": "inspect current contract", "state": "completed" },
+                        { "text": "update tool shape", "state": "in_progress" },
+                        { "text": "verify regression", "state": "pending" }
+                    ]
+                })
+            },
+        )
+        .await
+        .unwrap();
+    let create_payload = create_result.envelope.result.unwrap();
+    let work_item_id = create_payload["work_item"]["id"].as_str().unwrap();
+    assert_eq!(
+        create_payload["work_item"]["plan_status"].as_str(),
+        Some("ready")
+    );
+    assert_eq!(
+        create_payload["work_item"]["plan_artifact"]["preview"].as_str(),
+        Some("1. Inspect current contract\n2. Update tool shape\n3. Verify regression")
+    );
+    let plan_path = create_payload["work_item"]["plan_artifact"]["path"]
+        .as_str()
+        .unwrap();
+    assert!(std::path::Path::new(plan_path).is_file());
+    assert_eq!(
+        create_payload["work_item"]["plan_artifact"]["owner_agent_id"].as_str(),
+        Some("default")
+    );
+    assert_eq!(
+        create_payload["work_item"]["plan_artifact"]["workspace_id"].as_str(),
+        Some(crate::types::agent_home_workspace_id("default").as_str())
+    );
+    assert_eq!(
+        create_payload["work_item"]["plan_artifact"]["workspace_alias"].as_str(),
+        Some(AGENT_HOME_WORKSPACE_ID)
+    );
+    assert_eq!(
+        create_payload["work_item"]["plan_artifact"]["relative_path"].as_str(),
+        Some(format!("work-items/{work_item_id}/plan.md").as_str())
+    );
+    assert_eq!(
+        create_payload["work_item"]["todo_list"][0]["state"].as_str(),
+        Some("completed")
+    );
+    assert_eq!(
+        create_payload["work_item"]["todo_list"][1]["state"].as_str(),
+        Some("in_progress")
+    );
+    assert_eq!(
+        create_payload["work_item"]["todo_list"][2]["state"].as_str(),
+        Some("pending")
+    );
+    assert!(create_payload["work_item"]["todo_list"][0]["status"].is_null());
+
+    let (get_result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "get".into(),
+                name: "GetWorkItem".into(),
+                input: serde_json::json!({
+                    "work_item_id": work_item_id,
+                    "include_todo_list": true
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    let get_payload = get_result.envelope.result.unwrap();
+    assert_eq!(
+        get_payload["work_item"]["todo_list"][1]["state"].as_str(),
+        Some("in_progress")
+    );
+    assert!(get_payload["work_item"]["todo_list"][1]["status"].is_null());
+    assert!(get_payload["work_item"]["plan"].is_null());
+    assert_eq!(
+        get_payload["work_item"]["plan_artifact"]["path"].as_str(),
+        Some(plan_path)
+    );
+
+    let returned_items = get_payload["work_item"]["todo_list"].clone();
+    let (update_result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "update".into(),
+                name: "UpdateWorkItem".into(),
+                input: serde_json::json!({
+                    "work_item_id": work_item_id,
+                    "todo_list": returned_items
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    let update_payload = update_result.envelope.result.unwrap();
+    assert_eq!(
+        update_payload["work_item"]["todo_list"][1]["state"].as_str(),
+        Some("in_progress")
+    );
+    assert!(update_payload["work_item"]["todo_list"][1]["status"].is_null());
+}
+
+#[tokio::test]
+async fn work_item_plan_artifact_refreshes_after_direct_file_edit() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+    let work_item = runtime
+        .create_work_item(
+            "Refresh plan descriptor".into(),
+            Some(WorkItemPlanStatus::Ready),
+            Some("short plan".into()),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let (first_result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "first".into(),
+                name: "GetWorkItem".into(),
+                input: serde_json::json!({"work_item_id": work_item.id.clone()}),
+            },
+        )
+        .await
+        .unwrap();
+    let first_payload = first_result.envelope.result.unwrap();
+    let artifact = &first_payload["work_item"]["plan_artifact"];
+    let plan_path = artifact["path"].as_str().unwrap();
+    let first_hash = artifact["hash"].as_str().unwrap().to_string();
+    assert_eq!(artifact["preview"].as_str(), Some("short plan"));
+    assert_eq!(artifact["preview_complete"].as_bool(), Some(true));
+
+    std::fs::write(
+        plan_path,
+        format!("{}\nend", "expanded plan line\n".repeat(200)),
+    )
+    .unwrap();
+
+    let (second_result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "second".into(),
+                name: "GetWorkItem".into(),
+                input: serde_json::json!({"work_item_id": work_item.id.clone()}),
+            },
+        )
+        .await
+        .unwrap();
+    let second_payload = second_result.envelope.result.unwrap();
+    let refreshed = &second_payload["work_item"]["plan_artifact"];
+    assert_ne!(refreshed["hash"].as_str(), Some(first_hash.as_str()));
+    assert!(refreshed["bytes"].as_u64().unwrap() > artifact["bytes"].as_u64().unwrap());
+    assert_eq!(refreshed["preview_complete"].as_bool(), Some(false));
+    assert!(refreshed["preview"]
+        .as_str()
+        .unwrap()
+        .contains("expanded plan line"));
+}
+
+#[tokio::test]
+async fn turn_end_refreshes_changed_work_item_plan_artifact_snapshot() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work = runtime
+        .create_work_item(
+            "Refresh artifact at turn end".into(),
+            Some(WorkItemPlanStatus::Ready),
+            Some("initial plan".into()),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let original_artifact = work.plan_artifact.clone().unwrap();
+    let plan_path = original_artifact.path.clone();
+    std::fs::write(&plan_path, "changed plan body").unwrap();
+    bind_turn_to_work_item(&runtime, &work.id).await;
+
+    let committed = runtime
+        .maybe_commit_turn_end_work_item_transition()
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(committed.id, work.id);
+    assert_eq!(committed.revision, work.revision + 1);
+    assert_eq!(committed.plan_status, WorkItemPlanStatus::Ready);
+    assert_ne!(
+        committed.plan_artifact.as_ref().unwrap().hash,
+        original_artifact.hash
+    );
+    assert_eq!(
+        committed.plan_artifact.as_ref().unwrap().preview,
+        "changed plan body"
+    );
+    let latest = runtime.latest_work_item(&work.id).await.unwrap().unwrap();
+    assert_eq!(
+        latest.plan_artifact.as_ref().unwrap().hash,
+        committed.plan_artifact.as_ref().unwrap().hash
+    );
+    let events = runtime.storage().read_recent_events(20).unwrap();
+    let refreshed = events
+        .iter()
+        .find(|event| {
+            event.kind == "work_item_plan_artifact_refreshed"
+                && event.data["work_item_id"].as_str() == Some(work.id.as_str())
+        })
+        .expect("plan artifact refresh event");
+    assert!(refreshed.data.get("plan_artifact").is_none());
+    assert_eq!(
+        refreshed.data["plan_artifact_hash"].as_str(),
+        Some(committed.plan_artifact.as_ref().unwrap().hash.as_str())
+    );
+    assert_eq!(
+        refreshed.data["preview_complete"].as_bool(),
+        Some(committed.plan_artifact.as_ref().unwrap().preview_complete)
+    );
+}
+
+#[tokio::test]
+async fn turn_end_work_item_plan_artifact_refresh_is_noop_when_unchanged() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work = runtime
+        .create_work_item(
+            "Keep unchanged artifact stable".into(),
+            Some(WorkItemPlanStatus::NeedsInput),
+            Some("unchanged plan".into()),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    bind_turn_to_work_item(&runtime, &work.id).await;
+
+    let committed = runtime
+        .maybe_commit_turn_end_work_item_transition()
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(committed.revision, work.revision);
+    assert_eq!(committed.plan_status, WorkItemPlanStatus::NeedsInput);
+    assert_eq!(committed.plan_artifact, work.plan_artifact);
+    let latest = runtime.latest_work_item(&work.id).await.unwrap().unwrap();
+    assert_eq!(latest.revision, work.revision);
+}
+
+#[tokio::test]
+async fn turn_end_work_item_plan_artifact_refresh_rejects_missing_existing_artifact() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work = runtime
+        .create_work_item(
+            "Reject missing artifact".into(),
+            Some(WorkItemPlanStatus::Ready),
+            Some("plan that should not disappear".into()),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let plan_path = work.plan_artifact.as_ref().unwrap().path.clone();
+    std::fs::remove_file(&plan_path).unwrap();
+    bind_turn_to_work_item(&runtime, &work.id).await;
+
+    let error = runtime
+        .maybe_commit_turn_end_work_item_transition()
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("missing plan artifact"));
+    assert!(!plan_path.exists());
+    let latest = runtime.latest_work_item(&work.id).await.unwrap().unwrap();
+    assert_eq!(latest.revision, work.revision);
+}
+
+#[tokio::test]
+async fn complete_work_item_refreshes_latest_plan_artifact_snapshot() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work = runtime
+        .create_work_item(
+            "Complete with latest artifact".into(),
+            Some(WorkItemPlanStatus::Ready),
+            Some("initial completion plan".into()),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let plan_path = work.plan_artifact.as_ref().unwrap().path.clone();
+    std::fs::write(&plan_path, "completion plan after direct edit").unwrap();
+    let expected =
+        crate::work_item_plan::describe_plan_artifact(&plan_path, &work.agent_id, &work.id)
+            .unwrap();
+
+    let completed = runtime
+        .complete_work_item(work.id.clone(), Vec::new())
+        .await
+        .unwrap();
+
+    assert_eq!(completed.state, WorkItemState::Completed);
+    assert_eq!(completed.plan_status, WorkItemPlanStatus::Ready);
+    assert_eq!(completed.plan_artifact.as_ref(), Some(&expected));
+    let latest = runtime.latest_work_item(&work.id).await.unwrap().unwrap();
+    assert_eq!(latest.plan_artifact.as_ref(), Some(&expected));
+}
+
+#[tokio::test]
+async fn work_item_read_tools_reject_legacy_include_plan_argument() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+    let work_item = runtime
+        .create_work_item("Reject old read args".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+
+    for (tool_name, input) in [
+        (
+            "GetWorkItem",
+            serde_json::json!({"work_item_id": work_item.id.clone(), "include_plan": true}),
+        ),
+        (
+            "ListWorkItems",
+            serde_json::json!({"filter": "current", "include_plan": true}),
+        ),
+    ] {
+        let error = registry
+            .execute(
+                &runtime,
+                "default",
+                &AuthorityClass::OperatorInstruction,
+                &crate::tool::ToolCall {
+                    id: format!("{tool_name}-legacy-include-plan"),
+                    name: tool_name.into(),
+                    input,
+                },
+            )
+            .await
+            .unwrap_err();
+        let tool_error = crate::tool::ToolError::from_anyhow(&error);
+        assert_eq!(tool_error.kind, "invalid_tool_input");
+        let parse_error = tool_error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("parse_error"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(parse_error.contains("unknown field `include_plan`"));
+    }
+}
+
+#[tokio::test]
+async fn update_work_item_can_refine_objective() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+    let work_item = runtime
+        .create_work_item("Fix issue #869".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+
+    let (update_result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "refine-target".into(),
+                name: "UpdateWorkItem".into(),
+                input: serde_json::json!({
+                    "work_item_id": work_item.id.clone(),
+                    "objective": "Fix issue #869 by allowing objective refinement"
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    let payload = update_result.envelope.result.unwrap();
+    assert_eq!(
+        payload["work_item"]["objective"].as_str(),
+        Some("Fix issue #869 by allowing objective refinement")
+    );
+
+    let latest = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        latest.objective,
+        "Fix issue #869 by allowing objective refinement"
+    );
+}
+
+#[tokio::test]
+async fn update_work_item_can_refine_objective_and_todo_list_together() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+    let work_item = runtime
+        .create_work_item("Fix issue #869".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+
+    let (update_result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "refine-target-and-plan".into(),
+                name: "UpdateWorkItem".into(),
+                input: serde_json::json!({
+                    "work_item_id": work_item.id.clone(),
+                    "objective": "Fix issue #869 by allowing objective refinement",
+                    "todo_list": [
+                        { "text": "extend UpdateWorkItem schema", "state": "completed" },
+                        { "text": "verify target update persistence", "state": "in_progress" }
+                    ]
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    let payload = update_result.envelope.result.unwrap();
+    assert_eq!(
+        payload["work_item"]["objective"].as_str(),
+        Some("Fix issue #869 by allowing objective refinement")
+    );
+    assert_eq!(
+        payload["work_item"]["todo_list"][0]["state"].as_str(),
+        Some("completed")
+    );
+    assert_eq!(
+        payload["work_item"]["todo_list"][1]["state"].as_str(),
+        Some("in_progress")
+    );
+}
+
+#[tokio::test]
+async fn pick_work_item_clear_blocker_requires_reason() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+    let work_item = runtime
+        .create_work_item("resume blocked work".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+
+    let error = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "bad-pick-clear-blocker".into(),
+                name: "PickWorkItem".into(),
+                input: serde_json::json!({
+                    "work_item_id": work_item.id,
+                    "clear_blocker": true
+                }),
+            },
+        )
+        .await
+        .unwrap_err();
+    let tool_error = crate::tool::ToolError::from_anyhow(&error);
+    assert_eq!(tool_error.kind, "invalid_tool_input");
+    assert!(tool_error.message.contains("clear_blocker"));
+    assert!(tool_error.message.contains("reason"));
+    assert!(tool_error
+        .recovery_hint
+        .as_deref()
+        .unwrap_or_default()
+        .contains("inspection focus"));
+}
+
+#[tokio::test]
+async fn update_work_item_rejects_empty_objective() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+    let work_item = runtime
+        .create_work_item("Fix issue #869".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+
+    let error = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "empty-target".into(),
+                name: "UpdateWorkItem".into(),
+                input: serde_json::json!({
+                    "work_item_id": work_item.id.clone(),
+                    "objective": "   "
+                }),
+            },
+        )
+        .await
+        .unwrap_err();
+    let tool_error = crate::tool::ToolError::from_anyhow(&error);
+    assert_eq!(tool_error.kind, "invalid_tool_input");
+    assert!(tool_error.message.contains("objective"));
+}
+
+#[tokio::test]
+async fn update_work_item_old_plan_shape_returns_state_example_hint() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+
+    let error = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "bad-update".into(),
+                name: "UpdateWorkItem".into(),
+                input: serde_json::json!({
+                    "work_item_id": "item-1",
+                    "todo_list": [
+                        { "text": "inspect current handler", "status": "completed" }
+                    ]
+                }),
+            },
+        )
+        .await
+        .unwrap_err();
+    let tool_error = crate::tool::ToolError::from_anyhow(&error);
+    assert_eq!(tool_error.kind, "invalid_tool_input");
+    let parse_error = tool_error
+        .details
+        .as_ref()
+        .and_then(|details| details.get("parse_error"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert!(parse_error.contains("unknown field `status`"));
+    assert!(parse_error.contains("state"));
+    let recovery_hint = tool_error.recovery_hint.as_deref().unwrap_or_default();
+    assert!(recovery_hint.contains("work_item_id"));
+    assert!(recovery_hint.contains("\"state\":\"completed\""));
+    assert!(recovery_hint.contains("pending, in_progress, or completed"));
+}
+
+#[tokio::test]
+async fn update_work_item_missing_id_returns_top_level_field_hint() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+
+    let error = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "missing-id".into(),
+                name: "UpdateWorkItem".into(),
+                input: serde_json::json!({
+                    "todo_list": [
+                        { "text": "inspect current handler", "state": "completed" }
+                    ]
+                }),
+            },
+        )
+        .await
+        .unwrap_err();
+    let tool_error = crate::tool::ToolError::from_anyhow(&error);
+    assert_eq!(tool_error.kind, "invalid_tool_input");
+    let recovery_hint = tool_error.recovery_hint.as_deref().unwrap_or_default();
+    assert!(recovery_hint.contains("UpdateWorkItem schema"));
+    assert!(recovery_hint.contains("work_item_id"));
+    assert!(recovery_hint.contains("\"state\":\"completed\""));
+}
+
+#[tokio::test]
+async fn persist_brief_binds_current_turn_work_item() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work_item_id = seed_bound_work_item(&runtime, WorkItemState::Open, None, None).await;
+
+    runtime
+        .persist_brief(&BriefRecord::new(
+            "default",
+            BriefKind::Result,
+            "bound brief",
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+    let briefs = runtime.recent_briefs(10).await.unwrap();
+    assert_eq!(briefs.len(), 1);
+    assert_eq!(
+        briefs[0].work_item_id.as_deref(),
+        Some(work_item_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn create_callback_returns_default_ingress_with_current_turn_work_item() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    seed_bound_work_item(&runtime, WorkItemState::Open, None, None).await;
+
+    runtime
+        .create_callback(
+            "wait for review".into(),
+            "github".into(),
+            "review_submitted".into(),
+            Some("pull_request:302".into()),
+            CallbackDeliveryMode::WakeHint,
+        )
+        .await
+        .unwrap();
+
+    let descriptors = runtime.latest_external_triggers().await.unwrap();
+    assert_eq!(descriptors.len(), 1);
+    assert_eq!(descriptors[0].scope, ExternalTriggerScope::Agent);
+}
+
+#[tokio::test]
+async fn interactive_tool_execution_binds_current_turn_work_item() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(OneToolThenTextProvider {
+            calls: Mutex::new(0),
+        }),
+        "default".into(),
+        ContextConfig {
+            prompt_budget_estimated_tokens: 16384,
+            compaction_keep_recent_estimated_tokens: 2048,
+            ..context_config()
+        },
+    )
+    .unwrap();
+
+    let work_item = runtime
+        .create_work_item("verify binding".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    let message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "run one verification command".into(),
+        },
+    );
+
+    runtime
+        .process_interactive_message(
+            &message,
+            None,
+            LoopControlOptions {
+                max_tool_rounds: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let tools = runtime.storage().read_recent_tool_executions(10).unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].tool_name, "ExecCommand");
+    assert_eq!(
+        tools[0].work_item_id.as_deref(),
+        Some(work_item.id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn complete_work_item_promotes_same_round_report_and_binds_evidence() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let seed_runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = seed_runtime
+        .create_work_item("ship completion report".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    seed_runtime
+        .pick_work_item(work_item.id.clone())
+        .await
+        .unwrap();
+
+    let report_text = "Implemented completion report promotion and verified focused tests.";
+    let expected_work_revision = seed_runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    let provider = Arc::new(CompleteWorkItemReportProvider {
+        work_item_id: work_item.id.clone(),
+        report_text: Some(report_text.into()),
+        calls: Mutex::new(0),
+    });
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        provider.clone(),
+        "default".into(),
+        continuation_context_config(),
+    )
+    .unwrap();
+    let message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "finish the tracked work".into(),
+        },
+    );
+
+    runtime
+        .process_interactive_message(
+            &message,
+            None,
+            LoopControlOptions {
+                max_tool_rounds: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        *provider.calls.lock().await,
+        2,
+        "promoted completion report should not hard-stop the provider loop"
+    );
+
+    let completed = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.state, WorkItemState::Completed);
+    assert_eq!(completed.result_summary, None);
+    let briefs = runtime.recent_briefs(10).await.unwrap();
+    let result_briefs = briefs
+        .iter()
+        .filter(|brief| brief.kind == BriefKind::Result && brief.text == report_text)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        result_briefs.len(),
+        1,
+        "completion report should produce exactly one user-facing result brief"
+    );
+    assert_eq!(
+        result_briefs[0].work_item_id.as_deref(),
+        Some(work_item.id.as_str())
+    );
+    assert_eq!(
+        completed.result_brief_id.as_deref(),
+        Some(result_briefs[0].id.as_str())
+    );
+    let completion_intent = completed
+        .completion_intent
+        .as_ref()
+        .expect("completed work item should retain completion intent");
+    assert_eq!(
+        completion_intent.source_message_id.as_deref(),
+        Some(message.id.as_str())
+    );
+    assert_eq!(
+        completion_intent.source_turn_id.as_deref(),
+        result_briefs[0].turn_id.as_deref()
+    );
+    assert_eq!(
+        completion_intent.expected_work_revision,
+        expected_work_revision
+    );
+    assert_eq!(completion_intent.report_state, CompletionReportState::Bound);
+    assert_eq!(
+        completion_intent.result_brief_id.as_deref(),
+        Some(result_briefs[0].id.as_str())
+    );
+    assert_eq!(result_briefs[0].turn_index, Some(1));
+    assert!(runtime
+        .storage()
+        .latest_delivery_summary(&work_item.id)
+        .unwrap()
+        .is_none());
+    // The normal result brief is no longer suppressed — it coexists with the
+    // promoted completion report brief.
+    let normal_brief = briefs.iter().find(|brief| {
+        brief.kind == BriefKind::Result
+            && brief.related_message_id.as_deref() == Some(message.id.as_str())
+    });
+    assert!(
+        normal_brief.is_some(),
+        "normal terminal result brief should exist"
+    );
+    let tools = runtime.storage().read_recent_tool_executions(10).unwrap();
+    let complete_tool = tools
+        .iter()
+        .find(|tool| tool.tool_name == "CompleteWorkItem")
+        .expect("completion tool should be recorded");
+    assert_eq!(
+        complete_tool.work_item_id.as_deref(),
+        Some(work_item.id.as_str())
+    );
+    let transcript = runtime.storage().read_recent_transcript(10).unwrap();
+    let assistant_round = transcript
+        .iter()
+        .find(|entry| entry.kind == crate::types::TranscriptEntryKind::AssistantRound)
+        .expect("assistant round should be recorded");
+    assert_eq!(
+        assistant_round.data["work_item_id"].as_str(),
+        Some(work_item.id.as_str())
+    );
+    let tool_results = transcript
+        .iter()
+        .find(|entry| entry.kind == crate::types::TranscriptEntryKind::ToolResults)
+        .expect("tool results should be recorded");
+    // New format uses refs with provider_visible_text
+    let refs = tool_results
+        .data
+        .get("refs")
+        .and_then(|v| v.as_array())
+        .expect("missing refs array in new format");
+    let content = refs[0]
+        .get("provider_visible_text")
+        .and_then(|v| v.as_str())
+        .expect("provider_visible_text");
+    let tool_result: serde_json::Value = serde_json::from_str(content).unwrap();
+    assert_eq!(
+        tool_result["result"]["completion_report_promoted"].as_bool(),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn later_final_report_binds_completed_work_item_after_continuation_resume() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let seed_runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let caller = seed_runtime
+        .create_work_item(
+            "resume caller after child completion".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    seed_runtime
+        .pick_work_item(caller.id.clone())
+        .await
+        .unwrap();
+    let completed_work = seed_runtime
+        .create_work_item(
+            "complete child without preceding report".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    seed_runtime
+        .pick_work_item(completed_work.id.clone())
+        .await
+        .unwrap();
+
+    let provider = Arc::new(CompleteWorkItemReportProvider {
+        work_item_id: completed_work.id.clone(),
+        report_text: None,
+        calls: Mutex::new(0),
+    });
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        provider,
+        "default".into(),
+        continuation_context_config(),
+    )
+    .unwrap();
+    let message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "complete the child and return to the caller".into(),
+        },
+    );
+
+    runtime
+        .process_interactive_message(
+            &message,
+            None,
+            LoopControlOptions {
+                max_tool_rounds: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let completed = runtime
+        .latest_work_item(&completed_work.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let result_brief_id = completed
+        .result_brief_id
+        .as_deref()
+        .expect("later final report should bind the completed work item");
+    let result_brief = runtime
+        .storage()
+        .read_brief_by_id(result_brief_id)
+        .unwrap()
+        .expect("bound later final report should exist");
+    assert_eq!(result_brief.text, "done");
+    assert_eq!(
+        result_brief.work_item_id.as_deref(),
+        Some(completed_work.id.as_str())
+    );
+    assert_eq!(
+        result_brief.related_message_id.as_deref(),
+        Some(message.id.as_str())
+    );
+    let completion_intent = completed
+        .completion_intent
+        .as_ref()
+        .expect("completion intent should remain durable");
+    assert_eq!(completion_intent.report_state, CompletionReportState::Bound);
+    assert_eq!(
+        completion_intent.result_brief_id.as_deref(),
+        Some(result_brief_id)
+    );
+    let state = runtime.agent_state().await.unwrap();
+    assert_eq!(
+        state.current_work_item_id.as_deref(),
+        Some(caller.id.as_str())
+    );
+    assert_eq!(
+        state.current_turn_work_item_id.as_deref(),
+        Some(caller.id.as_str())
+    );
+    assert!(
+        runtime
+            .recent_briefs(10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|brief| brief.work_item_id.as_deref() != Some(caller.id.as_str())),
+        "completed child final report must not be rebound to resumed caller"
+    );
+
+    let restarted = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let restarted_completed = restarted
+        .latest_work_item(&completed_work.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        restarted_completed.result_brief_id,
+        completed.result_brief_id
+    );
+    assert_eq!(
+        restarted_completed.completion_intent,
+        completed.completion_intent
+    );
+}
+
+#[tokio::test]
+async fn completion_intent_does_not_borrow_mismatched_execution_identity() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let active = runtime
+        .create_work_item("active execution".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let unrelated = runtime
+        .create_work_item(
+            "completed outside active execution".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runtime.pick_work_item(active.id.clone()).await.unwrap();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "continue active execution".into(),
+        },
+    );
+    message.turn_id = Some("turn-active-execution".into());
+    runtime
+        .begin_interactive_turn(Some(&message), None, None)
+        .await
+        .unwrap();
+
+    let completed = runtime
+        .complete_work_item(unrelated.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    let intent = completed
+        .completion_intent
+        .as_ref()
+        .expect("completion intent");
+    assert_eq!(intent.source_activation_id, None);
+    assert_eq!(intent.source_message_id, None);
+    assert_eq!(intent.source_turn_id, None);
+    assert_eq!(intent.expected_work_revision, unrelated.revision);
+}
+
+#[tokio::test]
+async fn turn_end_marks_unbound_completion_report_missing_and_persists_restart() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "complete without a final report".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "complete without reporting".into(),
+        },
+    );
+    message.turn_id = Some("turn-missing-completion-report".into());
+    runtime
+        .begin_interactive_turn(Some(&message), None, None)
+        .await
+        .unwrap();
+
+    let completed = runtime
+        .complete_work_item(work_item.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        completed
+            .completion_intent
+            .as_ref()
+            .expect("completion intent")
+            .report_state,
+        CompletionReportState::Pending
+    );
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.last_turn_terminal = Some(TurnTerminalRecord {
+            turn_id: message.turn_id.clone().unwrap(),
+            turn_index: guard.state.turn_index,
+            kind: TurnTerminalKind::Completed,
+            reason: None,
+            last_assistant_message: None,
+            checkpoint: None,
+            completed_at: Utc::now(),
+            duration_ms: 10,
+        });
+        guard.persist_state(&runtime.inner.storage).unwrap();
+    }
+
+    assert!(runtime
+        .maybe_commit_turn_end_work_item_transition()
+        .await
+        .unwrap()
+        .is_none());
+    let missing = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(missing.result_brief_id, None);
+    assert_eq!(
+        missing
+            .completion_intent
+            .as_ref()
+            .expect("completion intent")
+            .report_state,
+        CompletionReportState::Missing
+    );
+
+    let restarted = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    assert_eq!(
+        restarted
+            .latest_work_item(&work_item.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .completion_intent,
+        missing.completion_intent
+    );
+}
+
+#[tokio::test]
+async fn complete_work_item_followed_by_same_round_tool_keeps_terminal_brief() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let seed_runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = seed_runtime
+        .create_work_item("complete then verify".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    seed_runtime
+        .pick_work_item(work_item.id.clone())
+        .await
+        .unwrap();
+
+    let provider = Arc::new(CompleteThenExecProvider {
+        work_item_id: work_item.id.clone(),
+        calls: Mutex::new(0),
+    });
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        provider.clone(),
+        "default".into(),
+        continuation_context_config(),
+    )
+    .unwrap();
+    let message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "complete and verify".into(),
+        },
+    );
+
+    runtime
+        .process_interactive_message(
+            &message,
+            None,
+            LoopControlOptions {
+                max_tool_rounds: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(*provider.calls.lock().await, 2);
+    let briefs = runtime.recent_briefs(10).await.unwrap();
+    assert!(briefs.iter().any(|brief| {
+        brief.kind == BriefKind::Result && brief.text == "Finished the tracked work."
+    }));
+    assert!(briefs.iter().any(|brief| {
+        brief.kind == BriefKind::Result && brief.text == "Verified after completion."
+    }));
+}
+
+#[tokio::test]
+async fn complete_work_item_does_not_promote_text_before_other_tool() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let seed_runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = seed_runtime
+        .create_work_item("complete after another tool".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    seed_runtime
+        .pick_work_item(work_item.id.clone())
+        .await
+        .unwrap();
+
+    let provider = Arc::new(StaleTextThenCompleteProvider {
+        work_item_id: work_item.id.clone(),
+        calls: Mutex::new(0),
+    });
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        provider,
+        "default".into(),
+        continuation_context_config(),
+    )
+    .unwrap();
+    let message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "inspect then complete".into(),
+        },
+    );
+
+    runtime
+        .process_interactive_message(
+            &message,
+            None,
+            LoopControlOptions {
+                max_tool_rounds: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let completed = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.state, WorkItemState::Completed);
+    assert_eq!(completed.result_summary, None);
+    assert!(runtime
+        .storage()
+        .latest_delivery_summary(&work_item.id)
+        .unwrap()
+        .is_none());
+    let transcript = runtime.storage().read_recent_transcript(10).unwrap();
+    let tool_results = transcript
+        .iter()
+        .find(|entry| entry.kind == crate::types::TranscriptEntryKind::ToolResults)
+        .expect("tool results should be recorded");
+    // New format uses refs
+    let refs = tool_results
+        .data
+        .get("refs")
+        .and_then(|v| v.as_array())
+        .expect("missing refs array in new format");
+    let completion_ref = refs
+        .iter()
+        .find(|ref_entry| {
+            ref_entry.get("tool_call_id").and_then(|v| v.as_str()) == Some("complete-work")
+        })
+        .expect("completion result should be recorded");
+    let content = completion_ref
+        .get("provider_visible_text")
+        .and_then(|v| v.as_str())
+        .expect("provider_visible_text");
+    let content_json: serde_json::Value = serde_json::from_str(content).unwrap();
+    assert_eq!(
+        content_json["result"]["completion_report_promoted"].as_bool(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn promoted_completion_report_resumes_next_queued_work_item_via_system_tick() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let seed_runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let active = seed_runtime
+        .create_work_item("finish active work".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    seed_runtime
+        .pick_work_item(active.id.clone())
+        .await
+        .unwrap();
+    let queued = seed_runtime
+        .create_work_item("resume queued work".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+
+    let provider = Arc::new(CompleteWorkItemReportProvider {
+        work_item_id: active.id.clone(),
+        report_text: Some("Active work is complete.".into()),
+        calls: Mutex::new(0),
+    });
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        provider,
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "finish active work".into(),
+        },
+    );
+
+    runtime
+        .process_message(message, closure_decision(ClosureOutcome::Completed, None))
+        .await
+        .unwrap();
+
+    let messages = runtime.storage().read_recent_messages(10).unwrap();
+    let tick = messages
+        .iter()
+        .find(|message| {
+            matches!(
+                (&message.kind, &message.origin),
+                (MessageKind::SystemTick, MessageOrigin::System { subsystem }) if subsystem == "work_queue"
+            )
+        })
+        .expect("queued runnable work item should be resumed by work queue tick");
+    assert_eq!(tick.work_item_id.as_deref(), Some(queued.id.as_str()));
+    assert_eq!(
+        tick.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("work_queue"))
+            .and_then(|metadata| metadata.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("queued_available")
+    );
+}
+
+#[tokio::test]
+async fn complete_work_item_without_same_round_report_warns_without_summary() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let seed_runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = seed_runtime
+        .create_work_item("complete without report".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    seed_runtime
+        .pick_work_item(work_item.id.clone())
+        .await
+        .unwrap();
+
+    let provider = Arc::new(CompleteWorkItemReportProvider {
+        work_item_id: work_item.id.clone(),
+        report_text: None,
+        calls: Mutex::new(0),
+    });
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        provider.clone(),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "finish the tracked work".into(),
+        },
+    );
+
+    runtime
+        .process_interactive_message(
+            &message,
+            None,
+            LoopControlOptions {
+                max_tool_rounds: None,
+            },
+        )
+        .await
+        .unwrap();
+    let completed = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.state, WorkItemState::Completed);
+    assert_eq!(completed.result_summary, None);
+    assert!(runtime
+        .storage()
+        .latest_delivery_summary(&work_item.id)
+        .unwrap()
+        .is_none());
+    let transcript = runtime.storage().read_recent_transcript(10).unwrap();
+    let tool_results = transcript
+        .iter()
+        .find(|entry| entry.kind == crate::types::TranscriptEntryKind::ToolResults)
+        .expect("tool results should be recorded");
+    // New format uses refs
+    let refs = tool_results
+        .data
+        .get("refs")
+        .and_then(|v| v.as_array())
+        .expect("missing refs array in new format");
+    let content = refs[0]
+        .get("provider_visible_text")
+        .and_then(|v| v.as_str())
+        .expect("provider_visible_text");
+    let tool_result: serde_json::Value = serde_json::from_str(content).unwrap();
+    assert_eq!(
+        tool_result["result"]["warnings"][0]["kind"].as_str(),
+        Some("missing_completion_report")
+    );
+    let events = runtime.storage().read_recent_events(20).unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "work_item_completion_warning"
+            && event.data["kind"].as_str() == Some("missing_completion_report")
+            && event.data["work_item_id"].as_str() == Some(work_item.id.as_str())
+    }));
+}
+
+#[tokio::test]
+async fn multiple_complete_work_items_in_one_round_do_not_promote_or_short_circuit() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let seed_runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let first = seed_runtime
+        .create_work_item("first completion".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let second = seed_runtime
+        .create_work_item("second completion".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+
+    let provider = Arc::new(MultiCompleteWorkItemReportProvider {
+        work_item_ids: vec![first.id.clone(), second.id.clone()],
+        report_texts: vec![
+            "Finished the first work item.".into(),
+            "Finished the second work item.".into(),
+        ],
+        calls: Mutex::new(0),
+    });
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        provider.clone(),
+        "default".into(),
+        continuation_context_config(),
+    )
+    .unwrap();
+    let message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "finish both tracked items".into(),
+        },
+    );
+
+    runtime
+        .process_interactive_message(
+            &message,
+            None,
+            LoopControlOptions {
+                max_tool_rounds: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    for (work_item_id, report_text) in [
+        (&first.id, "Finished the first work item."),
+        (&second.id, "Finished the second work item."),
+    ] {
+        let completed = runtime
+            .latest_work_item(work_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.state, WorkItemState::Completed);
+        assert_eq!(completed.result_summary, None);
+        let result_brief_id = completed
+            .result_brief_id
+            .as_deref()
+            .expect("completion report should store result brief id");
+        assert_eq!(
+            runtime
+                .storage()
+                .read_brief_by_id(result_brief_id)
+                .unwrap()
+                .expect("completion result brief should exist")
+                .text,
+            report_text
+        );
+        assert!(runtime
+            .storage()
+            .latest_delivery_summary(work_item_id)
+            .unwrap()
+            .is_none());
+    }
+    assert_eq!(
+        *provider.calls.lock().await,
+        2,
+        "multiple completion reports should not hard-stop the provider loop"
+    );
+    let briefs = runtime.recent_briefs(10).await.unwrap();
+    assert_eq!(
+        briefs
+            .iter()
+            .filter(|brief| brief.kind == BriefKind::Result
+                && brief.work_item_id.as_deref() == Some(first.id.as_str()))
+            .count(),
+        1
+    );
+    assert_eq!(
+        briefs
+            .iter()
+            .filter(|brief| brief.kind == BriefKind::Result
+                && brief.work_item_id.as_deref() == Some(second.id.as_str()))
+            .count(),
+        1
+    );
+    let events = runtime.storage().read_recent_events(usize::MAX).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.kind == "work_item_completion_warning"
+                    && event.data["kind"].as_str()
+                        == Some("completion_report_not_promoted_multiple_completions")
+            })
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn repeated_complete_work_item_does_not_overwrite_existing_report() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let seed_runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = seed_runtime
+        .create_work_item("already completed".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let completed = seed_runtime
+        .complete_work_item(work_item.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    seed_runtime
+        .promote_work_item_completion_report(
+            completed.id.clone(),
+            "Original completion report".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CompleteWorkItemReportProvider {
+            work_item_id: work_item.id.clone(),
+            report_text: Some("Replacement report should not be promoted".into()),
+            calls: Mutex::new(0),
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "repeat completion".into(),
+        },
+    );
+
+    runtime
+        .process_interactive_message(
+            &message,
+            None,
+            LoopControlOptions {
+                max_tool_rounds: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let completed = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.result_summary, None);
+    let result_brief_id = completed
+        .result_brief_id
+        .as_deref()
+        .expect("original result brief id should remain");
+    let brief = runtime
+        .storage()
+        .read_brief_by_id(result_brief_id)
+        .unwrap()
+        .expect("original result brief should remain");
+    assert_eq!(brief.text, "Original completion report");
+    assert!(runtime
+        .storage()
+        .latest_delivery_summary(&work_item.id)
+        .unwrap()
+        .is_none());
+    let transcript = runtime.storage().read_recent_transcript(10).unwrap();
+    let tool_results = transcript
+        .iter()
+        .find(|entry| entry.kind == crate::types::TranscriptEntryKind::ToolResults)
+        .expect("tool results should be recorded");
+    // New format uses refs
+    let refs = tool_results
+        .data
+        .get("refs")
+        .and_then(|v| v.as_array())
+        .expect("missing refs array in new format");
+    let content = refs[0]
+        .get("provider_visible_text")
+        .and_then(|v| v.as_str())
+        .expect("provider_visible_text");
+    let tool_result: serde_json::Value = serde_json::from_str(content).unwrap();
+    assert_eq!(
+        tool_result["result"]["completed_transition"].as_bool(),
+        Some(false)
+    );
+    assert_ne!(
+        tool_result["result"]["completion_report_promoted"].as_bool(),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn conflicting_completion_report_promotion_keeps_first_canonical_brief() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item("bind one canonical report".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let completed = runtime
+        .complete_work_item(work_item.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    let first = runtime
+        .promote_work_item_completion_report(
+            completed.id.clone(),
+            "First canonical completion report".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let first_brief_id = first
+        .result_brief_id
+        .clone()
+        .expect("first promotion should bind a brief");
+
+    let repeated = runtime
+        .promote_work_item_completion_report(
+            completed.id.clone(),
+            "Conflicting replacement report".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        repeated.result_brief_id.as_deref(),
+        Some(first_brief_id.as_str())
+    );
+    assert_eq!(
+        repeated
+            .completion_intent
+            .as_ref()
+            .expect("completion intent")
+            .result_brief_id
+            .as_deref(),
+        Some(first_brief_id.as_str())
+    );
+    assert_eq!(
+        runtime
+            .storage()
+            .read_brief_by_id(&first_brief_id)
+            .unwrap()
+            .expect("first canonical brief")
+            .text,
+        "First canonical completion report"
+    );
+    assert!(runtime
+        .recent_briefs(10)
+        .await
+        .unwrap()
+        .iter()
+        .all(|brief| brief.text != "Conflicting replacement report"));
+}
+
+#[tokio::test]
+async fn complete_work_item_with_unfinished_todos_returns_structured_warning() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item("finish todos".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime
+        .update_work_item_fields(
+            work_item.id.clone(),
+            None,
+            None,
+            None,
+            Some(vec![
+                TodoItem {
+                    text: "still pending".into(),
+                    state: TodoItemState::Pending,
+                },
+                TodoItem {
+                    text: "actively checking".into(),
+                    state: TodoItemState::InProgress,
+                },
+            ]),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+    let (result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "complete".into(),
+                name: "CompleteWorkItem".into(),
+                input: serde_json::json!({"work_item_id": work_item.id}),
+            },
+        )
+        .await
+        .unwrap();
+    let payload = result.envelope.result.unwrap();
+    assert_eq!(
+        payload["warnings"][0]["kind"].as_str(),
+        Some("unfinished_todos")
+    );
+    assert_eq!(payload["warnings"][0]["pending_count"].as_u64(), Some(1));
+    assert_eq!(
+        payload["warnings"][0]["in_progress_count"].as_u64(),
+        Some(1)
+    );
+    let events = runtime.storage().read_recent_events(20).unwrap();
+    let completed_event = events
+        .iter()
+        .find(|event| {
+            event.kind == "work_item_written" && event.data["action"].as_str() == Some("completed")
+        })
+        .expect("completion event should be recorded");
+    assert_eq!(
+        completed_event.data["work_item_id"].as_str(),
+        Some(work_item.id.as_str())
+    );
+    assert_eq!(completed_event.data["warning_count"].as_u64(), Some(1));
+    assert!(completed_event.data.get("warnings").is_none());
+    assert!(completed_event.data.get("record").is_none());
+}
+
+#[tokio::test]
+async fn runtime_sleeps_after_processing() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let runtime_task = tokio::spawn(runtime.clone().run());
+
+    let message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "hello".into(),
+        },
+    );
+    runtime.enqueue(message).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let state = runtime.agent_state().await.unwrap();
+    assert_eq!(state.status, AgentStatus::Asleep);
+    runtime_task.abort();
+}
+
+#[tokio::test]
+async fn turn_end_work_item_commit_defaults_completed_turn_to_active() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work_item_id = seed_bound_work_item(&runtime, WorkItemState::Open, None, None).await;
+    let committed = runtime
+        .maybe_commit_turn_end_work_item_transition()
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(committed.id, work_item_id);
+    assert_eq!(committed.state, WorkItemState::Open);
+    assert!(committed.blocked_by.is_none());
+    assert!(runtime
+        .agent_state()
+        .await
+        .unwrap()
+        .current_turn_work_item_id
+        .is_none());
+}
+
+#[tokio::test]
+async fn turn_end_work_item_commit_ignores_unfinished_turn_binding() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work = runtime
+        .create_work_item("no terminal yet".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.turn_index = 7;
+        guard.state.current_turn_work_item_id = Some(work.id.clone());
+        guard.state.last_turn_terminal = None;
+        runtime.inner.storage.write_agent(&guard.state).unwrap();
+    }
+
+    let committed = runtime
+        .maybe_commit_turn_end_work_item_transition()
+        .await
+        .unwrap();
+    assert!(committed.is_none());
+    assert_eq!(
+        runtime
+            .agent_state()
+            .await
+            .unwrap()
+            .current_turn_work_item_id
+            .as_deref(),
+        Some(work.id.as_str())
+    );
+    assert_eq!(
+        runtime
+            .latest_work_item(&work.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        1
+    );
+}
+
+#[tokio::test]
+async fn turn_end_work_item_commit_keeps_failed_turn_open_without_blocker() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work_item_id = seed_bound_work_item(&runtime, WorkItemState::Open, None, None).await;
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.last_turn_terminal = Some(TurnTerminalRecord {
+            turn_id: "test-turn".into(),
+            turn_index: guard.state.turn_index,
+            kind: TurnTerminalKind::Aborted,
+            reason: None,
+            last_assistant_message: Some("provider context_length_exceeded".into()),
+            checkpoint: None,
+            completed_at: Utc::now(),
+            duration_ms: 42,
+        });
+        runtime.inner.storage.write_agent(&guard.state).unwrap();
+    }
+
+    let committed = runtime
+        .maybe_commit_turn_end_work_item_transition()
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(committed.id, work_item_id);
+    assert_eq!(committed.state, WorkItemState::Open);
+    assert!(committed.blocked_by.is_none());
+}
+
+#[tokio::test]
+async fn turn_end_work_item_commit_preserves_existing_blocker_on_failed_turn() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work_item_id = seed_bound_work_item(
+        &runtime,
+        WorkItemState::Open,
+        None,
+        Some("Waiting for reviewer response."),
+    )
+    .await;
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.last_turn_terminal = Some(TurnTerminalRecord {
+            turn_id: "test-turn".into(),
+            turn_index: guard.state.turn_index,
+            kind: TurnTerminalKind::Aborted,
+            reason: None,
+            last_assistant_message: Some("provider timeout".into()),
+            checkpoint: None,
+            completed_at: Utc::now(),
+            duration_ms: 42,
+        });
+        runtime.inner.storage.write_agent(&guard.state).unwrap();
+    }
+
+    let committed = runtime
+        .maybe_commit_turn_end_work_item_transition()
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(committed.id, work_item_id);
+    assert_eq!(committed.state, WorkItemState::Open);
+    assert_eq!(
+        committed.blocked_by.as_deref(),
+        Some("Waiting for reviewer response.")
+    );
+}
+
+#[tokio::test]
+async fn turn_end_work_item_commit_does_not_block_bound_item_for_active_task_presence() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work_item_id = seed_bound_work_item(&runtime, WorkItemState::Open, None, None).await;
+    mark_blocking_task(&runtime, "blocking-wait").await;
+
+    let committed = runtime
+        .maybe_commit_turn_end_work_item_transition()
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(committed.id, work_item_id);
+    assert_eq!(committed.state, WorkItemState::Open);
+    assert_eq!(committed.blocked_by.as_deref(), None);
+}
+
+#[tokio::test]
+async fn turn_end_work_item_commit_preserves_explicit_completed_claim_without_waiting_facts() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work_item_id = seed_bound_work_item(
+        &runtime,
+        WorkItemState::Completed,
+        Some("finished"),
+        Some("all requested changes are done"),
+    )
+    .await;
+    let committed = runtime
+        .maybe_commit_turn_end_work_item_transition()
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(committed.id, work_item_id);
+    assert_eq!(committed.state, WorkItemState::Completed);
+    assert!(committed.blocked_by.is_none());
+}
+
+#[tokio::test]
+async fn turn_end_work_item_commit_rejects_completed_claim_when_runtime_is_still_waiting() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work_item_id = seed_bound_work_item(
+        &runtime,
+        WorkItemState::Completed,
+        Some("finished"),
+        Some("marked complete too early"),
+    )
+    .await;
+    mark_blocking_task(&runtime, "blocking-after-complete").await;
+
+    let committed = runtime
+        .maybe_commit_turn_end_work_item_transition()
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(committed.id, work_item_id);
+    assert_eq!(committed.state, WorkItemState::Completed);
+    assert!(committed.blocked_by.is_none());
+}
+
+#[tokio::test]
+async fn turn_end_work_item_commit_preserves_explicit_queued_claim() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work_item_id = seed_bound_work_item(
+        &runtime,
+        WorkItemState::Open,
+        Some("yield the active slot"),
+        Some("requeue after this turn"),
+    )
+    .await;
+    let committed = runtime
+        .maybe_commit_turn_end_work_item_transition()
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(committed.id, work_item_id);
+    assert_eq!(committed.state, WorkItemState::Open);
+    assert!(committed.blocked_by.is_none());
+}
+
+#[tokio::test]
+async fn external_trigger_creation_returns_default_ingress_without_waiting_intent() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let capability = runtime
+        .create_external_trigger(
+            "wait for external review".into(),
+            "github".into(),
+            ExternalTriggerScope::Agent,
+            CallbackDeliveryMode::WakeHint,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(capability.delivery_mode, CallbackDeliveryMode::WakeHint);
+    assert_eq!(capability.status, ExternalTriggerStatus::Active);
+}
+
+#[tokio::test]
+async fn agent_scoped_external_trigger_survives_missing_work_item_cleanup() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let capability = runtime
+        .create_external_trigger(
+            "Check durable inbox for unread entries".into(),
+            "agentinbox".into(),
+            ExternalTriggerScope::Agent,
+            CallbackDeliveryMode::WakeHint,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(runtime
+        .latest_external_triggers()
+        .await
+        .unwrap()
+        .iter()
+        .any(
+            |record| record.external_trigger_id == capability.external_trigger_id
+                && record.status == ExternalTriggerStatus::Active
+        ));
+    let closure = runtime.current_closure_decision().await.unwrap();
+    assert_ne!(
+        closure.waiting_reason,
+        Some(WaitingReason::AwaitingExternalChange)
+    );
+}
+
+#[tokio::test]
+async fn agent_scoped_wake_hint_preserves_external_trigger_provenance() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.status = AgentStatus::Asleep;
+        guard.persist_state(&runtime.inner.storage).unwrap();
+    }
+    let capability = runtime
+        .create_external_trigger(
+            "Check AgentInbox for unread items".into(),
+            "agentinbox".into(),
+            ExternalTriggerScope::Agent,
+            CallbackDeliveryMode::WakeHint,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let result = runtime
+        .deliver_callback(
+            &capability.external_trigger_id,
+            CallbackDeliveryPayload {
+                body: Some(MessageBody::Json {
+                    value: serde_json::json!({
+                        "latest_entry_id": "ent_123",
+                        "preview": "new inbox item"
+                    }),
+                }),
+                content_type: Some("application/json".into()),
+                correlation_id: Some("corr-inbox".into()),
+                causation_id: Some("cause-webhook".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.disposition, CallbackIngressDisposition::Triggered);
+    assert_eq!(result.scope, ExternalTriggerScope::Agent);
+
+    let messages = runtime.storage().read_recent_messages(10).unwrap();
+    let tick = messages
+        .iter()
+        .find(|message| message.kind == MessageKind::SystemTick)
+        .expect("wake hint should emit a system tick");
+    let wake_hint = tick
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("wake_hint"))
+        .expect("wake hint metadata should exist");
+    assert_eq!(wake_hint["source"].as_str(), None);
+    assert_eq!(wake_hint["scope"].as_str(), Some("agent"));
+    assert_eq!(
+        wake_hint["external_trigger_id"].as_str(),
+        Some(capability.external_trigger_id.as_str())
+    );
+    assert_eq!(wake_hint["description"].as_str(), None);
+    assert_eq!(wake_hint["correlation_id"].as_str(), Some("corr-inbox"));
+    assert_eq!(wake_hint["causation_id"].as_str(), Some("cause-webhook"));
+    assert_eq!(
+        wake_hint["body"]["value"]["latest_entry_id"].as_str(),
+        Some("ent_123")
+    );
+}
+
+#[tokio::test]
+async fn agent_scoped_wake_hint_binds_unique_wildcard_external_wait() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.status = AgentStatus::Asleep;
+        guard.persist_state(&runtime.inner.storage).unwrap();
+    }
+    let work = runtime
+        .create_work_item("wait for callback".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime
+        .storage()
+        .append_wait_condition(&WaitConditionRecord {
+            id: "wait-any-external".into(),
+            agent_id: "default".into(),
+            work_item_id: Some(work.id.clone()),
+            status: WaitConditionStatus::Active,
+            kind: WaitConditionKind::External,
+            source: Some("WaitFor".into()),
+            subject_ref: Some("callback-resource".into()),
+            waiting_for: "callback".into(),
+            wake_sources: vec![WakeSource::ExternalIngress {
+                external_trigger_id: None,
+            }],
+            continuation: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            expires_at: None,
+            resolved_at: None,
+            cancelled_at: None,
+            turn_id: None,
+        })
+        .unwrap();
+    let capability = runtime
+        .create_external_trigger(
+            "resume callback wait".into(),
+            "test".into(),
+            ExternalTriggerScope::Agent,
+            CallbackDeliveryMode::WakeHint,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    runtime
+        .deliver_callback(
+            &capability.external_trigger_id,
+            CallbackDeliveryPayload {
+                body: None,
+                content_type: None,
+                correlation_id: None,
+                causation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let tick = runtime
+        .storage()
+        .read_recent_messages(10)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.kind == MessageKind::SystemTick)
+        .expect("wake hint should emit a system tick");
+    assert_eq!(tick.work_item_id.as_deref(), Some(work.id.as_str()));
+}
+
+#[tokio::test]
+async fn agent_scoped_wake_hint_does_not_bind_ambiguous_wildcard_external_waits() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    for sequence in 1..=2 {
+        let work = runtime
+            .create_work_item(
+                format!("wait for callback {sequence}"),
+                None,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        runtime
+            .storage()
+            .append_wait_condition(&WaitConditionRecord {
+                id: format!("wait-any-external-{sequence}"),
+                agent_id: "default".into(),
+                work_item_id: Some(work.id),
+                status: WaitConditionStatus::Active,
+                kind: WaitConditionKind::External,
+                source: Some("WaitFor".into()),
+                subject_ref: Some(format!("callback-resource-{sequence}")),
+                waiting_for: "callback".into(),
+                wake_sources: vec![WakeSource::ExternalIngress {
+                    external_trigger_id: None,
+                }],
+                continuation: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                expires_at: None,
+                resolved_at: None,
+                cancelled_at: None,
+                turn_id: None,
+            })
+            .unwrap();
+    }
+
+    assert_eq!(
+        runtime
+            .wake_hint_work_item_id(Some("trigger-external"))
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn default_external_ingress_wakes_without_owning_work_item_wait_state() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work = runtime
+        .create_work_item("wait for CI".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime
+        .update_work_item_fields(
+            work.id.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(Some("awaiting CI success".into())),
+        )
+        .await
+        .unwrap();
+    runtime.pick_work_item(work.id.clone()).await.unwrap();
+    let capability = runtime
+        .create_external_trigger(
+            "wait for CI".into(),
+            "github".into(),
+            ExternalTriggerScope::Agent,
+            CallbackDeliveryMode::WakeHint,
+            Some("CI run completed".into()),
+            Some("holon-run/holon#1079".into()),
+        )
+        .await
+        .unwrap();
+
+    let result = runtime
+        .deliver_callback(
+            &capability.external_trigger_id,
+            CallbackDeliveryPayload {
+                body: Some(MessageBody::Json {
+                    value: serde_json::json!({"check": "Rust", "conclusion": "success"}),
+                }),
+                content_type: Some("application/json".into()),
+                correlation_id: Some("corr-ci".into()),
+                causation_id: Some("run-123".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.disposition, CallbackIngressDisposition::Triggered);
+
+    let messages = runtime.storage().read_recent_messages(10).unwrap();
+    let tick = messages
+        .iter()
+        .find(|message| message.kind == MessageKind::SystemTick)
+        .expect("wake hint should emit a system tick");
+    assert_eq!(tick.work_item_id.as_deref(), None);
+    let wake_hint = tick
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("wake_hint"))
+        .expect("wake hint metadata should exist");
+    assert_eq!(wake_hint["scope"].as_str(), Some("agent"));
+    assert_eq!(wake_hint["work_item_id"].as_str(), None);
+
+    let repeated = runtime
+        .deliver_callback(
+            &capability.external_trigger_id,
+            CallbackDeliveryPayload {
+                body: Some(MessageBody::Json {
+                    value: serde_json::json!({"check": "Rust", "conclusion": "success", "attempt": 2})
+                }),
+                content_type: Some("application/json".into()),
+                correlation_id: Some("corr-ci".into()),
+                causation_id: Some("run-124".into())
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(repeated.disposition, CallbackIngressDisposition::Coalesced);
+    let latest = runtime
+        .storage()
+        .latest_work_item(&work.id)
+        .unwrap()
+        .expect("work item should exist");
+    assert_eq!(latest.blocked_by.as_deref(), Some("awaiting CI success"));
+
+    let events = runtime.storage().read_recent_events(20).unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "callback_delivered"
+            && event.data["work_item_id"].is_null()
+            && event.data["external_trigger_id"].as_str()
+                == Some(capability.external_trigger_id.as_str())
+    }));
+
+    let completed = runtime
+        .complete_work_item(work.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(completed.state, WorkItemState::Completed);
+    assert!(completed.blocked_by.is_none());
+}
+
+#[tokio::test]
+async fn external_wake_records_wait_reconciliation_and_resolves_wait() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("reconciled")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let now = Utc::now();
+    let work = runtime
+        .create_work_item("wait for CI".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime.pick_work_item(work.id.clone()).await.unwrap();
+    let wait_condition_id = "wait-ci".to_string();
+    let trigger_id = "trigger-ci".to_string();
+    runtime
+        .storage()
+        .append_wait_condition(&WaitConditionRecord {
+            id: wait_condition_id.clone(),
+            agent_id: "default".into(),
+            work_item_id: Some(work.id.clone()),
+            status: WaitConditionStatus::Active,
+            kind: WaitConditionKind::External,
+            source: Some("github".into()),
+            subject_ref: Some("holon-run/holon#1292".into()),
+            waiting_for: "checks complete".into(),
+            wake_sources: vec![WakeSource::ExternalIngress {
+                external_trigger_id: Some(trigger_id.clone()),
+            }],
+            continuation: None,
+            created_at: now,
+            updated_at: now,
+            expires_at: None,
+            resolved_at: None,
+            cancelled_at: None,
+            turn_id: None,
+        })
+        .unwrap();
+    runtime
+        .inner
+        .runtime_db
+        .external_triggers()
+        .upsert(&ExternalTriggerRecord {
+            external_trigger_id: trigger_id.clone(),
+            target_agent_id: "default".into(),
+            scope: ExternalTriggerScope::Agent,
+            delivery_mode: CallbackDeliveryMode::WakeHint,
+            token: Some("http://127.0.0.1:7878/callbacks/wake/ci".into()),
+            token_hash: "token-hash".into(),
+            status: ExternalTriggerStatus::Active,
+            created_at: now,
+            revoked_at: None,
+            last_delivered_at: None,
+            delivery_count: 0,
+        })
+        .unwrap();
+
+    runtime
+        .deliver_callback(
+            &trigger_id,
+            CallbackDeliveryPayload {
+                body: Some(MessageBody::Json {
+                    value: serde_json::json!({"check": "Rust", "conclusion": "success"}),
+                }),
+                content_type: Some("application/json".into()),
+                correlation_id: Some("corr-ci".into()),
+                causation_id: Some("run-123".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let tick = runtime
+        .storage()
+        .read_recent_messages(10)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.kind == MessageKind::SystemTick)
+        .expect("wake hint should enqueue a system tick");
+
+    runtime
+        .process_message(
+            tick,
+            closure_decision(
+                ClosureOutcome::Waiting,
+                Some(WaitingReason::AwaitingExternalChange),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let events = runtime.storage().read_recent_events(100).unwrap();
+    let signal = events
+        .iter()
+        .find(|event| {
+            event.kind == "wait_reconciliation_requested"
+                && event.data["wait_condition_id"] == wait_condition_id
+        })
+        .expect("external wake should request wait reconciliation");
+    assert_eq!(
+        signal.data["wake_source"].as_str(),
+        Some("external_ingress")
+    );
+    assert_eq!(signal.data["work_item_id"].as_str(), Some(work.id.as_str()));
+    assert_eq!(
+        signal.data["subject_ref"].as_str(),
+        Some(trigger_id.as_str())
+    );
+    assert_eq!(signal.data["waiting_for"].as_str(), Some("checks complete"));
+
+    let active = runtime
+        .storage()
+        .active_wait_conditions_for_work_item("default", &work.id)
+        .unwrap();
+    assert_eq!(
+        active.len(),
+        0,
+        "wait should be resolved after reconciliation"
+    );
+
+    // The WorkItem blocker should be cleared.
+    let updated_work = runtime
+        .inner
+        .runtime_db
+        .work_items()
+        .latest(&work.id)
+        .unwrap()
+        .expect("work item should exist");
+    assert_eq!(
+        updated_work.blocked_by, None,
+        "blocked_by should be cleared after wait reconciliation"
+    );
+}
+
+#[tokio::test]
+async fn completing_work_item_does_not_revoke_agent_external_trigger() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work = runtime
+        .create_work_item("wait for external review".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime.pick_work_item(work.id.clone()).await.unwrap();
+    let capability = runtime
+        .create_external_trigger(
+            "wait for review".into(),
+            "github".into(),
+            ExternalTriggerScope::Agent,
+            CallbackDeliveryMode::WakeHint,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    runtime
+        .complete_work_item(work.id.clone(), Vec::new())
+        .await
+        .unwrap();
+
+    let descriptor = runtime
+        .latest_external_triggers()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|record| record.external_trigger_id == capability.external_trigger_id)
+        .expect("external trigger descriptor should exist");
+    assert_eq!(descriptor.status, ExternalTriggerStatus::Active);
+
+    let result = runtime
+        .deliver_callback(
+            &capability.external_trigger_id,
+            CallbackDeliveryPayload {
+                body: Some(MessageBody::Text {
+                    text: "late callback".into(),
+                }),
+                content_type: Some("text/plain".into()),
+                correlation_id: None,
+                causation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.disposition, CallbackIngressDisposition::Triggered);
+}
+
+#[tokio::test]
+async fn creating_agent_trigger_is_idempotent_for_source_and_delivery_mode() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work = runtime
+        .create_work_item("replace external condition".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime.pick_work_item(work.id.clone()).await.unwrap();
+    let old_capability = runtime
+        .create_external_trigger(
+            "wait for CI".into(),
+            "github".into(),
+            ExternalTriggerScope::Agent,
+            CallbackDeliveryMode::WakeHint,
+            Some("ci pending".into()),
+            Some("pull/1217".into()),
+        )
+        .await
+        .unwrap();
+    let new_capability = runtime
+        .create_external_trigger(
+            "wait for review approval".into(),
+            "github".into(),
+            ExternalTriggerScope::Agent,
+            CallbackDeliveryMode::WakeHint,
+            Some("review approved".into()),
+            Some("pull/1217#review".into()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        old_capability.external_trigger_id,
+        new_capability.external_trigger_id
+    );
+    assert_eq!(new_capability.status, ExternalTriggerStatus::Active);
+
+    let descriptors = runtime.latest_external_triggers().await.unwrap();
+    assert!(descriptors.iter().any(|record| {
+        record.external_trigger_id == new_capability.external_trigger_id
+            && record.status == ExternalTriggerStatus::Active
+            && record.scope == ExternalTriggerScope::Agent
+    }));
+}
+
+#[tokio::test]
+async fn default_external_ingress_ignores_legacy_active_trigger_without_url() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let now = Utc::now();
+    let legacy_trigger_id = "legacy-missing-url-trigger".to_string();
+    runtime
+        .inner
+        .runtime_db
+        .external_triggers()
+        .upsert(&ExternalTriggerRecord {
+            external_trigger_id: legacy_trigger_id.clone(),
+            target_agent_id: "default".into(),
+            scope: ExternalTriggerScope::Agent,
+            delivery_mode: CallbackDeliveryMode::WakeHint,
+            token: None,
+            token_hash: "legacy-token-hash".into(),
+            status: ExternalTriggerStatus::Active,
+            created_at: now,
+            revoked_at: None,
+            last_delivered_at: None,
+            delivery_count: 0,
+        })
+        .unwrap();
+
+    let capability = runtime
+        .ensure_default_external_ingress(CallbackDeliveryMode::WakeHint)
+        .await
+        .unwrap();
+
+    assert_ne!(capability.external_trigger_id, legacy_trigger_id);
+    assert_eq!(capability.status, ExternalTriggerStatus::Active);
+    assert!(capability.trigger_url.contains("/callbacks/wake/"));
+    let descriptors = runtime.latest_external_triggers().await.unwrap();
+    assert!(descriptors.iter().any(|record| {
+        record.external_trigger_id == legacy_trigger_id
+            && record.status == ExternalTriggerStatus::Revoked
+            && record.token.is_none()
+    }));
+    assert!(descriptors.iter().any(|record| {
+        record.external_trigger_id == capability.external_trigger_id
+            && record.status == ExternalTriggerStatus::Active
+            && record.token.is_some()
+    }));
+}
+
+#[tokio::test]
+async fn reset_external_trigger_revokes_old_and_creates_new() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    // Provision the initial default trigger.
+    let first = runtime
+        .ensure_default_external_ingress(CallbackDeliveryMode::WakeHint)
+        .await
+        .unwrap();
+    assert!(first.trigger_url.contains("/callbacks/wake/"));
+
+    // Reset: old trigger should be revoked, new trigger created.
+    let second = runtime.reset_external_trigger().await.unwrap();
+    assert_ne!(first.external_trigger_id, second.external_trigger_id);
+    assert_eq!(second.status, ExternalTriggerStatus::Active);
+    assert!(second.trigger_url.contains("/callbacks/wake/"));
+
+    let descriptors = runtime.latest_external_triggers().await.unwrap();
+    // Old trigger is revoked.
+    assert!(descriptors.iter().any(|r| {
+        r.external_trigger_id == first.external_trigger_id
+            && r.status == ExternalTriggerStatus::Revoked
+    }));
+    // New trigger is active with a token.
+    assert!(descriptors.iter().any(|r| {
+        r.external_trigger_id == second.external_trigger_id
+            && r.status == ExternalTriggerStatus::Active
+            && r.token.is_some()
+    }));
+}
+
+#[tokio::test]
+async fn picking_new_work_item_does_not_cancel_agent_trigger() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let old_work = runtime
+        .create_work_item("old waiting condition".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime.pick_work_item(old_work.id.clone()).await.unwrap();
+    let old_work_trigger = runtime
+        .create_external_trigger(
+            "wait for old work event".into(),
+            "github".into(),
+            ExternalTriggerScope::Agent,
+            CallbackDeliveryMode::WakeHint,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let agent_trigger = runtime
+        .create_external_trigger(
+            "watch durable inbox".into(),
+            "agentinbox".into(),
+            ExternalTriggerScope::Agent,
+            CallbackDeliveryMode::WakeHint,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let new_work = runtime
+        .create_work_item("new active condition".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+
+    runtime.pick_work_item(new_work.id.clone()).await.unwrap();
+
+    assert_eq!(
+        old_work_trigger.external_trigger_id,
+        agent_trigger.external_trigger_id
+    );
+    assert!(runtime
+        .latest_external_triggers()
+        .await
+        .unwrap()
+        .iter()
+        .any(
+            |record| record.external_trigger_id == agent_trigger.external_trigger_id
+                && record.status == ExternalTriggerStatus::Active
+        ));
+}
+
+#[tokio::test]
+async fn default_external_ingress_does_not_contribute_to_waiting_closure() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    runtime
+        .create_external_trigger(
+            "Check durable inbox for unread entries".into(),
+            "agentinbox".into(),
+            ExternalTriggerScope::Agent,
+            CallbackDeliveryMode::WakeHint,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let closure = runtime.current_closure_decision().await.unwrap();
+    assert_ne!(closure.outcome, ClosureOutcome::Waiting);
+    assert_ne!(
+        closure.waiting_reason,
+        Some(WaitingReason::AwaitingExternalChange)
+    );
+}
+
+#[tokio::test]
+async fn current_closure_ignores_other_agent_timers() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    runtime
+        .inner
+        .storage
+        .append_timer(&TimerRecord {
+            id: "other-timer".into(),
+            agent_id: "other".into(),
+            created_at: Utc::now(),
+            duration_ms: 1000,
+            interval_ms: None,
+            repeat: false,
+            status: TimerStatus::Active,
+            summary: None,
+            next_fire_at: Some(Utc::now()),
+            last_fired_at: None,
+            fire_count: 0,
+        })
+        .unwrap();
+
+    let closure = runtime.current_closure_decision().await.unwrap();
+
+    assert_ne!(closure.waiting_reason, Some(WaitingReason::AwaitingTimer));
+    assert!(!closure
+        .evidence
+        .iter()
+        .any(|evidence| evidence == "active_timers=1"));
+}
+
+#[tokio::test]
+async fn current_closure_reports_continuable_for_current_work_item() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let storage = AppStorage::new_for_test(dir.path()).unwrap();
+    let active = WorkItemRecord::new(
+        "default",
+        "continue active runtime cleanup",
+        WorkItemState::Open,
+    );
+    let active_id = active.id.clone();
+    storage.append_work_item(&active).unwrap();
+    let mut agent = AgentState::new("default");
+    agent.current_work_item_id = Some(active_id.clone());
+    storage.write_agent(&agent).unwrap();
+
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("tick done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let closure = runtime.current_closure_decision().await.unwrap();
+    assert_eq!(closure.outcome, ClosureOutcome::Continuable);
+    assert_eq!(closure.waiting_reason, None);
+    let signal = closure.work_signal.expect("work signal should exist");
+    assert_eq!(signal.work_item_id, active_id);
+    assert_eq!(signal.state, WorkItemState::Open);
+    assert_eq!(
+        signal.reactivation_mode,
+        WorkReactivationMode::ContinueActive
+    );
+}
+
+#[tokio::test]
+async fn current_needs_input_work_item_waits_for_operator_without_work_signal() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let storage = AppStorage::new_for_test(dir.path()).unwrap();
+    let mut active = WorkItemRecord::new(
+        "default",
+        "choose implementation direction",
+        WorkItemState::Open,
+    );
+    active.plan_status = WorkItemPlanStatus::NeedsInput;
+    let active_id = active.id.clone();
+    storage.append_work_item(&active).unwrap();
+    let mut agent = AgentState::new("default");
+    agent.current_work_item_id = Some(active_id.clone());
+    storage.write_agent(&agent).unwrap();
+
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("tick done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let closure = runtime.current_closure_decision().await.unwrap();
+    assert_eq!(closure.outcome, ClosureOutcome::Waiting);
+    assert_eq!(
+        closure.waiting_reason,
+        Some(WaitingReason::AwaitingOperatorInput)
+    );
+    assert!(closure.work_signal.is_none());
+    assert!(closure
+        .evidence
+        .iter()
+        .any(|item| item == "awaiting_operator_input_signal"));
+
+    let emitted = runtime.maybe_emit_pending_system_tick(None).await.unwrap();
+    assert!(
+        !emitted,
+        "needs_input current work item must not auto-resume through work_queue"
+    );
+}
+
+#[tokio::test]
+async fn current_external_wait_does_not_suppress_queued_runnable_work_item() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let storage = AppStorage::new_for_test(dir.path()).unwrap();
+    let current = WorkItemRecord::new(
+        "default",
+        "waiting for external review",
+        WorkItemState::Open,
+    );
+    let current_id = current.id.clone();
+    storage.append_work_item(&current).unwrap();
+    let queued = WorkItemRecord::new("default", "queued follow-up work", WorkItemState::Open);
+    let queued_id = queued.id.clone();
+    storage.append_work_item(&queued).unwrap();
+    let now = Utc::now();
+    storage
+        .append_wait_condition(&WaitConditionRecord {
+            id: "wait-current".into(),
+            agent_id: "default".into(),
+            work_item_id: Some(current_id.clone()),
+            status: WaitConditionStatus::Active,
+            kind: WaitConditionKind::External,
+            source: Some("github".into()),
+            subject_ref: Some("pull_request:1".into()),
+            waiting_for: "wait for current review".into(),
+            wake_sources: vec![WakeSource::ExternalIngress {
+                external_trigger_id: Some("trigger-current".into()),
+            }],
+            continuation: None,
+            created_at: now,
+            updated_at: now,
+            expires_at: None,
+            resolved_at: None,
+            cancelled_at: None,
+            turn_id: None,
+        })
+        .unwrap();
+    let mut agent = AgentState::new("default");
+    agent.current_work_item_id = Some(current_id);
+    storage.write_agent(&agent).unwrap();
+
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("tick done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let closure = runtime.current_closure_decision().await.unwrap();
+    assert_eq!(closure.outcome, ClosureOutcome::Continuable);
+    assert_eq!(closure.waiting_reason, None);
+    let signal = closure.work_signal.expect("work signal should exist");
+    assert_eq!(signal.work_item_id, queued_id);
+    assert_eq!(
+        signal.reactivation_mode,
+        WorkReactivationMode::ActivateQueued
+    );
+    assert!(closure
+        .evidence
+        .iter()
+        .any(|item| item == "work_item_scheduling_state=WaitingExternal"));
+}
+
+#[tokio::test]
+async fn current_closure_reports_continuable_for_queued_work_item_without_active_item() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let storage = AppStorage::new_for_test(dir.path()).unwrap();
+    let queued = WorkItemRecord::new(
+        "default",
+        "surface queued runtime cleanup",
+        WorkItemState::Open,
+    );
+    let queued_id = queued.id.clone();
+    storage.append_work_item(&queued).unwrap();
+
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("tick done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let closure = runtime.current_closure_decision().await.unwrap();
+    assert_eq!(closure.outcome, ClosureOutcome::Continuable);
+    assert_eq!(closure.waiting_reason, None);
+    let signal = closure.work_signal.expect("work signal should exist");
+    assert_eq!(signal.work_item_id, queued_id);
+    assert_eq!(signal.state, WorkItemState::Open);
+    assert_eq!(
+        signal.reactivation_mode,
+        WorkReactivationMode::ActivateQueued
+    );
+}
+
+#[tokio::test]
+async fn queued_needs_input_work_item_is_not_runnable() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let storage = AppStorage::new_for_test(dir.path()).unwrap();
+    let mut queued =
+        WorkItemRecord::new("default", "waiting planning candidate", WorkItemState::Open);
+    queued.plan_status = WorkItemPlanStatus::NeedsInput;
+    storage.append_work_item(&queued).unwrap();
+
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("tick done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let closure = runtime.current_closure_decision().await.unwrap();
+    assert_eq!(closure.outcome, ClosureOutcome::Completed);
+    assert_eq!(closure.waiting_reason, None);
+    assert!(closure.work_signal.is_none());
+
+    let emitted = runtime.maybe_emit_pending_system_tick(None).await.unwrap();
+    assert!(
+        !emitted,
+        "queued needs_input work item should not emit queued_available"
+    );
+}
+
+#[tokio::test]
+async fn queued_notification_keeps_working_memory_unfocused_before_pick() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let storage = AppStorage::new_for_test(dir.path()).unwrap();
+    let queued = WorkItemRecord::new("default", "queued runtime cleanup", WorkItemState::Open);
+    storage.append_work_item(&queued).unwrap();
+
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let runtime_task = tokio::spawn(runtime.clone().run());
+
+    runtime
+        .enqueue(MessageEnvelope::new(
+            "default",
+            MessageKind::OperatorPrompt,
+            MessageOrigin::Operator { actor_id: None },
+            AuthorityClass::OperatorInstruction,
+            Priority::Normal,
+            MessageBody::Text {
+                text: "wrap up current work".into(),
+            },
+        ))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let state = runtime.agent_state().await.unwrap();
+    assert!(state.current_work_item_id.is_none());
+    assert!(state
+        .working_memory
+        .current_working_memory
+        .current_work_item_id
+        .is_none());
+    assert!(state
+        .working_memory
+        .active_episode_builder
+        .as_ref()
+        .and_then(|builder| builder.current_work_item_id.as_deref())
+        .is_none());
+
+    runtime_task.abort();
+}
+
+#[tokio::test]
+async fn blocking_current_work_item_releases_focus_and_unblock_does_not_repick() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work = runtime
+        .create_work_item("wait for dependency".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime.pick_work_item(work.id.clone()).await.unwrap();
+
+    let blocked = runtime
+        .update_work_item_fields(
+            work.id.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(Some("blocked on review".into())),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(blocked.readiness(), WorkItemReadiness::Blocked);
+    let state = runtime.agent_state().await.unwrap();
+    assert!(state.current_work_item_id.is_none());
+    assert!(state.current_turn_work_item_id.is_none());
+    let events = runtime.storage().read_recent_events(10).unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "work_item_focus_released"
+            && event.data["reason"] == "work_item_blocked"
+            && event.data["work_item_id"].as_str() == Some(work.id.as_str())
+    }));
+
+    let unblocked = runtime
+        .update_work_item_fields(work.id.clone(), None, None, None, None, Some(None))
+        .await
+        .unwrap();
+
+    assert_eq!(unblocked.readiness(), WorkItemReadiness::Runnable);
+    let state = runtime.agent_state().await.unwrap();
+    assert!(state.current_work_item_id.is_none());
+    assert!(state.current_turn_work_item_id.is_none());
+}
+
+#[tokio::test]
+async fn wait_for_tool_result_keeps_blocked_focus_current() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work = runtime
+        .create_work_item("block through tool".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime.pick_work_item(work.id.clone()).await.unwrap();
+
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+    let (result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "block".into(),
+                name: "WaitFor".into(),
+                input: serde_json::json!({
+                    "wake": "external",
+                    "resource": "github:holon-run/holon#1446",
+                    "reason": "blocked through tool result"
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+    let payload = result.envelope.result.unwrap();
+    assert_eq!(payload["work_item"]["readiness"].as_str(), Some("blocked"));
+    assert_eq!(payload["work_item"]["is_current"].as_bool(), Some(true));
+    assert_eq!(payload["work_item"]["focus"].as_str(), Some("current"));
+    let state = runtime.agent_state().await.unwrap();
+    assert_eq!(
+        state.current_work_item_id.as_deref(),
+        Some(work.id.as_str())
+    );
+    assert!(state.current_turn_work_item_id.is_none());
+    let events = runtime.storage().read_recent_events(10).unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "work_item_turn_binding_released"
+            && event.data["reason"] == "work_item_waiting"
+            && event.data["work_item_id"].as_str() == Some(work.id.as_str())
+    }));
+}
+
+#[tokio::test]
+async fn wait_for_falls_back_to_current_focus_for_lifecycle_execution() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work = runtime
+        .create_work_item(
+            "focused but not execution owner".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runtime.pick_work_item(work.id.clone()).await.unwrap();
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.current_execution_binding = Some(WorkItemExecutionBinding {
+            activation_id: Some("activation-lifecycle".into()),
+            admission_provenance: None,
+            source_message_id: "message-lifecycle".into(),
+            turn_id: "turn-lifecycle".into(),
+            work_item_id: None,
+            claimed_work_revision: None,
+        });
+        guard.persist_state(&runtime.inner.storage).unwrap();
+    }
+
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+    let (result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "lifecycle-wait".into(),
+                name: "WaitFor".into(),
+                input: serde_json::json!({
+                    "wake": "external",
+                    "resource": "github:holon-run/holon#2449",
+                    "reason": "lifecycle-owned wait"
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+    let payload = result.envelope.result.unwrap();
+    assert_eq!(payload["scope"].as_str(), Some("work_item"));
+    assert_eq!(payload["owner"]["kind"].as_str(), Some("work_item"));
+    assert_eq!(
+        payload["owner"]["work_item_id"].as_str(),
+        Some(work.id.as_str())
+    );
+    assert_eq!(payload["work_item_id"].as_str(), Some(work.id.as_str()));
+    let active = runtime
+        .storage()
+        .raw_active_wait_conditions_for_agent("default")
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].work_item_id.as_deref(), Some(work.id.as_str()));
+    assert_eq!(
+        runtime.agent_state().await.unwrap().current_work_item_id,
+        Some(work.id)
+    );
+}
+
+#[tokio::test]
+async fn wait_for_uses_lifecycle_owner_without_any_work_item_binding_or_focus() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.current_execution_binding = Some(WorkItemExecutionBinding {
+            activation_id: Some("activation-lifecycle".into()),
+            admission_provenance: None,
+            source_message_id: "message-lifecycle".into(),
+            turn_id: "turn-lifecycle".into(),
+            work_item_id: None,
+            claimed_work_revision: None,
+        });
+        guard.persist_state(&runtime.inner.storage).unwrap();
+    }
+
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+    let (result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "lifecycle-wait".into(),
+                name: "WaitFor".into(),
+                input: serde_json::json!({
+                    "wake": "external",
+                    "resource": "github:holon-run/holon#2449",
+                    "reason": "lifecycle-owned wait"
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+    let payload = result.envelope.result.unwrap();
+    assert_eq!(payload["scope"].as_str(), Some("agent"));
+    assert_eq!(payload["owner"]["kind"].as_str(), Some("agent_lifecycle"));
+    assert_eq!(payload["owner"]["agent_id"].as_str(), Some("default"));
+    assert!(payload.get("work_item_id").is_none());
+    let active = runtime
+        .storage()
+        .raw_active_wait_conditions_for_agent("default")
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    assert!(active[0].work_item_id.is_none());
+}
+
+#[tokio::test]
+async fn wait_for_tool_uses_bound_turn_work_item_without_durable_focus() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work = runtime
+        .create_work_item("bound turn wait".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.current_work_item_id = None;
+        guard.state.current_turn_work_item_id = Some(work.id.clone());
+        guard.persist_state(&runtime.inner.storage).unwrap();
+    }
+
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+    let (result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "bound-turn-wait".into(),
+                name: "WaitFor".into(),
+                input: serde_json::json!({
+                    "wake": "external",
+                    "resource": "github:holon-run/holon#bound-turn",
+                    "reason": "wait from explicitly bound turn"
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+    let payload = result.envelope.result.unwrap();
+    assert_eq!(payload["scope"].as_str(), Some("work_item"));
+    assert_eq!(payload["work_item_id"].as_str(), Some(work.id.as_str()));
+    let waits = runtime
+        .storage()
+        .active_wait_conditions_for_agent("default")
+        .unwrap();
+    assert_eq!(waits.len(), 1);
+    assert_eq!(waits[0].work_item_id.as_deref(), Some(work.id.as_str()));
+    let updated = runtime.latest_work_item(&work.id).await.unwrap().unwrap();
+    assert_eq!(
+        updated.blocked_by.as_deref(),
+        Some("wait from explicitly bound turn")
+    );
+    let state = runtime.agent_state().await.unwrap();
+    assert!(state.current_work_item_id.is_none());
+    assert!(state.current_turn_work_item_id.is_none());
+}
+
+#[tokio::test]
+async fn needs_input_current_work_item_keeps_focus_until_operator_wait() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work = runtime
+        .create_work_item("ask operator".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime.pick_work_item(work.id.clone()).await.unwrap();
+
+    let waiting = runtime
+        .update_work_item_fields(
+            work.id.clone(),
+            None,
+            Some(WorkItemPlanStatus::NeedsInput),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(waiting.readiness(), WorkItemReadiness::WaitingForOperator);
+    let state = runtime.agent_state().await.unwrap();
+    assert_eq!(
+        state.current_work_item_id.as_deref(),
+        Some(work.id.as_str())
+    );
+    assert_eq!(
+        state.current_turn_work_item_id.as_deref(),
+        Some(work.id.as_str())
+    );
+    let events = runtime.storage().read_recent_events(10).unwrap();
+    assert!(!events.iter().any(|event| {
+        event.kind == "work_item_focus_released"
+            && event.data["work_item_id"].as_str() == Some(work.id.as_str())
+    }));
+}
+
+#[tokio::test]
+async fn operator_input_wait_releases_execution_focus() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work = runtime
+        .create_work_item("wait for operator".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime.pick_work_item(work.id.clone()).await.unwrap();
+    runtime
+        .register_wait_for(
+            "default",
+            Some(work.id.clone()),
+            WaitForWakeKind::OperatorInput,
+            None,
+            "operator decision".into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let state = runtime.agent_state().await.unwrap();
+    assert!(state.current_work_item_id.is_none());
+    assert!(state.current_turn_work_item_id.is_none());
+    let projection = runtime.storage().work_queue_prompt_projection().unwrap();
+    assert!(projection.current.is_none());
+    assert!(projection
+        .waiting_for_operator
+        .iter()
+        .any(|item| item.work_item.id == work.id));
+    let events = runtime.storage().read_recent_events(10).unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "work_item_focus_released"
+            && event.data["reason"] == "operator_input_wait"
+            && event.data["work_item_id"].as_str() == Some(work.id.as_str())
+    }));
+}
+
+#[tokio::test]
+async fn pick_blocked_work_item_reports_inspection_focus() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work = runtime
+        .create_work_item("inspect blocker".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime
+        .update_work_item_fields(
+            work.id.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(Some("blocked on external signal".into())),
+        )
+        .await
+        .unwrap();
+
+    let picked = runtime
+        .pick_work_item_with_reason(work.id.clone(), Some("inspect blocker details".into()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        picked.current_work_item.readiness(),
+        WorkItemReadiness::Blocked
+    );
+    assert_eq!(
+        picked.transition.current_readiness,
+        WorkItemReadiness::Blocked
+    );
+    assert_eq!(picked.transition.current_focus_mode, "inspection");
+    assert!(!picked.transition.blocker_cleared);
+    assert!(picked.transition.warnings.is_empty());
+    let state = runtime.agent_state().await.unwrap();
+    assert_eq!(
+        state.current_work_item_id.as_deref(),
+        Some(work.id.as_str())
+    );
+
+    runtime
+        .update_work_item_fields(
+            work.id.clone(),
+            None,
+            None,
+            None,
+            Some(vec![crate::types::TodoItem {
+                text: "inspect blocker evidence".into(),
+                state: crate::types::TodoItemState::InProgress,
+            }]),
+            None,
+        )
+        .await
+        .unwrap();
+    let state = runtime.agent_state().await.unwrap();
+    assert_eq!(
+        state.current_work_item_id.as_deref(),
+        Some(work.id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn pick_blocked_work_item_with_clear_blocker_resumes_runnable_focus() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work = runtime
+        .create_work_item("resume cleared blocker".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime.pick_work_item(work.id.clone()).await.unwrap();
+    let wait = runtime
+        .register_wait_for(
+            "default",
+            Some(work.id.clone()),
+            WaitForWakeKind::External,
+            Some("github:holon-run/holon#1684".into()),
+            "blocked on old external wait".into(),
+            Some(60_000),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        wait.work_item.as_ref().unwrap().readiness(),
+        WorkItemReadiness::Blocked
+    );
+
+    let picked = runtime
+        .pick_work_item_with_reason_and_clear_blocker(
+            work.id.clone(),
+            Some("external wait has been inspected and is resolved".into()),
+            true,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        picked.current_work_item.readiness(),
+        WorkItemReadiness::Runnable
+    );
+    assert!(picked.current_work_item.blocked_by.is_none());
+    assert!(picked.current_work_item.recheck_at.is_none());
+    assert!(picked.current_work_item.recheck_consumed_at.is_none());
+    assert_eq!(
+        picked.transition.current_readiness,
+        WorkItemReadiness::Runnable
+    );
+    assert_eq!(picked.transition.current_focus_mode, "runnable");
+    assert!(picked.transition.blocker_cleared);
+    assert!(picked
+        .transition
+        .cancelled_wait_condition_ids
+        .contains(&wait.condition.id));
+    assert!(runtime
+        .storage()
+        .active_wait_conditions_for_work_item("default", &work.id)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn pick_from_runnable_current_yields_and_complete_resumes_caller() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let current = runtime
+        .create_work_item("current runnable".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let next = runtime
+        .create_work_item("next runnable".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime.pick_work_item(current.id.clone()).await.unwrap();
+
+    let picked = runtime
+        .pick_work_item_with_reason(next.id.clone(), None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        picked.transition.previous_work_item_id,
+        Some(current.id.clone())
+    );
+    assert_eq!(
+        picked.transition.previous_readiness,
+        Some(WorkItemReadiness::Runnable)
+    );
+    assert_eq!(picked.transition.switch_kind, "yield_current");
+    assert!(picked.transition.warnings.is_empty());
+    let created = picked
+        .continuation_created
+        .as_ref()
+        .expect("continuation frame should be created");
+    assert_eq!(created.suspended_work_item_id.as_str(), current.id.as_str());
+    assert_eq!(created.active_work_item_id.as_str(), next.id.as_str());
+    let frames = runtime.storage().latest_work_item_continuations().unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].state, WorkItemContinuationState::Active);
+
+    let projection = runtime.storage().work_queue_prompt_projection().unwrap();
+    let yielded = projection
+        .yielded
+        .iter()
+        .find(|item| item.work_item.id == current.id)
+        .expect("current should be yielded after picking next");
+    assert_eq!(
+        yielded.scheduling_state,
+        WorkItemSchedulingState::YieldedToWorkItem
+    );
+    assert_eq!(yielded.readiness, WorkItemReadiness::Yielded);
+    assert!(!projection
+        .queued_runnable
+        .iter()
+        .any(|item| item.work_item.id == current.id));
+    assert!(!projection
+        .blocked
+        .iter()
+        .any(|item| item.work_item.id == current.id));
+    let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
+    let (yielded_result, _) = registry
+        .execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &crate::tool::ToolCall {
+                id: "yielded".into(),
+                name: "ListWorkItems".into(),
+                input: serde_json::json!({"filter": "yielded"}),
+            },
+        )
+        .await
+        .unwrap();
+    let yielded_payload = yielded_result.envelope.result.unwrap();
+    assert_eq!(yielded_payload["total_matching"].as_u64(), Some(1));
+    assert_eq!(
+        yielded_payload["work_items"][0]["id"].as_str(),
+        Some(current.id.as_str())
+    );
+    assert_eq!(
+        yielded_payload["work_items"][0]["focus"].as_str(),
+        Some("yielded")
+    );
+    assert_eq!(
+        yielded_payload["work_items"][0]["readiness"].as_str(),
+        Some("yielded")
+    );
+
+    let completed = runtime
+        .complete_work_item_with_continuation(next.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    let resumed = completed
+        .continuation_resumed
+        .expect("completion should resume direct caller");
+    assert_eq!(resumed.suspended_work_item_id.as_str(), current.id.as_str());
+    assert_eq!(resumed.active_work_item_id.as_str(), next.id.as_str());
+    let state = runtime.agent_state().await.unwrap();
+    assert_eq!(
+        state.current_work_item_id.as_deref(),
+        Some(current.id.as_str())
+    );
+    assert_eq!(
+        state.current_turn_work_item_id.as_deref(),
+        Some(current.id.as_str())
+    );
+    let frames = runtime.storage().latest_work_item_continuations().unwrap();
+    assert_eq!(frames[0].state, WorkItemContinuationState::Resumed);
+    let events = wait_for_audit_events(
+        &runtime,
+        20,
+        |events| {
+            events.iter().any(|event| {
+                event.kind == "work_item_continuation_scheduler_evidence"
+                    && event.data["reason"].as_str() == Some("continuation_resumed")
+                    && event.data["work_item_id"].as_str() == Some(current.id.as_str())
+            })
+        },
+        "work item continuation scheduler evidence event",
+    )
+    .await;
+    assert!(events.iter().any(|event| {
+        event.kind == "work_item_continuation_scheduler_evidence"
+            && event.data["reason"].as_str() == Some("continuation_resumed")
+            && event.data["work_item_id"].as_str() == Some(current.id.as_str())
+    }));
+    let continuation_events: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind.starts_with("work_item_continuation_"))
+        .collect();
+    assert!(continuation_events
+        .iter()
+        .any(|event| event.data["continuation"]["frame_id"].as_str()
+            == Some(created.frame_id.as_str())));
+    assert!(continuation_events
+        .iter()
+        .any(|event| event.data["continuation"]["frame_id"].as_str()
+            == Some(resumed.frame_id.as_str())));
+    assert!(continuation_events
+        .iter()
+        .all(|event| event.data.get("frame").is_none()));
+}
+
+#[tokio::test]
+async fn work_item_continuation_stack_resumes_nested_callers() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let track = runtime
+        .create_work_item("track".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let issue = runtime
+        .create_work_item("issue".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let review = runtime
+        .create_work_item("review".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+
+    runtime.pick_work_item(track.id.clone()).await.unwrap();
+    runtime.pick_work_item(issue.id.clone()).await.unwrap();
+    runtime.pick_work_item(review.id.clone()).await.unwrap();
+
+    let active = runtime
+        .storage()
+        .latest_active_work_item_continuations_for_agent("default")
+        .unwrap();
+    assert_eq!(active.len(), 2);
+
+    runtime
+        .complete_work_item_with_continuation(review.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    let state = runtime.agent_state().await.unwrap();
+    assert_eq!(
+        state.current_work_item_id.as_deref(),
+        Some(issue.id.as_str())
+    );
+    let active = runtime
+        .storage()
+        .latest_active_work_item_continuations_for_agent("default")
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].suspended_work_item_id, track.id);
+    assert_eq!(active[0].active_work_item_id, issue.id);
+
+    runtime
+        .complete_work_item_with_continuation(issue.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    let state = runtime.agent_state().await.unwrap();
+    assert_eq!(
+        state.current_work_item_id.as_deref(),
+        Some(track.id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn explicit_pick_of_yielded_work_item_resolves_frame_without_new_yield() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let current = runtime
+        .create_work_item("current runnable".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let next = runtime
+        .create_work_item("next runnable".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime.pick_work_item(current.id.clone()).await.unwrap();
+    runtime.pick_work_item(next.id.clone()).await.unwrap();
+
+    let picked = runtime
+        .pick_work_item_with_reason(current.id.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(picked.transition.switch_kind, "explicit_yield_return");
+    assert!(picked.continuation_created.is_none());
+    assert!(picked.continuation_resolved.is_some());
+    let state = runtime.agent_state().await.unwrap();
+    assert_eq!(
+        state.current_work_item_id.as_deref(),
+        Some(current.id.as_str())
+    );
+    assert!(runtime
+        .storage()
+        .latest_active_work_item_continuation_for_suspended("default", &current.id)
+        .unwrap()
+        .is_none());
+    let frames = runtime.storage().latest_work_item_continuations().unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].state, WorkItemContinuationState::Resumed);
+}

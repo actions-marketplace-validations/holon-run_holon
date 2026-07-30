@@ -1,0 +1,474 @@
+use anyhow::Result;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::{
+    memory::refs::{RuntimeRef, ALLOWED_SOURCE_REF_PREFIXES},
+    runtime::RuntimeHandle,
+    tool::{helpers::invalid_tool_input, spec::typed_spec, ToolError},
+    types::{AuthorityClass, ToolCapabilityFamily},
+};
+
+use super::{serialize_success, BuiltinToolDefinition};
+use crate::tool::helpers::parse_tool_args;
+
+pub(crate) const NAME: &str = crate::tool::names::MEMORY_GET;
+const MAX_CHARS_MAX: usize = 50_000;
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MemoryGetArgs {
+    pub(crate) source_ref: String,
+    #[schemars(range(min = 1, max = 50000))]
+    pub(crate) max_chars: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct MemoryGetResponse {
+    memory: crate::memory::MemoryGetResult,
+}
+
+pub(crate) fn definition() -> Result<BuiltinToolDefinition> {
+    Ok(BuiltinToolDefinition {
+        family: ToolCapabilityFamily::CoreAgent,
+        spec: typed_spec::<MemoryGetArgs>(
+            NAME,
+            include_str!("../tool_descriptions/memory_get.md"),
+        )?,
+    })
+}
+
+pub(crate) async fn execute(
+    runtime: &RuntimeHandle,
+    _agent_id: &str,
+    _authority_class: &AuthorityClass,
+    input: &Value,
+) -> Result<crate::tool::ToolResult> {
+    let args: MemoryGetArgs = parse_tool_args(NAME, input)?;
+    let source_ref = validate_source_ref(args.source_ref)?;
+    let max_chars = validate_max_chars(args.max_chars)?;
+    let Some(memory) = runtime.get_memory(&source_ref, max_chars).await? else {
+        return Err(ToolError::new(
+            "memory_source_not_found",
+            format!("memory source `{source_ref}` was not found"),
+        )
+        .with_details(json!({
+            "source_ref": source_ref,
+            "allowed_source_ref_prefixes": ALLOWED_SOURCE_REF_PREFIXES,
+            "reason": "source_ref was syntactically valid but is not present in the current visible runtime sources",
+        }))
+        .with_recovery_hint(
+            "copy an available prompt source_ref such as brief_ref/cmd_ref/stdout_ref/stderr_ref/output_ref verbatim, or call MemorySearch to discover a visible source_ref",
+        )
+        .into());
+    };
+    serialize_success(NAME, &MemoryGetResponse { memory })
+}
+
+fn validate_source_ref(source_ref: String) -> Result<String> {
+    RuntimeRef::parse(&source_ref)
+        .map(|parsed| parsed.source_ref())
+        .map_err(|error| invalid_source_ref_error(&source_ref, error.validation_error()))
+}
+
+fn validate_max_chars(max_chars: Option<usize>) -> Result<Option<usize>> {
+    let Some(max_chars) = max_chars else {
+        return Ok(None);
+    };
+    if !(1..=MAX_CHARS_MAX).contains(&max_chars) {
+        return Err(invalid_tool_input(
+            NAME,
+            "MemoryGet `max_chars` must be between 1 and 50000 when provided",
+            json!({
+                "field": "max_chars",
+                "max_chars": max_chars,
+                "validation_error": "out of range",
+                "minimum": 1,
+                "maximum": MAX_CHARS_MAX,
+            }),
+            "omit `max_chars` for the default bound, or provide an integer from 1 through 50000",
+        ));
+    }
+    Ok(Some(max_chars))
+}
+
+fn invalid_source_ref_error(source_ref: &str, validation_error: &'static str) -> anyhow::Error {
+    invalid_tool_input(
+        NAME,
+        "MemoryGet `source_ref` must be a standardized runtime ref",
+        json!({
+            "field": "source_ref",
+            "source_ref": source_ref,
+            "validation_error": validation_error,
+            "allowed_source_ref_prefixes": ALLOWED_SOURCE_REF_PREFIXES,
+        }),
+        "copy an available prompt source_ref verbatim, or call MemorySearch to discover a visible source_ref; use ExecCommand for workspace files or skill docs instead of MemoryGet",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use chrono::Utc;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::{
+        context::ContextConfig,
+        provider::StubProvider,
+        runtime::RuntimeHandle,
+        types::{
+            AuthorityClass, TaskKind, TaskRecord, TaskStatus, ToolExecutionRecord,
+            ToolExecutionStatus,
+        },
+    };
+
+    fn tool_error(error: anyhow::Error) -> crate::tool::ToolError {
+        error
+            .downcast_ref::<crate::tool::ToolError>()
+            .expect("tool error")
+            .clone()
+    }
+
+    #[test]
+    fn source_ref_accepts_known_memory_prefixes() {
+        for source_ref in [
+            "agent_memory:self",
+            "workspace_profile:ws-123",
+            "brief:abc",
+            "turn:turn_123",
+            "episode:ep_123",
+            "work_item:work_123",
+            "task:task_123",
+            "tool_execution:tool-123:cmd",
+            "tool_execution:tool-123:stdout",
+            "tool_execution:tool-123:stderr",
+            "tool_execution:tool-123:output",
+            "tool_execution:tool-123:batch_item:2:cmd",
+            "tool_execution:tool-123:batch_item:2:stdout",
+            "tool_execution:tool-123:batch_item:2:stderr",
+            "tool_execution:tool-123:batch_item:2:output",
+        ] {
+            assert_eq!(
+                validate_source_ref(source_ref.to_string()).unwrap(),
+                source_ref
+            );
+        }
+    }
+
+    #[test]
+    fn source_ref_rejects_paths_and_unknown_prefixes() {
+        for source_ref in [
+            "/Users/jolestar/.agents/skills/agentinbox/SKILL.md",
+            "skill:/Users/jolestar/.agents/skills/agentinbox/SKILL.md",
+            "skill.md:/Users/jolestar/.agents/skills/agentinbox/SKILL.md",
+            "agentinbox:///SKILL.md",
+            "memory:invalid-ref-123",
+            "brief:/Users/jolestar/project/README.md",
+            "brief:https://example.com/memory",
+            "turn:../ledger/turn-1",
+            "episode:../ledger/episode-1",
+            "work_item:work_123?raw=true",
+            "tool_execution:tool-123",
+            "tool_execution:tool-123:batch_item:0:cmd",
+            "tool_execution:tool-123:batch_item:02:cmd",
+            "tool_execution:tool-123:batch_item:abc:cmd",
+            "tool_execution:tool-123:batch_item:2",
+            "tool_execution:tool-123:batch_item:2:artifact",
+            "tool_execution:tool-123:artifact",
+        ] {
+            let error = tool_error(validate_source_ref(source_ref.to_string()).unwrap_err());
+            assert_eq!(error.kind, "invalid_tool_input");
+            assert_eq!(
+                error.recovery_hint.as_deref(),
+                Some("copy an available prompt source_ref verbatim, or call MemorySearch to discover a visible source_ref; use ExecCommand for workspace files or skill docs instead of MemoryGet")
+            );
+        }
+    }
+
+    #[test]
+    fn source_ref_rejects_empty_suffix_and_whitespace() {
+        let empty_suffix = tool_error(validate_source_ref("brief:".to_string()).unwrap_err());
+        assert_eq!(empty_suffix.kind, "invalid_tool_input");
+        assert!(empty_suffix
+            .details
+            .as_ref()
+            .and_then(|details| details.get("validation_error"))
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("missing")));
+
+        let whitespace = tool_error(validate_source_ref("brief:abc def".to_string()).unwrap_err());
+        assert_eq!(whitespace.kind, "invalid_tool_input");
+        assert!(whitespace
+            .details
+            .as_ref()
+            .and_then(|details| details.get("validation_error"))
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("whitespace")));
+    }
+
+    #[test]
+    fn max_chars_accepts_omitted_and_bounded_values() {
+        assert_eq!(validate_max_chars(None).unwrap(), None);
+        assert_eq!(validate_max_chars(Some(1)).unwrap(), Some(1));
+        assert_eq!(
+            validate_max_chars(Some(MAX_CHARS_MAX)).unwrap(),
+            Some(MAX_CHARS_MAX)
+        );
+    }
+
+    #[test]
+    fn max_chars_rejects_zero_and_oversized_values() {
+        for max_chars in [0, MAX_CHARS_MAX + 1] {
+            let error = tool_error(validate_max_chars(Some(max_chars)).unwrap_err());
+            assert_eq!(error.kind, "invalid_tool_input");
+            assert!(error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("maximum"))
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_get_tool_accepts_command_receipt_source_refs() {
+        let dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let runtime = RuntimeHandle::new(
+            "default",
+            dir.path().to_path_buf(),
+            workspace.path().to_path_buf(),
+            "http://127.0.0.1:7878".into(),
+            Arc::new(StubProvider::new("done")),
+            "default".into(),
+            ContextConfig::default(),
+        )
+        .unwrap();
+        let command = "python - <<'PY'\nprint('memory_get_tool_receipt_1246')\nPY";
+        runtime
+            .storage()
+            .append_tool_execution(&ToolExecutionRecord {
+                id: "tool-get-1246".into(),
+                agent_id: "default".into(),
+                work_item_id: None,
+                turn_index: 0,
+                turn_id: None,
+                tool_name: "ExecCommand".into(),
+                created_at: Utc::now(),
+                completed_at: Some(Utc::now()),
+                duration_ms: 10,
+                authority_class: AuthorityClass::OperatorInstruction,
+                status: ToolExecutionStatus::Success,
+                input: json!({
+                    "cmd": command,
+                    "workdir": "src",
+                    "yield_time_ms": 1000,
+                    "max_output_tokens": 1200
+                }),
+                output: json!({"exit_code": 0}),
+                summary: "command exited with status 0".into(),
+                invocation_surface: None,
+            })
+            .unwrap();
+
+        let result = execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &json!({
+                "source_ref": "tool_execution:tool-get-1246:cmd"
+            }),
+        )
+        .await
+        .unwrap();
+        let content = result.envelope.result.unwrap()["memory"]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert!(content.contains("memory_get_tool_receipt_1246"));
+        assert!(content.contains("\"workdir\": \"src\""));
+        assert!(content.contains("\"yield_time_ms\": 1000"));
+        assert!(content.contains("\"max_output_tokens\": 1200"));
+    }
+
+    #[tokio::test]
+    async fn memory_get_tool_accepts_command_output_source_refs() {
+        let dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let runtime = RuntimeHandle::new(
+            "default",
+            dir.path().to_path_buf(),
+            workspace.path().to_path_buf(),
+            "http://127.0.0.1:7878".into(),
+            Arc::new(StubProvider::new("done")),
+            "default".into(),
+            ContextConfig::default(),
+        )
+        .unwrap();
+        runtime
+            .storage()
+            .append_tool_execution(&ToolExecutionRecord {
+                id: "tool-output-1246".into(),
+                agent_id: "default".into(),
+                work_item_id: None,
+                turn_index: 0,
+                turn_id: None,
+                tool_name: "ExecCommand".into(),
+                created_at: Utc::now(),
+                completed_at: Some(Utc::now()),
+                duration_ms: 10,
+                authority_class: AuthorityClass::OperatorInstruction,
+                status: ToolExecutionStatus::Success,
+                input: json!({"cmd": "printf memory_get_stdout_1246"}),
+                output: json!({
+                    "disposition": "completed",
+                    "exit_status": 0,
+                    "stdout_preview": "memory_get_stdout_1246\n",
+                    "stderr_preview": "",
+                    "truncated": false,
+                    "artifacts": []
+                }),
+                summary: "command exited with status 0".into(),
+                invocation_surface: None,
+            })
+            .unwrap();
+
+        let result = execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &json!({
+                "source_ref": "tool_execution:tool-output-1246:stdout"
+            }),
+        )
+        .await
+        .unwrap();
+        let content = result.envelope.result.unwrap()["memory"]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert!(content.contains("\"selector\": \"stdout\""));
+        assert!(content.contains("memory_get_stdout_1246"));
+        assert!(content.contains("\"output_available\": true"));
+    }
+
+    #[tokio::test]
+    async fn memory_get_tool_accepts_generic_tool_output_source_refs() {
+        let dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let runtime = RuntimeHandle::new(
+            "default",
+            dir.path().to_path_buf(),
+            workspace.path().to_path_buf(),
+            "http://127.0.0.1:7878".into(),
+            Arc::new(StubProvider::new("done")),
+            "default".into(),
+            ContextConfig::default(),
+        )
+        .unwrap();
+        runtime
+            .storage()
+            .append_tool_execution(&ToolExecutionRecord {
+                id: "tool-generic-get-1246".into(),
+                agent_id: "default".into(),
+                work_item_id: None,
+                turn_index: 0,
+                turn_id: None,
+                tool_name: "ViewImage".into(),
+                created_at: Utc::now(),
+                completed_at: Some(Utc::now()),
+                duration_ms: 10,
+                authority_class: AuthorityClass::OperatorInstruction,
+                status: ToolExecutionStatus::Success,
+                input: json!({"path": "fixtures/pixel.png", "prompt": "inspect"}),
+                output: json!({
+                    "envelope": {
+                        "result": {
+                            "visual_observation": "memory_get_generic_tool_output_1246"
+                        }
+                    },
+                    "is_error": false
+                }),
+                summary: "validated image metadata".into(),
+                invocation_surface: None,
+            })
+            .unwrap();
+
+        let result = execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &json!({
+                "source_ref": "tool_execution:tool-generic-get-1246:output"
+            }),
+        )
+        .await
+        .unwrap();
+        let content = result.envelope.result.unwrap()["memory"]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert!(content.contains("\"source_type\": \"tool_execution_output\""));
+        assert!(content.contains("\"tool_name\": \"ViewImage\""));
+        assert!(content.contains("memory_get_generic_tool_output_1246"));
+    }
+
+    #[tokio::test]
+    async fn memory_get_tool_accepts_task_source_refs() {
+        let dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let runtime = RuntimeHandle::new(
+            "default",
+            dir.path().to_path_buf(),
+            workspace.path().to_path_buf(),
+            "http://127.0.0.1:7878".into(),
+            Arc::new(StubProvider::new("done")),
+            "default".into(),
+            ContextConfig::default(),
+        )
+        .unwrap();
+
+        runtime
+            .storage()
+            .append_task(&TaskRecord {
+                id: "task-get-1246".into(),
+                agent_id: "default".into(),
+                kind: TaskKind::CommandTask,
+                status: TaskStatus::Completed,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                parent_message_id: None,
+                work_item_id: Some("wi-get-1246".into()),
+                summary: Some("task get memory source ref".into()),
+                detail: Some(serde_json::json!({"cmd": "echo task-get-1246"})),
+                recovery: None,
+            })
+            .unwrap();
+
+        let result = execute(
+            &runtime,
+            "default",
+            &AuthorityClass::OperatorInstruction,
+            &json!({
+                "source_ref": "task:task-get-1246"
+            }),
+        )
+        .await
+        .unwrap();
+        let content = result.envelope.result.unwrap()["memory"]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert!(content.contains("task_id: task-get-1246"));
+        assert!(content.contains("summary: task get memory source ref"));
+        assert!(content.contains("cmd: echo task-get-1246"));
+        assert!(content.contains("work_item_id: wi-get-1246"));
+    }
+}

@@ -1,0 +1,63 @@
+#[path = "support/runtime_tasks.rs"]
+mod runtime_tasks;
+
+mod support;
+
+macro_rules! runtime_async_tests {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[tokio::test]
+            async fn $name() -> anyhow::Result<()> {
+                runtime_tasks::$name().await
+            }
+        )*
+    };
+}
+
+runtime_async_tests!(
+    background_task_rejoins_main_session,
+    background_command_task_result_wakes_sleeping_agent_via_canonical_lifecycle_nudge,
+    stop_task_cancels_running_background_task,
+    lifecycle_stop_interrupts_active_command_task,
+    tool_use_round_trip_executes_and_returns_result,
+    file_tools_can_modify_workspace_and_reenter_context,
+    shell_tools_capture_command_output,
+    shell_tools_truncate_large_output_before_provider_reinjection,
+    exec_command_reports_nonzero_exit_and_truncates_output,
+    exec_command_batch_returns_grouped_item_results,
+    exec_command_batch_does_not_wait_for_background_pipe_holders,
+    exec_command_batch_top_level_defaults_apply_to_items,
+    exec_command_batch_stop_on_error_skips_later_items,
+    exec_command_spawn_failure_returns_shell_recovery_hint,
+    tool_schema_and_dispatch_errors_are_recorded_without_corrupting_runtime_state,
+    runtime_provider_failure_surfaces_failure_brief_and_transcript_entry,
+    runtime_failure_brief_and_transcript_sanitize_long_provider_error,
+    runtime_failure_brief_and_transcript_redact_short_provider_secret,
+    command_task_runs_to_completion_and_persists_detail,
+    task_output_returns_completed_command_task_output,
+    task_output_non_blocking_reports_running_command_task,
+    task_output_waits_for_command_task_completion,
+    task_input_delivers_stdin_to_managed_command_task,
+    task_output_times_out_for_long_running_task,
+    task_output_prefers_terminal_task_record_over_stale_task_message,
+    task_output_accepts_terminal_command_snapshot_without_explicit_readiness_flag,
+    task_output_accepts_terminal_command_without_snapshot_fields,
+    task_output_rejects_message_only_terminal_status_for_running_command,
+    task_status_and_task_output_keep_lifecycle_and_output_boundaries,
+    command_task_output_truncation_preserves_path_artifact_reference,
+    command_task_stop_cancels_running_command,
+    background_command_task_persists_terminal_state_while_runtime_stopped,
+    command_task_result_enqueue_retries_stale_agent_state,
+    blocking_command_task_clears_active_state_while_runtime_stopped,
+    command_task_result_is_canonical_lifecycle_nudge_on_completion,
+    task_result_rejoin_preserves_runtime_provenance_not_operator_authority,
+    command_terminal_reentry_does_not_set_awaiting_task_closure,
+    command_task_runner_failure_marks_task_failed_and_cleans_up,
+    command_task_nonzero_exit_produces_failed_output_and_runtime_state,
+    exec_command_auto_promotes_long_running_command_task,
+    exec_command_reuses_equivalent_active_command_task_by_default,
+    exec_command_can_start_new_with_duplicate_policy,
+    exec_command_non_equivalent_same_preview_does_not_reuse,
+    exec_command_reuses_equivalent_scheduled_background_task,
+    exec_command_terminal_tasks_do_not_block_new_run,
+);

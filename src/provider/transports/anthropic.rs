@@ -1,0 +1,3410 @@
+use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use reqwest::{header::HeaderMap, Client, Response};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use tracing::warn;
+use twox_hash::XxHash64;
+
+use crate::{
+    config::{
+        AnthropicCacheStrategy, AnthropicContextManagementConfig, AppConfig,
+        ProviderBuiltinWebSearchConfig, ProviderId, ProviderRuntimeConfig,
+    },
+    prompt::PromptStability,
+    provider::{
+        builtin_web_search_probe_turn_request,
+        http_trace::{ProviderHttpTrace, ProviderHttpTraceRequest},
+        AgentProvider, AnthropicPromptCacheDiagnostics, CacheBreakpointInfo, ConversationMessage,
+        ModelBlock, ModelToolCallKind, PromptContentBlock, ProviderBuiltinWebSearchCapability,
+        ProviderCacheUsage, ProviderContextManagementPolicy, ProviderNativeWebSearchDiagnostics,
+        ProviderNativeWebSearchKind, ProviderNativeWebSearchRequest, ProviderPromptCapability,
+        ProviderResponseFormatDiagnostics, ProviderResponseFormatRequest, ProviderTurnRequest,
+        ProviderTurnResponse,
+    },
+};
+
+use super::{build_http_client, request_send_timeout, response_body_timeout, stream_idle_timeout};
+use crate::provider::retry::{
+    classify_reqwest_transport_error_with_trace, classify_status_error_with_trace,
+    invalid_response_error_with_trace, provider_transport_error,
+    timeout_transport_error_with_trace, ProviderFailureClassification, ProviderFailureKind,
+    RetryDisposition,
+};
+
+#[derive(Clone)]
+pub struct AnthropicProvider {
+    client: Client,
+    provider_id: String,
+    base_url: String,
+    auth_token: String,
+    model: String,
+    max_output_tokens: u32,
+    reasoning_effort: Option<String>,
+    supports_reasoning: bool,
+    context_management: AnthropicContextManagementConfig,
+    builtin_web_search: Option<ProviderBuiltinWebSearchConfig>,
+    trace_home_dir: PathBuf,
+    #[cfg(test)]
+    http_trace_override: Option<ProviderHttpTrace>,
+}
+
+#[derive(Debug, Serialize)]
+struct MessagesRequest<'a> {
+    model: &'a str,
+    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingRequest>,
+    stream: bool,
+    system: Value,
+    messages: Vec<ApiMessage>,
+    tools: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    betas: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_management: Option<ContextManagementRequest>,
+}
+
+#[derive(Debug, Serialize)]
+struct ThinkingRequest {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    budget_tokens: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextManagementRequest {
+    edits: Vec<ContextManagementEdit>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextManagementEdit {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    trigger: ContextManagementThreshold,
+    keep: ContextManagementThreshold,
+    exclude_tools: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clear_at_least: Option<ContextManagementThreshold>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextManagementThreshold {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    value: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiMessage {
+    role: &'static str,
+    content: Value,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct MessagesResponse {
+    id: Option<String>,
+    content: Vec<ApiResponseBlock>,
+    stop_reason: Option<String>,
+    usage: Option<ApiUsage>,
+    context_management: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct ApiResponseBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    text: Option<String>,
+    thinking: Option<String>,
+    signature: Option<String>,
+    data: Option<String>,
+    id: Option<String>,
+    name: Option<String>,
+    input: Option<Value>,
+    tool_use_id: Option<String>,
+    content: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct ApiUsage {
+    input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+}
+
+impl AnthropicProvider {
+    pub fn from_config(config: &AppConfig) -> Result<Self> {
+        Self::from_config_with_model(config, "claude-sonnet-4-6")
+    }
+
+    pub fn from_config_with_model(config: &AppConfig, model: &str) -> Result<Self> {
+        let provider_config = config
+            .providers
+            .get(&ProviderId::anthropic())
+            .ok_or_else(|| anyhow!("missing anthropic provider config"))?;
+        Self::from_runtime_config(
+            provider_config,
+            model,
+            config.runtime_max_output_tokens,
+            &config.home_dir,
+            true,
+        )
+    }
+
+    pub fn from_runtime_config(
+        provider_config: &ProviderRuntimeConfig,
+        model: &str,
+        max_output_tokens: u32,
+        trace_home_dir: &Path,
+        supports_reasoning: bool,
+    ) -> Result<Self> {
+        let client = build_http_client()?;
+        let auth_token = provider_config
+            .credential
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                let credential_name = provider_config
+                    .auth
+                    .env
+                    .as_deref()
+                    .or(provider_config.auth.profile.as_deref())
+                    .or(provider_config.auth.external.as_deref())
+                    .unwrap_or("configured credential");
+                anyhow!("missing {credential_name}")
+            })?;
+        Ok(Self {
+            client,
+            provider_id: provider_config.id.as_str().to_string(),
+            base_url: provider_config.base_url.trim_end_matches('/').to_string(),
+            auth_token,
+            model: model.to_string(),
+            max_output_tokens,
+            reasoning_effort: provider_config.reasoning_effort.clone(),
+            supports_reasoning,
+            context_management: provider_config.context_management.clone(),
+            builtin_web_search: provider_config.builtin_web_search.clone(),
+            trace_home_dir: trace_home_dir.to_path_buf(),
+            #[cfg(test)]
+            http_trace_override: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_http_trace_for_tests(mut self, trace: ProviderHttpTrace) -> Self {
+        self.http_trace_override = Some(trace);
+        self
+    }
+}
+
+/// Map an OpenAI-style `reasoning_effort` level to an Anthropic
+/// `thinking.budget_tokens` value.
+///
+/// Returns `None` when thinking is not requested (`reasoning_effort` is absent).
+/// The budget is computed as a percentage of `max_output_tokens`, clamped to
+/// the Anthropic minimum of 1024 and capped at `max_output_tokens - 1`.
+fn reasoning_effort_to_thinking(
+    reasoning_effort: &Option<String>,
+    max_output_tokens: u32,
+) -> Option<ThinkingRequest> {
+    let effort = reasoning_effort.as_ref()?;
+    let ratio: f64 = match effort.to_ascii_lowercase().as_str() {
+        "low" => 0.10,
+        "medium" => 0.25,
+        "high" => 0.50,
+        "xhigh" | "max" => 0.80,
+        // Unknown values: default to medium.
+        _ => 0.25,
+    };
+    let budget = (max_output_tokens as f64 * ratio).round() as u32;
+    // Anthropic requires budget_tokens >= 1024 and <= max_tokens - 1.
+    let budget = budget.max(1024).min(max_output_tokens.saturating_sub(1));
+    // If max_output_tokens is too small for thinking, skip it.
+    if budget < 1024 {
+        return None;
+    }
+    Some(ThinkingRequest {
+        kind: "enabled",
+        budget_tokens: budget,
+    })
+}
+
+#[async_trait]
+impl AgentProvider for AnthropicProvider {
+    async fn complete_turn(&self, request: ProviderTurnRequest) -> Result<ProviderTurnResponse> {
+        let cache_strategy = self.context_management.cache_strategy;
+        let wire_conversation = build_anthropic_wire_conversation(&request, cache_strategy);
+        let rolling_cache_marker =
+            rolling_conversation_cache_marker(&wire_conversation, cache_strategy);
+        let messages = build_anthropic_messages(&wire_conversation, rolling_cache_marker);
+        let response_format_tool_choice = anthropic_response_format_tool_choice(&request);
+        let request_body = MessagesRequest {
+            model: &self.model,
+            max_tokens: self.max_output_tokens,
+            thinking: if self.supports_reasoning {
+                reasoning_effort_to_thinking(&self.reasoning_effort, self.max_output_tokens)
+            } else {
+                None
+            },
+            stream: true,
+            system: build_anthropic_system(&request, cache_strategy),
+            messages,
+            tools: build_anthropic_tools(&request),
+            tool_choice: response_format_tool_choice,
+            betas: self.context_management.betas.clone(),
+            metadata: build_anthropic_metadata(&request, cache_strategy),
+            temperature: (cache_strategy == AnthropicCacheStrategy::ClaudeCodePromptCache)
+                .then_some(1.0),
+            context_management: build_context_management_request(&self.context_management),
+        };
+        let request_payload = serde_json::to_value(&request_body)?;
+
+        let url = format!("{}/v1/messages", self.base_url);
+        let model_ref = format!("anthropic/{}", self.model);
+        let mut headers = vec![
+            ("content-type", "application/json".to_string()),
+            ("authorization", format!("Bearer {}", self.auth_token)),
+            ("anthropic-version", "2023-06-01".to_string()),
+        ];
+        if self.context_management.enabled {
+            headers.push((
+                "anthropic-beta",
+                "context-management-2025-06-27".to_string(),
+            ));
+        }
+        #[cfg(test)]
+        let trace = self
+            .http_trace_override
+            .clone()
+            .or_else(|| ProviderHttpTrace::from_env(self.trace_home_dir.clone()));
+        #[cfg(not(test))]
+        let trace = ProviderHttpTrace::from_env(self.trace_home_dir.clone());
+        let request_trace = trace.and_then(|trace| {
+            trace.begin_request(
+                request
+                    .prompt_frame
+                    .cache
+                    .as_ref()
+                    .map(|cache| cache.agent_id.as_str()),
+                "anthropic",
+                Some(&model_ref),
+                url.as_str(),
+                "messages",
+                &headers,
+                &request_payload,
+            )
+        });
+        let mut request_builder = self.client.post(&url);
+        for (name, value) in &headers {
+            request_builder = request_builder.header(*name, value);
+        }
+        let response = request_builder
+            .timeout(request_send_timeout())
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|error| {
+                classify_reqwest_transport_error_with_trace(
+                    "Anthropic request failed",
+                    "request_send",
+                    "anthropic",
+                    Some(&model_ref),
+                    Some(url.as_str()),
+                    error,
+                    request_trace.as_ref(),
+                )
+            })?;
+        if let Some(trace) = request_trace.as_ref() {
+            trace.write_response_headers(response.status(), response.headers());
+        }
+        let provider_request_id = provider_request_id_from_headers(response.headers());
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = match tokio::time::timeout(response_body_timeout(), response.text()).await {
+                Ok(Ok(text)) => text,
+                _ => String::new(),
+            };
+            if let Some(trace) = request_trace.as_ref() {
+                trace.write_response_body(&body);
+            }
+            return Err(classify_status_error_with_trace(
+                "Anthropic request failed",
+                "response_status",
+                Some("anthropic"),
+                Some(&model_ref),
+                Some(url.as_str()),
+                status,
+                body,
+                request_trace.as_ref(),
+            ));
+        }
+
+        let parsed = if anthropic_response_is_sse(&response) {
+            read_anthropic_streaming_response(
+                response,
+                &model_ref,
+                url.as_str(),
+                request_trace.as_ref(),
+            )
+            .await?
+        } else {
+            read_anthropic_json_response(response, &model_ref, url.as_str(), request_trace.as_ref())
+                .await?
+        };
+        anthropic_messages_response_to_turn_response(
+            parsed,
+            provider_request_id,
+            &request,
+            &wire_conversation,
+            rolling_cache_marker,
+            &request_payload,
+            self.provider_id.as_str(),
+            self.model.as_str(),
+            cache_strategy,
+            &self.context_management.betas,
+            &model_ref,
+            url.as_str(),
+            request_trace.as_ref(),
+        )
+    }
+
+    #[cfg(test)]
+    fn configured_model_refs(&self) -> Vec<String> {
+        vec![format!("anthropic/{}", self.model)]
+    }
+
+    fn prompt_capabilities(&self) -> Vec<ProviderPromptCapability> {
+        let mut capabilities = vec![
+            ProviderPromptCapability::FullRequestOnly,
+            ProviderPromptCapability::PromptCacheBlocks,
+        ];
+        if self.context_management.enabled {
+            capabilities.push(ProviderPromptCapability::ContextManagement);
+        }
+        capabilities
+    }
+
+    fn builtin_web_search(&self) -> Option<ProviderBuiltinWebSearchCapability> {
+        let config = self.builtin_web_search.as_ref()?;
+        Some(ProviderBuiltinWebSearchCapability {
+            kind: config.kind,
+            provider_id: self.provider_id.clone(),
+            provider_model_ref: format!("{}/{}", self.provider_id, self.model),
+            provider_transport: "anthropic_messages".into(),
+            provider_base_url: self.base_url.clone(),
+            advertised_tool_type: config.advertised_tool_type.clone(),
+            backend_kind: config.backend_kind.clone(),
+        })
+    }
+
+    async fn probe_builtin_web_search(
+        &self,
+        request: ProviderNativeWebSearchRequest,
+    ) -> Result<()> {
+        self.complete_turn(builtin_web_search_probe_turn_request(request))
+            .await?;
+        Ok(())
+    }
+
+    fn context_management_policy(&self) -> Option<ProviderContextManagementPolicy> {
+        self.context_management
+            .enabled
+            .then(|| ProviderContextManagementPolicy {
+                provider: "anthropic".to_string(),
+                strategy: "clear_tool_uses_20250919".to_string(),
+                keep_recent_tool_uses: self.context_management.keep_recent_tool_uses as usize,
+                trigger_input_tokens: self.context_management.trigger_input_tokens,
+                clear_at_least_input_tokens: self.context_management.clear_at_least_input_tokens,
+            })
+    }
+}
+
+fn build_anthropic_wire_conversation(
+    request: &ProviderTurnRequest,
+    cache_strategy: AnthropicCacheStrategy,
+) -> Vec<ConversationMessage> {
+    match cache_strategy {
+        AnthropicCacheStrategy::MessagesNative => request.conversation.clone(),
+        AnthropicCacheStrategy::ClaudeCodePromptCache => strip_initial_context_message(request),
+    }
+}
+
+fn anthropic_response_is_sse(response: &Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+}
+
+async fn read_anthropic_json_response(
+    response: Response,
+    model_ref: &str,
+    url: &str,
+    trace: Option<&ProviderHttpTraceRequest>,
+) -> Result<MessagesResponse> {
+    let response_body = match tokio::time::timeout(response_body_timeout(), response.text()).await {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => {
+            return Err(classify_reqwest_transport_error_with_trace(
+                "Anthropic response body failed",
+                "response_body",
+                "anthropic",
+                Some(model_ref),
+                Some(url),
+                error,
+                trace,
+            ));
+        }
+        Err(_elapsed) => {
+            return Err(timeout_transport_error_with_trace(
+                "Anthropic response body read timed out",
+                "response_body",
+                "anthropic",
+                Some(model_ref),
+                Some(url),
+                format!("timed out after {:?}", response_body_timeout()),
+                trace,
+            ));
+        }
+    };
+    if let Some(trace) = trace {
+        trace.write_response_body(&response_body);
+    }
+    serde_json::from_str(&response_body).map_err(|error| {
+        invalid_response_error_with_trace(
+            "invalid Anthropic JSON",
+            "response_parse",
+            "anthropic",
+            Some(model_ref),
+            Some(url),
+            error.to_string(),
+            trace,
+        )
+    })
+}
+
+async fn read_anthropic_streaming_response(
+    mut response: Response,
+    model_ref: &str,
+    url: &str,
+    trace: Option<&ProviderHttpTraceRequest>,
+) -> Result<MessagesResponse> {
+    let mut parser = SseParser::default();
+    let mut accumulator = AnthropicStreamAccumulator::default();
+    let idle_timeout = stream_idle_timeout();
+
+    loop {
+        let next = tokio::time::timeout(idle_timeout, response.chunk())
+            .await
+            .map_err(|_| {
+                timeout_transport_error_with_trace(
+                    "Anthropic streaming response timed out",
+                    "streaming_response_body",
+                    "anthropic",
+                    Some(model_ref),
+                    Some(url),
+                    format!(
+                        "no Anthropic stream bytes received for {} ms",
+                        idle_timeout.as_millis()
+                    ),
+                    trace,
+                )
+            })?;
+
+        match next {
+            Ok(Some(chunk)) => {
+                if let Some(trace) = trace {
+                    trace.write_stream_chunk(&chunk);
+                }
+                for event in parser.push(&chunk).map_err(|error| {
+                    invalid_response_error_with_trace(
+                        "invalid Anthropic stream event",
+                        "streaming_response_parse",
+                        "anthropic",
+                        Some(model_ref),
+                        Some(url),
+                        error,
+                        trace,
+                    )
+                })? {
+                    accumulator.apply(event, model_ref, url, trace)?;
+                }
+            }
+            Err(error) => {
+                return Err(classify_reqwest_transport_error_with_trace(
+                    "Anthropic streaming response body failed",
+                    "streaming_response_body",
+                    "anthropic",
+                    Some(model_ref),
+                    Some(url),
+                    error,
+                    trace,
+                ));
+            }
+            Ok(None) => break,
+        }
+    }
+
+    for event in parser.finish().map_err(|error| {
+        invalid_response_error_with_trace(
+            "invalid Anthropic stream event",
+            "streaming_response_parse",
+            "anthropic",
+            Some(model_ref),
+            Some(url),
+            error,
+            trace,
+        )
+    })? {
+        accumulator.apply(event, model_ref, url, trace)?;
+    }
+    let response = accumulator.finish(model_ref, url, trace)?;
+    if let Some(trace) = trace {
+        trace.write_stream_terminal(&serde_json::to_value(&response).unwrap_or_else(|_| json!({})));
+    }
+    Ok(response)
+}
+
+fn anthropic_messages_response_to_turn_response(
+    parsed: MessagesResponse,
+    provider_request_id: Option<String>,
+    request: &ProviderTurnRequest,
+    wire_conversation: &[ConversationMessage],
+    rolling_cache_marker: Option<(usize, usize)>,
+    request_payload: &Value,
+    provider_id: &str,
+    model: &str,
+    cache_strategy: AnthropicCacheStrategy,
+    betas: &[String],
+    model_ref: &str,
+    url: &str,
+    trace: Option<&ProviderHttpTraceRequest>,
+) -> Result<ProviderTurnResponse> {
+    let input_tokens = parsed
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.input_tokens)
+        .unwrap_or(0);
+    let output_tokens = parsed
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.output_tokens)
+        .unwrap_or(0);
+    let cache_usage = parsed.usage.as_ref().map(|usage| ProviderCacheUsage {
+        read_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+        creation_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+    });
+    let tools_available = !request.tools.is_empty();
+    for (block_index, block) in parsed.content.iter().enumerate() {
+        warn_unsupported_anthropic_response_block(
+            block,
+            provider_id,
+            model,
+            block_index,
+            parsed.stop_reason.as_deref(),
+            tools_available,
+        );
+    }
+    if anthropic_response_has_text_form_tool_call_violation(
+        &parsed.content,
+        parsed.stop_reason.as_deref(),
+        tools_available,
+    ) {
+        warn!(
+            provider = provider_id,
+            model = model,
+            stop_reason = ?parsed.stop_reason,
+            tools_available,
+            "anthropic response stopped for tool_use but returned only text-form tool-call markup"
+        );
+        return Err(invalid_response_error_with_trace(
+            "invalid Anthropic tool response",
+            "response_protocol",
+            "anthropic",
+            Some(model_ref),
+            Some(url),
+            "stop_reason=tool_use without native tool_use block; text block contains tool-call-looking markup",
+            trace,
+        ));
+    }
+    let response_format_tool_name = anthropic_response_format_tool_name(request);
+    let blocks = parsed
+        .content
+        .into_iter()
+        .filter_map(|block| {
+            api_response_block_to_model(block, response_format_tool_name.as_deref())
+        })
+        .collect::<Vec<_>>();
+    if blocks.is_empty() {
+        return Err(invalid_response_error_with_trace(
+            "invalid Anthropic response",
+            "response_protocol",
+            "anthropic",
+            Some(model_ref),
+            Some(url),
+            "Anthropic response contained no supported content blocks",
+            trace,
+        ));
+    }
+
+    let cache_diagnostics = collect_anthropic_cache_diagnostics(
+        request,
+        wire_conversation,
+        rolling_cache_marker,
+        request_payload,
+        model,
+        cache_strategy,
+        betas,
+    );
+    let request_lowering_mode = anthropic_request_lowering_mode(request, cache_strategy);
+
+    Ok(ProviderTurnResponse {
+        blocks,
+        stop_reason: parsed.stop_reason,
+        input_tokens,
+        output_tokens,
+        cache_usage,
+        provider_message_id: parsed.id,
+        provider_request_id,
+        request_diagnostics: Some(crate::provider::ProviderRequestDiagnostics {
+            request_lowering_mode: request_lowering_mode.to_string(),
+            anthropic_cache: Some(cache_diagnostics),
+            anthropic_context_management: parsed.context_management,
+            openai_request_controls: None,
+            incremental_continuation: None,
+            openai_remote_compaction: None,
+            native_web_search: native_web_search_diagnostics(request),
+            response_format: response_format_diagnostics(request),
+        }),
+    })
+}
+
+fn provider_request_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-request-id")
+        .or_else(|| headers.get("request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+#[derive(Default)]
+struct SseParser {
+    buffer: Vec<u8>,
+}
+
+impl SseParser {
+    fn push(&mut self, chunk: &[u8]) -> std::result::Result<Vec<AnthropicStreamEvent>, String> {
+        self.buffer.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        loop {
+            let Some(end) = find_sse_event_end(&self.buffer) else {
+                break;
+            };
+            let raw = self.buffer.drain(..end).collect::<Vec<_>>();
+            let separator_len = if self.buffer.starts_with(b"\r\n\r\n") {
+                4
+            } else {
+                2
+            };
+            self.buffer.drain(..separator_len);
+            if let Some(event) = parse_sse_event(&raw)? {
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+
+    fn finish(mut self) -> std::result::Result<Vec<AnthropicStreamEvent>, String> {
+        if self.buffer.is_empty() {
+            return Ok(Vec::new());
+        }
+        let raw = std::mem::take(&mut self.buffer);
+        parse_sse_event(&raw).map(|event| event.into_iter().collect())
+    }
+}
+
+fn find_sse_event_end(buffer: &[u8]) -> Option<usize> {
+    buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .or_else(|| buffer.windows(2).position(|window| window == b"\n\n"))
+}
+
+fn parse_sse_event(raw: &[u8]) -> std::result::Result<Option<AnthropicStreamEvent>, String> {
+    let text = std::str::from_utf8(raw).map_err(|error| error.to_string())?;
+    let mut data = Vec::new();
+    let mut event_type: Option<&str> = None;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.strip_prefix(' ').unwrap_or(value));
+        } else if let Some(value) = line.strip_prefix("event:") {
+            event_type = Some(value.trim());
+        }
+    }
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let data = data.join("\n");
+    if data.trim() == "[DONE]" {
+        return Ok(None);
+    }
+    match serde_json::from_str::<AnthropicStreamEvent>(&data) {
+        Ok(event) => Ok(Some(event)),
+        Err(_) if event_type == Some("error") => parse_fallback_error_event(&data),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Fallback parser for non-standard SSE error events where `message` is a string
+/// (e.g. DashScope sends `{"code":"InvalidParameter","message":"..."}` with an
+/// `event: error` SSE line, instead of the Anthropic `{"error": {...}}` shape).
+fn parse_fallback_error_event(
+    data: &str,
+) -> std::result::Result<Option<AnthropicStreamEvent>, String> {
+    #[derive(Deserialize)]
+    struct FallbackError {
+        #[serde(default, rename = "type")]
+        kind: Option<String>,
+        #[serde(default)]
+        code: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+        error: Option<AnthropicStreamError>,
+    }
+    let parsed: FallbackError = serde_json::from_str(data).map_err(|e| e.to_string())?;
+    Ok(Some(AnthropicStreamEvent {
+        kind: parsed.kind.unwrap_or_else(|| "error".into()),
+        message: None,
+        index: None,
+        content_block: None,
+        delta: None,
+        usage: None,
+        error: Some(AnthropicStreamError {
+            kind: parsed
+                .code
+                .or_else(|| parsed.error.as_ref().and_then(|e| e.kind.clone())),
+            message: parsed
+                .message
+                .or_else(|| parsed.error.and_then(|e| e.message)),
+        }),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicStreamEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    message: Option<MessagesResponse>,
+    index: Option<usize>,
+    content_block: Option<ApiResponseBlock>,
+    delta: Option<AnthropicStreamDelta>,
+    usage: Option<ApiUsage>,
+    error: Option<AnthropicStreamError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicStreamDelta {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    text: Option<String>,
+    thinking: Option<String>,
+    signature: Option<String>,
+    partial_json: Option<String>,
+    stop_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicStreamError {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Default)]
+struct AnthropicStreamAccumulator {
+    response: Option<MessagesResponse>,
+    content: Vec<ApiResponseBlock>,
+    saw_message_stop: bool,
+}
+
+impl AnthropicStreamAccumulator {
+    fn apply(
+        &mut self,
+        event: AnthropicStreamEvent,
+        model_ref: &str,
+        url: &str,
+        trace: Option<&ProviderHttpTraceRequest>,
+    ) -> Result<()> {
+        match event.kind.as_str() {
+            "message_start" => {
+                if let Some(mut message) = event.message {
+                    message.content.clear();
+                    self.response = Some(message);
+                }
+            }
+            "content_block_start" => {
+                let index = event.index.unwrap_or(self.content.len());
+                let Some(mut block) = event.content_block else {
+                    return Ok(());
+                };
+                normalize_stream_start_block(&mut block);
+                if self.content.len() <= index {
+                    self.content
+                        .resize_with(index + 1, ApiResponseBlock::default);
+                }
+                self.content[index] = block;
+            }
+            "content_block_delta" => {
+                let Some(index) = event.index else {
+                    return Ok(());
+                };
+                if self.content.len() <= index {
+                    self.content
+                        .resize_with(index + 1, ApiResponseBlock::default);
+                }
+                apply_stream_delta(&mut self.content[index], event.delta);
+            }
+            "message_delta" => {
+                let response = self.response.get_or_insert_with(MessagesResponse::default);
+                if let Some(delta) = event.delta {
+                    if let Some(stop_reason) = delta.stop_reason {
+                        response.stop_reason = Some(stop_reason);
+                    }
+                }
+                if let Some(usage) = event.usage {
+                    merge_anthropic_usage(
+                        response.usage.get_or_insert_with(ApiUsage::default),
+                        usage,
+                    );
+                }
+            }
+            "message_stop" => {
+                self.saw_message_stop = true;
+            }
+            "ping" | "content_block_stop" => {}
+            "error" => {
+                let detail = event
+                    .error
+                    .map(|error| {
+                        format!(
+                            "{}: {}",
+                            error.kind.unwrap_or_else(|| "error".into()),
+                            error.message.unwrap_or_default()
+                        )
+                    })
+                    .unwrap_or_else(|| "Anthropic stream error event".into());
+                return Err(provider_transport_error(
+                    ProviderFailureClassification {
+                        kind: ProviderFailureKind::ServerError,
+                        disposition: RetryDisposition::Retryable,
+                    },
+                    None,
+                    None,
+                    format!("Anthropic stream failed: {detail}"),
+                ));
+            }
+            _ => {}
+        }
+        let _ = (model_ref, url, trace);
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        model_ref: &str,
+        url: &str,
+        trace: Option<&ProviderHttpTraceRequest>,
+    ) -> Result<MessagesResponse> {
+        let Some(mut response) = self.response.take() else {
+            return Err(invalid_response_error_with_trace(
+                "invalid Anthropic stream",
+                "streaming_response_protocol",
+                "anthropic",
+                Some(model_ref),
+                Some(url),
+                "stream completed without message_start",
+                trace,
+            ));
+        };
+        if !self.saw_message_stop {
+            return Err(invalid_response_error_with_trace(
+                "invalid Anthropic stream",
+                "streaming_response_protocol",
+                "anthropic",
+                Some(model_ref),
+                Some(url),
+                "stream completed without message_stop",
+                trace,
+            ));
+        }
+        response.content = self
+            .content
+            .into_iter()
+            .filter(|block| !block.kind.is_empty())
+            .map(finalize_stream_block)
+            .collect();
+        Ok(response)
+    }
+}
+
+fn normalize_stream_start_block(block: &mut ApiResponseBlock) {
+    match block.kind.as_str() {
+        "text" => block.text = Some(String::new()),
+        "thinking" => {
+            block.thinking = Some(String::new());
+            block.signature = None;
+        }
+        "tool_use" => block.input = Some(Value::String(String::new())),
+        _ => {}
+    }
+}
+
+fn apply_stream_delta(block: &mut ApiResponseBlock, delta: Option<AnthropicStreamDelta>) {
+    let Some(delta) = delta else {
+        return;
+    };
+    match delta.kind.as_deref() {
+        Some("text_delta") => {
+            block
+                .text
+                .get_or_insert_with(String::new)
+                .push_str(delta.text.as_deref().unwrap_or_default());
+        }
+        Some("thinking_delta") => {
+            block
+                .thinking
+                .get_or_insert_with(String::new)
+                .push_str(delta.thinking.as_deref().unwrap_or_default());
+        }
+        Some("signature_delta") => {
+            block.signature = delta.signature;
+        }
+        Some("input_json_delta") => {
+            let current = block
+                .input
+                .get_or_insert_with(|| Value::String(String::new()))
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            *block.input.as_mut().expect("input inserted") = Value::String(format!(
+                "{}{}",
+                current,
+                delta.partial_json.unwrap_or_default()
+            ));
+        }
+        _ => {}
+    }
+}
+
+fn finalize_stream_block(mut block: ApiResponseBlock) -> ApiResponseBlock {
+    if block.kind == "tool_use" {
+        if let Some(Value::String(raw)) = block.input.take() {
+            block.input = Some(serde_json::from_str(&raw).unwrap_or_else(|_| json!({})));
+        }
+    }
+    block
+}
+
+fn merge_anthropic_usage(target: &mut ApiUsage, update: ApiUsage) {
+    if update.input_tokens.is_some() {
+        target.input_tokens = update.input_tokens;
+    }
+    if update.output_tokens.is_some() {
+        target.output_tokens = update.output_tokens;
+    }
+    if update.cache_read_input_tokens.is_some() {
+        target.cache_read_input_tokens = update.cache_read_input_tokens;
+    }
+    if update.cache_creation_input_tokens.is_some() {
+        target.cache_creation_input_tokens = update.cache_creation_input_tokens;
+    }
+}
+
+fn strip_initial_context_message(request: &ProviderTurnRequest) -> Vec<ConversationMessage> {
+    let mut conversation = request.conversation.clone();
+    if matches!(
+        conversation.first(),
+        Some(ConversationMessage::UserBlocks(blocks))
+            if *blocks == request.prompt_frame.context_blocks
+    ) {
+        conversation.remove(0);
+        if conversation.is_empty()
+            || !matches!(
+                conversation.first(),
+                Some(ConversationMessage::UserText(_) | ConversationMessage::UserBlocks(_))
+            )
+        {
+            conversation.insert(
+                0,
+                ConversationMessage::UserText("Continue using the context above.".to_string()),
+            );
+        }
+    }
+    conversation
+}
+
+fn build_anthropic_system(
+    request: &ProviderTurnRequest,
+    cache_strategy: AnthropicCacheStrategy,
+) -> Value {
+    match cache_strategy {
+        AnthropicCacheStrategy::MessagesNative => current_anthropic_system(request),
+        AnthropicCacheStrategy::ClaudeCodePromptCache => {
+            claude_code_prompt_cache_anthropic_system(request)
+        }
+    }
+}
+
+fn current_anthropic_system(request: &ProviderTurnRequest) -> Value {
+    if request.prompt_frame.has_structured_system_blocks() {
+        Value::Array(
+            request
+                .prompt_frame
+                .system_blocks
+                .iter()
+                .map(prompt_block_to_anthropic_content)
+                .collect(),
+        )
+    } else {
+        Value::String(request.prompt_frame.system_prompt.clone())
+    }
+}
+
+fn claude_code_prompt_cache_anthropic_system(request: &ProviderTurnRequest) -> Value {
+    let mut system = vec![json!({
+        "type": "text",
+        "text": "x-anthropic-billing-header: holon",
+    })];
+
+    if !request.prompt_frame.system_prompt.trim().is_empty() {
+        system.push(cacheable_text_block(&request.prompt_frame.system_prompt));
+    }
+
+    let context_text = request
+        .prompt_frame
+        .context_blocks
+        .iter()
+        .map(|block| block.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !context_text.trim().is_empty() {
+        system.push(cacheable_text_block(&context_text));
+    }
+
+    Value::Array(system)
+}
+
+fn cacheable_text_block(text: &str) -> Value {
+    json!({
+        "type": "text",
+        "text": text,
+        "cache_control": { "type": "ephemeral" },
+    })
+}
+
+fn build_anthropic_metadata(
+    request: &ProviderTurnRequest,
+    cache_strategy: AnthropicCacheStrategy,
+) -> Option<Value> {
+    if cache_strategy != AnthropicCacheStrategy::ClaudeCodePromptCache {
+        return None;
+    }
+    let session_id = normalize_anthropic_session_id(
+        request
+            .prompt_frame
+            .cache
+            .as_ref()
+            .map(|cache| cache.prompt_cache_key.as_str()),
+    );
+    let user_id = json!({
+        "device_id": "holon",
+        "account_uuid": "",
+        "session_id": session_id,
+    })
+    .to_string();
+    Some(json!({
+        "user_id": user_id
+    }))
+}
+
+const ANTHROPIC_SESSION_ID_DEFAULT: &str = "holon-default";
+const ANTHROPIC_SESSION_ID_MIN_LEN: usize = 6;
+const ANTHROPIC_SESSION_ID_MAX_LEN: usize = 64;
+const ANTHROPIC_SESSION_ID_HASH_LEN: usize = 16;
+
+fn normalize_anthropic_session_id(raw: Option<&str>) -> String {
+    let raw = raw.unwrap_or_default().trim();
+    if raw.is_empty() {
+        return ANTHROPIC_SESSION_ID_DEFAULT.to_string();
+    }
+
+    if is_anthropic_session_id_safe(raw)
+        && raw.len() >= ANTHROPIC_SESSION_ID_MIN_LEN
+        && raw.len() <= ANTHROPIC_SESSION_ID_MAX_LEN
+    {
+        return raw.to_string();
+    }
+
+    let digest = sha256_hex(raw.as_bytes());
+    let hash = &digest[..ANTHROPIC_SESSION_ID_HASH_LEN];
+    let max_prefix_len = ANTHROPIC_SESSION_ID_MAX_LEN - ANTHROPIC_SESSION_ID_HASH_LEN - 1;
+    let mut prefix = sanitized_anthropic_session_id_prefix(raw, max_prefix_len);
+    if prefix.len() > max_prefix_len {
+        prefix.truncate(max_prefix_len);
+        trim_anthropic_session_id_suffix(&mut prefix);
+    }
+    if prefix.is_empty() {
+        prefix.push_str("holon");
+    }
+
+    format!("{prefix}-{hash}")
+}
+
+fn is_anthropic_session_id_safe(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn sanitized_anthropic_session_id_prefix(raw: &str, max_prefix_len: usize) -> String {
+    let mut prefix = String::with_capacity(raw.len().min(max_prefix_len));
+    for byte in raw.bytes() {
+        if prefix.len() >= max_prefix_len {
+            break;
+        }
+
+        if byte.is_ascii_alphanumeric() {
+            prefix.push(byte.to_ascii_lowercase() as char);
+        } else if byte == b'-' || byte == b'_' {
+            prefix.push(byte as char);
+        } else if !prefix.ends_with('-') {
+            prefix.push('-');
+        }
+    }
+    trim_anthropic_session_id_suffix(&mut prefix);
+    prefix
+}
+
+fn trim_anthropic_session_id_suffix(value: &mut String) {
+    while value.ends_with('-') || value.ends_with('_') {
+        value.pop();
+    }
+}
+
+fn anthropic_request_lowering_mode(
+    request: &ProviderTurnRequest,
+    cache_strategy: AnthropicCacheStrategy,
+) -> &'static str {
+    match cache_strategy {
+        AnthropicCacheStrategy::ClaudeCodePromptCache => "claude_code_prompt_cache",
+        AnthropicCacheStrategy::MessagesNative
+            if request.prompt_frame.has_structured_system_blocks() =>
+        {
+            "prompt_cache_blocks"
+        }
+        AnthropicCacheStrategy::MessagesNative => "plain_system",
+    }
+}
+
+fn build_anthropic_tools(request: &ProviderTurnRequest) -> Vec<Value> {
+    let mut tools = request
+        .tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            })
+        })
+        .collect::<Vec<_>>();
+    if matches!(
+        request.native_web_search.as_ref().map(|native| native.kind),
+        Some(ProviderNativeWebSearchKind::Anthropic)
+    ) {
+        tools.push(json!({
+            "type": request
+                .native_web_search
+                .as_ref()
+                .map(|native| native.advertised_tool_type.as_str())
+                .unwrap_or("web_search_20250305"),
+            "name": "web_search"
+        }));
+    }
+    if let Some(tool) = anthropic_response_format_tool(request) {
+        tools.push(tool);
+    }
+    tools
+}
+
+fn anthropic_response_format_tool(request: &ProviderTurnRequest) -> Option<Value> {
+    match request.response_format.as_ref()? {
+        ProviderResponseFormatRequest::JsonSchema(format) => Some(json!({
+            "name": anthropic_response_format_tool_name(request)?,
+            "description": format!(
+                "Return the final response as a JSON object matching the `{}` schema.",
+                format.name
+            ),
+            "input_schema": format.schema,
+            "strict": format.strict,
+        })),
+    }
+}
+
+fn anthropic_response_format_tool_name(request: &ProviderTurnRequest) -> Option<String> {
+    match request.response_format.as_ref()? {
+        ProviderResponseFormatRequest::JsonSchema(format) => {
+            Some(format!("structured_response_{}", format.name))
+        }
+    }
+}
+
+fn anthropic_response_format_tool_choice(request: &ProviderTurnRequest) -> Option<Value> {
+    Some(json!({
+        "type": "tool",
+        "name": anthropic_response_format_tool_name(request)?,
+    }))
+}
+
+fn native_web_search_diagnostics(
+    request: &ProviderTurnRequest,
+) -> Option<ProviderNativeWebSearchDiagnostics> {
+    let native = request.native_web_search.as_ref()?;
+    let lowered = native.kind == ProviderNativeWebSearchKind::Anthropic;
+    Some(ProviderNativeWebSearchDiagnostics {
+        kind: native.kind,
+        provider_id: native.provider_id.clone(),
+        provider_model_ref: native.provider_model_ref.clone(),
+        advertised_tool_type: native.advertised_tool_type.clone(),
+        backend_kind: native.backend_kind.clone(),
+        lowered,
+        fallback_reason: (!lowered)
+            .then(|| "anthropic transport only supports Anthropic-native web search".into()),
+    })
+}
+
+fn response_format_diagnostics(
+    request: &ProviderTurnRequest,
+) -> Option<ProviderResponseFormatDiagnostics> {
+    match request.response_format.as_ref()? {
+        ProviderResponseFormatRequest::JsonSchema(format) => {
+            Some(ProviderResponseFormatDiagnostics {
+                requested: true,
+                lowered: true,
+                format_type: "json_schema".into(),
+                schema_name: Some(format.name.clone()),
+                fallback_reason: None,
+            })
+        }
+    }
+}
+
+fn build_context_management_request(
+    config: &AnthropicContextManagementConfig,
+) -> Option<ContextManagementRequest> {
+    config.enabled.then(|| ContextManagementRequest {
+        edits: vec![ContextManagementEdit {
+            kind: "clear_tool_uses_20250919",
+            trigger: ContextManagementThreshold {
+                kind: "input_tokens",
+                value: config.trigger_input_tokens,
+            },
+            keep: ContextManagementThreshold {
+                kind: "tool_uses",
+                value: config.keep_recent_tool_uses,
+            },
+            exclude_tools: vec!["ApplyPatch"],
+            clear_at_least: config.clear_at_least_input_tokens.map(|value| {
+                ContextManagementThreshold {
+                    kind: "input_tokens",
+                    value,
+                }
+            }),
+        }],
+    })
+}
+
+fn build_anthropic_messages(
+    conversation: &[ConversationMessage],
+    rolling_cache_marker: Option<(usize, usize)>,
+) -> Vec<ApiMessage> {
+    conversation
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| conversation_message_has_content(message))
+        .map(|(message_index, message)| {
+            conversation_message_to_api(
+                message,
+                rolling_cache_marker
+                    .filter(|(marker_message_index, _)| *marker_message_index == message_index)
+                    .map(|(_, marker_block_index)| marker_block_index),
+            )
+        })
+        .collect()
+}
+
+fn conversation_message_has_content(message: &ConversationMessage) -> bool {
+    match message {
+        ConversationMessage::UserText(text) => !text.trim().is_empty(),
+        ConversationMessage::UserBlocks(blocks) => !blocks.is_empty(),
+        ConversationMessage::UserImage {
+            prompt,
+            data_base64,
+            ..
+        } => !prompt.trim().is_empty() || !data_base64.is_empty(),
+        ConversationMessage::AssistantBlocks(blocks) => !blocks.is_empty(),
+        ConversationMessage::UserToolResults(results) => !results.is_empty(),
+    }
+}
+
+fn conversation_message_to_api(
+    message: &ConversationMessage,
+    rolling_cache_block_index: Option<usize>,
+) -> ApiMessage {
+    match message {
+        ConversationMessage::UserText(text) => ApiMessage {
+            role: "user",
+            content: Value::Array(vec![maybe_mark_cache_control(
+                json!({ "type": "text", "text": text }),
+                rolling_cache_block_index == Some(0),
+            )]),
+        },
+        ConversationMessage::UserBlocks(blocks) => ApiMessage {
+            role: "user",
+            content: Value::Array(
+                blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(block_index, block)| {
+                        maybe_mark_cache_control(
+                            prompt_block_to_anthropic_content(block),
+                            rolling_cache_block_index == Some(block_index),
+                        )
+                    })
+                    .collect(),
+            ),
+        },
+        ConversationMessage::UserImage {
+            prompt,
+            media_type,
+            data_base64,
+        } => ApiMessage {
+            role: "user",
+            content: Value::Array(
+                [
+                    (!prompt.trim().is_empty()).then(|| {
+                        maybe_mark_cache_control(
+                            json!({
+                                "type": "text",
+                                "text": prompt,
+                            }),
+                            rolling_cache_block_index == Some(0),
+                        )
+                    }),
+                    (!data_base64.is_empty()).then(|| {
+                        json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": data_base64,
+                            },
+                        })
+                    }),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+            ),
+        },
+        ConversationMessage::AssistantBlocks(blocks) => ApiMessage {
+            role: "assistant",
+            content: Value::Array(
+                blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(block_index, block)| {
+                        maybe_mark_cache_control(
+                            match block {
+                                ModelBlock::Text { text } => json!({
+                                    "type": "text",
+                                    "text": text,
+                                }),
+                                ModelBlock::ToolUse {
+                                    id, name, input, ..
+                                } => json!({
+                                    "type": "tool_use",
+                                    "id": id,
+                                    "name": name,
+                                    "input": input,
+                                }),
+                                ModelBlock::Thinking { text, signature } => {
+                                    let mut v = json!({
+                                        "type": "thinking",
+                                        "thinking": text,
+                                    });
+                                    if !signature.is_empty() {
+                                        v.as_object_mut()
+                                            .unwrap()
+                                            .insert("signature".into(), json!(signature));
+                                    }
+                                    v
+                                }
+                                ModelBlock::RedactedThinking { data } => json!({
+                                    "type": "redacted_thinking",
+                                    "data": data,
+                                }),
+                            },
+                            rolling_cache_block_index == Some(block_index),
+                        )
+                    })
+                    .collect(),
+            ),
+        },
+        ConversationMessage::UserToolResults(results) => ApiMessage {
+            role: "user",
+            content: Value::Array(
+                results
+                    .iter()
+                    .enumerate()
+                    .map(|(block_index, result)| {
+                        maybe_mark_cache_control(
+                            json!({
+                                "type": "tool_result",
+                                "tool_use_id": result.tool_use_id,
+                                "content": result.content,
+                                "is_error": result.is_error,
+                            }),
+                            rolling_cache_block_index == Some(block_index),
+                        )
+                    })
+                    .collect(),
+            ),
+        },
+    }
+}
+
+fn maybe_mark_cache_control(mut content: Value, should_mark: bool) -> Value {
+    if should_mark && content.get("cache_control").is_none() {
+        content["cache_control"] = json!({ "type": "ephemeral" });
+    }
+    content
+}
+
+fn rolling_conversation_cache_marker(
+    conversation: &[ConversationMessage],
+    cache_strategy: AnthropicCacheStrategy,
+) -> Option<(usize, usize)> {
+    conversation
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(message_index, message)| {
+            last_cacheable_content_index(message, cache_strategy)
+                .map(|block_index| (message_index, block_index))
+        })
+}
+
+fn last_cacheable_content_index(
+    message: &ConversationMessage,
+    cache_strategy: AnthropicCacheStrategy,
+) -> Option<usize> {
+    match message {
+        ConversationMessage::UserText(_) => Some(0),
+        ConversationMessage::UserBlocks(blocks) => (!blocks.is_empty()).then_some(blocks.len() - 1),
+        ConversationMessage::UserImage { prompt, .. } => (!prompt.trim().is_empty()).then_some(0),
+        ConversationMessage::AssistantBlocks(blocks) => match cache_strategy {
+            AnthropicCacheStrategy::MessagesNative => {
+                (!blocks.is_empty()).then_some(blocks.len() - 1)
+            }
+            AnthropicCacheStrategy::ClaudeCodePromptCache => {
+                blocks.iter().enumerate().rev().find_map(|(index, block)| {
+                    matches!(block, ModelBlock::Text { .. }).then_some(index)
+                })
+            }
+        },
+        ConversationMessage::UserToolResults(results) => match cache_strategy {
+            AnthropicCacheStrategy::MessagesNative => {
+                (!results.is_empty()).then_some(results.len() - 1)
+            }
+            AnthropicCacheStrategy::ClaudeCodePromptCache => None,
+        },
+    }
+}
+
+fn prompt_block_to_anthropic_content(block: &PromptContentBlock) -> Value {
+    let mut content = json!({
+        "type": "text",
+        "text": block.text,
+    });
+    if block.cache_breakpoint {
+        content["cache_control"] = json!({ "type": "ephemeral" });
+    }
+    content
+}
+
+fn warn_unsupported_anthropic_response_block(
+    block: &ApiResponseBlock,
+    provider_id: &str,
+    model: &str,
+    block_index: usize,
+    stop_reason: Option<&str>,
+    tools_available: bool,
+) {
+    if matches!(
+        block.kind.as_str(),
+        "text" | "tool_use" | "thinking" | "redacted_thinking" | "server_tool_use" | "tool_result"
+    ) {
+        return;
+    }
+
+    warn!(
+        provider = provider_id,
+        model,
+        block_index,
+        block_type = %block.kind,
+        stop_reason,
+        tools_available,
+        "anthropic response contained unsupported content block"
+    );
+}
+
+fn anthropic_response_has_text_form_tool_call_violation(
+    blocks: &[ApiResponseBlock],
+    stop_reason: Option<&str>,
+    tools_available: bool,
+) -> bool {
+    if stop_reason != Some("tool_use") || !tools_available {
+        return false;
+    }
+    let mut has_text_form_tool_call = false;
+    for block in blocks {
+        if block.kind == "tool_use" {
+            return false;
+        }
+        if block.kind == "text"
+            && block
+                .text
+                .as_deref()
+                .is_some_and(text_contains_tool_call_markup)
+        {
+            has_text_form_tool_call = true;
+        }
+    }
+    has_text_form_tool_call
+}
+
+fn text_contains_tool_call_markup(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    lowered.contains("<tool_call")
+        || lowered.contains("<function=")
+        || lowered.contains("<function name=")
+        || lowered.contains("&lt;tool_call")
+        || lowered.contains("&lt;function=")
+        || lowered.contains("&lt;function name=")
+        || text.contains("<｜｜DSML｜｜tool_calls>")
+        || text.contains("<｜｜DSML｜｜invoke")
+}
+
+fn api_response_block_to_model(
+    block: ApiResponseBlock,
+    response_format_tool_name: Option<&str>,
+) -> Option<ModelBlock> {
+    match block.kind.as_str() {
+        "text" => Some(ModelBlock::Text {
+            text: block.text.unwrap_or_default(),
+        }),
+        "tool_use" => {
+            let name = block.name?;
+            let input = block.input.unwrap_or_else(|| json!({}));
+            if Some(name.as_str()) == response_format_tool_name {
+                return Some(ModelBlock::Text {
+                    text: serde_json::to_string(&input).ok()?,
+                });
+            }
+            Some(ModelBlock::ToolUse {
+                id: block.id?,
+                name,
+                input,
+                kind: ModelToolCallKind::Function,
+            })
+        }
+        "thinking" => Some(ModelBlock::Thinking {
+            text: block.thinking.unwrap_or_default(),
+            signature: block.signature.unwrap_or_default(),
+        }),
+        "redacted_thinking" => Some(ModelBlock::RedactedThinking {
+            data: block.data.unwrap_or_default(),
+        }),
+        // Anthropic server-side tool use (e.g. web search). This is a server-
+        // internal block that doesn't need to be stored or replayed.
+        "server_tool_use" => None,
+        // Anthropic server-side tool result (e.g. web search results) returned
+        // in the assistant response `content` array. This is distinct from
+        // client-side tool_result blocks in user messages, handled separately.
+        // Convert to Text so the content is preserved in subsequent turns.
+        "tool_result" => {
+            let text = match block.content {
+                Some(Value::String(s)) => s,
+                Some(Value::Array(arr)) => {
+                    // Anthropic tool_result content is an array of content blocks.
+                    // Extract text blocks and concatenate.
+                    arr.iter()
+                        .filter_map(|v| {
+                            v.get("text")
+                                .and_then(|t| t.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+                Some(other) => other.to_string(),
+                None => String::new(),
+            };
+            if text.is_empty() {
+                None
+            } else {
+                Some(ModelBlock::Text { text })
+            }
+        }
+        _ => None,
+    }
+}
+
+fn collect_anthropic_cache_diagnostics(
+    request: &ProviderTurnRequest,
+    conversation: &[ConversationMessage],
+    rolling_cache_marker: Option<(usize, usize)>,
+    request_payload: &Value,
+    model: &str,
+    cache_strategy: AnthropicCacheStrategy,
+    betas: &[String],
+) -> AnthropicPromptCacheDiagnostics {
+    let tools_count = request.tools.len();
+    let tools_hash = hash_tools(&request.tools);
+
+    let (system_hash, system_block_count, estimated_system_tokens) =
+        payload_system_diagnostics(request_payload);
+
+    let context_hash_by_stability = hash_context_by_stability(&request.prompt_frame.context_blocks);
+
+    let (conversation_message_count, conversation_content_block_count) =
+        count_conversation_blocks(conversation);
+
+    let cache_breakpoints = collect_cache_breakpoints(
+        request,
+        conversation,
+        rolling_cache_marker,
+        request_payload,
+        cache_strategy,
+    );
+
+    let (tokens_before_last_breakpoint, tokens_after_last_breakpoint) =
+        estimate_token_distribution_from_payload(request_payload, &cache_breakpoints);
+    let (system_cache_control_count, message_cache_control_count) =
+        count_payload_cache_controls(request_payload);
+
+    AnthropicPromptCacheDiagnostics {
+        cache_strategy: cache_strategy.as_str().to_string(),
+        model: model.to_string(),
+        betas: betas.to_vec(),
+        tools_count,
+        tools_hash,
+        system_hash,
+        system_block_count,
+        estimated_system_tokens,
+        context_hash_by_stability,
+        conversation_message_count,
+        conversation_content_block_count,
+        system_cache_control_count,
+        message_cache_control_count,
+        cache_breakpoints,
+        tokens_before_last_breakpoint,
+        tokens_after_last_breakpoint,
+        automatic_cache_control_requested: false,
+    }
+}
+
+fn hash_tools(tools: &[crate::tool::ToolSpec]) -> String {
+    let mut hasher = XxHash64::default();
+    for tool in tools {
+        tool.name.hash(&mut hasher);
+        tool.description.hash(&mut hasher);
+        // Hash input_schema to detect schema changes
+        tool.input_schema.to_string().hash(&mut hasher);
+        // Hash freeform_grammar to detect grammar changes
+        match &tool.freeform_grammar {
+            Some(grammar) => {
+                grammar.syntax.hash(&mut hasher);
+                grammar.definition.hash(&mut hasher);
+            }
+            None => 0u64.hash(&mut hasher),
+        };
+    }
+    format!("{:x}", hasher.finish())
+}
+
+fn hash_system_blocks(blocks: &[PromptContentBlock], system_prompt: &str) -> String {
+    let mut hasher = XxHash64::default();
+    system_prompt.hash(&mut hasher);
+    for block in blocks {
+        block.text.hash(&mut hasher);
+        block.stability.hash(&mut hasher);
+        // Include cache_breakpoint in hash to detect breakpoint changes
+        block.cache_breakpoint.hash(&mut hasher);
+    }
+    format!("{:x}", hasher.finish())
+}
+
+fn payload_system_diagnostics(request_payload: &Value) -> (String, usize, u64) {
+    let Some(system) = request_payload.get("system") else {
+        return (hash_system_blocks(&[], ""), 0, 0);
+    };
+    let block_count = system.as_array().map(Vec::len).unwrap_or(0);
+    let estimated_tokens = match system {
+        Value::String(text) => estimate_tokens_from_chars(text.len()),
+        Value::Array(blocks) => estimate_tokens_from_chars(
+            blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .map(str::len)
+                .sum(),
+        ),
+        _ => 0,
+    };
+    let mut hasher = XxHash64::default();
+    canonical_json(system).hash(&mut hasher);
+    (
+        format!("{:x}", hasher.finish()),
+        block_count,
+        estimated_tokens,
+    )
+}
+
+fn stability_label(stability: crate::prompt::PromptStability) -> &'static str {
+    match stability {
+        crate::prompt::PromptStability::Stable => "stable",
+        crate::prompt::PromptStability::AgentScoped => "agent_scoped",
+        crate::prompt::PromptStability::TurnScoped => "turn_scoped",
+    }
+}
+
+fn hash_context_by_stability(
+    blocks: &[PromptContentBlock],
+) -> std::collections::BTreeMap<String, String> {
+    let mut by_stability: std::collections::HashMap<PromptStability, Vec<&PromptContentBlock>> =
+        HashMap::new();
+    for block in blocks {
+        by_stability.entry(block.stability).or_default().push(block);
+    }
+
+    let mut result = std::collections::BTreeMap::new();
+    for (stability, blocks) in by_stability {
+        let mut hasher = XxHash64::default();
+        for block in blocks {
+            block.text.hash(&mut hasher);
+            // Include cache_breakpoint in context hash to detect breakpoint changes
+            block.cache_breakpoint.hash(&mut hasher);
+        }
+        result.insert(
+            stability_label(stability).to_string(),
+            format!("{:x}", hasher.finish()),
+        );
+    }
+    result
+}
+
+fn estimate_tokens_from_chars(byte_count: usize) -> u64 {
+    (byte_count / 4) as u64
+}
+
+fn count_conversation_blocks(conversation: &[ConversationMessage]) -> (usize, usize) {
+    let message_count = conversation.len();
+    let block_count = conversation.iter().fold(0, |acc, msg| match msg {
+        ConversationMessage::UserBlocks(blocks) => acc + blocks.len(),
+        ConversationMessage::AssistantBlocks(blocks) => acc + blocks.len(),
+        ConversationMessage::UserToolResults(results) => acc + results.len(),
+        _ => acc,
+    });
+    (message_count, block_count)
+}
+
+fn collect_cache_breakpoints(
+    request: &ProviderTurnRequest,
+    conversation: &[ConversationMessage],
+    rolling_cache_marker: Option<(usize, usize)>,
+    request_payload: &Value,
+    cache_strategy: AnthropicCacheStrategy,
+) -> Vec<CacheBreakpointInfo> {
+    const MAX_BREAKPOINTS: usize = 10;
+    let mut breakpoints = Vec::new();
+    let mut token_offset = 0u64;
+
+    match request_payload.get("system") {
+        Some(Value::String(text)) => {
+            token_offset += estimate_tokens_from_chars(text.len());
+        }
+        Some(Value::Array(system_blocks)) => {
+            for (idx, system_block) in system_blocks.iter().enumerate() {
+                let text = system_block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let block_tokens = estimate_tokens_from_chars(text.len());
+                if system_block.get("cache_control").is_some() {
+                    let (location, stability) =
+                        system_cache_breakpoint_metadata(request, cache_strategy, idx);
+                    if breakpoints.len() < MAX_BREAKPOINTS {
+                        breakpoints.push(CacheBreakpointInfo {
+                            location,
+                            provider_payload_path: format!("system[{}]", idx),
+                            block_kind: "system_text".to_string(),
+                            stability,
+                            estimated_prefix_tokens: token_offset + block_tokens,
+                            content_hash: hash_secret_safe_string(text),
+                            canonical_prefix_fingerprint: canonical_prefix_fingerprint(
+                                request_payload,
+                                CacheBreakpointPath::System(idx),
+                            ),
+                        });
+                    }
+                }
+                token_offset += block_tokens;
+            }
+        }
+        _ => {}
+    }
+
+    // Process conversation messages.
+    for (msg_idx, message) in conversation.iter().enumerate() {
+        if breakpoints.len() >= MAX_BREAKPOINTS {
+            break;
+        }
+        match message {
+            ConversationMessage::UserBlocks(blocks) => {
+                for (block_idx, block) in blocks.iter().enumerate() {
+                    if breakpoints.len() >= MAX_BREAKPOINTS {
+                        break;
+                    }
+                    let block_tokens = estimate_tokens_from_chars(block.text.len());
+                    if block.cache_breakpoint || rolling_cache_marker == Some((msg_idx, block_idx))
+                    {
+                        breakpoints.push(CacheBreakpointInfo {
+                            location: format!("messages[{}].content[{}]", msg_idx, block_idx),
+                            provider_payload_path: format!(
+                                "messages[{}].content[{}]",
+                                msg_idx, block_idx
+                            ),
+                            block_kind: "user_text".to_string(),
+                            stability: if block.cache_breakpoint {
+                                stability_label(block.stability).to_string()
+                            } else {
+                                "conversation_tail".to_string()
+                            },
+                            estimated_prefix_tokens: token_offset + block_tokens,
+                            content_hash: hash_secret_safe_string(&block.text),
+                            canonical_prefix_fingerprint: canonical_prefix_fingerprint(
+                                request_payload,
+                                CacheBreakpointPath::MessageContent(msg_idx, block_idx),
+                            ),
+                        });
+                    }
+                    token_offset += block_tokens;
+                }
+            }
+            ConversationMessage::UserText(text) => {
+                let block_tokens = estimate_tokens_from_chars(text.len());
+                if rolling_cache_marker == Some((msg_idx, 0)) {
+                    breakpoints.push(CacheBreakpointInfo {
+                        location: format!("messages[{}].content[0]", msg_idx),
+                        provider_payload_path: format!("messages[{}].content[0]", msg_idx),
+                        block_kind: "user_text".to_string(),
+                        stability: "conversation_tail".to_string(),
+                        estimated_prefix_tokens: token_offset + block_tokens,
+                        content_hash: hash_secret_safe_string(text),
+                        canonical_prefix_fingerprint: canonical_prefix_fingerprint(
+                            request_payload,
+                            CacheBreakpointPath::MessageContent(msg_idx, 0),
+                        ),
+                    });
+                }
+                token_offset += block_tokens;
+            }
+            ConversationMessage::UserImage { prompt, .. } => {
+                let block_tokens = estimate_tokens_from_chars(prompt.len());
+                if rolling_cache_marker == Some((msg_idx, 0)) {
+                    breakpoints.push(CacheBreakpointInfo {
+                        location: format!("messages[{}].content[0]", msg_idx),
+                        provider_payload_path: format!("messages[{}].content[0]", msg_idx),
+                        block_kind: "user_text".to_string(),
+                        stability: "conversation_tail".to_string(),
+                        estimated_prefix_tokens: token_offset + block_tokens,
+                        content_hash: hash_secret_safe_string(prompt),
+                        canonical_prefix_fingerprint: canonical_prefix_fingerprint(
+                            request_payload,
+                            CacheBreakpointPath::MessageContent(msg_idx, 0),
+                        ),
+                    });
+                }
+                token_offset += block_tokens;
+            }
+            ConversationMessage::AssistantBlocks(blocks) => {
+                for (block_idx, block) in blocks.iter().enumerate() {
+                    if breakpoints.len() >= MAX_BREAKPOINTS {
+                        break;
+                    }
+                    let block_tokens = estimate_model_block_tokens(block);
+                    if rolling_cache_marker == Some((msg_idx, block_idx)) {
+                        breakpoints.push(CacheBreakpointInfo {
+                            location: format!("messages[{}].content[{}]", msg_idx, block_idx),
+                            provider_payload_path: format!(
+                                "messages[{}].content[{}]",
+                                msg_idx, block_idx
+                            ),
+                            block_kind: model_block_kind(block).to_string(),
+                            stability: "conversation_tail".to_string(),
+                            estimated_prefix_tokens: token_offset + block_tokens,
+                            content_hash: hash_model_block(block),
+                            canonical_prefix_fingerprint: canonical_prefix_fingerprint(
+                                request_payload,
+                                CacheBreakpointPath::MessageContent(msg_idx, block_idx),
+                            ),
+                        });
+                    }
+                    token_offset += block_tokens;
+                }
+            }
+            ConversationMessage::UserToolResults(results) => {
+                for (block_idx, result) in results.iter().enumerate() {
+                    if breakpoints.len() >= MAX_BREAKPOINTS {
+                        break;
+                    }
+                    let block_tokens = estimate_tokens_from_chars(result.content.len());
+                    if rolling_cache_marker == Some((msg_idx, block_idx)) {
+                        breakpoints.push(CacheBreakpointInfo {
+                            location: format!("messages[{}].content[{}]", msg_idx, block_idx),
+                            provider_payload_path: format!(
+                                "messages[{}].content[{}]",
+                                msg_idx, block_idx
+                            ),
+                            block_kind: "tool_result".to_string(),
+                            stability: "conversation_tail".to_string(),
+                            estimated_prefix_tokens: token_offset + block_tokens,
+                            content_hash: hash_tool_result_block(result),
+                            canonical_prefix_fingerprint: canonical_prefix_fingerprint(
+                                request_payload,
+                                CacheBreakpointPath::MessageContent(msg_idx, block_idx),
+                            ),
+                        });
+                    }
+                    token_offset += block_tokens;
+                }
+            }
+        }
+    }
+
+    breakpoints
+}
+
+fn system_cache_breakpoint_metadata(
+    request: &ProviderTurnRequest,
+    cache_strategy: AnthropicCacheStrategy,
+    idx: usize,
+) -> (String, String) {
+    if cache_strategy == AnthropicCacheStrategy::MessagesNative {
+        if let Some(block) = request.prompt_frame.system_blocks.get(idx) {
+            return (
+                format!("system_blocks[{}]", idx),
+                stability_label(block.stability).to_string(),
+            );
+        }
+    }
+    (format!("system[{}]", idx), "provider_system".to_string())
+}
+
+enum CacheBreakpointPath {
+    System(usize),
+    MessageContent(usize, usize),
+}
+
+fn canonical_prefix_fingerprint(
+    request_payload: &Value,
+    breakpoint: CacheBreakpointPath,
+) -> String {
+    let mut prefix = canonical_prefix_base(request_payload);
+    match breakpoint {
+        CacheBreakpointPath::System(index) => {
+            if let Some(system) = request_payload.get("system").and_then(Value::as_array) {
+                let end = index.saturating_add(1).min(system.len());
+                prefix.insert("system".to_string(), Value::Array(system[..end].to_vec()));
+            }
+            if request_payload.get("messages").is_some() {
+                prefix.insert("messages".to_string(), Value::Array(Vec::new()));
+            }
+        }
+        CacheBreakpointPath::MessageContent(message_index, content_index) => {
+            if let Some(system) = request_payload.get("system") {
+                prefix.insert("system".to_string(), system.clone());
+            }
+            if let Some(messages) = request_payload.get("messages").and_then(Value::as_array) {
+                let end = message_index.saturating_add(1).min(messages.len());
+                let mut truncated_messages = messages[..end].to_vec();
+                if let Some(message) = truncated_messages.get_mut(message_index) {
+                    if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut)
+                    {
+                        content.truncate(content_index.saturating_add(1));
+                    }
+                }
+                prefix.insert("messages".to_string(), Value::Array(truncated_messages));
+            }
+        }
+    }
+    sha256_hex(canonical_json(&Value::Object(prefix)).as_bytes())
+}
+
+fn canonical_prefix_base(request_payload: &Value) -> serde_json::Map<String, Value> {
+    let mut prefix = serde_json::Map::new();
+    if let Some(object) = request_payload.as_object() {
+        for (key, value) in object {
+            if key != "system" && key != "messages" {
+                prefix.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    prefix
+}
+
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string()),
+        Value::Array(values) => {
+            let items = values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{}]", items)
+        }
+        Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            let items = keys
+                .into_iter()
+                .map(|key| {
+                    let key_json =
+                        serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string());
+                    let value_json = canonical_json(&map[key]);
+                    format!("{}:{}", key_json, value_json)
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{}}}", items)
+        }
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{:02x}", byte)).collect()
+}
+
+fn hash_secret_safe_string(s: &str) -> String {
+    sha256_hex(s.as_bytes())
+}
+
+fn model_block_kind(block: &ModelBlock) -> &'static str {
+    match block {
+        ModelBlock::Text { .. } => "assistant_text",
+        ModelBlock::ToolUse { .. } => "tool_use",
+        ModelBlock::Thinking { .. } => "thinking",
+        ModelBlock::RedactedThinking { .. } => "redacted_thinking",
+    }
+}
+
+fn hash_model_block(block: &ModelBlock) -> String {
+    match block {
+        ModelBlock::Text { text } => {
+            let value = json!({ "type": "text", "text": text });
+            sha256_hex(canonical_json(&value).as_bytes())
+        }
+        ModelBlock::Thinking { text, .. } => {
+            // Include a stable prefix so thinking blocks hash differently from text blocks
+            let value = json!({ "type": "thinking", "thinking": text });
+            sha256_hex(canonical_json(&value).as_bytes())
+        }
+        ModelBlock::RedactedThinking { data } => {
+            let value = json!({ "type": "redacted_thinking", "data": data });
+            sha256_hex(canonical_json(&value).as_bytes())
+        }
+        ModelBlock::ToolUse {
+            id, name, input, ..
+        } => {
+            let value = json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input,
+            });
+            sha256_hex(canonical_json(&value).as_bytes())
+        }
+    }
+}
+
+fn hash_tool_result_block(result: &crate::provider::ToolResultBlock) -> String {
+    let value = json!({
+        "type": "tool_result",
+        "tool_use_id": result.tool_use_id,
+        "content": result.content,
+        "is_error": result.is_error,
+    });
+    sha256_hex(canonical_json(&value).as_bytes())
+}
+
+fn estimate_model_block_tokens(block: &ModelBlock) -> u64 {
+    match block {
+        ModelBlock::Text { text } => estimate_tokens_from_chars(text.len()),
+        ModelBlock::ToolUse { .. } => 50,
+        ModelBlock::Thinking { text, .. } => estimate_tokens_from_chars(text.len()),
+        ModelBlock::RedactedThinking { data } => estimate_tokens_from_chars(data.len()),
+    }
+}
+
+fn estimate_token_distribution_from_payload(
+    request_payload: &Value,
+    breakpoints: &[CacheBreakpointInfo],
+) -> (u64, u64) {
+    if let Some(last_bp) = breakpoints.last() {
+        let before = last_bp.estimated_prefix_tokens;
+        let total_estimated = estimate_total_payload_tokens(request_payload);
+        let after = total_estimated.saturating_sub(before);
+        (before, after)
+    } else {
+        (0, estimate_total_payload_tokens(request_payload))
+    }
+}
+
+fn estimate_total_payload_tokens(request_payload: &Value) -> u64 {
+    let mut total = 0u64;
+    match request_payload.get("system") {
+        Some(Value::String(text)) => {
+            total += estimate_tokens_from_chars(text.len());
+        }
+        Some(Value::Array(blocks)) => {
+            total += blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .map(|text| estimate_tokens_from_chars(text.len()))
+                .sum::<u64>();
+        }
+        _ => {}
+    }
+
+    if let Some(messages) = request_payload.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            if let Some(content) = message.get("content").and_then(Value::as_array) {
+                for block in content {
+                    total += match block.get("type").and_then(Value::as_str) {
+                        Some("text") | Some("tool_result") => block
+                            .get("text")
+                            .or_else(|| block.get("content"))
+                            .and_then(Value::as_str)
+                            .map(|text| estimate_tokens_from_chars(text.len()))
+                            .unwrap_or(0),
+                        Some("tool_use") => 50,
+                        _ => 0,
+                    };
+                }
+            }
+        }
+    }
+    total
+}
+
+fn count_payload_cache_controls(request_payload: &Value) -> (usize, usize) {
+    let system_count = request_payload
+        .get("system")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block.get("cache_control").is_some())
+                .count()
+        })
+        .unwrap_or(0);
+    let message_count = request_payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_array))
+                .flatten()
+                .filter(|block| block.get("cache_control").is_some())
+                .count()
+        })
+        .unwrap_or(0);
+    (system_count, message_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prompt::PromptStability;
+    use crate::provider::{
+        PromptContentBlock, ProviderNativeWebSearchKind, ProviderNativeWebSearchRequest,
+        ProviderPromptFrame, ToolResultBlock,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn build_anthropic_messages_marks_latest_tool_result_as_rolling_cache_tail() {
+        let conversation = vec![
+            ConversationMessage::UserText("inspect".to_string()),
+            ConversationMessage::AssistantBlocks(vec![ModelBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "ExecCommand".to_string(),
+                input: json!({ "cmd": "printf ok" }),
+                kind: crate::provider::ModelToolCallKind::Function,
+            }]),
+            ConversationMessage::UserToolResults(vec![ToolResultBlock {
+                tool_use_id: "toolu_1".to_string(),
+                content: "ok".to_string(),
+                is_error: false,
+                error: None,
+            }]),
+        ];
+
+        let messages = build_anthropic_messages(
+            &conversation,
+            rolling_conversation_cache_marker(
+                &conversation,
+                AnthropicCacheStrategy::MessagesNative,
+            ),
+        );
+
+        assert_eq!(
+            messages[2].content[0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(messages[1].content[0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn api_response_block_preserves_text_form_dsml_tool_calls_as_text() {
+        let block = ApiResponseBlock {
+            kind: "text".to_string(),
+            text: Some(
+                r#"<｜｜DSML｜｜tool_calls>
+<｜｜DSML｜｜invoke name="WebFetch">
+<｜｜DSML｜｜parameter name="url" string="true">https://example.com</｜｜DSML｜｜parameter>
+</｜｜DSML｜｜invoke>
+</｜｜DSML｜｜tool_calls>"#
+                    .to_string(),
+            ),
+            thinking: None,
+            signature: None,
+            data: None,
+            id: None,
+            name: None,
+            input: None,
+            ..Default::default()
+        };
+
+        let model_block =
+            api_response_block_to_model(block, None).expect("text block should be kept");
+        match model_block {
+            ModelBlock::Text { text } => {
+                assert!(text.contains("<｜｜DSML｜｜tool_calls>"));
+                assert!(text.contains("WebFetch"));
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anthropic_response_flags_text_form_tool_call_violation() {
+        let blocks = vec![ApiResponseBlock {
+            kind: "text".to_string(),
+            text: Some(
+                r#"<tool_call>
+<function=ExecCommand>
+{"cmd":"echo ok"}
+</function>
+</tool_call>"#
+                    .to_string(),
+            ),
+            thinking: None,
+            signature: None,
+            data: None,
+            id: None,
+            name: None,
+            input: None,
+            ..Default::default()
+        }];
+
+        assert!(anthropic_response_has_text_form_tool_call_violation(
+            &blocks,
+            Some("tool_use"),
+            true,
+        ));
+        assert!(!anthropic_response_has_text_form_tool_call_violation(
+            &blocks,
+            Some("end_turn"),
+            true,
+        ));
+        assert!(!anthropic_response_has_text_form_tool_call_violation(
+            &blocks,
+            Some("tool_use"),
+            false,
+        ));
+    }
+
+    #[test]
+    fn anthropic_response_flags_html_escaped_text_form_tool_call_violation() {
+        let blocks = vec![ApiResponseBlock {
+            kind: "text".to_string(),
+            text: Some(
+                "&lt;tool_call&gt;&lt;function=ExecCommand&gt;{}&lt;/function&gt;&lt;/tool_call&gt;"
+                    .to_string(),
+            ),
+            thinking: None,
+            signature: None,
+            data: None,
+            id: None,
+            name: None,
+            input: None,
+            ..Default::default()
+        }];
+
+        assert!(anthropic_response_has_text_form_tool_call_violation(
+            &blocks,
+            Some("tool_use"),
+            true,
+        ));
+    }
+
+    #[test]
+    fn anthropic_response_native_tool_use_is_not_text_form_violation() {
+        let blocks = vec![
+            ApiResponseBlock {
+                kind: "text".to_string(),
+                text: Some("<tool_call>ignored text</tool_call>".to_string()),
+                thinking: None,
+                signature: None,
+                data: None,
+                id: None,
+                name: None,
+                input: None,
+                ..Default::default()
+            },
+            ApiResponseBlock {
+                kind: "tool_use".to_string(),
+                text: None,
+                thinking: None,
+                signature: None,
+                data: None,
+                id: Some("toolu_1".to_string()),
+                name: Some("ExecCommand".to_string()),
+                input: Some(json!({ "cmd": "echo ok" })),
+                ..Default::default()
+            },
+        ];
+
+        assert!(!anthropic_response_has_text_form_tool_call_violation(
+            &blocks,
+            Some("tool_use"),
+            true,
+        ));
+    }
+
+    #[test]
+    fn build_anthropic_messages_marks_latest_assistant_block_as_rolling_cache_tail() {
+        let conversation = vec![
+            ConversationMessage::UserText("hello".to_string()),
+            ConversationMessage::AssistantBlocks(vec![ModelBlock::Text {
+                text: "done".to_string(),
+            }]),
+        ];
+
+        let messages = build_anthropic_messages(
+            &conversation,
+            rolling_conversation_cache_marker(
+                &conversation,
+                AnthropicCacheStrategy::MessagesNative,
+            ),
+        );
+
+        assert_eq!(
+            messages[1].content[0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(messages[0].content[0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn build_anthropic_messages_skips_empty_provider_visible_messages() {
+        let conversation = vec![
+            ConversationMessage::UserText("inspect".to_string()),
+            ConversationMessage::AssistantBlocks(Vec::new()),
+            ConversationMessage::UserText("continue".to_string()),
+        ];
+
+        let messages = build_anthropic_messages(
+            &conversation,
+            rolling_conversation_cache_marker(
+                &conversation,
+                AnthropicCacheStrategy::MessagesNative,
+            ),
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content[0]["text"], "inspect");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content[0]["text"], "continue");
+        assert!(messages.iter().all(|message| {
+            message
+                .content
+                .as_array()
+                .is_some_and(|content| !content.is_empty())
+        }));
+    }
+
+    #[test]
+    fn build_anthropic_messages_lowers_user_image_content_blocks() {
+        let conversation = vec![ConversationMessage::UserImage {
+            prompt: "Describe the visible error dialog.".to_string(),
+            media_type: "image/png".to_string(),
+            data_base64: "iVBORw0KGgo=".to_string(),
+        }];
+
+        let messages = build_anthropic_messages(
+            &conversation,
+            rolling_conversation_cache_marker(
+                &conversation,
+                AnthropicCacheStrategy::MessagesNative,
+            ),
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content[0]["type"], "text");
+        assert_eq!(
+            messages[0].content[0]["text"],
+            "Describe the visible error dialog."
+        );
+        assert_eq!(
+            messages[0].content[0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert_eq!(messages[0].content[1]["type"], "image");
+        assert_eq!(messages[0].content[1]["source"]["type"], "base64");
+        assert_eq!(messages[0].content[1]["source"]["media_type"], "image/png");
+        assert_eq!(messages[0].content[1]["source"]["data"], "iVBORw0KGgo=");
+        assert!(messages[0].content[1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn build_anthropic_messages_preserves_tool_only_round_before_interjection() {
+        let conversation = vec![
+            ConversationMessage::AssistantBlocks(vec![ModelBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "ExecCommand".to_string(),
+                input: json!({ "cmd": "printf ok" }),
+                kind: crate::provider::ModelToolCallKind::Function,
+            }]),
+            ConversationMessage::UserToolResults(vec![ToolResultBlock {
+                tool_use_id: "toolu_1".to_string(),
+                content: "ok".to_string(),
+                is_error: false,
+                error: None,
+            }]),
+            ConversationMessage::UserText(
+                "[Operator message received while this turn was in progress]\ncontinue".to_string(),
+            ),
+        ];
+
+        let messages = build_anthropic_messages(
+            &conversation,
+            rolling_conversation_cache_marker(
+                &conversation,
+                AnthropicCacheStrategy::MessagesNative,
+            ),
+        );
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "assistant");
+        assert_eq!(messages[0].content[0]["type"], "tool_use");
+        assert_eq!(messages[0].content[0]["id"], "toolu_1");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content[0]["type"], "tool_result");
+        assert_eq!(messages[1].content[0]["tool_use_id"], "toolu_1");
+        assert_eq!(messages[2].role, "user");
+        assert!(messages[2].content[0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Operator message received")));
+    }
+
+    #[test]
+    fn rolling_cache_marker_does_not_mutate_provider_conversation() {
+        let conversation = vec![ConversationMessage::UserBlocks(vec![PromptContentBlock {
+            text: "turn scoped context".to_string(),
+            stability: PromptStability::TurnScoped,
+            cache_breakpoint: false,
+        }])];
+
+        let messages = build_anthropic_messages(
+            &conversation,
+            rolling_conversation_cache_marker(
+                &conversation,
+                AnthropicCacheStrategy::MessagesNative,
+            ),
+        );
+
+        assert_eq!(
+            messages[0].content[0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        let ConversationMessage::UserBlocks(blocks) = &conversation[0] else {
+            panic!("conversation should remain user blocks");
+        };
+        assert!(!blocks[0].cache_breakpoint);
+    }
+
+    #[test]
+    fn anthropic_request_payload_for_fingerprints_is_wire_object() {
+        let request = ProviderTurnRequest {
+            continuation_scope_id: None,
+            prompt_frame: ProviderPromptFrame {
+                system_prompt: "unused plain system".to_string(),
+                system_blocks: vec![PromptContentBlock {
+                    text: "System instruction".to_string(),
+                    stability: PromptStability::Stable,
+                    cache_breakpoint: true,
+                }],
+                context_blocks: vec![],
+                cache: None,
+            },
+            conversation: vec![ConversationMessage::UserText("Hello".to_string())],
+            tools: vec![],
+            native_web_search: None,
+            response_format: None,
+        };
+
+        let request_payload = anthropic_request_payload_for_test(&request);
+
+        assert!(request_payload.is_object());
+        assert!(request_payload.get("system").is_some());
+        assert!(request_payload.get("messages").is_some());
+        let fingerprint =
+            canonical_prefix_fingerprint(&request_payload, CacheBreakpointPath::System(0));
+        assert!(!fingerprint.is_empty());
+        assert_ne!(
+            fingerprint,
+            canonical_prefix_fingerprint(
+                &Value::String("response body".to_string()),
+                CacheBreakpointPath::System(0)
+            )
+        );
+    }
+
+    #[test]
+    fn test_collect_anthropic_cache_diagnostics_initial_request() {
+        let request = ProviderTurnRequest {
+            continuation_scope_id: None,
+            prompt_frame: ProviderPromptFrame {
+                system_prompt: "You are a helpful assistant.".to_string(),
+                system_blocks: vec![
+                    PromptContentBlock {
+                        text: "System instruction 1".to_string(),
+                        stability: PromptStability::Stable,
+                        cache_breakpoint: true,
+                    },
+                    PromptContentBlock {
+                        text: "System instruction 2".to_string(),
+                        stability: PromptStability::AgentScoped,
+                        cache_breakpoint: false,
+                    },
+                ],
+                context_blocks: vec![PromptContentBlock {
+                    text: "Context information".to_string(),
+                    stability: PromptStability::Stable,
+                    cache_breakpoint: false,
+                }],
+                cache: None,
+            },
+            conversation: vec![ConversationMessage::UserText(
+                "Hello, how are you?".to_string(),
+            )],
+            tools: vec![],
+            native_web_search: None,
+            response_format: None,
+        };
+
+        let request_payload = anthropic_request_payload_for_test(&request);
+        let diagnostics = collect_anthropic_cache_diagnostics(
+            &request,
+            &request.conversation,
+            rolling_conversation_cache_marker(
+                &request.conversation,
+                AnthropicCacheStrategy::MessagesNative,
+            ),
+            &request_payload,
+            "claude-sonnet-4-6",
+            AnthropicCacheStrategy::MessagesNative,
+            &[],
+        );
+
+        assert_eq!(diagnostics.tools_count, 0);
+        assert_eq!(diagnostics.system_block_count, 2);
+        assert!(diagnostics.estimated_system_tokens > 0);
+        assert_eq!(diagnostics.conversation_message_count, 1);
+        assert!(!diagnostics.cache_breakpoints.is_empty());
+        assert_eq!(diagnostics.cache_breakpoints.len(), 2);
+        assert_eq!(
+            diagnostics.cache_breakpoints[0].location,
+            "system_blocks[0]"
+        );
+        assert_eq!(diagnostics.cache_breakpoints[0].stability, "stable");
+        assert_eq!(
+            diagnostics.cache_breakpoints[0].provider_payload_path,
+            "system[0]"
+        );
+        assert_eq!(diagnostics.cache_breakpoints[0].block_kind, "system_text");
+        assert!(!diagnostics.cache_breakpoints[0]
+            .canonical_prefix_fingerprint
+            .is_empty());
+        assert_eq!(
+            diagnostics.cache_breakpoints[1].location,
+            "messages[0].content[0]"
+        );
+        assert_eq!(
+            diagnostics.cache_breakpoints[1].stability,
+            "conversation_tail"
+        );
+        assert!(diagnostics.tokens_before_last_breakpoint > 0);
+        assert_eq!(diagnostics.tokens_after_last_breakpoint, 0);
+    }
+
+    #[test]
+    fn test_collect_anthropic_cache_diagnostics_continuation_with_breakpoints() {
+        let request = ProviderTurnRequest {
+            continuation_scope_id: None,
+            prompt_frame: ProviderPromptFrame {
+                system_prompt: "You are a helpful assistant.".to_string(),
+                system_blocks: vec![
+                    PromptContentBlock {
+                        text: "System instruction 1".to_string(),
+                        stability: PromptStability::Stable,
+                        cache_breakpoint: true,
+                    },
+                    PromptContentBlock {
+                        text: "System instruction 2".to_string(),
+                        stability: PromptStability::AgentScoped,
+                        cache_breakpoint: true,
+                    },
+                ],
+                context_blocks: vec![PromptContentBlock {
+                    text: "Context information".to_string(),
+                    stability: PromptStability::Stable,
+                    cache_breakpoint: false,
+                }],
+                cache: None,
+            },
+            conversation: vec![
+                ConversationMessage::UserBlocks(vec![PromptContentBlock {
+                    text: "User message content".to_string(),
+                    stability: PromptStability::TurnScoped,
+                    cache_breakpoint: true,
+                }]),
+                ConversationMessage::AssistantBlocks(vec![ModelBlock::Text {
+                    text: "I'm doing well, thank you!".to_string(),
+                }]),
+            ],
+            tools: vec![],
+            native_web_search: None,
+            response_format: None,
+        };
+
+        let request_payload = anthropic_request_payload_for_test(&request);
+        let diagnostics = collect_anthropic_cache_diagnostics(
+            &request,
+            &request.conversation,
+            rolling_conversation_cache_marker(
+                &request.conversation,
+                AnthropicCacheStrategy::MessagesNative,
+            ),
+            &request_payload,
+            "claude-sonnet-4-6",
+            AnthropicCacheStrategy::MessagesNative,
+            &[],
+        );
+
+        assert_eq!(diagnostics.system_block_count, 2);
+        assert!(diagnostics.cache_breakpoints.len() <= 10);
+        assert!(diagnostics.cache_breakpoints.len() > 0);
+
+        // Check that breakpoints include system blocks
+        let system_breakpoints: Vec<_> = diagnostics
+            .cache_breakpoints
+            .iter()
+            .filter(|bp| bp.location.starts_with("system_blocks"))
+            .collect();
+        assert_eq!(system_breakpoints.len(), 2);
+
+        // Check token distribution
+        assert!(diagnostics.tokens_before_last_breakpoint > 0);
+        assert!(diagnostics.tokens_after_last_breakpoint < u64::MAX);
+    }
+
+    fn anthropic_request_payload_for_test(request: &ProviderTurnRequest) -> Value {
+        let rolling_cache_marker = rolling_conversation_cache_marker(
+            &request.conversation,
+            AnthropicCacheStrategy::MessagesNative,
+        );
+        let body = MessagesRequest {
+            model: "claude-sonnet-4-6",
+            max_tokens: 4096,
+            thinking: None,
+            stream: true,
+            system: if request.prompt_frame.has_structured_system_blocks() {
+                Value::Array(
+                    request
+                        .prompt_frame
+                        .system_blocks
+                        .iter()
+                        .map(prompt_block_to_anthropic_content)
+                        .collect(),
+                )
+            } else {
+                Value::String(request.prompt_frame.system_prompt.clone())
+            },
+            messages: build_anthropic_messages(&request.conversation, rolling_cache_marker),
+            tools: build_anthropic_tools(request),
+            tool_choice: anthropic_response_format_tool_choice(request),
+            betas: Vec::new(),
+            metadata: None,
+            temperature: None,
+            context_management: None,
+        };
+        serde_json::to_value(body).expect("test request payload should serialize")
+    }
+
+    #[test]
+    fn anthropic_request_payload_lowers_native_web_search_tool() {
+        let mut request = ProviderTurnRequest::plain(
+            "system",
+            vec![ConversationMessage::UserText("search the web".into())],
+            vec![],
+        );
+        request.native_web_search = Some(ProviderNativeWebSearchRequest {
+            kind: ProviderNativeWebSearchKind::Anthropic,
+            provider_id: "anthropic_native".into(),
+            provider_model_ref: "anthropic/claude-test".into(),
+            advertised_tool_type: "web_search_20250305".into(),
+            backend_kind: "anthropic_web_search".into(),
+            max_results: None,
+        });
+
+        let payload = anthropic_request_payload_for_test(&request);
+
+        assert!(payload["tools"]
+            .as_array()
+            .expect("tools should be an array")
+            .iter()
+            .any(|tool| tool == &json!({ "type": "web_search_20250305", "name": "web_search" })));
+    }
+
+    #[test]
+    fn anthropic_request_payload_enables_streaming() {
+        let request = ProviderTurnRequest::plain(
+            "system",
+            vec![ConversationMessage::UserText("hello".into())],
+            vec![],
+        );
+
+        let payload = anthropic_request_payload_for_test(&request);
+
+        assert_eq!(payload["stream"], true);
+    }
+
+    #[test]
+    fn anthropic_sse_parser_accumulates_text_usage_and_tool_json() {
+        let stream = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":3}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"ExecCommand\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"echo ok\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":7}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let events = SseParser::default()
+            .push(stream.as_bytes())
+            .expect("stream should parse");
+        let mut accumulator = AnthropicStreamAccumulator::default();
+        for event in events {
+            accumulator
+                .apply(event, "anthropic/claude-test", "https://example.test", None)
+                .expect("event should accumulate");
+        }
+
+        let response = accumulator
+            .finish("anthropic/claude-test", "https://example.test", None)
+            .expect("stream should finish");
+
+        assert_eq!(response.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(
+            response.usage.as_ref().and_then(|usage| usage.input_tokens),
+            Some(3)
+        );
+        assert_eq!(
+            response
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.output_tokens),
+            Some(7)
+        );
+        assert_eq!(response.content[0].text.as_deref(), Some("hello"));
+        assert_eq!(response.content[1].kind, "tool_use");
+        assert_eq!(
+            response.content[1].input.as_ref(),
+            Some(&json!({ "cmd": "echo ok" }))
+        );
+    }
+
+    #[test]
+    fn normalize_anthropic_session_id_preserves_safe_range() {
+        assert_eq!(
+            normalize_anthropic_session_id(Some("cache-key_123")),
+            "cache-key_123"
+        );
+    }
+
+    #[test]
+    fn normalize_anthropic_session_id_uses_default_for_empty_key() {
+        assert_eq!(normalize_anthropic_session_id(None), "holon-default");
+        assert_eq!(
+            normalize_anthropic_session_id(Some(" \n\t ")),
+            "holon-default"
+        );
+    }
+
+    #[test]
+    fn normalize_anthropic_session_id_handles_short_long_unicode_and_escaped_keys() {
+        let short = normalize_anthropic_session_id(Some("abc"));
+        assert_ne!(short, "abc");
+        assert_normalized_anthropic_session_id(&short);
+        assert!(short.starts_with("abc-"));
+
+        let long_key = "safe-key-".repeat(12);
+        let long = normalize_anthropic_session_id(Some(&long_key));
+        assert_ne!(long, long_key);
+        assert_normalized_anthropic_session_id(&long);
+        assert!(long.starts_with("safe-key-safe-key"));
+
+        let unicode = normalize_anthropic_session_id(Some("会话-缓存-キー"));
+        assert_normalized_anthropic_session_id(&unicode);
+        assert!(unicode.starts_with("holon-"));
+
+        let escaped = normalize_anthropic_session_id(Some("cache\"key\\with\nnewline"));
+        assert_normalized_anthropic_session_id(&escaped);
+        assert!(escaped.starts_with("cache-key-with-newline-"));
+        assert_eq!(
+            escaped,
+            normalize_anthropic_session_id(Some("cache\"key\\with\nnewline"))
+        );
+    }
+
+    fn assert_normalized_anthropic_session_id(value: &str) {
+        assert!(
+            value.len() >= ANTHROPIC_SESSION_ID_MIN_LEN
+                && value.len() <= ANTHROPIC_SESSION_ID_MAX_LEN,
+            "session id length should be in provider-compatible range"
+        );
+        assert!(
+            value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+            "session id should be ASCII metadata-safe"
+        );
+    }
+
+    #[test]
+    fn test_hash_tools_includes_schema() {
+        use crate::tool::ToolSpec;
+
+        let tool1 = ToolSpec {
+            name: "test_tool".to_string(),
+            description: "A test tool".to_string(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            freeform_grammar: None,
+        };
+
+        let tool2 = ToolSpec {
+            name: "test_tool".to_string(),
+            description: "A test tool".to_string(),
+            input_schema: json!({"type": "object", "properties": {"new_field": {"type": "string"}}}),
+            freeform_grammar: None,
+        };
+
+        let hash1 = hash_tools(&[tool1]);
+        let hash2 = hash_tools(&[tool2]);
+
+        // Different input_schema should produce different hashes
+        assert_ne!(
+            hash1, hash2,
+            "tools_hash should differ when input_schema changes"
+        );
+    }
+
+    #[test]
+    fn test_hash_tools_includes_freeform_grammar() {
+        use crate::tool::{spec::ToolFreeformGrammar, ToolSpec};
+
+        let tool1 = ToolSpec {
+            name: "test_tool".to_string(),
+            description: "A test tool".to_string(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            freeform_grammar: Some(ToolFreeformGrammar {
+                syntax: "grammar_v1".to_string(),
+                definition: "definition_v1".to_string(),
+            }),
+        };
+
+        let tool2 = ToolSpec {
+            name: "test_tool".to_string(),
+            description: "A test tool".to_string(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            freeform_grammar: Some(ToolFreeformGrammar {
+                syntax: "grammar_v2".to_string(),
+                definition: "definition_v2".to_string(),
+            }),
+        };
+
+        let tool3 = ToolSpec {
+            name: "test_tool".to_string(),
+            description: "A test tool".to_string(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            freeform_grammar: None,
+        };
+
+        let hash1 = hash_tools(&[tool1.clone()]);
+        let hash2 = hash_tools(&[tool2]);
+        let hash3 = hash_tools(&[tool3]);
+
+        // Different freeform_grammar syntax should produce different hashes
+        assert_ne!(
+            hash1, hash2,
+            "tools_hash should differ when freeform_grammar syntax changes"
+        );
+
+        // Tool with freeform_grammar should differ from tool without
+        assert_ne!(
+            hash1, hash3,
+            "tools_hash should differ when freeform_grammar presence changes"
+        );
+    }
+
+    #[test]
+    fn test_hash_context_by_stability() {
+        let blocks = vec![
+            PromptContentBlock {
+                text: "Stable content".to_string(),
+                stability: PromptStability::Stable,
+                cache_breakpoint: false,
+            },
+            PromptContentBlock {
+                text: "Agent scoped content".to_string(),
+                stability: PromptStability::AgentScoped,
+                cache_breakpoint: false,
+            },
+            PromptContentBlock {
+                text: "More stable content".to_string(),
+                stability: PromptStability::Stable,
+                cache_breakpoint: false,
+            },
+        ];
+
+        let hashes = hash_context_by_stability(&blocks);
+
+        assert!(hashes.contains_key("stable"));
+        assert!(hashes.contains_key("agent_scoped"));
+        assert!(!hashes.contains_key("turn_scoped"));
+    }
+
+    #[test]
+    fn test_estimate_token_distribution() {
+        let request = ProviderTurnRequest {
+            continuation_scope_id: None,
+            prompt_frame: ProviderPromptFrame {
+                system_prompt: "System prompt".to_string(),
+                system_blocks: vec![
+                    PromptContentBlock {
+                        text: "Block 1".to_string(),
+                        stability: PromptStability::Stable,
+                        cache_breakpoint: true,
+                    },
+                    PromptContentBlock {
+                        text: "Block 2".to_string(),
+                        stability: PromptStability::AgentScoped,
+                        cache_breakpoint: false,
+                    },
+                ],
+                context_blocks: vec![],
+                cache: None,
+            },
+            conversation: vec![ConversationMessage::UserText("User message".to_string())],
+            tools: vec![],
+            native_web_search: None,
+            response_format: None,
+        };
+
+        let request_payload = anthropic_request_payload_for_test(&request);
+        let breakpoints = collect_cache_breakpoints(
+            &request,
+            &request.conversation,
+            rolling_conversation_cache_marker(
+                &request.conversation,
+                AnthropicCacheStrategy::MessagesNative,
+            ),
+            &request_payload,
+            AnthropicCacheStrategy::MessagesNative,
+        );
+        let (before, after) =
+            estimate_token_distribution_from_payload(&request_payload, &breakpoints);
+
+        let total = estimate_total_payload_tokens(&request_payload);
+        assert_eq!(
+            before.saturating_add(after),
+            total,
+            "before + after should equal total"
+        );
+    }
+
+    #[test]
+    fn test_cache_breakpoints_bounded() {
+        let mut system_blocks = vec![];
+        for i in 0..20 {
+            system_blocks.push(PromptContentBlock {
+                text: format!("System block {}", i),
+                stability: PromptStability::Stable,
+                cache_breakpoint: true,
+            });
+        }
+
+        let request = ProviderTurnRequest {
+            continuation_scope_id: None,
+            prompt_frame: ProviderPromptFrame {
+                system_prompt: "System prompt".to_string(),
+                system_blocks,
+                context_blocks: vec![],
+                cache: None,
+            },
+            conversation: vec![],
+            tools: vec![],
+            native_web_search: None,
+            response_format: None,
+        };
+
+        let request_payload = anthropic_request_payload_for_test(&request);
+        let breakpoints = collect_cache_breakpoints(
+            &request,
+            &request.conversation,
+            None,
+            &request_payload,
+            AnthropicCacheStrategy::MessagesNative,
+        );
+
+        // Should be bounded by MAX_BREAKPOINTS (10)
+        assert!(
+            breakpoints.len() <= 10,
+            "cache_breakpoints should be bounded to 10 items"
+        );
+    }
+
+    #[test]
+    fn anthropic_request_payload_lowers_json_schema_response_format_as_forced_tool() {
+        let mut request = ProviderTurnRequest::plain(
+            "system",
+            vec![ConversationMessage::UserText("return json".into())],
+            vec![],
+        );
+        request.response_format = Some(ProviderResponseFormatRequest::JsonSchema(
+            crate::provider::ProviderJsonSchemaResponseFormat {
+                name: "answer_v1".into(),
+                strict: true,
+                schema: json!({
+                    "type": "object",
+                    "required": ["answer"],
+                    "properties": {
+                        "answer": { "type": "string" }
+                    }
+                }),
+            },
+        ));
+
+        let payload = anthropic_request_payload_for_test(&request);
+
+        assert_eq!(
+            payload["tools"][0]["name"],
+            json!("structured_response_answer_v1")
+        );
+        assert_eq!(payload["tools"][0]["strict"], json!(true));
+        assert_eq!(
+            payload["tools"][0]["input_schema"]["properties"]["answer"]["type"],
+            json!("string")
+        );
+        assert_eq!(
+            payload["tool_choice"],
+            json!({ "type": "tool", "name": "structured_response_answer_v1" })
+        );
+
+        let diagnostics = response_format_diagnostics(&request)
+            .expect("response format diagnostics should be recorded");
+
+        assert!(diagnostics.requested);
+        assert!(diagnostics.lowered);
+        assert_eq!(diagnostics.format_type, "json_schema");
+        assert_eq!(diagnostics.schema_name.as_deref(), Some("answer_v1"));
+        assert!(diagnostics.fallback_reason.is_none());
+    }
+
+    #[test]
+    fn api_response_block_converts_forced_response_format_tool_input_to_text_json() {
+        let block = ApiResponseBlock {
+            kind: "tool_use".to_string(),
+            text: None,
+            thinking: None,
+            signature: None,
+            data: None,
+            id: Some("toolu_1".to_string()),
+            name: Some("structured_response_answer_v1".to_string()),
+            input: Some(json!({ "answer": "ok" })),
+            ..Default::default()
+        };
+
+        let model_block = api_response_block_to_model(block, Some("structured_response_answer_v1"))
+            .expect("forced response format tool input should become text");
+
+        match model_block {
+            ModelBlock::Text { text } => assert_eq!(text, r#"{"answer":"ok"}"#),
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_to_thinking_none_when_absent() {
+        assert!(reasoning_effort_to_thinking(&None, 16384).is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_to_thinking_maps_levels() {
+        // low = 10% of 16384 = ~1638, clamped to min 1024
+        let low = reasoning_effort_to_thinking(&Some("low".into()), 16384).unwrap();
+        assert_eq!(low.kind, "enabled");
+        assert_eq!(low.budget_tokens, 1638);
+
+        // medium = 25% of 16384 = ~4096
+        let medium = reasoning_effort_to_thinking(&Some("medium".into()), 16384).unwrap();
+        assert_eq!(medium.budget_tokens, 4096);
+
+        // high = 50% of 16384 = ~8192
+        let high = reasoning_effort_to_thinking(&Some("high".into()), 16384).unwrap();
+        assert_eq!(high.budget_tokens, 8192);
+
+        // xhigh = 80% of 16384 = ~13107
+        let xhigh = reasoning_effort_to_thinking(&Some("xhigh".into()), 16384).unwrap();
+        assert_eq!(xhigh.budget_tokens, 13107);
+    }
+
+    #[test]
+    fn reasoning_effort_to_thinking_case_insensitive() {
+        let result = reasoning_effort_to_thinking(&Some("HIGH".into()), 16384).unwrap();
+        assert_eq!(result.budget_tokens, 8192);
+    }
+
+    #[test]
+    fn reasoning_effort_to_thinking_unknown_defaults_medium() {
+        let result = reasoning_effort_to_thinking(&Some("bogus".into()), 16384).unwrap();
+        assert_eq!(result.budget_tokens, 4096); // 25% = medium
+    }
+
+    #[test]
+    fn reasoning_effort_to_thinking_clamps_to_min_1024() {
+        // 10% of 4096 = ~410, should be clamped to 1024
+        let result = reasoning_effort_to_thinking(&Some("low".into()), 4096).unwrap();
+        assert_eq!(result.budget_tokens, 1024);
+    }
+
+    #[test]
+    fn reasoning_effort_to_thinking_capped_below_max_tokens() {
+        // budget must be <= max_output_tokens - 1
+        let result = reasoning_effort_to_thinking(&Some("xhigh".into()), 2048).unwrap();
+        assert!(result.budget_tokens <= 2047);
+        assert_eq!(result.budget_tokens, 1638); // 80% of 2048
+    }
+
+    #[test]
+    fn reasoning_effort_to_thinking_skips_when_too_small() {
+        // max_output_tokens = 1024 → max_tokens - 1 = 1023 < 1024 min → skip
+        assert!(reasoning_effort_to_thinking(&Some("high".into()), 1024).is_none());
+    }
+
+    #[test]
+    fn api_response_block_tool_result_converts_to_text() {
+        let block = ApiResponseBlock {
+            kind: "tool_result".to_string(),
+            tool_use_id: Some("srv_001".to_string()),
+            content: Some(json!([{
+                "type": "text",
+                "text": "Search results: Rust is awesome."
+            }])),
+            ..Default::default()
+        };
+        let model = api_response_block_to_model(block, None);
+        assert!(
+            matches!(&model, Some(ModelBlock::Text { text }) if text.contains("Search results: Rust is awesome.")),
+            "tool_result should convert to Text preserving content, got: {model:?}"
+        );
+    }
+
+    #[test]
+    fn api_response_block_server_tool_use_returns_none() {
+        let block = ApiResponseBlock {
+            kind: "server_tool_use".to_string(),
+            id: Some("srv_search_1".to_string()),
+            name: Some("web_search".to_string()),
+            input: Some(json!({"query": "rust async"})),
+            ..Default::default()
+        };
+        let model = api_response_block_to_model(block, None);
+        assert!(
+            model.is_none(),
+            "server_tool_use should return None (server-side only), got: {model:?}"
+        );
+    }
+
+    #[test]
+    fn warn_unsupported_silent_for_server_tool_blocks() {
+        // These types are handled, so warn_unsupported should return early (no warn!).
+        for kind in &["server_tool_use", "tool_result"] {
+            let block = ApiResponseBlock {
+                kind: kind.to_string(),
+                ..Default::default()
+            };
+            // The function returns () — if it doesn't panic/warn, we're good.
+            warn_unsupported_anthropic_response_block(&block, "test", "model", 0, None, false);
+        }
+    }
+
+    #[test]
+    fn parse_sse_error_event_dashscope_fallback() {
+        // DashScope sends non-standard error events: `message` is a string,
+        // wrapped in an SSE `event: error` line instead of the Anthropic
+        // `{"type":"error","error":{...}}` shape.
+        let raw = b"event: error\ndata: {\"request_id\":\"req_1\",\"code\":\"InvalidParameter\",\"message\":\"Inference engine abort\"}";
+        let event = parse_sse_event(raw)
+            .expect("parse should succeed via fallback")
+            .expect("should produce an event");
+        assert_eq!(event.kind, "error");
+        let error = event.error.expect("error field should be populated");
+        assert_eq!(error.kind.as_deref(), Some("InvalidParameter"));
+        assert_eq!(error.message.as_deref(), Some("Inference engine abort"));
+    }
+
+    #[test]
+    fn parse_sse_error_event_standard_anthropic() {
+        // Standard Anthropic error event should still parse normally.
+        let raw = b"data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}";
+        let event = parse_sse_event(raw)
+            .expect("parse should succeed")
+            .expect("should produce an event");
+        assert_eq!(event.kind, "error");
+        let error = event.error.expect("error field should be populated");
+        assert_eq!(error.kind.as_deref(), Some("overloaded_error"));
+        assert_eq!(error.message.as_deref(), Some("Overloaded"));
+    }
+
+    #[test]
+    fn sse_accumulator_classifies_dashscope_error_as_retryable() {
+        // End-to-end: DashScope error event should flow through SseParser,
+        // then AnthropicStreamAccumulator::apply, and be classified as
+        // ServerError + Retryable (not InvalidResponse + FailFast).
+        let sse = b"event: error\ndata: {\"code\":\"InvalidParameter\",\"message\":\"Inference engine abort\"}\n\n";
+        let mut parser = SseParser::default();
+        let events = parser.push(sse).expect("push should succeed");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "error");
+
+        let mut acc = AnthropicStreamAccumulator::default();
+        let err = acc
+            .apply(
+                events.into_iter().next().unwrap(),
+                "test-model",
+                "test-url",
+                None,
+            )
+            .expect_err("error event should fail the accumulator");
+        let classification = crate::provider::retry::classify_provider_error(&err);
+        assert_eq!(
+            classification.kind,
+            ProviderFailureKind::ServerError,
+            "DashScope error should be ServerError, not InvalidResponse"
+        );
+        assert_eq!(
+            classification.disposition,
+            RetryDisposition::Retryable,
+            "DashScope error should be Retryable, not FailFast"
+        );
+    }
+
+    #[test]
+    fn parse_sse_non_error_event_with_string_message_still_fails() {
+        // A non-error event with a string `message` should still fail to parse,
+        // because the fallback only applies when the SSE event type is "error".
+        let raw = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":\"oops\"}";
+        let result = parse_sse_event(raw);
+        assert!(
+            result.is_err(),
+            "non-error event with string message should still fail"
+        );
+    }
+}
