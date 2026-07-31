@@ -191,6 +191,13 @@ impl SchedulerAgentSnapshot {
 }
 
 impl SchedulerProjection {
+    pub(crate) fn without_canonical_authority(mut self) -> Self {
+        // activation_waits remains shared input for legacy wait-to-WorkItem correlation.
+        self.canonical_work_statuses = None;
+        self.canonical_wait_generations.clear();
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn set_canonical_wait_generation_for_test(
         &mut self,
