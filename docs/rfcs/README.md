@@ -23,6 +23,7 @@ implementation and tests.
 - [Agent Status Display Projection](./agent-status-display-projection.md)
 - [Agent Profile Model](./agent-profile-model.md)
 - [Runtime Scheduler Contract](./runtime-scheduler-contract.md)
+- [Scheduler Cutover Simplification](./scheduler-cutover-simplification.md)
 - [Agent Activation, Settlement, and Dispatch](./agent-activation-settlement-and-dispatch.md)
 - [Result Closure](./result-closure.md)
 - [Continuation Trigger](./continuation-trigger.md)
@@ -48,6 +49,7 @@ implementation and tests.
 - [Runtime Ledger Sequences and Object Revisions](./runtime-ledger-sequences-and-revisions.md)
 - [Runtime Ledger Files and Relations](./runtime-ledger-files-and-relations.md)
 - [Runtime Transition Commit Contract](./runtime-transition-commit-contract.md)
+- [Runtime Host Activation Admission And Read Projections](./runtime-host-activation-admission-and-read-projections.md)
 - [Runtime SQLite Retention And Space Reclamation](./runtime-db-retention.md)
 - [WorkItem Current Focus Canonical Fact](./work-item-current-focus.md)
 

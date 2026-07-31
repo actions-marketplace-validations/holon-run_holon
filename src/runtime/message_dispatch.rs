@@ -81,6 +81,11 @@ impl RuntimeHandle {
             scheduler_state.pending,
             self.now(),
         )?;
+        let scheduler_projection = if self.inner.scheduler_engine.is_canonical() {
+            scheduler_projection
+        } else {
+            scheduler_projection.without_canonical_authority()
+        };
         let scheduler_decision = scheduler::decide_next_action(
             &scheduler_projection,
             scheduler::SchedulerBoundary::MessageProcessing,
@@ -140,6 +145,17 @@ impl RuntimeHandle {
             self.record_continuation_trigger_received(&message, trigger, &prior_closure)
                 .await?;
         }
+
+        // Resolve wait conditions triggered by this message BEFORE the model
+        // processes it.  If the message is an external trigger or operator
+        // prompt that matches an active wait, the wait must transition to
+        // Resolved and the WorkItem blocker cleared before the model starts
+        // working.  Otherwise the model may complete the WorkItem first,
+        // causing the wait to be Cancelled (work_item_completed) instead of
+        // Resolved. Reconciliation failure intentionally blocks model
+        // processing rather than allowing work to proceed from ambiguous wait
+        // state.
+        self.record_wait_reconciliation_signals(&message).await?;
 
         match message.kind {
             MessageKind::OperatorPrompt

@@ -11,8 +11,6 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use clap::ValueEnum;
-use serde::Deserialize;
-
 use holon::{
     client::{normalize_control_base_url, LocalClient, LocalHttpError},
     config::{
@@ -281,8 +279,7 @@ fn runtime_command_uses_config_inspection(command: &Commands) -> bool {
     matches!(
         command,
         Commands::Debug {
-            command: DebugCommands::SchedulerRolloutApply { .. }
-                | DebugCommands::SchedulerRecoveryFixture { .. }
+            command: DebugCommands::SchedulerRecoveryFixture { .. }
                 | DebugCommands::SchedulerRestartFixture { .. }
         }
     )
@@ -843,6 +840,7 @@ async fn serve(mut config: AppConfig, options: ServeOptions) -> Result<()> {
     }
 
     let host = RuntimeHost::new(config.clone())?;
+    host.recover_orphaned_queue_claims_at_startup().await?;
     let runtime = host.default_runtime().await?;
     host.spawn_daemon_memory_indexer();
     host.spawn_daemon_runtime_db_retention();
@@ -1100,6 +1098,7 @@ mod tests {
             default_tool_output_tokens: 8_000,
             max_tool_output_tokens: 64_000,
             disable_provider_fallback: false,
+            scheduler_engine: holon::config::SchedulerEngineMode::Canonical,
             tui_alternate_screen: AltScreenMode::Auto,
             validated_model_overrides: Default::default(),
             validated_unknown_model_fallback: None,
@@ -1498,26 +1497,6 @@ mod tests {
     }
 
     #[test]
-    fn hidden_scheduler_rollout_apply_parses_input_and_json() {
-        let cli = Cli::parse_from([
-            "holon",
-            "debug",
-            "scheduler-rollout-apply",
-            "--input",
-            "/tmp/rollout.json",
-            "--json",
-        ]);
-        let Commands::Debug {
-            command: DebugCommands::SchedulerRolloutApply { input, json },
-        } = cli.command
-        else {
-            panic!("expected hidden scheduler-rollout-apply command");
-        };
-        assert_eq!(input, PathBuf::from("/tmp/rollout.json"));
-        assert!(json);
-    }
-
-    #[test]
     fn hidden_scheduler_recovery_fixture_parses_objective() {
         let cli = Cli::parse_from([
             "holon",
@@ -1582,13 +1561,6 @@ mod tests {
     #[test]
     fn hidden_offline_scheduler_commands_skip_runtime_model_resolution() {
         for args in [
-            vec![
-                "holon",
-                "debug",
-                "scheduler-rollout-apply",
-                "--input",
-                "/tmp/rollout.json",
-            ],
             vec![
                 "holon",
                 "debug",
@@ -2354,9 +2326,6 @@ async fn handle_debug_command(config: AppConfig, command: DebugCommands) -> Resu
         DebugCommands::SchedulerRecovery { agent, json, apply } => {
             print_scheduler_recovery_report(&config, agent, json, apply)
         }
-        DebugCommands::SchedulerRolloutApply { input, json } => {
-            apply_scheduler_rollout_command(&config, &input, json)
-        }
         DebugCommands::SchedulerRecoveryFixture {
             agent,
             objective,
@@ -2371,43 +2340,6 @@ async fn handle_debug_command(config: AppConfig, command: DebugCommands) -> Resu
         } => {
             seed_scheduler_restart_fixture(&config, agent, checkpoint, stage, objective, json).await
         }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct SchedulerRolloutApplyInput {
-    commands: Vec<SchedulerRolloutApplyCommand>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SchedulerRolloutApplyCommand {
-    command_identity: String,
-    command: holon::domain::scheduler_protocol::RolloutCommand,
-}
-
-fn apply_scheduler_rollout_command(config: &AppConfig, input: &Path, json: bool) -> Result<()> {
-    holon::runtime::require_scheduler_acceptance_fixtures_enabled()?;
-    let _maintenance_lock = RuntimeDbLock::try_lock(config.runtime_db_maintenance_lock_path())
-        .context("scheduler rollout apply requires holon serve to be stopped")?;
-    let request: SchedulerRolloutApplyInput = serde_json::from_slice(
-        &fs::read(input).with_context(|| format!("reading {}", input.display()))?,
-    )
-    .with_context(|| format!("parsing scheduler rollout command {}", input.display()))?;
-    let db = RuntimeDb::open_and_migrate(config.runtime_db_path(), config.runtime_db_lock_path())?;
-    if request.commands.is_empty() {
-        return Err(anyhow!("scheduler rollout command list must not be empty"));
-    }
-    let commands = request
-        .commands
-        .into_iter()
-        .map(|request| (request.command_identity, request.command))
-        .collect::<Vec<_>>();
-    let receipts = db.apply_scheduler_rollout_commands(&commands)?;
-    if json {
-        print_json(&serde_json::json!({ "receipts": receipts }))
-    } else {
-        println!("{}", serde_json::to_string_pretty(&receipts)?);
-        Ok(())
     }
 }
 
@@ -2469,24 +2401,49 @@ fn print_scheduler_recovery_report(
     let storage = host.agent_storage(&agent_id)?;
     let mut report =
         holon::runtime::scheduler_recovery_report(&storage, host.runtime_db(), &agent_id)?;
+    let mut apply_result = None;
     if apply {
         let _maintenance_lock = RuntimeDbLock::try_lock(config.runtime_db_maintenance_lock_path())
             .context("scheduler recovery apply requires holon serve to be stopped")?;
-        holon::runtime::apply_scheduler_recovery_plan(
+        apply_result = Some(holon::runtime::apply_scheduler_recovery_plan(
             &storage,
             host.runtime_db(),
             &agent_id,
             &report,
-        )?;
+        )?);
         report = holon::runtime::scheduler_recovery_report(&storage, host.runtime_db(), &agent_id)?;
     }
     if json {
-        return print_json(&serde_json::to_value(report)?);
+        return print_json(&serde_json::json!({
+            "report": report,
+            "apply": apply_result.map(|(changed, backup_path)| serde_json::json!({
+                "changed": changed,
+                "backup_path": backup_path,
+            })),
+        }));
     }
     println!(
         "Scheduler recovery candidates for {} (partition initialized: {})",
         report.agent_id, report.partition_initialized
     );
+    println!(
+        "- retired rollout metadata: marked={} present={} mode={} stale_authoritative={}",
+        report.retired_rollout_metadata.retirement_marked,
+        report.retired_rollout_metadata.compatibility_data_present,
+        report.retired_rollout_metadata.protocol_mode,
+        report
+            .retired_rollout_metadata
+            .stale_authoritative_scenario_count,
+    );
+    if let Some((changed, backup_path)) = apply_result {
+        println!(
+            "- applied recovery changes={} backup={}",
+            changed,
+            backup_path
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "not-created".into())
+        );
+    }
     for candidate in report.candidates {
         println!(
             "- {}: eligible={} reason={} target={:?}",

@@ -62,39 +62,6 @@ impl AgentProvider for CanonicalCompletionProvider {
     }
 }
 
-async fn finish_claimed_test_run(runtime: &RuntimeHandle) {
-    let mut guard = runtime.inner.agent.lock().await;
-    scheduler::apply_idle_projection(&mut guard.state, &runtime.inner.storage).unwrap();
-    guard.current_run_abort = None;
-    guard.persist_state(&runtime.inner.storage).unwrap();
-}
-
-fn terminal_transition(
-    message: &MessageEnvelope,
-    work_item_id: Option<&str>,
-) -> super::super::turn::TurnTerminalTransition {
-    let turn_id = message.turn_id.clone().expect("test message turn id");
-    let terminal = crate::types::TurnTerminalRecord {
-        turn_id: turn_id.clone(),
-        turn_index: 1,
-        kind: crate::types::TurnTerminalKind::Completed,
-        reason: None,
-        last_assistant_message: Some("terminal transition committed".into()),
-        checkpoint: None,
-        completed_at: Utc::now(),
-        duration_ms: 1,
-    };
-    let mut turn_record = crate::types::TurnRecord::new(&message.agent_id, turn_id, 1);
-    turn_record.current_work_item_id = work_item_id.map(ToString::to_string);
-    turn_record.trigger = Some(crate::types::TurnTriggerSummary::from_message(message));
-    turn_record.input_message_ids = vec![message.id.clone()];
-    turn_record.terminal = Some(crate::types::TurnTerminalSummary::from_terminal(&terminal));
-    super::super::turn::TurnTerminalTransition {
-        terminal,
-        turn_record,
-    }
-}
-
 fn trusted_operator_prompt(work_item_id: Option<&str>, text: &str) -> MessageEnvelope {
     let mut message = MessageEnvelope::new(
         "default",
@@ -207,11 +174,48 @@ fn canonical_waiting_snapshot(
             },
         )]),
         activations: Default::default(),
-        activation_authorities: Default::default(),
         activation_admissions: Default::default(),
         settlements: Default::default(),
         missing_settlements: Default::default(),
-        rollout: Default::default(),
+        admitted_generations: Default::default(),
+        continuation_admissions: Default::default(),
+        activation_inputs: Default::default(),
+    }
+}
+
+fn canonical_lifecycle_waiting_snapshot(wait_id: &str, wait_generation: u64) -> Snapshot {
+    Snapshot {
+        slot: ActivationSlot::Idle,
+        dispatch: AgentDispatchState::Awaiting {
+            wait: WaitIdentity {
+                id: wait_id.into(),
+                generation: wait_generation,
+            },
+        },
+        dispatch_revision: 1,
+        focus: None,
+        work: Default::default(),
+        waits: std::collections::BTreeMap::from([(
+            wait_id.into(),
+            WaitRecord {
+                current_generation: wait_generation,
+                generations: std::collections::BTreeMap::from([(
+                    wait_generation,
+                    WaitGenerationRecord {
+                        owner: SchedulerOwner::AgentLifecycle {
+                            agent_id: "default".into(),
+                        },
+                        state: WaitState::Active,
+                        trigger: None,
+                        consuming_activation_id: None,
+                    },
+                )]),
+            },
+        )]),
+        activations: Default::default(),
+        activation_admissions: Default::default(),
+        settlements: Default::default(),
+        missing_settlements: Default::default(),
         admitted_generations: Default::default(),
         continuation_admissions: Default::default(),
         activation_inputs: Default::default(),
@@ -535,30 +539,6 @@ async fn run_loop_claim_fault_rolls_back_scheduler_events_with_claim_facts() {
             context_config(),
         )
         .unwrap();
-        let connection = runtime.inner.runtime_db.connection().unwrap();
-        connection
-            .execute(
-                "UPDATE scheduler_protocol_config
-                 SET protocol_mode = 'shadow',
-                     config_revision = 1,
-                     updated_at = CURRENT_TIMESTAMP
-                 WHERE config_id = 1",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO scheduler_scenario_authorities (
-                   scenario_class, mode, rollback_target,
-                   manifest_revision, preflight_revision, updated_at
-                 ) VALUES (
-                   'reducer_only_candidates', 'shadow', 'off',
-                   NULL, NULL, CURRENT_TIMESTAMP
-                 )",
-                [],
-            )
-            .unwrap();
-
         let message = runtime
             .enqueue(MessageEnvelope::new(
                 "default",
@@ -600,16 +580,6 @@ async fn run_loop_claim_fault_rolls_back_scheduler_events_with_claim_facts() {
             )
             .unwrap();
         assert_eq!(queue_status, "queued");
-        let comparison_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*)
-                 FROM scheduler_shadow_comparisons
-                 WHERE comparison_identity = ?1",
-                [format!("message_admission:{}", message.id)],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(comparison_count, 0);
         let events = runtime.storage().read_recent_events(usize::MAX).unwrap();
         assert!(!events.iter().any(|event| {
             event.kind == "scheduler_diagnostic"
@@ -625,6 +595,261 @@ async fn run_loop_claim_fault_rolls_back_scheduler_events_with_claim_facts() {
             event.kind == "queue_entry_claimed" && event.data["message_id"] == message.id
         }));
     }
+}
+
+#[tokio::test]
+async fn runtime_failure_preserves_canonical_claim_for_bootstrap_reconciliation() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "preserve canonical claim after host failure".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::SystemTick,
+        MessageOrigin::System {
+            subsystem: "work_queue".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "claim before runtime failure".into(),
+        },
+    );
+    message.work_item_id = Some(work_item.id.clone());
+    message.turn_id = Some("turn-runtime-failure-canonical-claim".into());
+    let message = runtime.enqueue(message).await.unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+    finish_claimed_test_run(&runtime).await;
+
+    runtime
+        .record_runtime_loop_failure(&anyhow!("settlement commit failed"))
+        .await;
+
+    assert_eq!(
+        runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest_all()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == message.id)
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Dequeued)
+    );
+    assert!(runtime
+        .storage()
+        .read_recent_events(64)
+        .unwrap()
+        .iter()
+        .all(|event| {
+            event.kind != "queue_claim_released_for_runtime_restart"
+                || event.data["message_id"] != message.id
+        }));
+}
+
+#[tokio::test]
+async fn legacy_recovery_plan_reconciles_an_existing_dispatch_reservation() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "legacy recovery dispatch v1".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runtime
+        .update_work_item_fields(
+            work_item.id.clone(),
+            Some("legacy recovery dispatch v2".into()),
+            None,
+            None,
+            None,
+            Some(None),
+        )
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    let registration = runtime
+        .register_wait_for(
+            "default",
+            Some(work_item.id.clone()),
+            WaitForWakeKind::External,
+            Some("github:holon-run/holon#recovery-dispatch".into()),
+            "waiting before legacy recovery".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let waiting_source = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let old_generation = waiting_source
+        .revision
+        .checked_sub(1)
+        .filter(|generation| *generation > 0)
+        .expect("fixture must have an older canonical generation");
+    let mut canonical =
+        canonical_waiting_snapshot(&waiting_source, &registration.condition.id, old_generation);
+    let demand = canonical.work.get_mut(&work_item.id).unwrap();
+    demand.metadata_revision = old_generation;
+    demand.scheduling_generation = old_generation;
+    runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .initialize_scheduler_protocol_partition("default", &canonical)
+        .unwrap();
+
+    let waiting_report =
+        scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
+            .unwrap();
+    let waiting_candidate = waiting_report
+        .legacy_adoptions
+        .iter()
+        .find(|candidate| candidate.work_item_id == work_item.id)
+        .expect("waiting legacy adoption candidate");
+    assert!(waiting_candidate.eligible);
+    apply_scheduler_recovery_plan(
+        &runtime.inner.storage,
+        &runtime.inner.runtime_db,
+        "default",
+        &waiting_report,
+    )
+    .unwrap();
+    let rearmed = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_scheduler_protocol_snapshot("default")
+        .unwrap();
+    assert_eq!(
+        rearmed.waits[&registration.condition.id].generations[&old_generation].state,
+        WaitState::Resolved
+    );
+    assert_eq!(
+        rearmed.dispatch,
+        AgentDispatchState::Awaiting {
+            wait: WaitIdentity {
+                id: registration.condition.id.clone(),
+                generation: waiting_source.revision,
+            },
+        }
+    );
+
+    let mut resolved = runtime
+        .storage()
+        .latest_wait_conditions()
+        .unwrap()
+        .into_iter()
+        .find(|condition| condition.id == registration.condition.id)
+        .expect("legacy wait condition");
+    let resolved_at = Utc::now();
+    resolved.status = WaitConditionStatus::Resolved;
+    resolved.updated_at = resolved_at;
+    resolved.resolved_at = Some(resolved_at);
+    runtime
+        .inner
+        .runtime_db
+        .wait_conditions()
+        .upsert(&resolved)
+        .unwrap();
+    runtime
+        .update_work_item_fields(
+            work_item.id.clone(),
+            Some("legacy recovery dispatch runnable".into()),
+            None,
+            None,
+            None,
+            Some(None),
+        )
+        .await
+        .unwrap();
+    let runnable_source = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let runnable_report =
+        scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
+            .unwrap();
+    let runnable_candidate = runnable_report
+        .legacy_adoptions
+        .iter()
+        .find(|candidate| candidate.work_item_id == work_item.id)
+        .expect("runnable legacy adoption candidate");
+    assert!(
+        runnable_candidate.eligible,
+        "runnable candidate rejected: {}",
+        runnable_candidate.reason
+    );
+    apply_scheduler_recovery_plan(
+        &runtime.inner.storage,
+        &runtime.inner.runtime_db,
+        "default",
+        &runnable_report,
+    )
+    .unwrap();
+    let released = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_scheduler_protocol_snapshot("default")
+        .unwrap();
+    assert_eq!(released.dispatch, AgentDispatchState::Open);
+    assert_eq!(
+        released.waits[&registration.condition.id].generations[&waiting_source.revision].state,
+        WaitState::Resolved
+    );
+    assert_eq!(
+        released.work[&work_item.id].scheduling_generation,
+        runnable_source.revision
+    );
+    assert_eq!(released.work[&work_item.id].status, WorkStatus::Runnable);
 }
 
 #[tokio::test]
@@ -950,7 +1175,6 @@ async fn settlement_recovery_repairs_processed_cross_work_item_pick_as_targeted_
             scheduler_claim_work_item: None,
             scheduler_protocol_bootstrap: None,
             scheduler_protocol_commands,
-            scheduler_rollout_expectations: Vec::new(),
             agent_state: None,
             message_evidence: Vec::new(),
             transcript_entries: Vec::new(),
@@ -996,7 +1220,8 @@ async fn settlement_recovery_repairs_processed_cross_work_item_pick_as_targeted_
             "default",
             &report,
         )
-        .unwrap(),
+        .unwrap()
+        .0,
         1
     );
 
@@ -1029,7 +1254,8 @@ async fn settlement_recovery_repairs_processed_cross_work_item_pick_as_targeted_
             )
             .unwrap(),
         )
-        .unwrap(),
+        .unwrap()
+        .0,
         0
     );
 }
@@ -1545,7 +1771,6 @@ async fn stale_bootstrap_recovery_command_cannot_settle_successor_generation() {
             scheduler_claim_work_item: None,
             scheduler_protocol_bootstrap: None,
             scheduler_protocol_commands: vec![stale_command],
-            scheduler_rollout_expectations: Vec::new(),
             agent_state: None,
             message_evidence: Vec::new(),
             transcript_entries: Vec::new(),
@@ -1705,6 +1930,152 @@ async fn bootstrap_recovery_fault_rolls_back_queue_canonical_and_audit() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn legacy_engine_claim_and_settlement_do_not_write_canonical_protocol() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new_with_scheduler_engine(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+        crate::config::SchedulerEngineMode::Legacy,
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item("legacy production loop".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::SystemTick,
+        MessageOrigin::System {
+            subsystem: "work_queue".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "run legacy work".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    message.work_item_id = Some(work_item.id.clone());
+    message.turn_id = Some("turn-legacy-production-loop".into());
+    let message = runtime.enqueue(message).await.unwrap();
+
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
+        .unwrap();
+    assert!(matches!(poll, scheduler_executor::RunLoopPoll::Message(_)));
+    assert!(runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_scheduler_protocol_snapshot_if_initialized("default")
+        .unwrap()
+        .is_none());
+
+    finish_claimed_test_run(&runtime).await;
+    let terminal = terminal_transition(&message, Some(&work_item.id));
+    runtime
+        .commit_queue_terminal_settlement(
+            QueueEntryRecord {
+                message_id: message.id.clone(),
+                agent_id: message.agent_id.clone(),
+                priority: message.priority,
+                status: QueueEntryStatus::Processed,
+                created_at: message.created_at,
+                updated_at: Utc::now(),
+            },
+            Vec::new(),
+            true,
+            Some(&terminal),
+        )
+        .await
+        .unwrap();
+
+    assert!(runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_scheduler_protocol_snapshot_if_initialized("default")
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn legacy_engine_startup_rejects_running_canonical_activation() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let provider = Arc::new(CountingProvider {
+        calls: Mutex::new(0),
+        reply: "unused",
+    });
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        provider.clone(),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item("canonical in flight".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::SystemTick,
+        MessageOrigin::System {
+            subsystem: "work_queue".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "leave canonical activation running".into(),
+        },
+    );
+    message.work_item_id = Some(work_item.id);
+    message.turn_id = Some("turn-canonical-in-flight".into());
+    runtime.enqueue(message).await.unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+    drop(runtime);
+
+    let legacy = RuntimeHandle::new_with_scheduler_engine(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        provider,
+        "default".into(),
+        context_config(),
+        crate::config::SchedulerEngineMode::Legacy,
+    )
+    .unwrap();
+    let error = legacy.run().await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("non-terminal canonical activations remain"));
 }
 
 #[tokio::test]
@@ -2050,6 +2421,352 @@ async fn production_protocol_wait_settlement_creates_rejoinable_wait_generation(
     assert!(settled_rejoin
         .settlements
         .contains_key(&canonical_settlement_id(&rejoin.id)));
+}
+
+#[tokio::test]
+async fn lifecycle_settlement_adopts_wait_without_work_item_turn_binding() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "lifecycle-created external wait".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(work_item.turn_id, None);
+
+    let mut message = trusted_operator_prompt(None, "create and wait on a WorkItem");
+    message.turn_id = Some("turn-lifecycle-adopt-wait".into());
+    let message = runtime.enqueue(message).await.unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+    runtime
+        .begin_interactive_turn(Some(&message), None, None)
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    let registration = runtime
+        .register_wait_for(
+            "default",
+            Some(work_item.id.clone()),
+            WaitForWakeKind::External,
+            Some("github:holon-run/holon#lifecycle-adopt".into()),
+            "waiting for lifecycle adoption".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        registration.condition.turn_id.as_deref(),
+        message.turn_id.as_deref()
+    );
+    let updated_work_item = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated_work_item.turn_id, None);
+
+    finish_claimed_test_run(&runtime).await;
+    let terminal = terminal_transition(&message, None);
+    runtime
+        .commit_queue_terminal_settlement(
+            QueueEntryRecord {
+                message_id: message.id.clone(),
+                agent_id: message.agent_id.clone(),
+                priority: message.priority,
+                status: QueueEntryStatus::Processed,
+                created_at: message.created_at,
+                updated_at: Utc::now(),
+            },
+            Vec::new(),
+            true,
+            Some(&terminal),
+        )
+        .await
+        .unwrap();
+
+    let settled = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_scheduler_protocol_snapshot("default")
+        .unwrap();
+    assert_eq!(settled.slot, ActivationSlot::Idle);
+    assert_eq!(
+        settled.work.get(&work_item.id).map(|demand| &demand.status),
+        Some(&WorkStatus::Waiting {
+            wait_id: registration.condition.id.clone(),
+        })
+    );
+    assert_eq!(
+        settled.waits[&registration.condition.id].generations[&updated_work_item.revision].owner,
+        SchedulerOwner::WorkItem {
+            work_item_id: work_item.id.clone(),
+        }
+    );
+    assert!(settled
+        .settlements
+        .contains_key(&canonical_settlement_id(&message.id)));
+    assert!(settled.missing_settlements.is_empty());
+    assert_eq!(
+        runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest_all()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == message.id)
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Processed)
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_wait_handoff_to_work_item_wait_is_atomic_idempotent_and_restart_safe() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let lifecycle_wait = runtime
+        .register_wait_for(
+            "default",
+            None,
+            WaitForWakeKind::External,
+            Some("github:holon-run/holon#lifecycle-source".into()),
+            "waiting for lifecycle external event".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let lifecycle_generation = 1;
+    runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .initialize_scheduler_protocol_partition(
+            "default",
+            &canonical_lifecycle_waiting_snapshot(
+                &lifecycle_wait.condition.id,
+                lifecycle_generation,
+            ),
+        )
+        .unwrap();
+
+    let mut message = trusted_operator_prompt(None, "create a WorkItem and wait for its task");
+    message.turn_id = Some("turn-lifecycle-wait-handoff".into());
+    let message = runtime.enqueue(message).await.unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+    let admitted = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_scheduler_protocol_snapshot("default")
+        .unwrap();
+    assert!(matches!(
+        &admitted.activation_admissions[&activation_id]
+            .activation
+            .cause,
+        ActivationCause::LifecycleExternalNudge { message_id }
+            if message_id == &message.id
+    ));
+
+    runtime
+        .begin_interactive_turn(Some(&message), None, None)
+        .await
+        .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "work created by lifecycle nudge".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    let work_wait = runtime
+        .register_wait_for(
+            "default",
+            Some(work_item.id.clone()),
+            WaitForWakeKind::TaskResult,
+            Some("task-lifecycle-handoff".into()),
+            "waiting for lifecycle handoff task".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let updated_work_item = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    finish_claimed_test_run(&runtime).await;
+    let terminal = terminal_transition(&message, None);
+    let processed = QueueEntryRecord {
+        message_id: message.id.clone(),
+        agent_id: message.agent_id.clone(),
+        priority: message.priority,
+        status: QueueEntryStatus::Processed,
+        created_at: message.created_at,
+        updated_at: Utc::now(),
+    };
+    runtime
+        .commit_queue_terminal_settlement(processed.clone(), Vec::new(), true, Some(&terminal))
+        .await
+        .unwrap();
+
+    let settled = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_scheduler_protocol_snapshot("default")
+        .unwrap();
+    let work_generation = updated_work_item.revision;
+    assert_eq!(settled.slot, ActivationSlot::Idle);
+    assert_eq!(
+        settled.waits[&lifecycle_wait.condition.id].generations[&lifecycle_generation].state,
+        WaitState::Resolved
+    );
+    assert_eq!(
+        settled.work[&work_item.id].status,
+        WorkStatus::Waiting {
+            wait_id: work_wait.condition.id.clone(),
+        }
+    );
+    assert_eq!(
+        settled.waits[&work_wait.condition.id].generations[&work_generation].owner,
+        SchedulerOwner::WorkItem {
+            work_item_id: work_item.id.clone(),
+        }
+    );
+    assert_eq!(
+        settled.dispatch,
+        AgentDispatchState::Awaiting {
+            wait: WaitIdentity {
+                id: work_wait.condition.id.clone(),
+                generation: work_generation,
+            },
+        }
+    );
+    assert_eq!(settled.focus.as_deref(), Some(work_item.id.as_str()));
+    assert!(settled.missing_settlements.is_empty());
+
+    let replay_commands = runtime
+        .canonical_queue_settlement_commands(&processed, Some(&terminal.turn_record))
+        .await
+        .unwrap();
+    assert!(matches!(
+        replay_commands.as_slice(),
+        [crate::domain::scheduler_protocol::ProtocolCommand::SettleActivation(_)]
+    ));
+    assert!(!runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .commit_scheduler_recovery_plan("default", &replay_commands)
+        .unwrap());
+
+    drop(runtime);
+    let reopened = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let mut rejoin = task_result_message("task-lifecycle-handoff").with_admission(
+        MessageDeliverySurface::TaskRejoin,
+        AdmissionContext::RuntimeOwned,
+    );
+    rejoin.work_item_id = Some(work_item.id.clone());
+    rejoin.metadata = Some(serde_json::json!({
+        "task_id": "task-lifecycle-handoff",
+        "task_kind": "command_task",
+        "task_status": "completed",
+        "task_result_id": "result-lifecycle-handoff",
+        "work_item_id": work_item.id,
+    }));
+    rejoin.turn_id = Some("turn-lifecycle-handoff-rejoin".into());
+    let rejoin = reopened.enqueue(rejoin).await.unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&reopened)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+    let rejoined = reopened
+        .inner
+        .runtime_db
+        .transitions()
+        .load_scheduler_protocol_snapshot("default")
+        .unwrap();
+    assert!(matches!(
+        rejoined.slot,
+        ActivationSlot::Running {
+            owner: SchedulerOwner::WorkItem { ref work_item_id },
+            admitted_generation,
+            ..
+        } if work_item_id == &work_item.id && admitted_generation == work_generation
+    ));
+    assert_eq!(
+        rejoined.waits[&work_wait.condition.id].generations[&work_generation].state,
+        WaitState::Consumed
+    );
+    assert_eq!(
+        rejoined.waits[&work_wait.condition.id].generations[&work_generation]
+            .consuming_activation_id
+            .as_deref(),
+        Some(scheduler_executor::canonical_activation_id(&rejoin.id).as_str())
+    );
 }
 
 #[tokio::test]
@@ -2639,15 +3356,31 @@ async fn authoritative_explicit_operator_binding_ignores_unrelated_waits() {
         snapshot.waits[&unrelated_wait.condition.id].generations[&unrelated_generation].state,
         WaitState::Active
     );
+    runtime
+        .record_wait_reconciliation_signals(&message)
+        .await
+        .unwrap();
+    let latest_waits = runtime.storage().latest_wait_conditions().unwrap();
     assert_eq!(
-        runtime
-            .storage()
-            .latest_wait_conditions()
-            .unwrap()
-            .into_iter()
+        latest_waits
+            .iter()
+            .find(|wait| wait.id == target_wait.condition.id)
+            .map(|wait| &wait.status),
+        Some(&WaitConditionStatus::Resolved)
+    );
+    assert_eq!(
+        latest_waits
+            .iter()
+            .find(|wait| wait.id == unrelated_wait.condition.id)
+            .map(|wait| &wait.status),
+        Some(&WaitConditionStatus::Active)
+    );
+    assert_eq!(
+        latest_waits
+            .iter()
             .find(|wait| wait.id == agent_wait.condition.id)
-            .map(|wait| wait.status),
-        Some(WaitConditionStatus::Active)
+            .map(|wait| &wait.status),
+        Some(&WaitConditionStatus::Active)
     );
 }
 
@@ -2820,11 +3553,9 @@ async fn authoritative_explicit_operator_wait_ambiguity_remains_queued() {
                     ),
                 ]),
                 activations: Default::default(),
-                activation_authorities: Default::default(),
                 activation_admissions: Default::default(),
                 settlements: Default::default(),
                 missing_settlements: Default::default(),
-                rollout: Default::default(),
                 admitted_generations: Default::default(),
                 continuation_admissions: Default::default(),
                 activation_inputs: Default::default(),
@@ -3769,11 +4500,9 @@ async fn completed_production_settlement_uses_exact_bound_result_brief() {
                 )]),
                 waits: Default::default(),
                 activations: Default::default(),
-                activation_authorities: Default::default(),
                 activation_admissions: Default::default(),
                 settlements: Default::default(),
                 missing_settlements: Default::default(),
-                rollout: Default::default(),
                 admitted_generations: Default::default(),
                 continuation_admissions: Default::default(),
                 activation_inputs: Default::default(),
@@ -3934,6 +4663,222 @@ async fn completed_production_settlement_uses_exact_bound_result_brief() {
         settlement.operator_delivery.as_deref(),
         Some(decoy.id.as_str())
     );
+}
+
+#[tokio::test]
+async fn completed_wait_resume_settlement_accepts_exact_reconciliation_revision() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "complete after canonical wait resume".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let mut wait_message = MessageEnvelope::new(
+        "default",
+        MessageKind::SystemTick,
+        MessageOrigin::System {
+            subsystem: "work_queue".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "wait before completion".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    wait_message.work_item_id = Some(work_item.id.clone());
+    wait_message.turn_id = Some("turn-wait-before-completion".into());
+    let wait_message = runtime.enqueue(wait_message).await.unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+    let registration = runtime
+        .register_wait_for(
+            "default",
+            Some(work_item.id.clone()),
+            WaitForWakeKind::TaskResult,
+            Some("task-complete-after-wait".into()),
+            "waiting before completion".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    finish_claimed_test_run(&runtime).await;
+    let wait_terminal = terminal_transition(&wait_message, Some(&work_item.id));
+    runtime
+        .commit_queue_terminal_settlement(
+            QueueEntryRecord {
+                message_id: wait_message.id.clone(),
+                agent_id: wait_message.agent_id.clone(),
+                priority: wait_message.priority,
+                status: QueueEntryStatus::Processed,
+                created_at: wait_message.created_at,
+                updated_at: Utc::now(),
+            },
+            Vec::new(),
+            true,
+            Some(&wait_terminal),
+        )
+        .await
+        .unwrap();
+
+    runtime
+        .storage()
+        .append_task(&TaskRecord {
+            id: "task-complete-after-wait".into(),
+            agent_id: "default".into(),
+            kind: TaskKind::CommandTask,
+            status: TaskStatus::Completed,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            parent_message_id: None,
+            work_item_id: Some(work_item.id.clone()),
+            summary: Some("task completed after wait".into()),
+            detail: None,
+            recovery: None,
+        })
+        .unwrap();
+    let mut resume = task_result_message("task-complete-after-wait").with_admission(
+        MessageDeliverySurface::TaskRejoin,
+        AdmissionContext::RuntimeOwned,
+    );
+    resume.work_item_id = Some(work_item.id.clone());
+    resume.metadata = Some(serde_json::json!({
+        "task_id": "task-complete-after-wait",
+        "task_kind": "command_task",
+        "task_status": "completed",
+        "task_result_id": "result-complete-after-wait",
+        "work_item_id": work_item.id,
+    }));
+    resume.turn_id = Some("turn-complete-after-wait".into());
+    let resume = runtime.enqueue(resume).await.unwrap();
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("completed task result should be claimed");
+    };
+    assert_eq!(scheduled.message.id, resume.id);
+    let activation_id = scheduler_executor::canonical_activation_id(&resume.id);
+    let claimed = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_scheduler_protocol_snapshot("default")
+        .unwrap();
+    let source_revision = claimed.activation_admissions[&activation_id]
+        .activation
+        .source_revision
+        .expect("wait resume source revision");
+    assert_eq!(
+        claimed.waits[&registration.condition.id].generations
+            [&claimed.waits[&registration.condition.id].current_generation]
+            .consuming_activation_id
+            .as_deref(),
+        Some(activation_id.as_str())
+    );
+
+    runtime
+        .record_wait_reconciliation_signals(&resume)
+        .await
+        .unwrap();
+    runtime
+        .begin_interactive_turn_with_provenance(
+            Some(&resume),
+            None,
+            None,
+            scheduled
+                .dispatch_plan
+                .execution_admission_provenance
+                .clone(),
+        )
+        .await
+        .unwrap();
+    let completed = runtime
+        .complete_work_item(work_item.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        completed
+            .completion_intent
+            .as_ref()
+            .expect("completion intent")
+            .expected_work_revision,
+        source_revision + 1
+    );
+    let completed = runtime
+        .promote_work_item_completion_report(
+            work_item.id.clone(),
+            "completed after wait resume".into(),
+            Some(1),
+            Some(1),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let result_brief_id = completed
+        .result_brief_id
+        .clone()
+        .expect("completion report brief");
+
+    finish_claimed_test_run(&runtime).await;
+    let resume_terminal = terminal_transition(&resume, Some(&work_item.id));
+    runtime
+        .commit_queue_terminal_settlement(
+            QueueEntryRecord {
+                message_id: resume.id.clone(),
+                agent_id: resume.agent_id.clone(),
+                priority: resume.priority,
+                status: QueueEntryStatus::Processed,
+                created_at: resume.created_at,
+                updated_at: Utc::now(),
+            },
+            Vec::new(),
+            true,
+            Some(&resume_terminal),
+        )
+        .await
+        .unwrap();
+
+    let settled = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_scheduler_protocol_snapshot("default")
+        .unwrap();
+    assert_eq!(
+        settled.settlements[&canonical_settlement_id(&resume.id)]
+            .operator_delivery
+            .as_deref(),
+        Some(result_brief_id.as_str())
+    );
+    assert!(settled.missing_settlements.is_empty());
 }
 
 #[tokio::test]
@@ -4365,7 +5310,7 @@ async fn message_admission_fault_rolls_back_all_canonical_facts() {
 }
 
 #[tokio::test]
-async fn authoritative_mode_allows_message_admission_outside_authoritative_scenario() {
+async fn control_message_admission_does_not_depend_on_retired_rollout_rows() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let runtime = RuntimeHandle::new(
@@ -4381,29 +5326,6 @@ async fn authoritative_mode_allows_message_admission_outside_authoritative_scena
         context_config(),
     )
     .unwrap();
-    let connection = runtime.inner.runtime_db.connection().unwrap();
-    connection
-        .execute(
-            "UPDATE scheduler_protocol_config
-             SET protocol_mode = 'authoritative',
-                 config_revision = 1,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE config_id = 1",
-            [],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO scheduler_scenario_authorities (
-               scenario_class, mode, rollback_target,
-               manifest_revision, preflight_revision, updated_at
-             ) VALUES (
-               'reducer_only_candidates', 'authoritative', 'shadow',
-               NULL, NULL, CURRENT_TIMESTAMP
-             )",
-            [],
-        )
-        .unwrap();
     let message = MessageEnvelope::new(
         "default",
         MessageKind::Control,
@@ -4413,7 +5335,7 @@ async fn authoritative_mode_allows_message_admission_outside_authoritative_scena
         AuthorityClass::RuntimeInstruction,
         Priority::Normal,
         MessageBody::Text {
-            text: "excluded from shadow comparison".into(),
+            text: "retired rollout rows are not admission inputs".into(),
         },
     );
 
@@ -4442,7 +5364,7 @@ async fn authoritative_mode_allows_message_admission_outside_authoritative_scena
 }
 
 #[tokio::test]
-async fn run_loop_stale_head_noops_before_authoritative_fence() {
+async fn run_loop_stale_head_noops_before_canonical_claim() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let runtime = RuntimeHandle::new(
@@ -4458,27 +5380,6 @@ async fn run_loop_stale_head_noops_before_authoritative_fence() {
         context_config(),
     )
     .unwrap();
-    let connection = runtime.inner.runtime_db.connection().unwrap();
-    connection
-        .execute(
-            "UPDATE scheduler_protocol_config
-             SET protocol_mode = 'shadow',
-                 config_revision = config_revision + 1,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE config_id = 1",
-            [],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "UPDATE scheduler_scenario_authorities
-             SET mode = 'shadow',
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE scenario_class = 'reducer_only_candidates'",
-            [],
-        )
-        .unwrap();
-
     let message = runtime
         .enqueue(MessageEnvelope::new(
             "default",
@@ -4510,27 +5411,6 @@ async fn run_loop_stale_head_noops_before_authoritative_fence() {
         .queue_entries()
         .try_claim_queued_message(&competing_claim)
         .unwrap());
-    connection
-        .execute(
-            "UPDATE scheduler_protocol_config
-             SET protocol_mode = 'authoritative',
-                 config_revision = config_revision + 1,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE config_id = 1",
-            [],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "UPDATE scheduler_scenario_authorities
-             SET mode = 'authoritative',
-                 rollback_target = 'shadow',
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE scenario_class = 'reducer_only_candidates'",
-            [],
-        )
-        .unwrap();
-
     let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
         .poll()
         .await
@@ -4538,16 +5418,6 @@ async fn run_loop_stale_head_noops_before_authoritative_fence() {
 
     assert!(matches!(poll, scheduler_executor::RunLoopPoll::Idle));
     assert_eq!(runtime.agent_state().await.unwrap().pending, 0);
-    let connection = runtime.inner.runtime_db.connection().unwrap();
-    let comparison_count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM scheduler_shadow_comparisons
-             WHERE comparison_identity = ?1",
-            [format!("message_admission:{}", message.id)],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(comparison_count, 0);
     let events = runtime.storage().read_recent_events(usize::MAX).unwrap();
     assert!(!events.iter().any(|event| {
         event.kind == "scheduler_decision" && event.data["message_id"] == message.id
@@ -4838,7 +5708,7 @@ async fn indefinite_sleep_with_current_runnable_work_item_emits_continuation_tic
 }
 
 #[tokio::test]
-async fn lifecycle_sleep_work_queue_override_allows_matched_authoritative_evidence() {
+async fn lifecycle_sleep_work_queue_override_preserves_active_run() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let runtime = RuntimeHandle::new(
@@ -4877,7 +5747,7 @@ async fn lifecycle_sleep_work_queue_override_allows_matched_authoritative_eviden
         .unwrap()
         .into_iter()
         .find(|message| message.kind == MessageKind::SystemTick)
-        .expect("matched authoritative evidence should admit the work queue tick");
+        .expect("runnable work should admit the work queue tick");
     assert_eq!(tick.work_item_id.as_deref(), Some(work_item_id.as_str()));
     assert!(runtime
         .storage()
@@ -7018,7 +7888,114 @@ async fn task_result_records_wait_reconciliation_and_resolves_task_wait_conditio
 }
 
 #[tokio::test]
-async fn timer_operator_and_system_ticks_record_wait_reconciliation_signals() {
+async fn legacy_task_result_resolves_unique_wait_without_canonical_partition() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new_with_scheduler_engine(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "legacy task follow-up",
+        }),
+        "default".into(),
+        context_config(),
+        crate::config::SchedulerEngineMode::Legacy,
+    )
+    .unwrap();
+    let now = Utc::now();
+    let mut work_item = WorkItemRecord::new("default", "legacy task wait", WorkItemState::Open);
+    work_item.id = "wi-legacy-task".into();
+    work_item.blocked_by = Some("task result".into());
+    runtime.storage().append_work_item(&work_item).unwrap();
+    runtime
+        .storage()
+        .append_wait_condition(&WaitConditionRecord {
+            id: "wait-legacy-task".into(),
+            agent_id: "default".into(),
+            work_item_id: Some(work_item.id.clone()),
+            status: WaitConditionStatus::Active,
+            kind: WaitConditionKind::Task,
+            source: None,
+            subject_ref: Some("task-legacy".into()),
+            waiting_for: "task result".into(),
+            wake_sources: vec![WakeSource::TaskResult {
+                task_id: "task-legacy".into(),
+            }],
+            continuation: None,
+            created_at: now,
+            updated_at: now,
+            expires_at: None,
+            resolved_at: None,
+            cancelled_at: None,
+            turn_id: None,
+        })
+        .unwrap();
+
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::TaskResult,
+        MessageOrigin::Task {
+            task_id: "task-legacy".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "task completed".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::TaskRejoin,
+        AdmissionContext::RuntimeOwned,
+    );
+    message.metadata = Some(serde_json::json!({
+        "task_id": "task-legacy",
+        "task_kind": "child_agent_task",
+        "task_status": "completed",
+        "work_item_id": work_item.id,
+    }));
+    message.task_id = Some("task-legacy".into());
+    message.work_item_id = Some(work_item.id.clone());
+
+    runtime
+        .process_message(
+            message,
+            closure_decision(
+                ClosureOutcome::Waiting,
+                Some(WaitingReason::AwaitingTaskResult),
+            ),
+        )
+        .await
+        .unwrap();
+
+    assert!(runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_scheduler_protocol_snapshot_if_initialized("default")
+        .unwrap()
+        .is_none());
+    assert!(runtime
+        .storage()
+        .latest_wait_conditions()
+        .unwrap()
+        .iter()
+        .any(|condition| {
+            condition.id == "wait-legacy-task" && condition.status == WaitConditionStatus::Resolved
+        }));
+    assert!(runtime
+        .inner
+        .runtime_db
+        .work_items()
+        .latest(&work_item.id)
+        .unwrap()
+        .is_some_and(|work| work.blocked_by.is_none()));
+}
+
+#[tokio::test]
+async fn timer_and_system_ticks_record_wait_reconciliation_signals() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let runtime = RuntimeHandle::new(
@@ -7040,11 +8017,6 @@ async fn timer_operator_and_system_ticks_record_wait_reconciliation_signals() {
             "wait-timer",
             WaitConditionKind::Timer,
             vec![WakeSource::Timer { wake_at: now }],
-        ),
-        (
-            "wait-operator",
-            WaitConditionKind::Operator,
-            vec![WakeSource::OperatorInput],
         ),
         (
             "wait-system",
@@ -7095,18 +8067,6 @@ async fn timer_operator_and_system_ticks_record_wait_reconciliation_signals() {
         ),
         MessageEnvelope::new(
             "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator {
-                actor_id: Some("operator-1".into()),
-            },
-            AuthorityClass::OperatorInstruction,
-            Priority::Interject,
-            MessageBody::Text {
-                text: "operator input".into(),
-            },
-        ),
-        MessageEnvelope::new(
-            "default",
             MessageKind::SystemTick,
             MessageOrigin::System {
                 subsystem: "scheduler".into(),
@@ -7125,11 +8085,7 @@ async fn timer_operator_and_system_ticks_record_wait_reconciliation_signals() {
     }
 
     let events = runtime.storage().read_recent_events(100).unwrap();
-    for (condition_id, wake_source) in [
-        ("wait-timer", "timer"),
-        ("wait-operator", "operator_input"),
-        ("wait-system", "system_tick"),
-    ] {
+    for (condition_id, wake_source) in [("wait-timer", "timer"), ("wait-system", "system_tick")] {
         assert!(events.iter().any(|event| {
             event.kind == "wait_reconciliation_requested"
                 && event.data["wait_condition_id"] == condition_id
@@ -7143,7 +8099,7 @@ async fn timer_operator_and_system_ticks_record_wait_reconciliation_signals() {
     assert_eq!(
         active_conditions.len(),
         0,
-        "all three waits should be resolved after reconciliation"
+        "both waits should be resolved after reconciliation"
     );
 }
 
@@ -7169,26 +8125,33 @@ async fn same_turn_message_does_not_reconcile_wait_condition() {
     work_item.id = "work-op-wait".into();
     runtime.storage().append_work_item(&work_item).unwrap();
     // Register an operator-input wait condition that was created during turn "turn-seed".
+    let wait = WaitConditionRecord {
+        id: "wait-op-same-turn".into(),
+        agent_id: "default".into(),
+        work_item_id: Some("work-op-wait".into()),
+        status: WaitConditionStatus::Active,
+        kind: WaitConditionKind::Operator,
+        source: None,
+        subject_ref: None,
+        waiting_for: "operator resume".into(),
+        wake_sources: vec![WakeSource::OperatorInput],
+        continuation: None,
+        created_at: now,
+        updated_at: now,
+        expires_at: None,
+        resolved_at: None,
+        cancelled_at: None,
+        turn_id: Some("turn-seed".into()),
+    };
+    runtime.storage().append_wait_condition(&wait).unwrap();
     runtime
-        .storage()
-        .append_wait_condition(&WaitConditionRecord {
-            id: "wait-op-same-turn".into(),
-            agent_id: "default".into(),
-            work_item_id: Some("work-op-wait".into()),
-            status: WaitConditionStatus::Active,
-            kind: WaitConditionKind::Operator,
-            source: None,
-            subject_ref: None,
-            waiting_for: "operator resume".into(),
-            wake_sources: vec![WakeSource::OperatorInput],
-            continuation: None,
-            created_at: now,
-            updated_at: now,
-            expires_at: None,
-            resolved_at: None,
-            cancelled_at: None,
-            turn_id: Some("turn-seed".into()),
-        })
+        .inner
+        .runtime_db
+        .transitions()
+        .initialize_scheduler_protocol_partition(
+            "default",
+            &canonical_waiting_snapshot(&work_item, &wait.id, work_item.revision),
+        )
         .unwrap();
 
     // Process an operator message that belongs to the SAME turn that created the
@@ -7224,25 +8187,22 @@ async fn same_turn_message_does_not_reconcile_wait_condition() {
         "same-turn message must not reconcile the wait"
     );
 
-    // A later operator message with a DIFFERENT turn_id must reconcile the wait.
-    let mut resume_message = MessageEnvelope::new(
-        "default",
-        MessageKind::OperatorPrompt,
-        MessageOrigin::Operator {
-            actor_id: Some("operator-1".into()),
-        },
-        AuthorityClass::OperatorInstruction,
-        Priority::Interject,
-        MessageBody::Text {
-            text: "resume prompt".into(),
-        },
-    );
+    // A later operator message with a DIFFERENT turn_id must first consume the
+    // canonical wait, then reconcile the legacy wait projection.
+    let mut resume_message = trusted_operator_prompt(Some("work-op-wait"), "resume prompt");
+    resume_message.priority = Priority::Interject;
     resume_message.turn_id = Some("turn-resume".into());
+    let resume_message = runtime.enqueue(resume_message).await.unwrap();
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("different-turn operator message should consume the canonical wait");
+    };
+    assert_eq!(scheduled.message.id, resume_message.id);
     runtime
-        .process_message(
-            resume_message,
-            closure_decision(ClosureOutcome::Completed, None),
-        )
+        .record_wait_reconciliation_signals(&scheduled.message)
         .await
         .unwrap();
 
@@ -8220,6 +9180,7 @@ async fn scheduler_repair_dry_run_and_apply_cancel_agent_wait() {
     };
     let dry_run = runtime.apply_scheduler_repair(request).await.unwrap();
     assert!(dry_run.dry_run);
+    assert!(dry_run.backup_path.is_none());
     assert_eq!(
         runtime
             .storage()
@@ -8242,6 +9203,8 @@ async fn scheduler_repair_dry_run_and_apply_cancel_agent_wait() {
         .await
         .unwrap();
     assert!(applied.changed);
+    let backup_path = applied.backup_path.expect("repair backup");
+    assert!(backup_path.exists());
     assert!(runtime
         .storage()
         .raw_active_wait_conditions_for_agent("default")
@@ -8296,7 +9259,6 @@ async fn scheduler_repair_only_drops_wake_only_queue_entries_with_occ() {
             scheduler_claim_work_item: None,
             scheduler_protocol_bootstrap: None,
             scheduler_protocol_commands: Vec::new(),
-            scheduler_rollout_expectations: Vec::new(),
             agent_state: None,
             message_evidence: vec![wake_message],
             transcript_entries: Vec::new(),
@@ -8321,6 +9283,10 @@ async fn scheduler_repair_only_drops_wake_only_queue_entries_with_occ() {
         .await
         .unwrap();
     assert_eq!(result.operation, "drop_wake_only_queue_entry");
+    assert!(result
+        .backup_path
+        .as_ref()
+        .is_some_and(|path| path.exists()));
     assert_eq!(
         runtime
             .storage()
@@ -8507,7 +9473,6 @@ async fn post_commit_agent_state_projection_does_not_overwrite_newer_memory() {
             scheduler_claim_work_item: None,
             scheduler_protocol_bootstrap: None,
             scheduler_protocol_commands: Vec::new(),
-            scheduler_rollout_expectations: Vec::new(),
             agent_state: Some(crate::runtime_db::transitions::AgentStateMutation {
                 expected: Some(Box::new(expected)),
                 record: Box::new(committed),

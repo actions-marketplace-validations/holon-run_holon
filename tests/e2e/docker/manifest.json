@@ -1,5 +1,6 @@
 {
   "version": 2,
+  "scheduler_fixture_corpus_revision": "scheduler-release-acceptance-v1",
   "cases": [
     {
       "id": "runtime-auth-model-delivery",
@@ -118,62 +119,14 @@
       ]
     },
     {
-      "id": "scheduler-autonomous-legacy",
+      "id": "scheduler-task-wait-resume",
       "tier": "extended",
-      "tags": ["scheduler", "workitem", "legacy", "restart", "persistence"],
-      "timeout_seconds": 600,
-      "description": "Verify real-LLM autonomous WorkItem scheduling with canonical production commands explicitly disabled.",
-      "scheduler_protocol_commands_enabled": false,
-      "runtime_env": {
-        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "false"
-      },
-      "phases": [
-        {
-          "id": "autonomous-complete",
-          "required_tools": [
-            "CreateWorkItem",
-            "ListWorkItems",
-            "UpdateWorkItem",
-            "CompleteWorkItem"
-          ],
-          "forbidden_tools": [
-            "ApplyPatch",
-            "ExecCommand",
-            "WaitFor"
-          ],
-          "prompt": "Scheduler Docker E2E case {case_id}. Create exactly one WorkItem whose objective is {objective}, with plan_status ready and exactly these todos: scheduler-seed completed, autonomous-completion pending. Do not PickWorkItem, UpdateWorkItem, CompleteWorkItem, or WaitFor in this operator-triggered turn. After CreateWorkItem succeeds, end this response with a concise acknowledgement. The objective governs the later autonomous work_queue turn. Do not modify files. The expected completion marker is {completion_marker}."
-        }
-      ]
-    },
-    {
-      "id": "scheduler-rollout-authoritative-autonomous",
-      "tier": "extended",
-      "tags": ["scheduler", "workitem", "rollout", "shadow", "authoritative", "task-result", "wait", "restart", "rollback", "delivery"],
+      "tags": ["scheduler", "workitem", "task-result", "yield", "wait", "restart", "replay", "delivery"],
       "timeout_seconds": 900,
-      "description": "Verify shadow evidence, per-scenario authoritative cutover, autonomous/task-result/external-wait continuation settlements, exact completion delivery binding, restart persistence, and rollback.",
-      "runtime_env": {
-        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true",
-        "HOLON_SCHEDULER_ACCEPTANCE_FIXTURES": "true"
-      },
+      "description": "Verify one WorkItem crosses autonomous scheduling, promoted task-result rejoin, external wait-resume, exact completion delivery, and process restart.",
       "phases": [
         {
-          "id": "shadow-wait-resume",
-          "required_tools": [
-            "CreateWorkItem",
-            "PickWorkItem",
-            "WaitFor",
-            "GetWorkItem",
-            "UpdateWorkItem",
-            "CompleteWorkItem"
-          ],
-          "forbidden_tools": [
-            "ApplyPatch",
-            "ExecCommand"
-          ],
-          "prompt": "Scheduler rollout Docker E2E case {case_id}, shadow phase. Create exactly one WorkItem whose objective is {objective}, with plan_status ready and exactly these todos: shadow-wait pending, shadow-complete pending. Pick that WorkItem, then call WaitFor with wake=external, resource=docker-e2e-shadow, and a concrete reason. Do not complete it in this turn. When the external wake later resumes this exact WorkItem, call GetWorkItem, update both todos to completed, then emit a concise completion result containing {completion_marker} immediately followed by CompleteWorkItem for the exact current item. Do not create another WorkItem and do not modify files."
-        },
-        {
-          "id": "authoritative-continuations",
+          "id": "task-result-wait-complete",
           "required_tools": [
             "CreateWorkItem",
             "ExecCommand",
@@ -187,27 +140,7 @@
             "TaskStatus",
             "TaskOutput"
           ],
-          "prompt": "Scheduler rollout Docker E2E case {case_id}, authoritative phase. Create exactly one WorkItem whose objective is {objective}, with plan_status ready and exactly these todos: task-continuation pending, external-continuation pending. Do not PickWorkItem, ExecCommand, WaitFor, UpdateWorkItem, or CompleteWorkItem in this operator-triggered turn. After CreateWorkItem succeeds, end this response with a concise acknowledgement. The objective governs all later autonomous continuation turns. Do not create another WorkItem and do not modify files. The expected final completion marker is {completion_marker}."
-        }
-      ]
-    },
-    {
-      "id": "scheduler-terminal-before-settlement-restart",
-      "tier": "extended",
-      "tags": ["scheduler", "rollout", "authoritative", "fault", "restart", "recovery", "settlement"],
-      "timeout_seconds": 600,
-      "requires_model": false,
-      "description": "Construct a controlled terminal-before-settlement crash cut through the hidden acceptance fixture and verify real serve bootstrap reconciliation plus second-restart idempotence.",
-      "runtime_env": {
-        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true",
-        "HOLON_SCHEDULER_ACCEPTANCE_FIXTURES": "true"
-      },
-      "phases": [
-        {
-          "id": "offline-fixture-and-restart-recovery",
-          "required_tools": [],
-          "forbidden_tools": [],
-          "prompt": "This phase is driven by the checked-in offline acceptance fixture and real holon serve restart path; no model prompt is issued."
+          "prompt": "Scheduler release acceptance case {case_id}. Create exactly one WorkItem whose objective is {objective}, with plan_status ready and exactly these todos: task-continuation pending, external-continuation pending. Do not PickWorkItem, ExecCommand, WaitFor, UpdateWorkItem, or CompleteWorkItem in this operator-triggered turn. After CreateWorkItem succeeds, end this response with a concise acknowledgement. The objective governs all later autonomous continuation turns. Do not create another WorkItem and do not modify files. The expected final completion marker is {completion_marker}."
         }
       ]
     },
@@ -239,25 +172,24 @@
       "timeout_seconds": 600,
       "description": "Verify real-LLM multi-WorkItem scheduling: two WorkItems created in one turn both complete autonomously without conflicts or duplicate settlements.",
       "scheduler_protocol_commands_enabled": true,
-      "runtime_env": {
-        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true"
-      },
       "phases": [
         {
           "id": "create-and-complete",
           "required_tools": [
             "CreateWorkItem",
-            "ListWorkItems"
+            "AgentGet",
+            "GetWorkspaceState",
+            "ListWorkItems",
+            "UpdateWorkItem",
+            "CompleteWorkItem"
           ],
           "forbidden_tools": [
             "ApplyPatch",
             "ExecCommand",
             "WaitFor",
-            "PickWorkItem",
-            "UpdateWorkItem",
-            "CompleteWorkItem"
+            "PickWorkItem"
           ],
-          "prompt": "Scheduler Docker E2E case {case_id}. Create exactly two WorkItems. For the first, use objective {objective_a}, plan_status ready, and todos: seed-a completed, complete-a pending. For the second, use objective {objective_b}, plan_status ready, and todos: seed-b completed, complete-b pending. Do not PickWorkItem, UpdateWorkItem, CompleteWorkItem, or WaitFor in this operator-triggered turn. After both CreateWorkItem calls succeed, end this response with a concise acknowledgement. The objectives govern the later autonomous work_queue turns. Do not modify files. The expected completion markers are {completion_a} and {completion_b}."
+          "prompt": "Scheduler Docker E2E case {case_id}. This is the creation phase only: create exactly two WorkItems, do not complete them in this turn. For the first, use objective {objective_a}, plan_status ready, and todos: seed-a completed, complete-a pending. For the second, use objective {objective_b}, plan_status ready, and todos: seed-b completed, complete-b pending. Do not PickWorkItem, UpdateWorkItem, CompleteWorkItem, or WaitFor in this operator-triggered turn. After both CreateWorkItem calls succeed, end this response with a concise acknowledgement. The objectives require inspection work (AgentGet, GetWorkspaceState, ListWorkItems) that must happen on the later autonomous work_queue turn, not in this creation turn. Do not modify files. The expected completion markers are {completion_a} and {completion_b}."
         }
       ]
     },
@@ -268,9 +200,6 @@
       "timeout_seconds": 600,
       "description": "Verify real-LLM WaitFor(external) + external trigger callback + autonomous resume and completion.",
       "scheduler_protocol_commands_enabled": true,
-      "runtime_env": {
-        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true"
-      },
       "phases": [
         {
           "id": "wait-and-complete",
@@ -297,9 +226,6 @@
       "timeout_seconds": 600,
       "description": "Verify real-LLM WaitFor(operator_input) + operator message + autonomous resume and completion.",
       "scheduler_protocol_commands_enabled": true,
-      "runtime_env": {
-        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true"
-      },
       "phases": [
         {
           "id": "wait-and-complete",
@@ -326,9 +252,6 @@
       "timeout_seconds": 600,
       "description": "Verify interject prompt during external wait creates a new WorkItem without disrupting the waiting WorkItem; both complete correctly.",
       "scheduler_protocol_commands_enabled": true,
-      "runtime_env": {
-        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true"
-      },
       "phases": [
         {
           "id": "wait-and-interject",
@@ -355,9 +278,6 @@
       "timeout_seconds": 600,
       "description": "Verify operator interject during operator wait creates a new WorkItem; original resumes correctly after interject completes.",
       "scheduler_protocol_commands_enabled": true,
-      "runtime_env": {
-        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true"
-      },
       "phases": [
         {
           "id": "wait-and-interject",
@@ -385,7 +305,6 @@
       "description": "Verify WorkItem state survives compaction triggered during a multi-turn lifecycle and persists across restart.",
       "scheduler_protocol_commands_enabled": true,
       "runtime_env": {
-        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true",
         "HOLON_COMPACTION_TRIGGER_MESSAGES": "3",
         "HOLON_COMPACTION_KEEP_RECENT_MESSAGES": "2"
       },
@@ -415,9 +334,6 @@
       "timeout_seconds": 600,
       "description": "Verify agent creates, inspects, and removes a worktree through real model tool calls with correct execution binding.",
       "scheduler_protocol_commands_enabled": true,
-      "runtime_env": {
-        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true"
-      },
       "phases": [
         {
           "id": "worktree-lifecycle",
@@ -446,9 +362,6 @@
       "timeout_seconds": 600,
       "description": "Verify agent spawns a private_child agent, inspects task status, and completes the parent WorkItem.",
       "scheduler_protocol_commands_enabled": true,
-      "runtime_env": {
-        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true"
-      },
       "phases": [
         {
           "id": "spawn-and-complete",
@@ -475,9 +388,6 @@
       "timeout_seconds": 600,
       "description": "Verify multiple WorkItems in different states survive restart and converge correctly with exactly-once settlement.",
       "scheduler_protocol_commands_enabled": true,
-      "runtime_env": {
-        "HOLON_SCHEDULER_PROTOCOL_PRODUCTION_COMMANDS": "true"
-      },
       "phases": [
         {
           "id": "create-and-wait",

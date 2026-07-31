@@ -4374,6 +4374,13 @@
                 "minimum": 0,
                 "type": "integer"
               },
+              "scheduler": {
+                "enum": [
+                  "legacy",
+                  "canonical"
+                ],
+                "type": "string"
+              },
               "unknown_model_fallback_configured": {
                 "type": "boolean"
               },
@@ -4469,6 +4476,7 @@
               "default_tool_output_tokens",
               "max_tool_output_tokens",
               "disable_provider_fallback",
+              "scheduler",
               "runtime_db_retention",
               "providers",
               "web_search",
@@ -4807,6 +4815,13 @@
                 "minimum": 0,
                 "type": "integer"
               },
+              "scheduler": {
+                "enum": [
+                  "legacy",
+                  "canonical"
+                ],
+                "type": "string"
+              },
               "unknown_model_fallback_configured": {
                 "type": "boolean"
               },
@@ -4902,6 +4917,7 @@
               "default_tool_output_tokens",
               "max_tool_output_tokens",
               "disable_provider_fallback",
+              "scheduler",
               "runtime_db_retention",
               "providers",
               "web_search",
@@ -5274,6 +5290,12 @@
           "after": true,
           "agent_id": {
             "type": "string"
+          },
+          "backup_path": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "before": true,
           "changed": {
@@ -11398,7 +11420,7 @@
         ]
       },
       "post": {
-        "description": "Dry-run or apply one OCC-guarded scheduler repair operation and emit an audit event for committed changes.",
+        "description": "Dry-run or apply one OCC-guarded scheduler repair operation. Non-dry-run requests create and verify a SQLite backup before committing and emit an audit event.",
         "operationId": "applySchedulerRepair",
         "parameters": [
           {

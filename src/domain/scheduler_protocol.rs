@@ -1,8 +1,7 @@
 //! Pure deterministic scheduler protocol kernel.
 //!
 //! This module is the production home of the executable Scheduler / WorkItem
-//! baseline. It is intentionally storage-independent and has no call site in
-//! the production scheduler while the legacy scheduler remains authoritative.
+//! baseline. It is intentionally storage-independent.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -19,11 +18,9 @@ pub struct Snapshot {
     pub work: BTreeMap<String, WorkDemand>,
     pub waits: BTreeMap<String, WaitRecord>,
     pub activations: BTreeMap<String, ActivationRecord>,
-    pub activation_authorities: BTreeMap<String, ActivationAdmissionAuthority>,
     pub activation_admissions: BTreeMap<String, AdmitActivationCommand>,
     pub settlements: BTreeMap<String, ActivationSettlement>,
     pub missing_settlements: BTreeMap<String, MissingSettlementRecord>,
-    pub rollout: RolloutState,
     pub admitted_generations: BTreeSet<String>,
     pub continuation_admissions: BTreeMap<String, ContinuationAdmissionRecord>,
     #[serde(default)]
@@ -40,11 +37,9 @@ struct SnapshotWire {
     work: Option<BTreeMap<String, WorkDemand>>,
     waits: Option<BTreeMap<String, WaitRecord>>,
     activations: Option<BTreeMap<String, ActivationRecord>>,
-    activation_authorities: Option<BTreeMap<String, ActivationAdmissionAuthority>>,
     activation_admissions: Option<BTreeMap<String, AdmitActivationCommand>>,
     settlements: Option<BTreeMap<String, ActivationSettlement>>,
     missing_settlements: Option<BTreeMap<String, MissingSettlementRecord>>,
-    rollout: Option<RolloutState>,
     admitted_generations: Option<BTreeSet<String>>,
     continuation_admissions: Option<BTreeMap<String, ContinuationAdmissionRecord>>,
     #[serde(default)]
@@ -67,13 +62,7 @@ impl TryFrom<SnapshotWire> for Snapshot {
         let activations = wire
             .activations
             .ok_or_else(|| "snapshot is missing canonical activation records".to_string())?;
-        let rollout = wire
-            .rollout
-            .ok_or_else(|| "snapshot is missing canonical rollout state".to_string())?;
         let dispatch = wire.dispatch.into_snapshot_dispatch(&waits)?;
-        let activation_authorities = wire
-            .activation_authorities
-            .ok_or_else(|| "snapshot is missing canonical activation authorities".to_string())?;
         let activation_admissions = wire
             .activation_admissions
             .ok_or_else(|| "snapshot is missing canonical activation admissions".to_string())?;
@@ -97,11 +86,9 @@ impl TryFrom<SnapshotWire> for Snapshot {
             work,
             waits,
             activations,
-            activation_authorities,
             activation_admissions,
             settlements,
             missing_settlements,
-            rollout,
             admitted_generations,
             continuation_admissions,
             activation_inputs: wire.activation_inputs.unwrap_or_default(),
@@ -339,61 +326,6 @@ pub enum WaitState {
     Resolved,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RolloutState {
-    pub protocol_mode: ProtocolMode,
-    pub config_revision: u64,
-    #[serde(default)]
-    pub latest_preflight_revision: u64,
-    #[serde(default)]
-    pub preflights: BTreeMap<u64, RolloutPreflightRecord>,
-    #[serde(default)]
-    pub manifest: Option<RolloutManifest>,
-    #[serde(default)]
-    pub scenarios: BTreeMap<String, ScenarioAuthority>,
-    #[serde(default)]
-    pub hard_blockers: BTreeSet<ScenarioHardBlockerRecord>,
-}
-
-impl Default for RolloutState {
-    fn default() -> Self {
-        Self {
-            protocol_mode: ProtocolMode::Legacy,
-            config_revision: 0,
-            latest_preflight_revision: 0,
-            preflights: BTreeMap::new(),
-            manifest: None,
-            scenarios: BTreeMap::new(),
-            hard_blockers: BTreeSet::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RolloutPreflightRecord {
-    pub revision: u64,
-    pub manifest_revision: u64,
-    pub state: RolloutPreflightState,
-    #[serde(default)]
-    pub manifest: Option<RolloutManifest>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RolloutPreflightState {
-    Open,
-    Completed,
-    Consumed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProtocolMode {
-    Legacy,
-    Shadow,
-    Authoritative,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScenarioMode {
@@ -410,24 +342,12 @@ pub enum SchedulerScenarioClass {
     ExactWaitResume,
     ExplicitlyBoundOperatorInput,
     WorkItemAutonomousContinuation,
-    OrdinarySemanticOperatorBinding,
     OperatorInterjection,
     Settlement,
     Delivery,
 }
 
 impl SchedulerScenarioClass {
-    pub const PRODUCTION_AUTHORITY: [Self; 8] = [
-        Self::ReducerOnlyCandidates,
-        Self::WorkItemAutonomousContinuation,
-        Self::ExactTaskRejoin,
-        Self::ExactWaitResume,
-        Self::ExplicitlyBoundOperatorInput,
-        Self::Settlement,
-        Self::OperatorInterjection,
-        Self::Delivery,
-    ];
-
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ReducerOnlyCandidates => "reducer_only_candidates",
@@ -435,123 +355,11 @@ impl SchedulerScenarioClass {
             Self::ExactWaitResume => "exact_wait_resume",
             Self::ExplicitlyBoundOperatorInput => "explicitly_bound_operator_input",
             Self::WorkItemAutonomousContinuation => "work_item_autonomous_continuation",
-            Self::OrdinarySemanticOperatorBinding => "ordinary_semantic_operator_binding",
             Self::OperatorInterjection => "operator_interjection",
             Self::Settlement => "settlement",
             Self::Delivery => "delivery",
         }
     }
-
-    pub const fn authoritative_dependencies(self) -> &'static [Self] {
-        match self {
-            Self::OperatorInterjection => &[
-                Self::WorkItemAutonomousContinuation,
-                Self::ExactTaskRejoin,
-                Self::ExactWaitResume,
-                Self::ExplicitlyBoundOperatorInput,
-                Self::Settlement,
-            ],
-            _ => &[],
-        }
-    }
-}
-
-impl std::str::FromStr for SchedulerScenarioClass {
-    type Err = ();
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "reducer_only_candidates" => Ok(Self::ReducerOnlyCandidates),
-            "exact_task_rejoin" => Ok(Self::ExactTaskRejoin),
-            "exact_wait_resume" => Ok(Self::ExactWaitResume),
-            "explicitly_bound_operator_input" => Ok(Self::ExplicitlyBoundOperatorInput),
-            "work_item_autonomous_continuation" => Ok(Self::WorkItemAutonomousContinuation),
-            "ordinary_semantic_operator_binding" => Ok(Self::OrdinarySemanticOperatorBinding),
-            "operator_interjection" => Ok(Self::OperatorInterjection),
-            "settlement" => Ok(Self::Settlement),
-            "delivery" => Ok(Self::Delivery),
-            _ => Err(()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RolloutManifest {
-    pub revision: u64,
-    pub preflight_revision: u64,
-    pub preflight_for_manifest_revision: u64,
-    pub preflight_succeeded: bool,
-    pub protocol_build: String,
-    pub schema_build: String,
-    pub schema_revision: u64,
-    pub fixture_corpus_revision: String,
-    pub classes: BTreeMap<String, RolloutClassEvidence>,
-    pub safety_divergence_bps: u32,
-    pub canonical_state_divergence_bps: u32,
-    pub allowed_observational_divergence: BTreeMap<String, ObservationalDivergenceAllowance>,
-    pub approver: String,
-    pub approved_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObservationalDivergenceAllowance {
-    pub maximum_rate_bps: u32,
-    pub reviewed_by: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RolloutClassEvidence {
-    pub configured_mode: ScenarioMode,
-    pub minimum_shadow_samples: u64,
-    pub minimum_shadow_duration_secs: u64,
-    pub observed_shadow_samples: u64,
-    pub observed_shadow_duration_secs: u64,
-    pub maximum_p99_latency_regression_bps: u32,
-    pub observed_p99_latency_regression_bps: u32,
-    pub hard_blocker_count: u64,
-    pub unresolved_divergence_count: u64,
-    pub required_evidence: BTreeSet<String>,
-    pub verified_evidence: BTreeSet<String>,
-    pub rollback_policy: RollbackPolicy,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RollbackPolicy {
-    pub trigger: RollbackTrigger,
-    pub action: RollbackAction,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RollbackTrigger {
-    AnyHardBlocker,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RollbackAction {
-    StopAdmissionsAndRevert { target: ScenarioMode },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct ScenarioHardBlockerRecord {
-    pub scenario_class: String,
-    pub blocker_code: String,
-    pub config_revision: u64,
-    pub manifest_revision: u64,
-    pub preflight_revision: u64,
-    pub trigger: RollbackTrigger,
-    pub action: RollbackAction,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScenarioAuthority {
-    pub mode: ScenarioMode,
-    pub rollback_target: ScenarioMode,
-    #[serde(default)]
-    pub manifest_revision: Option<u64>,
-    #[serde(default)]
-    pub preflight_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -567,16 +375,6 @@ pub struct AgentActivation {
     pub source_revision: Option<u64>,
     pub idempotency_key: String,
     pub provenance: ActivationProvenance,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ActivationAdmissionAuthority {
-    pub authority_id: String,
-    pub activation: AgentActivation,
-    pub expected_scheduling_generation: u64,
-    pub expected_dispatch_revision: u64,
-    #[serde(default)]
-    pub consumed_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -903,14 +701,6 @@ pub struct AdmitActivationCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IssueActivationAuthorityCommand {
-    pub authority_id: String,
-    pub activation: AgentActivation,
-    pub expected_scheduling_generation: u64,
-    pub expected_dispatch_revision: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettleActivationCommand {
     pub settlement: ActivationSettlement,
 }
@@ -960,6 +750,29 @@ pub struct AdoptLegacyWorkStateCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleWaitHandoffProof {
+    pub wait: WaitIdentity,
+    pub expected_dispatch_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdoptActivationWorkStateCommand {
+    pub source_activation_id: String,
+    pub source_message_id: String,
+    pub source_turn_id: String,
+    pub source_admitted_generation: u64,
+    pub work_item_id: String,
+    pub source_work_item_revision: u64,
+    pub wait: LegacyWaitAdoption,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_lifecycle_wait: Option<LifecycleWaitHandoffProof>,
+    #[serde(default)]
+    pub focus: bool,
+    #[serde(default)]
+    pub reserve_dispatch: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LegacyCompletionReport {
     pub turn_terminal: String,
     pub operator_delivery: String,
@@ -980,8 +793,6 @@ pub struct LegacyEventMigrationContext {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LegacyEventMigration {
-    #[serde(default)]
-    pub authority_command: Option<IssueActivationAuthorityCommand>,
     pub command: ProtocolCommand,
     pub outcome: ProtocolCommandOutcome,
 }
@@ -1085,54 +896,12 @@ pub struct AttachActivationInputCommand {
 pub enum ProtocolCommand {
     RegisterWorkDemand(RegisterWorkDemandCommand),
     AdoptLegacyWorkState(AdoptLegacyWorkStateCommand),
-    IssueActivationAuthority(IssueActivationAuthorityCommand),
+    AdoptActivationWorkState(AdoptActivationWorkStateCommand),
     AdmitActivation(AdmitActivationCommand),
     SettleActivation(SettleActivationCommand),
     RecordMissingSettlement(MissingSettlementRecord),
     TriggerWait(TriggerWaitCommand),
     AttachActivationInput(AttachActivationInputCommand),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RolloutCommand {
-    ConfigureProtocol {
-        expected_config_revision: u64,
-        mode: ProtocolMode,
-    },
-    OpenPreflight {
-        expected_config_revision: u64,
-        manifest_revision: u64,
-    },
-    CompletePreflight {
-        expected_config_revision: u64,
-        expected_preflight_revision: u64,
-        manifest: RolloutManifest,
-    },
-    InstallManifest {
-        expected_config_revision: u64,
-        manifest: RolloutManifest,
-    },
-    ChangeScenarioAuthority {
-        scenario_class: String,
-        expected_config_revision: u64,
-        expected_manifest_revision: u64,
-        expected_preflight_revision: u64,
-        mode: ScenarioMode,
-    },
-    ChangeScenarioAuthorityFromExplicitMode {
-        scenario_class: String,
-        expected_config_revision: u64,
-        expected_manifest_revision: u64,
-        expected_preflight_revision: u64,
-    },
-    ReportScenarioHardBlocker {
-        scenario_class: String,
-        blocker_code: String,
-        expected_config_revision: u64,
-        expected_manifest_revision: u64,
-        expected_preflight_revision: u64,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1184,43 +953,6 @@ pub enum Event {
     UpdateMetadata {
         work_item_id: String,
         expected_metadata_revision: u64,
-    },
-    ConfigureProtocol {
-        expected_config_revision: u64,
-        mode: ProtocolMode,
-    },
-    OpenRolloutPreflight {
-        expected_config_revision: u64,
-        manifest_revision: u64,
-    },
-    CompleteRolloutPreflight {
-        expected_config_revision: u64,
-        expected_preflight_revision: u64,
-        manifest: RolloutManifest,
-    },
-    InstallRolloutManifest {
-        expected_config_revision: u64,
-        manifest: RolloutManifest,
-    },
-    ChangeScenarioAuthority {
-        scenario_class: String,
-        expected_config_revision: u64,
-        expected_manifest_revision: u64,
-        expected_preflight_revision: u64,
-        mode: ScenarioMode,
-    },
-    ChangeScenarioAuthorityFromExplicitMode {
-        scenario_class: String,
-        expected_config_revision: u64,
-        expected_manifest_revision: u64,
-        expected_preflight_revision: u64,
-    },
-    ReportScenarioHardBlocker {
-        scenario_class: String,
-        blocker_code: String,
-        expected_config_revision: u64,
-        expected_manifest_revision: u64,
-        expected_preflight_revision: u64,
     },
     OperatorIntervention {
         input_id: String,
@@ -1430,17 +1162,10 @@ pub struct Outcome {
 pub enum Decision {
     WorkDemandRegistered,
     LegacyWorkStateAdopted,
-    AuthorityIssued,
     Admitted,
     Settled,
     WaitTriggered,
     MetadataUpdated,
-    ProtocolConfigured,
-    RolloutPreflightOpened,
-    RolloutPreflightCompleted,
-    ManifestInstalled,
-    ScenarioAuthorityChanged,
-    RollbackTripped,
     DuplicateIgnored,
     OperatorIntervention,
     ActivationInputAttached,
@@ -1454,85 +1179,6 @@ pub fn reduce(snapshot: &Snapshot, event: &Event) -> Outcome {
         return rejected(snapshot, "typed_protocol_command_required");
     }
     reduce_event(snapshot, event)
-}
-
-pub fn reduce_rollout_command(
-    snapshot: &Snapshot,
-    command: &RolloutCommand,
-) -> ProtocolCommandOutcome {
-    let event = match command {
-        RolloutCommand::ConfigureProtocol {
-            expected_config_revision,
-            mode,
-        } => Event::ConfigureProtocol {
-            expected_config_revision: *expected_config_revision,
-            mode: *mode,
-        },
-        RolloutCommand::OpenPreflight {
-            expected_config_revision,
-            manifest_revision,
-        } => Event::OpenRolloutPreflight {
-            expected_config_revision: *expected_config_revision,
-            manifest_revision: *manifest_revision,
-        },
-        RolloutCommand::CompletePreflight {
-            expected_config_revision,
-            expected_preflight_revision,
-            manifest,
-        } => Event::CompleteRolloutPreflight {
-            expected_config_revision: *expected_config_revision,
-            expected_preflight_revision: *expected_preflight_revision,
-            manifest: manifest.clone(),
-        },
-        RolloutCommand::InstallManifest {
-            expected_config_revision,
-            manifest,
-        } => Event::InstallRolloutManifest {
-            expected_config_revision: *expected_config_revision,
-            manifest: manifest.clone(),
-        },
-        RolloutCommand::ChangeScenarioAuthority {
-            scenario_class,
-            expected_config_revision,
-            expected_manifest_revision,
-            expected_preflight_revision,
-            mode,
-        } => Event::ChangeScenarioAuthority {
-            scenario_class: scenario_class.clone(),
-            expected_config_revision: *expected_config_revision,
-            expected_manifest_revision: *expected_manifest_revision,
-            expected_preflight_revision: *expected_preflight_revision,
-            mode: *mode,
-        },
-        RolloutCommand::ChangeScenarioAuthorityFromExplicitMode {
-            scenario_class,
-            expected_config_revision,
-            expected_manifest_revision,
-            expected_preflight_revision,
-        } => Event::ChangeScenarioAuthorityFromExplicitMode {
-            scenario_class: scenario_class.clone(),
-            expected_config_revision: *expected_config_revision,
-            expected_manifest_revision: *expected_manifest_revision,
-            expected_preflight_revision: *expected_preflight_revision,
-        },
-        RolloutCommand::ReportScenarioHardBlocker {
-            scenario_class,
-            blocker_code,
-            expected_config_revision,
-            expected_manifest_revision,
-            expected_preflight_revision,
-        } => Event::ReportScenarioHardBlocker {
-            scenario_class: scenario_class.clone(),
-            blocker_code: blocker_code.clone(),
-            expected_config_revision: *expected_config_revision,
-            expected_manifest_revision: *expected_manifest_revision,
-            expected_preflight_revision: *expected_preflight_revision,
-        },
-    };
-    let outcome = reduce_event(snapshot, &event);
-    let conflict =
-        (outcome.decision == Decision::Rejected).then(|| reducer_conflict(&outcome.diagnostics[0]));
-    ProtocolCommandOutcome { outcome, conflict }
 }
 
 pub fn migrate_legacy_event(
@@ -1551,7 +1197,7 @@ pub fn migrate_legacy_event(
         ));
     }
 
-    let (command, authority_command) = match event {
+    let command = match event {
         Event::Admit {
             activation_id,
             owner,
@@ -1671,28 +1317,16 @@ pub fn migrate_legacy_event(
                 expected_scheduling_generation: *expected_generation,
                 expected_dispatch_revision: *expected_dispatch_revision,
             };
-            let authority_command = IssueActivationAuthorityCommand {
-                authority_id: command.authority_id.clone(),
-                activation: command.activation.clone(),
-                expected_scheduling_generation: command.expected_scheduling_generation,
-                expected_dispatch_revision: command.expected_dispatch_revision,
-            };
-            (
-                ProtocolCommand::AdmitActivation(command),
-                Some(authority_command),
-            )
+            ProtocolCommand::AdmitActivation(command)
         }
         Event::Settle {
             activation_id,
             settlement: Settlement::Missing,
-        } => (
-            ProtocolCommand::RecordMissingSettlement(MissingSettlementRecord {
-                id: context.record_id.clone(),
-                activation_id: activation_id.clone(),
-                created_at: context.recorded_at.clone(),
-            }),
-            None,
-        ),
+        } => ProtocolCommand::RecordMissingSettlement(MissingSettlementRecord {
+            id: context.record_id.clone(),
+            activation_id: activation_id.clone(),
+            created_at: context.recorded_at.clone(),
+        }),
         Event::Settle {
             activation_id,
             settlement,
@@ -1765,23 +1399,20 @@ pub fn migrate_legacy_event(
                     "legacy_completion_report_required",
                 ));
             }
-            (
-                ProtocolCommand::SettleActivation(SettleActivationCommand {
-                    settlement: ActivationSettlement {
-                        id: context.record_id.clone(),
-                        activation_id: activation_id.clone(),
-                        turn_terminal: report.map(|report| report.turn_terminal.clone()),
-                        disposition,
-                        agent_dispatch,
-                        operator_delivery: report.map(|report| report.operator_delivery.clone()),
-                        evidence: report
-                            .map(|report| report.evidence.clone())
-                            .unwrap_or_default(),
-                        created_at: context.recorded_at.clone(),
-                    },
-                }),
-                None,
-            )
+            ProtocolCommand::SettleActivation(SettleActivationCommand {
+                settlement: ActivationSettlement {
+                    id: context.record_id.clone(),
+                    activation_id: activation_id.clone(),
+                    turn_terminal: report.map(|report| report.turn_terminal.clone()),
+                    disposition,
+                    agent_dispatch,
+                    operator_delivery: report.map(|report| report.operator_delivery.clone()),
+                    evidence: report
+                        .map(|report| report.evidence.clone())
+                        .unwrap_or_default(),
+                    created_at: context.recorded_at.clone(),
+                },
+            })
         }
         _ => {
             return Err(command_conflict(
@@ -1791,32 +1422,11 @@ pub fn migrate_legacy_event(
         }
     };
 
-    let authorized = if let Some(authority_command) = &authority_command {
-        let issued = reduce_command(
-            snapshot,
-            &ProtocolCommand::IssueActivationAuthority(authority_command.clone()),
-        );
-        if issued.outcome.decision == Decision::Rejected {
-            return Err(issued.conflict.unwrap_or_else(|| {
-                command_conflict(
-                    ProtocolConflictKind::AuthorityConflict,
-                    "legacy_migration_authority_conflict",
-                )
-            }));
-        }
-        issued.outcome.snapshot
-    } else {
-        snapshot.clone()
-    };
-    let mut outcome = reduce_command(&authorized, &command);
+    let mut outcome = reduce_command(snapshot, &command);
     if outcome.outcome.decision == Decision::Rejected {
         outcome.outcome.snapshot = snapshot.clone();
     }
-    Ok(LegacyEventMigration {
-        authority_command,
-        command,
-        outcome,
-    })
+    Ok(LegacyEventMigration { command, outcome })
 }
 
 fn reduce_event(snapshot: &Snapshot, event: &Event) -> Outcome {
@@ -1851,71 +1461,6 @@ fn reduce_event(snapshot: &Snapshot, event: &Event) -> Outcome {
             work_item_id,
             expected_metadata_revision,
         } => update_metadata(snapshot, work_item_id, *expected_metadata_revision),
-        Event::ConfigureProtocol {
-            expected_config_revision,
-            mode,
-        } => configure_protocol(snapshot, *expected_config_revision, *mode),
-        Event::OpenRolloutPreflight {
-            expected_config_revision,
-            manifest_revision,
-        } => open_rollout_preflight(snapshot, *expected_config_revision, *manifest_revision),
-        Event::CompleteRolloutPreflight {
-            expected_config_revision,
-            expected_preflight_revision,
-            manifest,
-        } => complete_rollout_preflight(
-            snapshot,
-            *expected_config_revision,
-            *expected_preflight_revision,
-            manifest,
-        ),
-        Event::InstallRolloutManifest {
-            expected_config_revision,
-            manifest,
-        } => install_rollout_manifest(snapshot, *expected_config_revision, manifest),
-        Event::ChangeScenarioAuthority {
-            scenario_class,
-            expected_config_revision,
-            expected_manifest_revision,
-            expected_preflight_revision,
-            mode,
-        } => change_scenario_authority(
-            snapshot,
-            scenario_class,
-            *expected_config_revision,
-            *expected_manifest_revision,
-            *expected_preflight_revision,
-            *mode,
-            false,
-        ),
-        Event::ChangeScenarioAuthorityFromExplicitMode {
-            scenario_class,
-            expected_config_revision,
-            expected_manifest_revision,
-            expected_preflight_revision,
-        } => change_scenario_authority(
-            snapshot,
-            scenario_class,
-            *expected_config_revision,
-            *expected_manifest_revision,
-            *expected_preflight_revision,
-            ScenarioMode::Authoritative,
-            true,
-        ),
-        Event::ReportScenarioHardBlocker {
-            scenario_class,
-            blocker_code,
-            expected_config_revision,
-            expected_manifest_revision,
-            expected_preflight_revision,
-        } => report_scenario_hard_blocker(
-            snapshot,
-            scenario_class,
-            blocker_code,
-            *expected_config_revision,
-            *expected_manifest_revision,
-            *expected_preflight_revision,
-        ),
         Event::OperatorIntervention { input_id } => Outcome {
             decision: Decision::OperatorIntervention,
             transitions: Vec::new(),
@@ -1942,8 +1487,8 @@ pub fn reduce_command(snapshot: &Snapshot, command: &ProtocolCommand) -> Protoco
     if let ProtocolCommand::AdoptLegacyWorkState(command) = command {
         return adopt_legacy_work_state(snapshot, command);
     }
-    if let ProtocolCommand::IssueActivationAuthority(command) = command {
-        return issue_activation_authority(snapshot, command);
+    if let ProtocolCommand::AdoptActivationWorkState(command) = command {
+        return adopt_activation_work_state(snapshot, command);
     }
     let event = match lower_command(snapshot, command) {
         Ok(event) => event,
@@ -1954,12 +1499,6 @@ pub fn reduce_command(snapshot: &Snapshot, command: &ProtocolCommand) -> Protoco
     let mut outcome = reduce_event(snapshot, &event);
     match (command, &outcome.decision) {
         (ProtocolCommand::AdmitActivation(command), Decision::Admitted) => {
-            outcome
-                .snapshot
-                .activation_authorities
-                .get_mut(&command.authority_id)
-                .expect("validated activation authority exists")
-                .consumed_by = Some(command.activation.id.clone());
             outcome
                 .snapshot
                 .activation_admissions
@@ -2102,19 +1641,68 @@ fn replay_or_conflict(
                 );
             }
         }
-        ProtocolCommand::IssueActivationAuthority(command) => {
-            if let Some(existing) = snapshot.activation_authorities.get(&command.authority_id) {
-                return Some(if authority_matches_issue(existing, command) {
-                    duplicate_command(snapshot, "activation_authority_already_issued")
-                } else {
-                    rejected_command(
+        ProtocolCommand::AdoptActivationWorkState(command) => {
+            if let Some(existing) = snapshot.work.get(&command.work_item_id) {
+                let wait_matches = snapshot
+                    .waits
+                    .get(&command.wait.wait_id)
+                    .is_some_and(|wait| {
+                        wait.current_generation == command.wait.generation
+                            && wait.generations.get(&command.wait.generation)
+                                == Some(&WaitGenerationRecord {
+                                    owner: SchedulerOwner::WorkItem {
+                                        work_item_id: command.work_item_id.clone(),
+                                    },
+                                    state: WaitState::Active,
+                                    trigger: None,
+                                    consuming_activation_id: None,
+                                })
+                    });
+                if existing.metadata_revision == command.source_work_item_revision
+                    && existing.scheduling_generation == command.wait.generation
+                    && existing.status
+                        == (WorkStatus::Waiting {
+                            wait_id: command.wait.wait_id.clone(),
+                        })
+                    && wait_matches
+                    && (!command.focus
+                        || snapshot.focus.as_deref() == Some(command.work_item_id.as_str()))
+                    && (!command.reserve_dispatch
+                        || snapshot.dispatch
+                            == (AgentDispatchState::Awaiting {
+                                wait: WaitIdentity {
+                                    id: command.wait.wait_id.clone(),
+                                    generation: command.wait.generation,
+                                },
+                            }))
+                {
+                    return Some(duplicate_command(
+                        snapshot,
+                        "activation_work_state_already_adopted",
+                    ));
+                }
+                if existing.metadata_revision < command.source_work_item_revision {
+                    return None;
+                }
+                if existing.metadata_revision > command.source_work_item_revision {
+                    return Some(rejected_command(
                         snapshot,
                         command_conflict(
-                            ProtocolConflictKind::AuthorityConflict,
-                            "activation_authority_id_command_conflict",
+                            ProtocolConflictKind::StaleRevision,
+                            "activation_work_state_adoption_stale_revision",
                         ),
-                    )
-                });
+                    ));
+                }
+                if existing.scheduling_generation < command.wait.generation {
+                    return None;
+                }
+                return Some(rejected_command(
+                    snapshot,
+                    command_conflict(
+                        ProtocolConflictKind::StaleGeneration,
+                        "activation_work_state_adoption_stale_generation",
+                    ),
+                ));
             }
         }
         ProtocolCommand::AdmitActivation(command) => {
@@ -2139,6 +1727,19 @@ fn replay_or_conflict(
                     command_conflict(
                         ProtocolConflictKind::IdempotencyConflict,
                         "activation_idempotency_key_conflict",
+                    ),
+                ));
+            }
+            if snapshot
+                .activation_admissions
+                .values()
+                .any(|existing| existing.authority_id == command.authority_id)
+            {
+                return Some(rejected_command(
+                    snapshot,
+                    command_conflict(
+                        ProtocolConflictKind::AuthorityConflict,
+                        "activation_authority_id_command_conflict",
                     ),
                 ));
             }
@@ -2256,15 +1857,12 @@ fn lower_command(
     command: &ProtocolCommand,
 ) -> Result<Event, ProtocolConflict> {
     match command {
-        ProtocolCommand::RegisterWorkDemand(_) | ProtocolCommand::AdoptLegacyWorkState(_) => {
+        ProtocolCommand::RegisterWorkDemand(_)
+        | ProtocolCommand::AdoptLegacyWorkState(_)
+        | ProtocolCommand::AdoptActivationWorkState(_) => {
             unreachable!("work demand mutations are reduced directly")
         }
-        ProtocolCommand::IssueActivationAuthority(_) => {
-            unreachable!("authority issuance is reduced directly")
-        }
-        ProtocolCommand::AdmitActivation(command) => {
-            lower_admit_activation(snapshot, command, false)
-        }
+        ProtocolCommand::AdmitActivation(command) => lower_admit_activation(command),
         ProtocolCommand::SettleActivation(command) => {
             if !snapshot
                 .activation_admissions
@@ -2453,6 +2051,17 @@ fn adopt_legacy_work_state(
             ),
         );
     }
+    let source_dispatch_wait = snapshot
+        .work
+        .get(&command.work_item_id)
+        .and_then(|demand| match &demand.status {
+            WorkStatus::Waiting { wait_id } => Some(WaitIdentity {
+                id: wait_id.clone(),
+                generation: demand.scheduling_generation,
+            }),
+            _ => None,
+        })
+        .filter(|wait| snapshot.dispatch == (AgentDispatchState::Awaiting { wait: wait.clone() }));
     if command.focus
         && snapshot
             .focus
@@ -2523,7 +2132,10 @@ fn adopt_legacy_work_state(
             }
         }
     }
-    if command.reserve_dispatch && snapshot.dispatch != AgentDispatchState::Open {
+    if command.reserve_dispatch
+        && snapshot.dispatch != AgentDispatchState::Open
+        && source_dispatch_wait.is_none()
+    {
         return rejected_command(
             snapshot,
             command_conflict(
@@ -2555,9 +2167,16 @@ fn adopt_legacy_work_state(
     let mut next = snapshot.clone();
     if let Some(existing) = next.work.get(&command.work_item_id) {
         if let WorkStatus::Waiting { wait_id } = &existing.status {
-            if command.wait.as_ref().map(|wait| wait.wait_id.as_str()) != Some(wait_id.as_str()) {
+            let existing_wait = WaitIdentity {
+                id: wait_id.clone(),
+                generation: existing.scheduling_generation,
+            };
+            let target_preserves_generation = command.wait.as_ref().is_some_and(|wait| {
+                wait.wait_id == existing_wait.id && wait.generation == existing_wait.generation
+            });
+            if !target_preserves_generation {
                 if let Some(wait) = next.waits.get_mut(wait_id) {
-                    if let Some(generation) = wait.generations.get_mut(&wait.current_generation) {
+                    if let Some(generation) = wait.generations.get_mut(&existing_wait.generation) {
                         if matches!(generation.state, WaitState::Active | WaitState::Triggered) {
                             generation.state = WaitState::Resolved;
                             generation.trigger = None;
@@ -2570,32 +2189,48 @@ fn adopt_legacy_work_state(
     next.work
         .insert(command.work_item_id.clone(), command.demand.clone());
     if let Some(wait) = &command.wait {
-        next.waits.insert(
-            wait.wait_id.clone(),
-            WaitRecord {
-                current_generation: wait.generation,
-                generations: BTreeMap::from([(
-                    wait.generation,
-                    WaitGenerationRecord {
-                        owner: SchedulerOwner::WorkItem {
-                            work_item_id: wait.owner_work_item_id.clone(),
-                        },
-                        state: WaitState::Active,
-                        trigger: None,
-                        consuming_activation_id: None,
-                    },
-                )]),
+        let target_generation = WaitGenerationRecord {
+            owner: SchedulerOwner::WorkItem {
+                work_item_id: wait.owner_work_item_id.clone(),
             },
-        );
-        if command.reserve_dispatch {
-            next.dispatch = AgentDispatchState::Awaiting {
-                wait: WaitIdentity {
-                    id: wait.wait_id.clone(),
-                    generation: wait.generation,
+            state: WaitState::Active,
+            trigger: None,
+            consuming_activation_id: None,
+        };
+        if source_dispatch_wait
+            .as_ref()
+            .is_some_and(|source| source.id == wait.wait_id)
+        {
+            let record = next
+                .waits
+                .get_mut(&wait.wait_id)
+                .expect("source dispatch wait exists");
+            record.current_generation = wait.generation;
+            record
+                .generations
+                .insert(wait.generation, target_generation);
+        } else {
+            next.waits.insert(
+                wait.wait_id.clone(),
+                WaitRecord {
+                    current_generation: wait.generation,
+                    generations: BTreeMap::from([(wait.generation, target_generation)]),
                 },
-            };
-            next.dispatch_revision += 1;
+            );
         }
+        if command.reserve_dispatch || source_dispatch_wait.is_some() {
+            set_dispatch_state(
+                &mut next,
+                AgentDispatchState::Awaiting {
+                    wait: WaitIdentity {
+                        id: wait.wait_id.clone(),
+                        generation: wait.generation,
+                    },
+                },
+            );
+        }
+    } else if source_dispatch_wait.is_some() {
+        set_dispatch_state(&mut next, AgentDispatchState::Open);
     }
     // Terminalize the replaced old focus demand if a proof was provided and validated.
     let mut transitions = vec![format!(
@@ -2622,73 +2257,380 @@ fn adopt_legacy_work_state(
     }
 }
 
-fn authority_matches_issue(
-    authority: &ActivationAdmissionAuthority,
-    command: &IssueActivationAuthorityCommand,
-) -> bool {
-    authority.authority_id == command.authority_id
-        && authority.activation == command.activation
-        && authority.expected_scheduling_generation == command.expected_scheduling_generation
-        && authority.expected_dispatch_revision == command.expected_dispatch_revision
-}
-
-fn issue_activation_authority(
+fn adopt_activation_work_state(
     snapshot: &Snapshot,
-    command: &IssueActivationAuthorityCommand,
+    command: &AdoptActivationWorkStateCommand,
 ) -> ProtocolCommandOutcome {
-    if snapshot.activation_authorities.values().any(|authority| {
-        authority.activation.id == command.activation.id
-            || authority.activation.idempotency_key == command.activation.idempotency_key
+    if command.source_activation_id.is_empty()
+        || command.source_message_id.is_empty()
+        || command.source_turn_id.is_empty()
+        || command.source_admitted_generation == 0
+        || command.work_item_id.is_empty()
+        || command.source_work_item_revision == 0
+        || command.wait.wait_id.is_empty()
+        || command.wait.owner_work_item_id != command.work_item_id
+        || command.wait.generation == 0
+        || command.wait.source_updated_at.is_empty()
+        || command
+            .source_lifecycle_wait
+            .as_ref()
+            .is_some_and(|proof| proof.wait.id.is_empty() || proof.wait.generation == 0)
+    {
+        return rejected_command(
+            snapshot,
+            command_conflict(
+                ProtocolConflictKind::InvalidCommand,
+                "activation_work_state_adoption_fields_required",
+            ),
+        );
+    }
+    let Some(activation) = snapshot.activations.get(&command.source_activation_id) else {
+        return rejected_command(
+            snapshot,
+            command_conflict(
+                ProtocolConflictKind::NotFound,
+                "activation_work_state_source_activation_missing",
+            ),
+        );
+    };
+    let source_is_lifecycle_nudge = snapshot
+        .activation_admissions
+        .get(&command.source_activation_id)
+        .is_some_and(|admission| {
+            matches!(
+                admission.activation.cause,
+                ActivationCause::LifecycleExternalNudge { .. }
+            )
+        });
+    if command.source_activation_id != format!("activation:message:{}", command.source_message_id)
+        || activation.owner.lifecycle_agent_id().is_none()
+        || !source_is_lifecycle_nudge
+        || activation.admitted_generation != command.source_admitted_generation
+        || activation.state != ActivationState::Settled
+    {
+        return rejected_command(
+            snapshot,
+            command_conflict(
+                ProtocolConflictKind::BindingConflict,
+                "activation_work_state_source_activation_mismatch",
+            ),
+        );
+    }
+    let source_settlement = snapshot.settlements.values().find(|settlement| {
+        settlement.activation_id == command.source_activation_id
+            && settlement.turn_terminal.as_deref() == Some(command.source_turn_id.as_str())
+    });
+    if !source_settlement.is_some_and(|settlement| {
+        settlement.disposition == ActivationDisposition::WorkContinues
+            && settlement.agent_dispatch == AgentDispatchDisposition::Open
+            && settlement.operator_delivery.is_none()
     }) {
         return rejected_command(
             snapshot,
             command_conflict(
-                ProtocolConflictKind::IdentityConflict,
-                "activation_authority_identity_conflict",
+                ProtocolConflictKind::BindingConflict,
+                "activation_work_state_source_settlement_mismatch",
+            ),
+        );
+    }
+    let existing_work = snapshot.work.get(&command.work_item_id);
+    let existing_wait_id = existing_work.and_then(|work| match &work.status {
+        WorkStatus::Waiting { wait_id } => Some(wait_id.as_str()),
+        _ => None,
+    });
+    if let Some(existing_work) = existing_work {
+        if existing_work.metadata_revision > command.source_work_item_revision {
+            return rejected_command(
+                snapshot,
+                command_conflict(
+                    ProtocolConflictKind::StaleRevision,
+                    "activation_work_state_adoption_stale_revision",
+                ),
+            );
+        }
+        if existing_work.metadata_revision == command.source_work_item_revision
+            && existing_work.scheduling_generation >= command.wait.generation
+        {
+            return rejected_command(
+                snapshot,
+                command_conflict(
+                    ProtocolConflictKind::StaleGeneration,
+                    "activation_work_state_adoption_stale_generation",
+                ),
+            );
+        }
+        if existing_wait_id.is_none() {
+            return rejected_command(
+                snapshot,
+                command_conflict(
+                    ProtocolConflictKind::StateConflict,
+                    "activation_work_state_existing_work_not_waiting",
+                ),
+            );
+        }
+        if existing_work.scheduling_generation >= command.wait.generation {
+            return rejected_command(
+                snapshot,
+                command_conflict(
+                    ProtocolConflictKind::StaleGeneration,
+                    "activation_work_state_adoption_stale_generation",
+                ),
+            );
+        }
+        let existing_wait_id = existing_wait_id.expect("checked existing waiting work");
+        let Some(existing_wait) = snapshot.waits.get(existing_wait_id) else {
+            return rejected_command(
+                snapshot,
+                command_conflict(
+                    ProtocolConflictKind::StateConflict,
+                    "activation_work_state_existing_wait_conflict",
+                ),
+            );
+        };
+        let Some(current) = existing_wait
+            .generations
+            .get(&existing_wait.current_generation)
+        else {
+            return rejected_command(
+                snapshot,
+                command_conflict(
+                    ProtocolConflictKind::StateConflict,
+                    "activation_work_state_existing_wait_conflict",
+                ),
+            );
+        };
+        if existing_wait.current_generation != existing_work.scheduling_generation
+            || current.owner
+                != (SchedulerOwner::WorkItem {
+                    work_item_id: command.work_item_id.clone(),
+                })
+            || !matches!(current.state, WaitState::Active | WaitState::Triggered)
+        {
+            return rejected_command(
+                snapshot,
+                command_conflict(
+                    ProtocolConflictKind::StateConflict,
+                    "activation_work_state_existing_wait_conflict",
+                ),
+            );
+        }
+    }
+    if let Some(existing_wait) = snapshot.waits.get(&command.wait.wait_id) {
+        let current = existing_wait
+            .generations
+            .get(&existing_wait.current_generation)
+            .expect("current wait generation exists");
+        let target_is_current_wait = existing_wait_id == Some(command.wait.wait_id.as_str());
+        if !target_is_current_wait
+            && (current.owner
+                != (SchedulerOwner::WorkItem {
+                    work_item_id: command.work_item_id.clone(),
+                })
+                || existing_wait.current_generation >= command.wait.generation
+                || current.state != WaitState::Resolved)
+        {
+            return rejected_command(
+                snapshot,
+                command_conflict(
+                    ProtocolConflictKind::IdentityConflict,
+                    "activation_work_state_wait_conflict",
+                ),
+            );
+        }
+    }
+    let existing_work_dispatch_matches = existing_wait_id.is_some_and(|wait_id| {
+        snapshot.dispatch
+            == (AgentDispatchState::Awaiting {
+                wait: WaitIdentity {
+                    id: wait_id.to_string(),
+                    generation: existing_work
+                        .expect("existing wait requires existing work")
+                        .scheduling_generation,
+                },
+            })
+    });
+    let source_lifecycle_dispatch_matches =
+        command.source_lifecycle_wait.as_ref().is_some_and(|proof| {
+            snapshot.dispatch_revision == proof.expected_dispatch_revision
+                && snapshot.dispatch
+                    == (AgentDispatchState::Awaiting {
+                        wait: proof.wait.clone(),
+                    })
+                && snapshot
+                    .waits
+                    .get(&proof.wait.id)
+                    .and_then(|wait| wait.generations.get(&proof.wait.generation))
+                    .is_some_and(|generation| {
+                        generation.owner == activation.owner
+                            && matches!(generation.state, WaitState::Active | WaitState::Triggered)
+                    })
+        });
+    if command.source_lifecycle_wait.is_some() && !source_lifecycle_dispatch_matches {
+        return rejected_command(
+            snapshot,
+            command_conflict(
+                ProtocolConflictKind::BindingConflict,
+                "activation_work_state_source_lifecycle_wait_mismatch",
+            ),
+        );
+    }
+    if snapshot.dispatch != AgentDispatchState::Open
+        && !existing_work_dispatch_matches
+        && !source_lifecycle_dispatch_matches
+    {
+        return rejected_command(
+            snapshot,
+            command_conflict(
+                ProtocolConflictKind::StateConflict,
+                "activation_work_state_dispatch_not_open",
+            ),
+        );
+    }
+    if snapshot.dispatch == AgentDispatchState::Open && command.source_lifecycle_wait.is_some() {
+        return rejected_command(
+            snapshot,
+            command_conflict(
+                ProtocolConflictKind::BindingConflict,
+                "activation_work_state_source_lifecycle_wait_mismatch",
             ),
         );
     }
 
-    let authority = ActivationAdmissionAuthority {
-        authority_id: command.authority_id.clone(),
-        activation: command.activation.clone(),
-        expected_scheduling_generation: command.expected_scheduling_generation,
-        expected_dispatch_revision: command.expected_dispatch_revision,
-        consumed_by: None,
-    };
-    let mut validating = snapshot.clone();
-    validating
-        .activation_authorities
-        .insert(command.authority_id.clone(), authority.clone());
-    let admission = AdmitActivationCommand {
-        authority_id: command.authority_id.clone(),
-        activation: command.activation.clone(),
-        expected_scheduling_generation: command.expected_scheduling_generation,
-        expected_dispatch_revision: command.expected_dispatch_revision,
-    };
-    if let Err(conflict) = lower_admit_activation(&validating, &admission, false) {
-        return rejected_command(snapshot, conflict);
+    let mut next = snapshot.clone();
+    let mut transitions = Vec::new();
+    if let Some(proof) = &command.source_lifecycle_wait {
+        let wait = next
+            .waits
+            .get_mut(&proof.wait.id)
+            .expect("validated source lifecycle wait exists");
+        let generation = wait
+            .generations
+            .get_mut(&proof.wait.generation)
+            .expect("validated source lifecycle wait generation exists");
+        generation.state = WaitState::Resolved;
+        generation.trigger = None;
+        generation.consuming_activation_id = None;
+        transitions.push(format!(
+            "wait:{}:generation:{}:resolved_by_work_item_handoff",
+            proof.wait.id, proof.wait.generation
+        ));
     }
-
+    if let Some(existing_wait_id) = existing_wait_id {
+        if command
+            .source_lifecycle_wait
+            .as_ref()
+            .is_some_and(|proof| proof.wait.id == existing_wait_id)
+        {
+            return rejected_command(
+                snapshot,
+                command_conflict(
+                    ProtocolConflictKind::IdentityConflict,
+                    "activation_work_state_wait_conflict",
+                ),
+            );
+        }
+        if let Some(wait) = next.waits.get_mut(existing_wait_id) {
+            let generation = wait
+                .generations
+                .get_mut(&wait.current_generation)
+                .expect("current wait generation exists");
+            if matches!(generation.state, WaitState::Active | WaitState::Triggered) {
+                generation.state = WaitState::Resolved;
+                generation.trigger = None;
+                generation.consuming_activation_id = None;
+                transitions.push(format!(
+                    "wait:{existing_wait_id}:generation:{}:resolved_by_activation_rearm",
+                    wait.current_generation
+                ));
+            }
+        }
+    }
+    next.work.insert(
+        command.work_item_id.clone(),
+        WorkDemand {
+            metadata_revision: command.source_work_item_revision,
+            scheduling_generation: command.wait.generation,
+            status: WorkStatus::Waiting {
+                wait_id: command.wait.wait_id.clone(),
+            },
+            capabilities: Default::default(),
+            locks: Default::default(),
+            locality: "runtime".into(),
+            cost_class: "default".into(),
+        },
+    );
+    if let Some(wait) = next.waits.get_mut(&command.wait.wait_id) {
+        wait.current_generation = command.wait.generation;
+        wait.generations.insert(
+            command.wait.generation,
+            WaitGenerationRecord {
+                owner: SchedulerOwner::WorkItem {
+                    work_item_id: command.work_item_id.clone(),
+                },
+                state: WaitState::Active,
+                trigger: None,
+                consuming_activation_id: None,
+            },
+        );
+    } else {
+        next.waits.insert(
+            command.wait.wait_id.clone(),
+            WaitRecord {
+                current_generation: command.wait.generation,
+                generations: BTreeMap::from([(
+                    command.wait.generation,
+                    WaitGenerationRecord {
+                        owner: SchedulerOwner::WorkItem {
+                            work_item_id: command.work_item_id.clone(),
+                        },
+                        state: WaitState::Active,
+                        trigger: None,
+                        consuming_activation_id: None,
+                    },
+                )]),
+            },
+        );
+    }
+    if command.reserve_dispatch {
+        let dispatch = AgentDispatchState::Awaiting {
+            wait: WaitIdentity {
+                id: command.wait.wait_id.clone(),
+                generation: command.wait.generation,
+            },
+        };
+        if next.dispatch != dispatch {
+            next.dispatch = dispatch;
+            next.dispatch_revision += 1;
+        }
+    } else if next.dispatch != AgentDispatchState::Open {
+        next.dispatch = AgentDispatchState::Open;
+        next.dispatch_revision += 1;
+    }
+    if command.focus {
+        next.focus = Some(command.work_item_id.clone());
+    }
+    transitions.extend([
+        format!(
+            "work:{}:activation_state_adopted:generation:{}",
+            command.work_item_id, command.wait.generation
+        ),
+        format!(
+            "wait:{}:generation:{}:armed",
+            command.wait.wait_id, command.wait.generation
+        ),
+    ]);
     ProtocolCommandOutcome {
         outcome: Outcome {
-            decision: Decision::AuthorityIssued,
-            transitions: vec![format!(
-                "activation_authority:{}:issued:{}",
-                command.authority_id, command.activation.id
-            )],
+            decision: Decision::LegacyWorkStateAdopted,
+            transitions,
             diagnostics: Vec::new(),
-            snapshot: validating,
+            snapshot: next,
         },
         conflict: None,
     }
 }
 
-fn lower_admit_activation(
-    snapshot: &Snapshot,
-    command: &AdmitActivationCommand,
-    allow_consumed_authority: bool,
-) -> Result<Event, ProtocolConflict> {
+fn lower_admit_activation(command: &AdmitActivationCommand) -> Result<Event, ProtocolConflict> {
     let activation = &command.activation;
     if command.authority_id.is_empty()
         || activation.id.is_empty()
@@ -2711,34 +2653,6 @@ fn lower_admit_activation(
         return Err(command_conflict(
             ProtocolConflictKind::InvalidCommand,
             "activation_identity_or_provenance_required",
-        ));
-    }
-    let authority = snapshot
-        .activation_authorities
-        .get(&command.authority_id)
-        .ok_or_else(|| {
-            command_conflict(
-                ProtocolConflictKind::NotFound,
-                "activation_authority_not_found",
-            )
-        })?;
-    if authority.authority_id != command.authority_id
-        || authority.activation != command.activation
-        || authority.expected_scheduling_generation != command.expected_scheduling_generation
-        || authority.expected_dispatch_revision != command.expected_dispatch_revision
-    {
-        return Err(command_conflict(
-            ProtocolConflictKind::BindingConflict,
-            "activation_authority_mismatch",
-        ));
-    }
-    if authority.consumed_by.is_some()
-        && !(allow_consumed_authority
-            && authority.consumed_by.as_deref() == Some(activation.id.as_str()))
-    {
-        return Err(command_conflict(
-            ProtocolConflictKind::Duplicate,
-            "activation_authority_already_consumed",
         ));
     }
     if !activation_provenance_matches_cause(&activation.provenance, &activation.cause) {
@@ -4451,682 +4365,7 @@ fn update_metadata(
     }
 }
 
-fn configure_protocol(
-    snapshot: &Snapshot,
-    expected_config_revision: u64,
-    mode: ProtocolMode,
-) -> Outcome {
-    if snapshot.rollout.config_revision != expected_config_revision {
-        return rejected(snapshot, "stale_rollout_config_revision");
-    }
-    if mode != ProtocolMode::Legacy && snapshot.rollout.manifest.is_none() {
-        return rejected(snapshot, "non_legacy_protocol_requires_manifest");
-    }
-    if snapshot
-        .rollout
-        .scenarios
-        .values()
-        .any(|scenario| !scenario_allowed(mode, scenario.mode))
-    {
-        return rejected(snapshot, "scenario_exceeds_protocol_ceiling");
-    }
-    let mut next = snapshot.clone();
-    next.rollout.protocol_mode = mode;
-    next.rollout.config_revision += 1;
-    Outcome {
-        decision: Decision::ProtocolConfigured,
-        transitions: vec![format!(
-            "rollout:protocol:{:?}->{mode:?}",
-            snapshot.rollout.protocol_mode
-        )],
-        diagnostics: Vec::new(),
-        snapshot: next,
-    }
-}
-
-fn open_rollout_preflight(
-    snapshot: &Snapshot,
-    expected_config_revision: u64,
-    manifest_revision: u64,
-) -> Outcome {
-    if snapshot.rollout.config_revision != expected_config_revision {
-        return rejected(snapshot, "stale_rollout_config_revision");
-    }
-    if snapshot
-        .rollout
-        .manifest
-        .as_ref()
-        .is_some_and(|current| manifest_revision <= current.revision)
-    {
-        return rejected(snapshot, "manifest_revision_not_advanced");
-    }
-    if snapshot
-        .rollout
-        .preflights
-        .values()
-        .any(|preflight| preflight.state == RolloutPreflightState::Open)
-    {
-        return rejected(snapshot, "rollout_preflight_window_already_open");
-    }
-
-    let mut next = snapshot.clone();
-    let revision = next.rollout.latest_preflight_revision + 1;
-    next.rollout.latest_preflight_revision = revision;
-    next.rollout.preflights.insert(
-        revision,
-        RolloutPreflightRecord {
-            revision,
-            manifest_revision,
-            state: RolloutPreflightState::Open,
-            manifest: None,
-        },
-    );
-    Outcome {
-        decision: Decision::RolloutPreflightOpened,
-        transitions: vec![format!(
-            "rollout:preflight:{revision}:opened:manifest:{manifest_revision}"
-        )],
-        diagnostics: Vec::new(),
-        snapshot: next,
-    }
-}
-
-fn complete_rollout_preflight(
-    snapshot: &Snapshot,
-    expected_config_revision: u64,
-    expected_preflight_revision: u64,
-    manifest: &RolloutManifest,
-) -> Outcome {
-    if snapshot.rollout.config_revision != expected_config_revision {
-        return rejected(snapshot, "stale_rollout_config_revision");
-    }
-    let Some(preflight) = snapshot
-        .rollout
-        .preflights
-        .get(&expected_preflight_revision)
-    else {
-        return rejected(snapshot, "rollout_preflight_record_missing");
-    };
-    if preflight.state != RolloutPreflightState::Open {
-        return rejected(snapshot, "rollout_preflight_window_not_open");
-    }
-    if manifest.preflight_revision != expected_preflight_revision
-        || manifest.preflight_for_manifest_revision != preflight.manifest_revision
-        || manifest.revision != preflight.manifest_revision
-    {
-        return rejected(snapshot, "rollout_preflight_binding_mismatch");
-    }
-    if !manifest.preflight_succeeded {
-        return rejected(snapshot, "rollout_preflight_failed");
-    }
-    if !rollout_manifest_is_installable(manifest) {
-        return rejected(snapshot, "rollout_manifest_incomplete");
-    }
-
-    let mut next = snapshot.clone();
-    let preflight = next
-        .rollout
-        .preflights
-        .get_mut(&expected_preflight_revision)
-        .expect("preflight exists");
-    preflight.state = RolloutPreflightState::Completed;
-    preflight.manifest = Some(manifest.clone());
-    Outcome {
-        decision: Decision::RolloutPreflightCompleted,
-        transitions: vec![format!(
-            "rollout:preflight:{expected_preflight_revision}:completed:manifest:{}",
-            manifest.revision
-        )],
-        diagnostics: Vec::new(),
-        snapshot: next,
-    }
-}
-
-fn install_rollout_manifest(
-    snapshot: &Snapshot,
-    expected_config_revision: u64,
-    manifest: &RolloutManifest,
-) -> Outcome {
-    if snapshot.rollout.config_revision != expected_config_revision {
-        return rejected(snapshot, "stale_rollout_config_revision");
-    }
-    if snapshot
-        .rollout
-        .manifest
-        .as_ref()
-        .is_some_and(|current| manifest.revision <= current.revision)
-    {
-        return rejected(snapshot, "manifest_revision_not_advanced");
-    }
-    if !manifest.preflight_succeeded {
-        return rejected(snapshot, "rollout_preflight_failed");
-    }
-    if !rollout_manifest_is_installable(manifest) {
-        return rejected(snapshot, "rollout_manifest_incomplete");
-    }
-    let Some(preflight) = snapshot
-        .rollout
-        .preflights
-        .get(&manifest.preflight_revision)
-    else {
-        return rejected(snapshot, "rollout_preflight_record_missing");
-    };
-    if preflight.state != RolloutPreflightState::Completed {
-        return rejected(snapshot, "rollout_preflight_record_not_installable");
-    }
-    if preflight.manifest_revision != manifest.revision
-        || preflight.manifest.as_ref() != Some(manifest)
-    {
-        return rejected(snapshot, "rollout_preflight_record_mismatch");
-    }
-    let mut next = snapshot.clone();
-    let mut transitions = vec![format!("rollout:manifest:installed:{}", manifest.revision)];
-    for (scenario_class, scenario) in &mut next.rollout.scenarios {
-        if scenario.mode == ScenarioMode::Authoritative {
-            transitions.push(format!(
-                "rollout:scenario:{scenario_class}:authoritative->{:?}:manifest_replaced",
-                scenario.rollback_target
-            ));
-            scenario.mode = scenario.rollback_target;
-        }
-        scenario.manifest_revision = None;
-        scenario.preflight_revision = None;
-    }
-    next.rollout
-        .preflights
-        .get_mut(&manifest.preflight_revision)
-        .expect("preflight exists")
-        .state = RolloutPreflightState::Consumed;
-    next.rollout.manifest = Some(manifest.clone());
-    next.rollout.config_revision += 1;
-    Outcome {
-        decision: Decision::ManifestInstalled,
-        transitions,
-        diagnostics: Vec::new(),
-        snapshot: next,
-    }
-}
-
-fn change_scenario_authority(
-    snapshot: &Snapshot,
-    scenario_class: &str,
-    expected_config_revision: u64,
-    expected_manifest_revision: u64,
-    expected_preflight_revision: u64,
-    mode: ScenarioMode,
-    explicit_mode: bool,
-) -> Outcome {
-    if snapshot.rollout.config_revision != expected_config_revision {
-        return rejected(snapshot, "stale_rollout_config_revision");
-    }
-    if !scenario_allowed(snapshot.rollout.protocol_mode, mode) {
-        return rejected(snapshot, "scenario_exceeds_protocol_ceiling");
-    }
-    let Some(manifest) = snapshot.rollout.manifest.as_ref() else {
-        return rejected(snapshot, "rollout_manifest_missing");
-    };
-    if manifest.revision != expected_manifest_revision {
-        return rejected(snapshot, "stale_rollout_manifest_revision");
-    }
-    if manifest.preflight_revision != expected_preflight_revision {
-        return rejected(snapshot, "stale_rollout_preflight_revision");
-    }
-    let class = manifest.classes.get(scenario_class);
-    let current_mode = snapshot
-        .rollout
-        .scenarios
-        .get(scenario_class)
-        .map(|scenario| scenario.mode)
-        .unwrap_or(ScenarioMode::Off);
-    if mode == ScenarioMode::Authoritative && current_mode != ScenarioMode::Shadow {
-        return rejected(snapshot, "scenario_not_shadow");
-    }
-    if !matches!(
-        (current_mode, mode),
-        (ScenarioMode::Off, ScenarioMode::Shadow)
-            | (ScenarioMode::Shadow, ScenarioMode::Off)
-            | (ScenarioMode::Shadow, ScenarioMode::Authoritative)
-            | (ScenarioMode::Authoritative, ScenarioMode::Shadow)
-    ) {
-        return rejected(snapshot, "invalid_scenario_authority_transition");
-    }
-    if mode == ScenarioMode::Shadow
-        && !class.is_some_and(|class| {
-            matches!(
-                class.configured_mode,
-                ScenarioMode::Shadow | ScenarioMode::Authoritative
-            )
-        })
-    {
-        return rejected(snapshot, "scenario_not_enabled_by_manifest");
-    }
-    if mode == ScenarioMode::Authoritative {
-        if !manifest.preflight_succeeded {
-            return rejected(snapshot, "rollout_preflight_failed");
-        }
-        let Some(class) = class else {
-            return rejected(snapshot, "scenario_not_approved_for_authority");
-        };
-        if explicit_mode {
-            if !SchedulerScenarioClass::PRODUCTION_AUTHORITY
-                .iter()
-                .any(|candidate| candidate.as_str() == scenario_class)
-            {
-                return rejected(snapshot, "scenario_not_in_production_authority_scope");
-            }
-        } else {
-            if class.configured_mode != ScenarioMode::Authoritative {
-                return rejected(snapshot, "scenario_not_approved_for_authority");
-            }
-            if !rollout_class_evidence_is_complete(scenario_class, class) {
-                return rejected(snapshot, "rollout_class_evidence_incomplete");
-            }
-        }
-        if snapshot.rollout.hard_blockers.iter().any(|blocker| {
-            blocker.scenario_class == scenario_class
-                && blocker.manifest_revision == manifest.revision
-                && blocker.preflight_revision == manifest.preflight_revision
-        }) {
-            return rejected(snapshot, "scenario_has_unresolved_hard_blocker");
-        }
-        let Some(parsed_scenario) = scenario_class.parse::<SchedulerScenarioClass>().ok() else {
-            return rejected(snapshot, "unknown_scenario_class");
-        };
-        if parsed_scenario
-            .authoritative_dependencies()
-            .iter()
-            .any(|dependency| {
-                snapshot
-                    .rollout
-                    .scenarios
-                    .get(dependency.as_str())
-                    .is_none_or(|authority| authority.mode != ScenarioMode::Authoritative)
-            })
-        {
-            return rejected(snapshot, "scenario_authority_dependency_not_satisfied");
-        }
-    }
-    let rollback_target = manifest
-        .classes
-        .get(scenario_class)
-        .map(|class| rollback_target(&class.rollback_policy))
-        .unwrap_or(ScenarioMode::Off);
-    if rollback_target == ScenarioMode::Authoritative {
-        return rejected(snapshot, "invalid_authoritative_rollback_target");
-    }
-    let mut next = snapshot.clone();
-    next.rollout.scenarios.insert(
-        scenario_class.to_string(),
-        ScenarioAuthority {
-            mode,
-            rollback_target,
-            manifest_revision: (mode == ScenarioMode::Authoritative).then_some(manifest.revision),
-            preflight_revision: (mode == ScenarioMode::Authoritative)
-                .then_some(manifest.preflight_revision),
-        },
-    );
-    let mut transitions = vec![format!("rollout:scenario:{scenario_class}:{mode:?}")];
-    if mode != ScenarioMode::Authoritative {
-        cascade_rollout_dependents(
-            &mut next,
-            scenario_class,
-            &mut transitions,
-            "dependency_authority_lowered",
-        );
-    }
-    next.rollout.config_revision += 1;
-    Outcome {
-        decision: Decision::ScenarioAuthorityChanged,
-        transitions,
-        diagnostics: Vec::new(),
-        snapshot: next,
-    }
-}
-
-fn report_scenario_hard_blocker(
-    snapshot: &Snapshot,
-    scenario_class: &str,
-    blocker_code: &str,
-    expected_config_revision: u64,
-    expected_manifest_revision: u64,
-    expected_preflight_revision: u64,
-) -> Outcome {
-    if snapshot.rollout.config_revision != expected_config_revision {
-        return rejected(snapshot, "stale_rollout_config_revision");
-    }
-    let Some(scenario) = snapshot.rollout.scenarios.get(scenario_class) else {
-        return rejected(snapshot, "unknown_scenario_class");
-    };
-    if scenario.mode != ScenarioMode::Authoritative {
-        return rejected(snapshot, "scenario_not_authoritative");
-    }
-    if scenario.manifest_revision != Some(expected_manifest_revision) {
-        return rejected(snapshot, "stale_rollout_manifest_revision");
-    }
-    if scenario.preflight_revision != Some(expected_preflight_revision) {
-        return rejected(snapshot, "stale_rollout_preflight_revision");
-    }
-    if blocker_code.is_empty() {
-        return rejected(snapshot, "hard_blocker_code_missing");
-    }
-    let Some(class) = snapshot
-        .rollout
-        .manifest
-        .as_ref()
-        .and_then(|manifest| manifest.classes.get(scenario_class))
-    else {
-        return rejected(snapshot, "scenario_not_approved_for_authority");
-    };
-    if class.rollback_policy.trigger != RollbackTrigger::AnyHardBlocker {
-        return rejected(snapshot, "hard_blocker_trigger_not_configured");
-    }
-    let rollback_trigger = class.rollback_policy.trigger;
-    let rollback_action = class.rollback_policy.action;
-    let rollback_target = rollback_target(&class.rollback_policy);
-    let mut next = snapshot.clone();
-    let mut transitions = vec![
-        format!("rollout:hard_blocker:{scenario_class}:{blocker_code}"),
-        format!(
-            "rollout:scenario:{scenario_class}:authoritative->{rollback_target:?}:stop_admissions_and_revert"
-        ),
-    ];
-    next.rollout
-        .hard_blockers
-        .insert(ScenarioHardBlockerRecord {
-            scenario_class: scenario_class.to_string(),
-            blocker_code: blocker_code.to_string(),
-            config_revision: expected_config_revision,
-            manifest_revision: expected_manifest_revision,
-            preflight_revision: expected_preflight_revision,
-            trigger: rollback_trigger,
-            action: rollback_action,
-        });
-    let rolled_back = next
-        .rollout
-        .scenarios
-        .get_mut(scenario_class)
-        .expect("scenario exists");
-    rolled_back.mode = rollback_target;
-    rolled_back.manifest_revision = None;
-    rolled_back.preflight_revision = None;
-    cascade_rollout_dependents(
-        &mut next,
-        scenario_class,
-        &mut transitions,
-        "dependency_hard_blocker",
-    );
-    next.rollout.config_revision += 1;
-    Outcome {
-        decision: Decision::RollbackTripped,
-        transitions,
-        diagnostics: Vec::new(),
-        snapshot: next,
-    }
-}
-
-fn cascade_rollout_dependents(
-    snapshot: &mut Snapshot,
-    changed_scenario: &str,
-    transitions: &mut Vec<String>,
-    reason: &str,
-) {
-    let dependent = SchedulerScenarioClass::OperatorInterjection;
-    if !dependent
-        .authoritative_dependencies()
-        .iter()
-        .any(|dependency| dependency.as_str() == changed_scenario)
-    {
-        return;
-    }
-    let Some(authority) = snapshot.rollout.scenarios.get_mut(dependent.as_str()) else {
-        return;
-    };
-    if authority.mode != ScenarioMode::Authoritative {
-        return;
-    }
-    let target = authority.rollback_target;
-    authority.mode = target;
-    authority.manifest_revision = None;
-    authority.preflight_revision = None;
-    transitions.push(format!(
-        "rollout:scenario:{}:authoritative->{target:?}:{reason}",
-        dependent.as_str()
-    ));
-}
-
-fn rollback_target(policy: &RollbackPolicy) -> ScenarioMode {
-    match policy.action {
-        RollbackAction::StopAdmissionsAndRevert { target } => target,
-    }
-}
-
-fn scenario_allowed(protocol_mode: ProtocolMode, scenario_mode: ScenarioMode) -> bool {
-    matches!(
-        (protocol_mode, scenario_mode),
-        (_, ScenarioMode::Off)
-            | (ProtocolMode::Shadow, ScenarioMode::Shadow)
-            | (
-                ProtocolMode::Authoritative,
-                ScenarioMode::Shadow | ScenarioMode::Authoritative
-            )
-    )
-}
-
-struct RolloutClassGate {
-    minimum_shadow_samples: u64,
-    minimum_shadow_duration_secs: u64,
-    required_evidence: &'static [&'static str],
-}
-
-const UNIVERSAL_ROLLOUT_EVIDENCE: &[&str] = &["restart", "fault_injection", "rollback_drill"];
-const MAXIMUM_P99_LATENCY_REGRESSION_BPS: u32 = 1_000;
-const MAXIMUM_OBSERVATIONAL_DIVERGENCE_BPS: u32 = 100;
-
-fn rollout_class_gate(scenario_class: &str) -> Option<RolloutClassGate> {
-    let scenario_class = scenario_class.parse::<SchedulerScenarioClass>().ok()?;
-    let gate = match scenario_class {
-        SchedulerScenarioClass::ReducerOnlyCandidates => RolloutClassGate {
-            minimum_shadow_samples: 10_000,
-            minimum_shadow_duration_secs: 72 * 60 * 60,
-            required_evidence: &["deterministic_replay", "duplicate_command_idempotency"],
-        },
-        SchedulerScenarioClass::ExactTaskRejoin => RolloutClassGate {
-            minimum_shadow_samples: 1_000,
-            minimum_shadow_duration_secs: 7 * 24 * 60 * 60,
-            required_evidence: &[
-                "duplicate_task_result",
-                "out_of_order_task_result",
-                "restart_before_rejoin_settlement",
-            ],
-        },
-        SchedulerScenarioClass::ExactWaitResume => RolloutClassGate {
-            minimum_shadow_samples: 1_000,
-            minimum_shadow_duration_secs: 7 * 24 * 60 * 60,
-            required_evidence: &[
-                "duplicate_trigger",
-                "stale_generation",
-                "restart_after_consume",
-                "rearm",
-            ],
-        },
-        SchedulerScenarioClass::ExplicitlyBoundOperatorInput
-        | SchedulerScenarioClass::OperatorInterjection => RolloutClassGate {
-            minimum_shadow_samples: 1_000,
-            minimum_shadow_duration_secs: 7 * 24 * 60 * 60,
-            required_evidence: &[
-                "duplicate_ingress",
-                "stale_binding_revision",
-                "wrong_agent_target",
-            ],
-        },
-        SchedulerScenarioClass::Settlement => RolloutClassGate {
-            minimum_shadow_samples: 1_000,
-            minimum_shadow_duration_secs: 7 * 24 * 60 * 60,
-            required_evidence: &[
-                "duplicate_settlement",
-                "missing_settlement_recovery",
-                "restart_before_settlement_commit",
-            ],
-        },
-        SchedulerScenarioClass::Delivery => RolloutClassGate {
-            minimum_shadow_samples: 1_000,
-            minimum_shadow_duration_secs: 7 * 24 * 60 * 60,
-            required_evidence: &[
-                "duplicate_delivery",
-                "delivery_retry",
-                "restart_before_delivery_commit",
-            ],
-        },
-        SchedulerScenarioClass::WorkItemAutonomousContinuation => RolloutClassGate {
-            minimum_shadow_samples: 2_000,
-            minimum_shadow_duration_secs: 14 * 24 * 60 * 60,
-            required_evidence: &[
-                "concurrent_claim",
-                "reservation_conflict",
-                "yield_return",
-                "work_item_rollback",
-            ],
-        },
-        SchedulerScenarioClass::OrdinarySemanticOperatorBinding => RolloutClassGate {
-            minimum_shadow_samples: 5_000,
-            minimum_shadow_duration_secs: 14 * 24 * 60 * 60,
-            required_evidence: &[
-                "ambiguous_input",
-                "low_confidence_input",
-                "conflicting_proposals",
-                "zero_wrong_automatic_bindings",
-            ],
-        },
-    };
-    Some(gate)
-}
-
-fn rollout_class_evidence_is_installable(
-    scenario_class: &str,
-    class: &RolloutClassEvidence,
-) -> bool {
-    let Some(gate) = rollout_class_gate(scenario_class) else {
-        return false;
-    };
-    let mandatory_evidence: BTreeSet<&str> = UNIVERSAL_ROLLOUT_EVIDENCE
-        .iter()
-        .chain(gate.required_evidence.iter())
-        .copied()
-        .collect();
-
-    matches!(
-        class.configured_mode,
-        ScenarioMode::Shadow | ScenarioMode::Authoritative
-    ) && class.minimum_shadow_samples >= gate.minimum_shadow_samples
-        && class.minimum_shadow_duration_secs >= gate.minimum_shadow_duration_secs
-        && class.maximum_p99_latency_regression_bps <= MAXIMUM_P99_LATENCY_REGRESSION_BPS
-        && class.observed_p99_latency_regression_bps <= class.maximum_p99_latency_regression_bps
-        && mandatory_evidence
-            .iter()
-            .all(|evidence| class.required_evidence.contains(*evidence))
-        && class
-            .verified_evidence
-            .iter()
-            .all(|evidence| class.required_evidence.contains(evidence))
-        && class.rollback_policy.trigger == RollbackTrigger::AnyHardBlocker
-        && rollback_target(&class.rollback_policy) != ScenarioMode::Authoritative
-        && (class.configured_mode == ScenarioMode::Shadow
-            || rollout_class_evidence_is_complete(scenario_class, class))
-}
-
-pub(crate) fn rollout_class_evidence_is_complete(
-    scenario_class: &str,
-    class: &RolloutClassEvidence,
-) -> bool {
-    let Some(gate) = rollout_class_gate(scenario_class) else {
-        return false;
-    };
-    let mandatory_evidence: BTreeSet<&str> = UNIVERSAL_ROLLOUT_EVIDENCE
-        .iter()
-        .chain(gate.required_evidence.iter())
-        .copied()
-        .collect();
-
-    class.minimum_shadow_samples >= gate.minimum_shadow_samples
-        && class.minimum_shadow_duration_secs >= gate.minimum_shadow_duration_secs
-        && class.observed_shadow_samples >= class.minimum_shadow_samples
-        && class.observed_shadow_duration_secs >= class.minimum_shadow_duration_secs
-        && class.maximum_p99_latency_regression_bps <= MAXIMUM_P99_LATENCY_REGRESSION_BPS
-        && class.observed_p99_latency_regression_bps <= class.maximum_p99_latency_regression_bps
-        && class.hard_blocker_count == 0
-        && class.unresolved_divergence_count == 0
-        && mandatory_evidence
-            .iter()
-            .all(|evidence| class.required_evidence.contains(*evidence))
-        && mandatory_evidence
-            .iter()
-            .all(|evidence| class.verified_evidence.contains(*evidence))
-        && class
-            .required_evidence
-            .iter()
-            .all(|evidence| class.verified_evidence.contains(evidence))
-        && class.rollback_policy.trigger == RollbackTrigger::AnyHardBlocker
-        && rollback_target(&class.rollback_policy) != ScenarioMode::Authoritative
-}
-
-fn rollout_manifest_is_installable(manifest: &RolloutManifest) -> bool {
-    manifest.preflight_for_manifest_revision == manifest.revision
-        && manifest.preflight_succeeded
-        && !manifest.protocol_build.is_empty()
-        && !manifest.schema_build.is_empty()
-        && manifest.schema_revision > 0
-        && !manifest.fixture_corpus_revision.is_empty()
-        && !manifest.classes.is_empty()
-        && manifest.classes.iter().all(|(scenario_class, class)| {
-            rollout_class_evidence_is_installable(scenario_class, class)
-        })
-        && manifest.safety_divergence_bps == 0
-        && manifest.canonical_state_divergence_bps == 0
-        && manifest
-            .allowed_observational_divergence
-            .iter()
-            .all(|(code, allowance)| {
-                !code.is_empty()
-                    && allowance.maximum_rate_bps <= MAXIMUM_OBSERVATIONAL_DIVERGENCE_BPS
-                    && !allowance.reviewed_by.is_empty()
-            })
-        && !manifest.approver.is_empty()
-        && !manifest.approved_at.is_empty()
-}
-
-fn rejected(snapshot: &Snapshot, diagnostic: &str) -> Outcome {
-    Outcome {
-        decision: Decision::Rejected,
-        transitions: Vec::new(),
-        diagnostics: vec![diagnostic.to_string()],
-        snapshot: snapshot.clone(),
-    }
-}
-
 pub fn assert_invariants(snapshot: &Snapshot) -> Result<(), String> {
-    for (scenario_class, authority) in &snapshot.rollout.scenarios {
-        if authority.mode != ScenarioMode::Authoritative {
-            continue;
-        }
-        let scenario = scenario_class
-            .parse::<SchedulerScenarioClass>()
-            .map_err(|_| "rollout contains an unknown scenario class".to_string())?;
-        if scenario
-            .authoritative_dependencies()
-            .iter()
-            .any(|dependency| {
-                snapshot
-                    .rollout
-                    .scenarios
-                    .get(dependency.as_str())
-                    .is_none_or(|authority| authority.mode != ScenarioMode::Authoritative)
-            })
-        {
-            return Err(format!(
-                "authoritative rollout scenario {scenario_class} has non-authoritative dependencies"
-            ));
-        }
-    }
     if let Some(focus) = &snapshot.focus {
         let work = snapshot
             .work
@@ -5143,7 +4382,7 @@ pub fn assert_invariants(snapshot: &Snapshot) -> Result<(), String> {
         let Some(activation) = snapshot.activations.get(activation_id) else {
             return Err("canonical activation admission record is invalid".into());
         };
-        let event = lower_admit_activation(snapshot, command, true)
+        let event = lower_admit_activation(command)
             .map_err(|_| "canonical activation admission record is invalid".to_string())?;
         let Event::Admit {
             activation_id: event_activation_id,
@@ -5183,16 +4422,9 @@ pub fn assert_invariants(snapshot: &Snapshot) -> Result<(), String> {
             || activation.admitted_generation != expected_generation
             || activation.recovery_for != recovery_for
             || expected_dispatch_revision > snapshot.dispatch_revision
-            || snapshot
-                .activation_authorities
-                .get(&command.authority_id)
-                .and_then(|authority| authority.consumed_by.as_deref())
-                != Some(activation_id.as_str())
             || !idempotency_keys.insert(command.activation.idempotency_key.as_str())
         {
-            return Err(
-                "canonical activation admission record disagrees with authority state".into(),
-            );
+            return Err("canonical activation admission record is invalid".into());
         }
     }
     if snapshot.admitted_generations != canonical_admission_fences {
@@ -5201,30 +4433,13 @@ pub fn assert_invariants(snapshot: &Snapshot) -> Result<(), String> {
             snapshot.admitted_generations
         ));
     }
-    let mut authority_activation_ids = BTreeSet::new();
-    let mut authority_idempotency_keys = BTreeSet::new();
-    for (authority_id, authority) in &snapshot.activation_authorities {
-        if authority_id != &authority.authority_id {
-            return Err("activation authority map key disagrees with authority identity".into());
-        }
-        if !authority_activation_ids.insert(authority.activation.id.as_str())
-            || !authority_idempotency_keys.insert(authority.activation.idempotency_key.as_str())
-        {
-            return Err("activation authorities reuse activation identity".into());
-        }
-        if let Some(activation_id) = &authority.consumed_by {
-            let Some(command) = snapshot.activation_admissions.get(activation_id) else {
-                return Err("consumed activation authority has no canonical admission".into());
-            };
-            if authority_id != &command.authority_id
-                || authority.activation != command.activation
-                || authority.expected_scheduling_generation
-                    != command.expected_scheduling_generation
-                || authority.expected_dispatch_revision != command.expected_dispatch_revision
-            {
-                return Err("consumed activation authority disagrees with admission".into());
-            }
-        }
+    let mut authority_ids = BTreeSet::new();
+    if snapshot
+        .activation_admissions
+        .values()
+        .any(|command| !authority_ids.insert(command.authority_id.as_str()))
+    {
+        return Err("canonical activation admissions reuse authority identity".into());
     }
     let mut activation_input_message_ids = BTreeSet::new();
     for (attachment_id, attachment) in &snapshot.activation_inputs {
@@ -5632,110 +4847,25 @@ pub fn assert_invariants(snapshot: &Snapshot) -> Result<(), String> {
             );
         }
     } else if !snapshot.settlements.is_empty() && snapshot.dispatch != AgentDispatchState::Open {
-        let lifecycle_wait_is_preserved = match &snapshot.dispatch {
+        // Settlement may atomically adopt an activation's WorkItem-owned wait,
+        // so the preserved authoritative lane is not limited to lifecycle-owned
+        // waits. It must still identify an active canonical wait generation.
+        let active_wait_is_preserved = match &snapshot.dispatch {
             AgentDispatchState::Awaiting { wait } => snapshot
                 .waits
                 .get(&wait.id)
                 .and_then(|record| record.generations.get(&wait.generation))
                 .is_some_and(|generation| {
-                    matches!(generation.owner, SchedulerOwner::AgentLifecycle { .. })
-                        && matches!(generation.state, WaitState::Active | WaitState::Triggered)
+                    matches!(generation.state, WaitState::Active | WaitState::Triggered)
                 }),
             AgentDispatchState::Open => false,
         };
-        if !lifecycle_wait_is_preserved {
+        if !active_wait_is_preserved {
             return Err(
                 "canonical settlement dispatch disagrees with authoritative lane state".into(),
             );
         }
     }
-    if let Some(manifest) = &snapshot.rollout.manifest {
-        if !rollout_manifest_is_installable(manifest) {
-            return Err("rollout manifest is incomplete".into());
-        }
-        let preflight = snapshot
-            .rollout
-            .preflights
-            .get(&manifest.preflight_revision)
-            .ok_or_else(|| "rollout manifest has no canonical preflight".to_string())?;
-        if preflight.state != RolloutPreflightState::Consumed
-            || preflight.manifest_revision != manifest.revision
-            || preflight.manifest.as_ref() != Some(manifest)
-        {
-            return Err("rollout manifest disagrees with canonical preflight".into());
-        }
-    }
-    if snapshot
-        .rollout
-        .preflights
-        .iter()
-        .any(|(revision, preflight)| {
-            *revision != preflight.revision
-                || *revision > snapshot.rollout.latest_preflight_revision
-                || match preflight.state {
-                    RolloutPreflightState::Open => preflight.manifest.is_some(),
-                    RolloutPreflightState::Completed | RolloutPreflightState::Consumed => {
-                        preflight.manifest.as_ref().is_none_or(|manifest| {
-                            manifest.revision != preflight.manifest_revision
-                                || manifest.preflight_revision != preflight.revision
-                                || manifest.preflight_for_manifest_revision
-                                    != preflight.manifest_revision
-                        })
-                    }
-                }
-        })
-    {
-        return Err("rollout preflight record is invalid".into());
-    }
-    for blocker in &snapshot.rollout.hard_blockers {
-        if blocker.scenario_class.is_empty()
-            || blocker.blocker_code.is_empty()
-            || blocker.trigger != RollbackTrigger::AnyHardBlocker
-            || rollback_target(&RollbackPolicy {
-                trigger: blocker.trigger,
-                action: blocker.action,
-            }) == ScenarioMode::Authoritative
-        {
-            return Err("rollout hard blocker record is invalid".into());
-        }
-    }
-    for (scenario_class, scenario) in &snapshot.rollout.scenarios {
-        if !scenario_allowed(snapshot.rollout.protocol_mode, scenario.mode) {
-            return Err(format!(
-                "scenario {scenario_class} exceeds the protocol ceiling"
-            ));
-        }
-        match scenario.mode {
-            ScenarioMode::Authoritative => {
-                let manifest = snapshot
-                    .rollout
-                    .manifest
-                    .as_ref()
-                    .ok_or_else(|| "authoritative scenario has no manifest".to_string())?;
-                let class = manifest
-                    .classes
-                    .get(scenario_class)
-                    .ok_or_else(|| "authoritative scenario has no class evidence".to_string())?;
-                if !manifest.preflight_succeeded
-                    || scenario.manifest_revision != Some(manifest.revision)
-                    || scenario.preflight_revision != Some(manifest.preflight_revision)
-                    || scenario.rollback_target != rollback_target(&class.rollback_policy)
-                {
-                    return Err(format!(
-                        "authoritative scenario {scenario_class} has stale rollout evidence"
-                    ));
-                }
-            }
-            ScenarioMode::Off | ScenarioMode::Shadow => {
-                if scenario.manifest_revision.is_some() || scenario.preflight_revision.is_some() {
-                    return Err(format!(
-                        "non-authoritative scenario {scenario_class} retains authority fences"
-                    ));
-                }
-            }
-        }
-    }
-
     match &snapshot.slot {
         ActivationSlot::Idle => {}
         ActivationSlot::Running {
@@ -6085,18 +5215,22 @@ pub fn assert_invariants(snapshot: &Snapshot) -> Result<(), String> {
     Ok(())
 }
 
+fn rejected(snapshot: &Snapshot, diagnostic: &str) -> Outcome {
+    Outcome {
+        decision: Decision::Rejected,
+        transitions: Vec::new(),
+        diagnostics: vec![diagnostic.to_string()],
+        snapshot: snapshot.clone(),
+    }
+}
+
 #[cfg(test)]
 mod wire_compatibility_tests {
-    use std::collections::BTreeMap;
 
     use super::{
-        activation_provenance_matches_cause, reduce_rollout_command, rollout_class_gate,
-        ActivationBinding, ActivationCause, ActivationInputAttachment, ActivationOrigin,
-        ActivationProvenance, ActivationSlot, ActivationTrust, AgentDispatchState, Decision,
-        ProtocolMode, RollbackAction, RollbackPolicy, RollbackTrigger, RolloutClassEvidence,
-        RolloutCommand, RolloutManifest, RolloutState, ScenarioAuthority, ScenarioMode,
-        SchedulerOwner, SchedulerScenarioClass, Snapshot, WaitGenerationRecord, WaitState,
-        MAXIMUM_P99_LATENCY_REGRESSION_BPS, UNIVERSAL_ROLLOUT_EVIDENCE,
+        activation_provenance_matches_cause, ActivationBinding, ActivationCause,
+        ActivationInputAttachment, ActivationOrigin, ActivationProvenance, ActivationTrust,
+        SchedulerOwner, WaitGenerationRecord, WaitState,
     };
 
     #[test]
@@ -6227,168 +5361,6 @@ mod wire_compatibility_tests {
         assert!(error
             .to_string()
             .contains("exactly one complete owner/generation format"));
-    }
-
-    #[test]
-    fn operator_interjection_authority_requires_all_dependencies() {
-        let mut snapshot = rollout_snapshot();
-        for dependency in SchedulerScenarioClass::OperatorInterjection.authoritative_dependencies()
-        {
-            snapshot
-                .rollout
-                .scenarios
-                .insert(dependency.as_str().into(), authoritative_scenario());
-        }
-        snapshot
-            .rollout
-            .scenarios
-            .get_mut(SchedulerScenarioClass::ExactWaitResume.as_str())
-            .expect("dependency")
-            .mode = ScenarioMode::Shadow;
-        snapshot.rollout.scenarios.insert(
-            SchedulerScenarioClass::OperatorInterjection.as_str().into(),
-            ScenarioAuthority {
-                mode: ScenarioMode::Shadow,
-                rollback_target: ScenarioMode::Shadow,
-                manifest_revision: None,
-                preflight_revision: None,
-            },
-        );
-
-        let outcome = reduce_rollout_command(
-            &snapshot,
-            &RolloutCommand::ChangeScenarioAuthority {
-                scenario_class: SchedulerScenarioClass::OperatorInterjection.as_str().into(),
-                expected_config_revision: 7,
-                expected_manifest_revision: 1,
-                expected_preflight_revision: 1,
-                mode: ScenarioMode::Authoritative,
-            },
-        );
-        assert_eq!(outcome.outcome.decision, Decision::Rejected);
-        assert_eq!(
-            outcome.outcome.diagnostics,
-            ["scenario_authority_dependency_not_satisfied"]
-        );
-    }
-
-    #[test]
-    fn lowering_dependency_cascades_operator_interjection() {
-        let mut snapshot = rollout_snapshot();
-        for dependency in SchedulerScenarioClass::OperatorInterjection.authoritative_dependencies()
-        {
-            snapshot
-                .rollout
-                .scenarios
-                .insert(dependency.as_str().into(), authoritative_scenario());
-        }
-        snapshot.rollout.scenarios.insert(
-            SchedulerScenarioClass::OperatorInterjection.as_str().into(),
-            authoritative_scenario(),
-        );
-
-        let outcome = reduce_rollout_command(
-            &snapshot,
-            &RolloutCommand::ChangeScenarioAuthority {
-                scenario_class: SchedulerScenarioClass::ExactWaitResume.as_str().into(),
-                expected_config_revision: 7,
-                expected_manifest_revision: 1,
-                expected_preflight_revision: 1,
-                mode: ScenarioMode::Shadow,
-            },
-        );
-        assert_eq!(outcome.outcome.decision, Decision::ScenarioAuthorityChanged);
-        assert_eq!(
-            outcome.outcome.snapshot.rollout.scenarios
-                [SchedulerScenarioClass::OperatorInterjection.as_str()]
-            .mode,
-            ScenarioMode::Shadow
-        );
-    }
-
-    fn rollout_snapshot() -> Snapshot {
-        let classes = SchedulerScenarioClass::PRODUCTION_AUTHORITY
-            .into_iter()
-            .map(|scenario_class| {
-                let gate = rollout_class_gate(scenario_class.as_str())
-                    .expect("production scheduler scenario has a rollout gate");
-                let required_evidence: std::collections::BTreeSet<String> =
-                    UNIVERSAL_ROLLOUT_EVIDENCE
-                        .iter()
-                        .chain(gate.required_evidence.iter())
-                        .map(|evidence| (*evidence).to_string())
-                        .collect();
-                (
-                    scenario_class.as_str().to_string(),
-                    RolloutClassEvidence {
-                        configured_mode: ScenarioMode::Authoritative,
-                        minimum_shadow_samples: gate.minimum_shadow_samples,
-                        minimum_shadow_duration_secs: gate.minimum_shadow_duration_secs,
-                        observed_shadow_samples: gate.minimum_shadow_samples,
-                        observed_shadow_duration_secs: gate.minimum_shadow_duration_secs,
-                        maximum_p99_latency_regression_bps: MAXIMUM_P99_LATENCY_REGRESSION_BPS,
-                        observed_p99_latency_regression_bps: 0,
-                        hard_blocker_count: 0,
-                        unresolved_divergence_count: 0,
-                        verified_evidence: required_evidence.clone(),
-                        required_evidence,
-                        rollback_policy: RollbackPolicy {
-                            trigger: RollbackTrigger::AnyHardBlocker,
-                            action: RollbackAction::StopAdmissionsAndRevert {
-                                target: ScenarioMode::Shadow,
-                            },
-                        },
-                    },
-                )
-            })
-            .collect();
-        let manifest = RolloutManifest {
-            revision: 1,
-            preflight_revision: 1,
-            preflight_for_manifest_revision: 1,
-            preflight_succeeded: true,
-            protocol_build: "test".into(),
-            schema_build: "test".into(),
-            schema_revision: 38,
-            fixture_corpus_revision: "test".into(),
-            classes,
-            safety_divergence_bps: 0,
-            canonical_state_divergence_bps: 0,
-            allowed_observational_divergence: BTreeMap::new(),
-            approver: "test".into(),
-            approved_at: "test".into(),
-        };
-        Snapshot {
-            slot: ActivationSlot::Idle,
-            dispatch: AgentDispatchState::Open,
-            dispatch_revision: 0,
-            focus: None,
-            work: BTreeMap::new(),
-            waits: BTreeMap::new(),
-            activations: BTreeMap::new(),
-            activation_authorities: BTreeMap::new(),
-            activation_admissions: BTreeMap::new(),
-            settlements: BTreeMap::new(),
-            missing_settlements: BTreeMap::new(),
-            rollout: RolloutState {
-                protocol_mode: ProtocolMode::Authoritative,
-                config_revision: 7,
-                manifest: Some(manifest),
-                ..RolloutState::default()
-            },
-            admitted_generations: Default::default(),
-            continuation_admissions: BTreeMap::new(),
-            activation_inputs: BTreeMap::new(),
-        }
-    }
-
-    fn authoritative_scenario() -> ScenarioAuthority {
-        ScenarioAuthority {
-            mode: ScenarioMode::Authoritative,
-            rollback_target: ScenarioMode::Shadow,
-            manifest_revision: Some(1),
-            preflight_revision: Some(1),
-        }
     }
 
     fn activation_input_json(owner_fields: serde_json::Value) -> serde_json::Value {

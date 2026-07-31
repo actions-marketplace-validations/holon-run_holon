@@ -5,15 +5,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use model::{
-    assert_invariants, reduce, reduce_command, ActivationAdmissionAuthority, ActivationBinding,
-    ActivationCause, ActivationDisposition, ActivationLifecycleState, ActivationOrigin,
-    ActivationPriority, ActivationProvenance, ActivationRecord, ActivationSettlement,
-    ActivationSlot, ActivationState, ActivationTrust, AdmissionCause, AdmitActivationCommand,
-    AgentActivation, AgentDispatchDisposition, AgentDispatchState, Decision, Event,
-    IssueActivationAuthorityCommand, MissingSettlementRecord, ObservationalDivergenceAllowance,
-    PreemptionPolicy, ProtocolCommand, ProtocolConflictKind, ProtocolMode,
-    RegisterWorkDemandCommand, RollbackAction, RollbackPolicy, RollbackTrigger,
-    RolloutClassEvidence, RolloutManifest, RolloutPreflightState, RolloutState, ScenarioMode,
+    assert_invariants, reduce, reduce_command, ActivationBinding, ActivationCause,
+    ActivationDisposition, ActivationLifecycleState, ActivationOrigin, ActivationPriority,
+    ActivationProvenance, ActivationRecord, ActivationSettlement, ActivationSlot, ActivationState,
+    ActivationTrust, AdmissionCause, AdmitActivationCommand, AdoptActivationWorkStateCommand,
+    AdoptLegacyWorkStateCommand, AgentActivation, AgentDispatchDisposition, AgentDispatchState,
+    Decision, Event, LegacyWaitAdoption, LifecycleWaitHandoffProof, MissingSettlementRecord,
+    PreemptionPolicy, ProtocolCommand, ProtocolConflictKind, RegisterWorkDemandCommand,
     SchedulerOwner, SettleActivationCommand, Settlement, Snapshot, WaitGenerationRecord,
     WaitIdentity, WaitRecord, WaitState, WaitTrigger, WorkDemand, WorkStatus,
     YieldContinuationRecord,
@@ -32,14 +30,8 @@ struct Fixture {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "surface", rename_all = "snake_case")]
 enum FixtureInput {
-    Protocol {
-        command: ProtocolCommand,
-        #[serde(default)]
-        authority: Option<ActivationAdmissionAuthority>,
-    },
-    Event {
-        event: Event,
-    },
+    Protocol { command: ProtocolCommand },
+    Event { event: Event },
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,11 +45,9 @@ struct Expected {
     work: BTreeMap<String, WorkDemand>,
     waits: BTreeMap<String, WaitRecord>,
     activations: BTreeMap<String, ActivationRecord>,
-    activation_authorities: BTreeMap<String, ActivationAdmissionAuthority>,
     activation_admissions: BTreeMap<String, AdmitActivationCommand>,
     settlements: BTreeMap<String, ActivationSettlement>,
     missing_settlements: BTreeMap<String, MissingSettlementRecord>,
-    rollout: RolloutState,
     admitted_generations: Vec<String>,
     continuation_admissions: Vec<String>,
 }
@@ -77,39 +67,7 @@ fn fixtures() -> Vec<Fixture> {
 
 fn apply_fixture_input(snapshot: &Snapshot, input: &FixtureInput) -> model::Outcome {
     match input {
-        FixtureInput::Protocol { command, authority } => {
-            let mut authorized = snapshot.clone();
-            let authority_id = authority.as_ref().map(|authority| {
-                let authority_id = match command {
-                    ProtocolCommand::AdmitActivation(command) => command.authority_id.clone(),
-                    _ => panic!("fixture authority requires an admission command"),
-                };
-                authorized
-                    .activation_authorities
-                    .insert(authority_id.clone(), authority.clone());
-                authority_id
-            });
-            let previous_authority = authority_id.as_ref().and_then(|authority_id| {
-                snapshot.activation_authorities.get(authority_id).cloned()
-            });
-            let mut outcome = reduce_command(&authorized, command).outcome;
-            if outcome.decision != Decision::Admitted {
-                if let Some(authority_id) = authority_id {
-                    if let Some(previous_authority) = previous_authority {
-                        outcome
-                            .snapshot
-                            .activation_authorities
-                            .insert(authority_id, previous_authority);
-                    } else {
-                        outcome
-                            .snapshot
-                            .activation_authorities
-                            .remove(&authority_id);
-                    }
-                }
-            }
-            outcome
-        }
+        FixtureInput::Protocol { command } => reduce_command(snapshot, command).outcome,
         FixtureInput::Event { event } => reduce(snapshot, event),
     }
 }
@@ -236,29 +194,7 @@ fn apply_event(snapshot: &Snapshot, event: &Event) -> model::Outcome {
                 expected_scheduling_generation: *expected_generation,
                 expected_dispatch_revision: *expected_dispatch_revision,
             };
-            let mut authorized = snapshot.clone();
-            let previous_authority = authorized
-                .activation_authorities
-                .get(&command.authority_id)
-                .cloned();
-            authorize_admission(&mut authorized, &command);
-            let authority_id = command.authority_id.clone();
-            let mut outcome =
-                reduce_command(&authorized, &ProtocolCommand::AdmitActivation(command)).outcome;
-            if outcome.decision != Decision::Admitted {
-                if let Some(previous_authority) = previous_authority {
-                    outcome
-                        .snapshot
-                        .activation_authorities
-                        .insert(authority_id, previous_authority);
-                } else {
-                    outcome
-                        .snapshot
-                        .activation_authorities
-                        .remove(&authority_id);
-                }
-            }
-            outcome
+            reduce_command(snapshot, &ProtocolCommand::AdmitActivation(command)).outcome
         }
         Event::Settle {
             activation_id,
@@ -440,11 +376,6 @@ fn historical_scenarios_replay_to_one_explicit_state() {
             fixture.name
         );
         assert_eq!(
-            snapshot.activation_authorities, fixture.expected.activation_authorities,
-            "{}: activation authorities",
-            fixture.name
-        );
-        assert_eq!(
             snapshot.activation_admissions, fixture.expected.activation_admissions,
             "{}: activation admissions",
             fixture.name
@@ -457,11 +388,6 @@ fn historical_scenarios_replay_to_one_explicit_state() {
         assert_eq!(
             snapshot.missing_settlements, fixture.expected.missing_settlements,
             "{}: missing settlements",
-            fixture.name
-        );
-        assert_eq!(
-            snapshot.rollout, fixture.expected.rollout,
-            "{}: rollout",
             fixture.name
         );
         assert_eq!(
@@ -527,8 +453,7 @@ fn serialized_snapshot_preserves_canonical_activation_replay_fence() {
 #[test]
 fn legacy_wait_shapes_replay_with_explicit_generation_fences() {
     let command = typed_admission("a1", "key-1", 1);
-    let mut snapshot = minimal_snapshot(1);
-    authorize_admission(&mut snapshot, &command);
+    let snapshot = minimal_snapshot(1);
     let admitted = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
     let legacy_event: Event = serde_json::from_value(serde_json::json!({
         "kind": "settle",
@@ -579,8 +504,7 @@ fn legacy_wait_shapes_replay_with_explicit_generation_fences() {
 #[test]
 fn explicit_zero_wait_generations_are_not_upgraded_as_legacy_shapes() {
     let command = typed_admission("a1", "key-1", 1);
-    let mut snapshot = minimal_snapshot(1);
-    authorize_admission(&mut snapshot, &command);
+    let snapshot = minimal_snapshot(1);
     let admitted = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
     let settlement = typed_settlement(
         "s1",
@@ -787,10 +711,6 @@ fn legacy_wait_resume_migration_preserves_original_callback_provenance() {
     let migrated = model::migrate_legacy_event(&triggered.snapshot, &resume, &context)
         .expect("legacy wait resume migration");
     assert_eq!(migrated.outcome.outcome.decision, Decision::Admitted);
-    let authority = migrated
-        .authority_command
-        .expect("admission migration issues authority");
-    assert_eq!(authority.activation.provenance, provenance);
     let ProtocolCommand::AdmitActivation(command) = migrated.command else {
         panic!("legacy wait resume must migrate to typed admission");
     };
@@ -819,18 +739,17 @@ fn snapshot_without_canonical_protocol_facts_is_rejected() {
     encoded
         .as_object_mut()
         .expect("snapshot object")
-        .remove("activation_authorities");
+        .remove("activation_admissions");
     let error = serde_json::from_value::<Snapshot>(encoded).expect_err("reject legacy snapshot");
     assert!(error
         .to_string()
-        .contains("snapshot is missing canonical activation authorities"));
+        .contains("snapshot is missing canonical activation admissions"));
 }
 
 #[test]
 fn wait_settlement_generation_mismatch_is_classified_as_stale_generation() {
     let command = typed_admission("a1", "key-1", 1);
-    let mut snapshot = minimal_snapshot(1);
-    authorize_admission(&mut snapshot, &command);
+    let snapshot = minimal_snapshot(1);
     let admitted = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
     let snapshot = admitted.outcome.snapshot;
     let rejected = reduce_command(
@@ -1145,8 +1064,7 @@ fn stale_wait_generation_cannot_trigger_or_resume_reused_wait_id() {
 #[test]
 fn activation_cannot_settle_after_scheduling_generation_changes() {
     let command = typed_admission("a1", "key-1", 4);
-    let mut snapshot = minimal_snapshot(4);
-    authorize_admission(&mut snapshot, &command);
+    let snapshot = minimal_snapshot(4);
     let mut snapshot = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command))
         .outcome
         .snapshot;
@@ -1560,10 +1478,6 @@ fn settlement_recovery_rejects_a_current_revision_with_an_awaiting_reservation()
     combined.waits = waiting.snapshot.waits.clone();
     combined.dispatch = waiting.snapshot.dispatch.clone();
     combined.dispatch_revision = waiting.snapshot.dispatch_revision;
-    combined.activation_authorities.insert(
-        "authority-a-wait".into(),
-        waiting.snapshot.activation_authorities["authority-a-wait"].clone(),
-    );
     combined.activation_admissions.insert(
         "a-wait".into(),
         waiting.snapshot.activation_admissions["a-wait"].clone(),
@@ -1584,7 +1498,6 @@ fn settlement_recovery_rejects_a_current_revision_with_an_awaiting_reservation()
         activation_id: "a-missing".into(),
     };
     recovery.activation.provenance.origin = ActivationOrigin::RuntimeRecovery;
-    authorize_admission(&mut combined, &recovery);
     assert_invariants(&combined)
         .expect("missing settlement and another work item's wait reservation are canonical");
 
@@ -1733,686 +1646,9 @@ fn targeted_yield_is_fenced_and_target_completion_restores_source_once() {
 }
 
 #[test]
-fn rollout_authority_requires_complete_evidence_and_fenced_rollback() {
-    let snapshot = minimal_snapshot(1);
-    let mut incomplete = rollout_manifest();
-    incomplete
-        .classes
-        .get_mut("exact_wait_resume")
-        .expect("class")
-        .verified_evidence
-        .remove("rollback_drill");
-    let rejected = apply_event(
-        &snapshot,
-        &Event::InstallRolloutManifest {
-            expected_config_revision: 0,
-            manifest: incomplete,
-        },
-    );
-    assert_eq!(rejected.decision, Decision::Rejected);
-    assert_eq!(rejected.diagnostics, ["rollout_manifest_incomplete"]);
-
-    let mut empty_required = rollout_manifest();
-    empty_required
-        .classes
-        .get_mut("exact_wait_resume")
-        .expect("class")
-        .required_evidence
-        .clear();
-    assert_rollout_manifest_rejected(&snapshot, empty_required);
-
-    let mut omitted_mandatory_evidence = rollout_manifest();
-    let class = omitted_mandatory_evidence
-        .classes
-        .get_mut("exact_wait_resume")
-        .expect("class");
-    class.required_evidence.remove("duplicate_trigger");
-    class.verified_evidence.remove("duplicate_trigger");
-    assert_rollout_manifest_rejected(&snapshot, omitted_mandatory_evidence);
-
-    let mut insufficient_samples = rollout_manifest();
-    let class = insufficient_samples
-        .classes
-        .get_mut("exact_wait_resume")
-        .expect("class");
-    class.minimum_shadow_samples = 999;
-    class.observed_shadow_samples = 999;
-    assert_rollout_manifest_rejected(&snapshot, insufficient_samples);
-
-    let mut insufficient_duration = rollout_manifest();
-    let class = insufficient_duration
-        .classes
-        .get_mut("exact_wait_resume")
-        .expect("class");
-    class.minimum_shadow_duration_secs = 604_799;
-    class.observed_shadow_duration_secs = 604_799;
-    assert_rollout_manifest_rejected(&snapshot, insufficient_duration);
-
-    let mut excessive_p99_budget = rollout_manifest();
-    excessive_p99_budget
-        .classes
-        .get_mut("exact_wait_resume")
-        .expect("class")
-        .maximum_p99_latency_regression_bps = 1_001;
-    assert_rollout_manifest_rejected(&snapshot, excessive_p99_budget);
-
-    let mut excessive_observed_p99 = rollout_manifest();
-    excessive_observed_p99
-        .classes
-        .get_mut("exact_wait_resume")
-        .expect("class")
-        .observed_p99_latency_regression_bps = 501;
-    assert_rollout_manifest_rejected(&snapshot, excessive_observed_p99);
-
-    let mut safety_divergence = rollout_manifest();
-    safety_divergence.safety_divergence_bps = 1;
-    assert_rollout_manifest_rejected(&snapshot, safety_divergence);
-
-    let mut canonical_divergence = rollout_manifest();
-    canonical_divergence.canonical_state_divergence_bps = 1;
-    assert_rollout_manifest_rejected(&snapshot, canonical_divergence);
-
-    let mut unreviewed_observational_divergence = rollout_manifest();
-    unreviewed_observational_divergence
-        .allowed_observational_divergence
-        .get_mut("diagnostic_order")
-        .expect("allowance")
-        .reviewed_by
-        .clear();
-    assert_rollout_manifest_rejected(&snapshot, unreviewed_observational_divergence);
-
-    let mut excessive_observational_divergence = rollout_manifest();
-    excessive_observational_divergence
-        .allowed_observational_divergence
-        .get_mut("diagnostic_order")
-        .expect("allowance")
-        .maximum_rate_bps = 101;
-    assert_rollout_manifest_rejected(&snapshot, excessive_observational_divergence);
-
-    let mut missing_rollback_trigger = rollout_manifest();
-    missing_rollback_trigger
-        .classes
-        .get_mut("exact_wait_resume")
-        .expect("class")
-        .rollback_policy
-        .action = RollbackAction::StopAdmissionsAndRevert {
-        target: ScenarioMode::Authoritative,
-    };
-    assert_rollout_manifest_rejected(&snapshot, missing_rollback_trigger);
-
-    for configured_mode in [ScenarioMode::Shadow, ScenarioMode::Off] {
-        let mut invalid_rollback_target = rollout_manifest();
-        let class = invalid_rollback_target
-            .classes
-            .get_mut("exact_wait_resume")
-            .expect("class");
-        class.configured_mode = configured_mode;
-        class.rollback_policy.action = RollbackAction::StopAdmissionsAndRevert {
-            target: ScenarioMode::Authoritative,
-        };
-        assert_rollout_manifest_rejected(&snapshot, invalid_rollback_target);
-    }
-
-    let (preflight_ready, manifest) = complete_rollout_preflight(&snapshot, rollout_manifest());
-    let installed = apply_event(
-        &preflight_ready,
-        &Event::InstallRolloutManifest {
-            expected_config_revision: 0,
-            manifest,
-        },
-    );
-    assert_eq!(installed.decision, Decision::ManifestInstalled);
-
-    let mut stale_preflight_binding = rollout_manifest();
-    stale_preflight_binding.revision = 2;
-    assert_rollout_manifest_rejected(&installed.snapshot, stale_preflight_binding);
-
-    let unchanged_new_revision = next_rollout_manifest();
-    assert_rollout_preflight_refresh_required(&installed.snapshot, unchanged_new_revision);
-
-    let mut changed_threshold = next_rollout_manifest();
-    let class = changed_threshold
-        .classes
-        .get_mut("exact_wait_resume")
-        .expect("class");
-    class.minimum_shadow_samples += 1;
-    class.observed_shadow_samples += 1;
-    assert_rollout_preflight_refresh_required(&installed.snapshot, changed_threshold);
-
-    let mut changed_corpus = next_rollout_manifest();
-    changed_corpus.fixture_corpus_revision = "scheduler-workitem-phase0-v2".into();
-    assert_rollout_preflight_refresh_required(&installed.snapshot, changed_corpus);
-
-    let mut changed_divergence_allowance = next_rollout_manifest();
-    changed_divergence_allowance
-        .allowed_observational_divergence
-        .get_mut("diagnostic_order")
-        .expect("allowance")
-        .maximum_rate_bps += 1;
-    assert_rollout_preflight_refresh_required(&installed.snapshot, changed_divergence_allowance);
-
-    let mut changed_classification = next_rollout_manifest();
-    changed_classification
-        .classes
-        .get_mut("exact_wait_resume")
-        .expect("class")
-        .configured_mode = ScenarioMode::Shadow;
-    assert_rollout_preflight_refresh_required(&installed.snapshot, changed_classification);
-
-    let mut changed_required_evidence = next_rollout_manifest();
-    let class = changed_required_evidence
-        .classes
-        .get_mut("exact_wait_resume")
-        .expect("class");
-    class.required_evidence.insert("operator_signoff".into());
-    class.verified_evidence.insert("operator_signoff".into());
-    assert_rollout_preflight_refresh_required(&installed.snapshot, changed_required_evidence);
-
-    let mut changed_latency_budget = next_rollout_manifest();
-    changed_latency_budget
-        .classes
-        .get_mut("exact_wait_resume")
-        .expect("class")
-        .maximum_p99_latency_regression_bps = 499;
-    assert_rollout_preflight_refresh_required(&installed.snapshot, changed_latency_budget);
-
-    let mut changed_rollback_policy = next_rollout_manifest();
-    changed_rollback_policy
-        .classes
-        .get_mut("exact_wait_resume")
-        .expect("class")
-        .rollback_policy
-        .action = RollbackAction::StopAdmissionsAndRevert {
-        target: ScenarioMode::Off,
-    };
-    assert_rollout_preflight_refresh_required(&installed.snapshot, changed_rollback_policy);
-
-    let mut changed_build_and_schema = next_rollout_manifest();
-    changed_build_and_schema.protocol_build = "holon-0.30.1-test".into();
-    changed_build_and_schema.schema_build = "scheduler-protocol-schema-v2".into();
-    changed_build_and_schema.schema_revision = 2;
-    assert_rollout_preflight_refresh_required(&installed.snapshot, changed_build_and_schema);
-
-    let mut changed_observation_results = next_rollout_manifest();
-    let class = changed_observation_results
-        .classes
-        .get_mut("exact_wait_resume")
-        .expect("class");
-    class.observed_shadow_samples += 1;
-    class.observed_shadow_duration_secs += 1;
-    class.observed_p99_latency_regression_bps += 1;
-    assert_rollout_preflight_refresh_required(&installed.snapshot, changed_observation_results);
-
-    let failed_opened = apply_event(
-        &installed.snapshot,
-        &Event::OpenRolloutPreflight {
-            expected_config_revision: 1,
-            manifest_revision: 2,
-        },
-    );
-    assert_eq!(failed_opened.decision, Decision::RolloutPreflightOpened);
-    let failed_preflight_revision = failed_opened.snapshot.rollout.latest_preflight_revision;
-    let mut failed_preflight = next_rollout_manifest();
-    failed_preflight.preflight_revision = failed_preflight_revision;
-    failed_preflight.preflight_for_manifest_revision = failed_preflight.revision;
-    failed_preflight.preflight_succeeded = false;
-    let failed_completion = apply_event(
-        &failed_opened.snapshot,
-        &Event::CompleteRolloutPreflight {
-            expected_config_revision: 1,
-            expected_preflight_revision: failed_preflight_revision,
-            manifest: failed_preflight.clone(),
-        },
-    );
-    assert_eq!(failed_completion.decision, Decision::Rejected);
-    assert_eq!(failed_completion.diagnostics, ["rollout_preflight_failed"]);
-    assert_eq!(failed_completion.snapshot, failed_opened.snapshot);
-
-    let mut forged_completed = failed_opened.snapshot.clone();
-    let forged_record = forged_completed
-        .rollout
-        .preflights
-        .get_mut(&failed_preflight_revision)
-        .expect("failed preflight record");
-    forged_record.state = RolloutPreflightState::Completed;
-    forged_record.manifest = Some(failed_preflight.clone());
-    let failed_installation = apply_event(
-        &forged_completed,
-        &Event::InstallRolloutManifest {
-            expected_config_revision: 1,
-            manifest: failed_preflight,
-        },
-    );
-    assert_eq!(failed_installation.decision, Decision::Rejected);
-    assert_eq!(
-        failed_installation.diagnostics,
-        ["rollout_preflight_failed"]
-    );
-    assert_eq!(failed_installation.snapshot, forged_completed);
-
-    let mut replayed_observation = installed
-        .snapshot
-        .rollout
-        .manifest
-        .clone()
-        .expect("installed manifest");
-    replayed_observation.revision = 2;
-    replayed_observation.preflight_revision = 2;
-    replayed_observation.preflight_for_manifest_revision = 2;
-    let replayed = apply_event(
-        &installed.snapshot,
-        &Event::InstallRolloutManifest {
-            expected_config_revision: 1,
-            manifest: replayed_observation,
-        },
-    );
-    assert_eq!(replayed.decision, Decision::Rejected);
-    assert_eq!(replayed.diagnostics, ["rollout_preflight_record_missing"]);
-
-    let opened_only = apply_event(
-        &installed.snapshot,
-        &Event::OpenRolloutPreflight {
-            expected_config_revision: 1,
-            manifest_revision: 2,
-        },
-    );
-    assert_eq!(opened_only.decision, Decision::RolloutPreflightOpened);
-    let mut uncompleted_observation = next_rollout_manifest();
-    uncompleted_observation.preflight_revision = 2;
-    let uncompleted = apply_event(
-        &opened_only.snapshot,
-        &Event::InstallRolloutManifest {
-            expected_config_revision: 1,
-            manifest: uncompleted_observation,
-        },
-    );
-    assert_eq!(uncompleted.decision, Decision::Rejected);
-    assert_eq!(
-        uncompleted.diagnostics,
-        ["rollout_preflight_record_not_installable"]
-    );
-
-    let mut refreshed_preflight = next_rollout_manifest();
-    refreshed_preflight.fixture_corpus_revision = "scheduler-workitem-phase0-v2".into();
-    let (refreshed_ready, refreshed_preflight) =
-        complete_rollout_preflight(&installed.snapshot, refreshed_preflight);
-    let mut changed_after_preflight = refreshed_preflight.clone();
-    changed_after_preflight
-        .classes
-        .get_mut("exact_wait_resume")
-        .expect("class")
-        .observed_shadow_samples += 1;
-    let mismatched = apply_event(
-        &refreshed_ready,
-        &Event::InstallRolloutManifest {
-            expected_config_revision: 1,
-            manifest: changed_after_preflight,
-        },
-    );
-    assert_eq!(mismatched.decision, Decision::Rejected);
-    assert_eq!(
-        mismatched.diagnostics,
-        ["rollout_preflight_record_mismatch"]
-    );
-    let refreshed = apply_event(
-        &refreshed_ready,
-        &Event::InstallRolloutManifest {
-            expected_config_revision: 1,
-            manifest: refreshed_preflight,
-        },
-    );
-    assert_eq!(refreshed.decision, Decision::ManifestInstalled);
-
-    let configured = apply_event(
-        &installed.snapshot,
-        &Event::ConfigureProtocol {
-            expected_config_revision: 1,
-            mode: ProtocolMode::Authoritative,
-        },
-    );
-    assert_eq!(configured.decision, Decision::ProtocolConfigured);
-    let off_to_authoritative = apply_event(
-        &configured.snapshot,
-        &Event::ChangeScenarioAuthority {
-            scenario_class: "exact_wait_resume".into(),
-            expected_config_revision: 2,
-            expected_manifest_revision: 1,
-            expected_preflight_revision: 1,
-            mode: ScenarioMode::Authoritative,
-        },
-    );
-    assert_eq!(off_to_authoritative.decision, Decision::Rejected);
-    assert_eq!(off_to_authoritative.diagnostics, ["scenario_not_shadow"]);
-    assert_eq!(off_to_authoritative.snapshot, configured.snapshot);
-
-    let shadowed = apply_event(
-        &configured.snapshot,
-        &Event::ChangeScenarioAuthority {
-            scenario_class: "exact_wait_resume".into(),
-            expected_config_revision: 2,
-            expected_manifest_revision: 1,
-            expected_preflight_revision: 1,
-            mode: ScenarioMode::Shadow,
-        },
-    );
-    assert_eq!(shadowed.decision, Decision::ScenarioAuthorityChanged);
-    let authorized = apply_event(
-        &shadowed.snapshot,
-        &Event::ChangeScenarioAuthority {
-            scenario_class: "exact_wait_resume".into(),
-            expected_config_revision: 3,
-            expected_manifest_revision: 1,
-            expected_preflight_revision: 1,
-            mode: ScenarioMode::Authoritative,
-        },
-    );
-    assert_eq!(authorized.decision, Decision::ScenarioAuthorityChanged);
-
-    let skipped_shadow_on_downgrade = apply_event(
-        &authorized.snapshot,
-        &Event::ChangeScenarioAuthority {
-            scenario_class: "exact_wait_resume".into(),
-            expected_config_revision: 4,
-            expected_manifest_revision: 1,
-            expected_preflight_revision: 1,
-            mode: ScenarioMode::Off,
-        },
-    );
-    assert_eq!(skipped_shadow_on_downgrade.decision, Decision::Rejected);
-    assert_eq!(
-        skipped_shadow_on_downgrade.diagnostics,
-        ["invalid_scenario_authority_transition"]
-    );
-    assert_eq!(skipped_shadow_on_downgrade.snapshot, authorized.snapshot);
-
-    let stale = apply_event(
-        &authorized.snapshot,
-        &Event::ReportScenarioHardBlocker {
-            scenario_class: "exact_wait_resume".into(),
-            blocker_code: "stale_wait_generation_accepted".into(),
-            expected_config_revision: 3,
-            expected_manifest_revision: 1,
-            expected_preflight_revision: 1,
-        },
-    );
-    assert_eq!(stale.decision, Decision::Rejected);
-    assert_eq!(stale.diagnostics, ["stale_rollout_config_revision"]);
-
-    let stale_manifest = apply_event(
-        &authorized.snapshot,
-        &Event::ReportScenarioHardBlocker {
-            scenario_class: "exact_wait_resume".into(),
-            blocker_code: "stale_wait_generation_accepted".into(),
-            expected_config_revision: 4,
-            expected_manifest_revision: 0,
-            expected_preflight_revision: 1,
-        },
-    );
-    assert_eq!(stale_manifest.decision, Decision::Rejected);
-    assert_eq!(
-        stale_manifest.diagnostics,
-        ["stale_rollout_manifest_revision"]
-    );
-
-    let stale_preflight = apply_event(
-        &authorized.snapshot,
-        &Event::ReportScenarioHardBlocker {
-            scenario_class: "exact_wait_resume".into(),
-            blocker_code: "stale_wait_generation_accepted".into(),
-            expected_config_revision: 4,
-            expected_manifest_revision: 1,
-            expected_preflight_revision: 0,
-        },
-    );
-    assert_eq!(stale_preflight.decision, Decision::Rejected);
-    assert_eq!(
-        stale_preflight.diagnostics,
-        ["stale_rollout_preflight_revision"]
-    );
-
-    let blocker = Event::ReportScenarioHardBlocker {
-        scenario_class: "exact_wait_resume".into(),
-        blocker_code: "stale_wait_generation_accepted".into(),
-        expected_config_revision: 4,
-        expected_manifest_revision: 1,
-        expected_preflight_revision: 1,
-    };
-    let rolled_back = apply_event(&authorized.snapshot, &blocker);
-    assert_eq!(rolled_back.decision, Decision::RollbackTripped);
-    assert_eq!(
-        rolled_back.snapshot.rollout.scenarios["exact_wait_resume"].mode,
-        ScenarioMode::Shadow
-    );
-    let recorded = rolled_back
-        .snapshot
-        .rollout
-        .hard_blockers
-        .iter()
-        .next()
-        .expect("hard blocker record");
-    assert_eq!(recorded.scenario_class, "exact_wait_resume");
-    assert_eq!(recorded.blocker_code, "stale_wait_generation_accepted");
-    assert_eq!(recorded.config_revision, 4);
-    assert_eq!(recorded.manifest_revision, 1);
-    assert_eq!(recorded.preflight_revision, 1);
-    assert_eq!(recorded.trigger, RollbackTrigger::AnyHardBlocker);
-    assert_eq!(
-        recorded.action,
-        RollbackAction::StopAdmissionsAndRevert {
-            target: ScenarioMode::Shadow,
-        }
-    );
-
-    let encoded = serde_json::to_vec(&rolled_back.snapshot).expect("serialize rollback snapshot");
-    let reloaded: Snapshot =
-        serde_json::from_slice(&encoded).expect("deserialize rollback snapshot");
-    assert_eq!(reloaded, rolled_back.snapshot);
-
-    let duplicate = apply_event(&reloaded, &blocker);
-    assert_eq!(duplicate.decision, Decision::Rejected);
-    assert_eq!(duplicate.diagnostics, ["stale_rollout_config_revision"]);
-    assert_eq!(duplicate.snapshot, reloaded);
-}
-
-#[test]
-fn explicit_startup_authority_bypasses_only_evidence_completion() {
-    let snapshot = minimal_snapshot(1);
-    let mut manifest = rollout_manifest();
-    let class = manifest
-        .classes
-        .get_mut("exact_wait_resume")
-        .expect("class");
-    class.configured_mode = ScenarioMode::Shadow;
-    class.observed_shadow_samples = 0;
-    class.observed_shadow_duration_secs = 0;
-    class.verified_evidence.clear();
-    let (preflight, manifest) = complete_rollout_preflight(&snapshot, manifest);
-    let installed = apply_event(
-        &preflight,
-        &Event::InstallRolloutManifest {
-            expected_config_revision: 0,
-            manifest,
-        },
-    );
-    assert_eq!(installed.decision, Decision::ManifestInstalled);
-    let configured = apply_event(
-        &installed.snapshot,
-        &Event::ConfigureProtocol {
-            expected_config_revision: 1,
-            mode: ProtocolMode::Authoritative,
-        },
-    );
-    let shadowed = apply_event(
-        &configured.snapshot,
-        &Event::ChangeScenarioAuthority {
-            scenario_class: "exact_wait_resume".into(),
-            expected_config_revision: 2,
-            expected_manifest_revision: 1,
-            expected_preflight_revision: 1,
-            mode: ScenarioMode::Shadow,
-        },
-    );
-    assert_eq!(shadowed.decision, Decision::ScenarioAuthorityChanged);
-
-    let ordinary = apply_event(
-        &shadowed.snapshot,
-        &Event::ChangeScenarioAuthority {
-            scenario_class: "exact_wait_resume".into(),
-            expected_config_revision: 3,
-            expected_manifest_revision: 1,
-            expected_preflight_revision: 1,
-            mode: ScenarioMode::Authoritative,
-        },
-    );
-    assert_eq!(ordinary.decision, Decision::Rejected);
-    assert_eq!(
-        ordinary.diagnostics,
-        ["scenario_not_approved_for_authority"]
-    );
-
-    let explicit = apply_event(
-        &shadowed.snapshot,
-        &Event::ChangeScenarioAuthorityFromExplicitMode {
-            scenario_class: "exact_wait_resume".into(),
-            expected_config_revision: 3,
-            expected_manifest_revision: 1,
-            expected_preflight_revision: 1,
-        },
-    );
-    assert_eq!(explicit.decision, Decision::ScenarioAuthorityChanged);
-    assert_eq!(
-        explicit.snapshot.rollout.scenarios["exact_wait_resume"].mode,
-        ScenarioMode::Authoritative
-    );
-    assert!(assert_invariants(&explicit.snapshot).is_ok());
-}
-
-fn assert_rollout_manifest_rejected(snapshot: &Snapshot, manifest: RolloutManifest) {
-    let rejected = apply_event(
-        snapshot,
-        &Event::InstallRolloutManifest {
-            expected_config_revision: snapshot.rollout.config_revision,
-            manifest,
-        },
-    );
-    assert_eq!(rejected.decision, Decision::Rejected);
-    assert_eq!(rejected.diagnostics, ["rollout_manifest_incomplete"]);
-    assert_eq!(rejected.snapshot, *snapshot);
-}
-
-fn assert_rollout_preflight_refresh_required(snapshot: &Snapshot, manifest: RolloutManifest) {
-    let rejected = apply_event(
-        snapshot,
-        &Event::InstallRolloutManifest {
-            expected_config_revision: snapshot.rollout.config_revision,
-            manifest,
-        },
-    );
-    assert_eq!(rejected.decision, Decision::Rejected);
-    assert_eq!(
-        rejected.diagnostics,
-        ["rollout_preflight_record_not_installable"]
-    );
-    assert_eq!(rejected.snapshot, *snapshot);
-}
-
-fn complete_rollout_preflight(
-    snapshot: &Snapshot,
-    mut manifest: RolloutManifest,
-) -> (Snapshot, RolloutManifest) {
-    let opened = apply_event(
-        snapshot,
-        &Event::OpenRolloutPreflight {
-            expected_config_revision: snapshot.rollout.config_revision,
-            manifest_revision: manifest.revision,
-        },
-    );
-    assert_eq!(opened.decision, Decision::RolloutPreflightOpened);
-    let preflight_revision = opened.snapshot.rollout.latest_preflight_revision;
-    manifest.preflight_revision = preflight_revision;
-    manifest.preflight_for_manifest_revision = manifest.revision;
-    let completed = apply_event(
-        &opened.snapshot,
-        &Event::CompleteRolloutPreflight {
-            expected_config_revision: snapshot.rollout.config_revision,
-            expected_preflight_revision: preflight_revision,
-            manifest: manifest.clone(),
-        },
-    );
-    assert_eq!(completed.decision, Decision::RolloutPreflightCompleted);
-    (completed.snapshot, manifest)
-}
-
-fn rollout_manifest() -> RolloutManifest {
-    let evidence: BTreeSet<String> = [
-        "restart",
-        "fault_injection",
-        "rollback_drill",
-        "duplicate_trigger",
-        "stale_generation",
-        "restart_after_consume",
-        "rearm",
-    ]
-    .into_iter()
-    .map(Into::into)
-    .collect();
-    RolloutManifest {
-        revision: 1,
-        preflight_revision: 1,
-        preflight_for_manifest_revision: 1,
-        preflight_succeeded: true,
-        protocol_build: "holon-0.30.0-test".into(),
-        schema_build: "scheduler-protocol-schema-v1".into(),
-        schema_revision: 1,
-        fixture_corpus_revision: "scheduler-workitem-phase0-v1".into(),
-        classes: BTreeMap::from([(
-            "exact_wait_resume".into(),
-            RolloutClassEvidence {
-                configured_mode: ScenarioMode::Authoritative,
-                minimum_shadow_samples: 1_000,
-                minimum_shadow_duration_secs: 604_800,
-                observed_shadow_samples: 1_000,
-                observed_shadow_duration_secs: 604_800,
-                maximum_p99_latency_regression_bps: 500,
-                observed_p99_latency_regression_bps: 100,
-                hard_blocker_count: 0,
-                unresolved_divergence_count: 0,
-                required_evidence: evidence.clone(),
-                verified_evidence: evidence,
-                rollback_policy: RollbackPolicy {
-                    trigger: RollbackTrigger::AnyHardBlocker,
-                    action: RollbackAction::StopAdmissionsAndRevert {
-                        target: ScenarioMode::Shadow,
-                    },
-                },
-            },
-        )]),
-        safety_divergence_bps: 0,
-        canonical_state_divergence_bps: 0,
-        allowed_observational_divergence: BTreeMap::from([(
-            "diagnostic_order".into(),
-            ObservationalDivergenceAllowance {
-                maximum_rate_bps: 10,
-                reviewed_by: "phase0-reviewer".into(),
-            },
-        )]),
-        approver: "phase0-reviewer".into(),
-        approved_at: "2026-07-20T00:00:00Z".into(),
-    }
-}
-
-fn next_rollout_manifest() -> RolloutManifest {
-    let mut manifest = rollout_manifest();
-    manifest.revision += 1;
-    manifest.preflight_for_manifest_revision = manifest.revision;
-    manifest
-}
-
-#[test]
 fn typed_commands_retain_admission_identity_and_replay_deterministically() {
     let command = typed_admission("a1", "key-1", 1);
-    let mut snapshot = minimal_snapshot(1);
-    authorize_admission(&mut snapshot, &command);
+    let snapshot = minimal_snapshot(1);
     let admitted = reduce_command(
         &snapshot,
         &ProtocolCommand::AdmitActivation(command.clone()),
@@ -2447,20 +1683,19 @@ fn typed_commands_retain_admission_identity_and_replay_deterministically() {
 }
 
 #[test]
-fn typed_admission_rejects_provenance_authority_spoofing() {
+fn typed_admission_rejects_provenance_spoofing() {
     let mut command = typed_admission("a1", "key-1", 1);
-    let mut snapshot = minimal_snapshot(1);
-    authorize_admission(&mut snapshot, &command);
-    command.activation.provenance.source_id = "attacker-self-declared-runtime".into();
+    let snapshot = minimal_snapshot(1);
+    command.activation.provenance.trust = ActivationTrust::ExternalEvidence;
     let rejected = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
     assert_eq!(rejected.outcome.decision, Decision::Rejected);
     assert_eq!(
         rejected.conflict.expect("typed conflict").kind,
-        ProtocolConflictKind::BindingConflict
+        ProtocolConflictKind::InvalidCommand
     );
     assert_eq!(
         rejected.outcome.diagnostics,
-        ["activation_authority_mismatch"]
+        ["activation_provenance_authority_mismatch"]
     );
     assert_eq!(rejected.outcome.snapshot, snapshot);
 }
@@ -2468,8 +1703,7 @@ fn typed_admission_rejects_provenance_authority_spoofing() {
 #[test]
 fn typed_settlement_has_one_canonical_identity_and_idempotent_replay() {
     let command = typed_admission("a1", "key-1", 1);
-    let mut snapshot = minimal_snapshot(1);
-    authorize_admission(&mut snapshot, &command);
+    let snapshot = minimal_snapshot(1);
     let admitted = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
     let settlement = typed_settlement("s1", "a1", ActivationDisposition::WorkContinues);
     let settled = reduce_command(
@@ -2506,6 +1740,520 @@ fn typed_settlement_has_one_canonical_identity_and_idempotent_replay() {
         conflicting.outcome.diagnostics,
         ["activation_terminal_settlement_already_recorded"]
     );
+}
+
+#[test]
+fn lifecycle_settlement_can_atomically_adopt_work_item_wait() {
+    let mut snapshot = minimal_snapshot(1);
+    snapshot.focus = None;
+    snapshot.work.clear();
+    let activation_id = "activation:message:msg-1";
+    let admission = AdmitActivationCommand {
+        authority_id: "authority-lifecycle".into(),
+        activation: AgentActivation {
+            id: activation_id.into(),
+            agent_id: "agent-1".into(),
+            state: ActivationLifecycleState::Admitted,
+            cause: ActivationCause::LifecycleExternalNudge {
+                message_id: "msg-1".into(),
+            },
+            binding: ActivationBinding::Lifecycle {
+                agent_id: "agent-1".into(),
+            },
+            priority: ActivationPriority::Normal,
+            preemption: PreemptionPolicy::NonPreemptive,
+            source_revision: None,
+            idempotency_key: "lifecycle-msg-1".into(),
+            provenance: ActivationProvenance {
+                origin: ActivationOrigin::System,
+                trust: ActivationTrust::RuntimeInstruction,
+                source_id: "scheduler".into(),
+                correlation_id: None,
+                causation_id: None,
+            },
+        },
+        expected_scheduling_generation: 1,
+        expected_dispatch_revision: 0,
+    };
+    let admitted = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(admission));
+    let settled = reduce_command(
+        &admitted.outcome.snapshot,
+        &ProtocolCommand::SettleActivation(SettleActivationCommand {
+            settlement: ActivationSettlement {
+                id: "settlement:message:msg-1".into(),
+                activation_id: activation_id.into(),
+                turn_terminal: Some("turn-1".into()),
+                disposition: ActivationDisposition::WorkContinues,
+                agent_dispatch: AgentDispatchDisposition::Open,
+                operator_delivery: None,
+                evidence: vec!["message:msg-1".into()],
+                created_at: "2026-07-30T00:00:00Z".into(),
+            },
+        }),
+    );
+    let command = ProtocolCommand::AdoptActivationWorkState(AdoptActivationWorkStateCommand {
+        source_activation_id: activation_id.into(),
+        source_message_id: "msg-1".into(),
+        source_turn_id: "turn-1".into(),
+        source_admitted_generation: 1,
+        work_item_id: "work-1".into(),
+        source_work_item_revision: 2,
+        wait: LegacyWaitAdoption {
+            wait_id: "wait-1".into(),
+            generation: 2,
+            owner_work_item_id: "work-1".into(),
+            source_updated_at: "2026-07-30T00:00:01Z".into(),
+        },
+        source_lifecycle_wait: None,
+        focus: true,
+        reserve_dispatch: true,
+    });
+
+    let adopted = reduce_command(&settled.outcome.snapshot, &command);
+    assert_eq!(adopted.outcome.decision, Decision::LegacyWorkStateAdopted);
+    assert_eq!(adopted.outcome.snapshot.focus.as_deref(), Some("work-1"));
+    assert_eq!(
+        adopted.outcome.snapshot.dispatch,
+        AgentDispatchState::Awaiting {
+            wait: WaitIdentity {
+                id: "wait-1".into(),
+                generation: 2,
+            },
+        }
+    );
+    assert_invariants(&adopted.outcome.snapshot).unwrap();
+
+    let replay = reduce_command(&adopted.outcome.snapshot, &command);
+    assert_eq!(replay.outcome.decision, Decision::DuplicateIgnored);
+
+    let mut rearm_command = command.clone();
+    let ProtocolCommand::AdoptActivationWorkState(rearm) = &mut rearm_command else {
+        unreachable!("fixture is an activation adoption command");
+    };
+    rearm.source_work_item_revision = 3;
+    rearm.wait.wait_id = "wait-2".into();
+    rearm.wait.generation = 3;
+    rearm.wait.source_updated_at = "2026-07-30T00:00:02Z".into();
+
+    let mut stale_command = rearm_command.clone();
+    let ProtocolCommand::AdoptActivationWorkState(stale) = &mut stale_command else {
+        unreachable!("fixture is an activation adoption command");
+    };
+    stale.source_work_item_revision = 1;
+    stale.wait.generation = 1;
+    let stale = reduce_command(&adopted.outcome.snapshot, &stale_command);
+    assert_eq!(stale.outcome.decision, Decision::Rejected);
+    assert_eq!(
+        stale.conflict.expect("typed conflict").kind,
+        ProtocolConflictKind::StaleRevision
+    );
+
+    let mut terminal_snapshot = adopted.outcome.snapshot.clone();
+    terminal_snapshot.focus = None;
+    terminal_snapshot.dispatch = AgentDispatchState::Open;
+    terminal_snapshot.work.get_mut("work-1").unwrap().status = WorkStatus::Terminal;
+    terminal_snapshot
+        .work
+        .get_mut("work-1")
+        .unwrap()
+        .scheduling_generation = 3;
+    terminal_snapshot
+        .waits
+        .get_mut("wait-1")
+        .unwrap()
+        .generations
+        .get_mut(&2)
+        .unwrap()
+        .state = WaitState::Resolved;
+    assert_invariants(&terminal_snapshot).unwrap();
+    let mut terminal_command = rearm_command.clone();
+    let ProtocolCommand::AdoptActivationWorkState(terminal) = &mut terminal_command else {
+        unreachable!("fixture is an activation adoption command");
+    };
+    terminal.source_work_item_revision = 4;
+    terminal.wait.generation = 4;
+    let terminal = reduce_command(&terminal_snapshot, &terminal_command);
+    assert_eq!(terminal.outcome.decision, Decision::Rejected);
+    assert_eq!(
+        terminal.conflict.expect("typed conflict").kind,
+        ProtocolConflictKind::StateConflict
+    );
+
+    let mut stale_generation_snapshot = adopted.outcome.snapshot.clone();
+    let work = stale_generation_snapshot.work.get_mut("work-1").unwrap();
+    work.scheduling_generation = 5;
+    let wait = stale_generation_snapshot.waits.get_mut("wait-1").unwrap();
+    wait.generations.get_mut(&2).unwrap().state = WaitState::Resolved;
+    wait.current_generation = 5;
+    wait.generations.insert(
+        5,
+        WaitGenerationRecord {
+            owner: SchedulerOwner::WorkItem {
+                work_item_id: "work-1".into(),
+            },
+            state: WaitState::Active,
+            trigger: None,
+            consuming_activation_id: None,
+        },
+    );
+    stale_generation_snapshot.dispatch = AgentDispatchState::Awaiting {
+        wait: WaitIdentity {
+            id: "wait-1".into(),
+            generation: 5,
+        },
+    };
+    assert_invariants(&stale_generation_snapshot).unwrap();
+    let stale_generation = reduce_command(&stale_generation_snapshot, &rearm_command);
+    assert_eq!(stale_generation.outcome.decision, Decision::Rejected);
+    assert_eq!(
+        stale_generation.conflict.expect("typed conflict").kind,
+        ProtocolConflictKind::StaleGeneration
+    );
+
+    let mut unrelated_dispatch_snapshot = adopted.outcome.snapshot.clone();
+    unrelated_dispatch_snapshot.waits.insert(
+        "wait-lifecycle".into(),
+        WaitRecord {
+            current_generation: 1,
+            generations: BTreeMap::from([(
+                1,
+                WaitGenerationRecord {
+                    owner: SchedulerOwner::AgentLifecycle {
+                        agent_id: "agent-1".into(),
+                    },
+                    state: WaitState::Active,
+                    trigger: None,
+                    consuming_activation_id: None,
+                },
+            )]),
+        },
+    );
+    unrelated_dispatch_snapshot.dispatch = AgentDispatchState::Awaiting {
+        wait: WaitIdentity {
+            id: "wait-lifecycle".into(),
+            generation: 1,
+        },
+    };
+    assert_invariants(&unrelated_dispatch_snapshot).unwrap();
+    let unrelated_dispatch = reduce_command(&unrelated_dispatch_snapshot, &rearm_command);
+    assert_eq!(unrelated_dispatch.outcome.decision, Decision::Rejected);
+    assert_eq!(
+        unrelated_dispatch.conflict.expect("typed conflict").kind,
+        ProtocolConflictKind::StateConflict
+    );
+
+    let mut ownership_conflict_snapshot = adopted.outcome.snapshot.clone();
+    ownership_conflict_snapshot.work.insert(
+        "work-2".into(),
+        WorkDemand {
+            metadata_revision: 5,
+            scheduling_generation: 5,
+            status: WorkStatus::Runnable,
+            capabilities: BTreeSet::new(),
+            locks: BTreeSet::new(),
+            locality: "runtime".into(),
+            cost_class: "default".into(),
+        },
+    );
+    ownership_conflict_snapshot.waits.insert(
+        "wait-2".into(),
+        WaitRecord {
+            current_generation: 1,
+            generations: BTreeMap::from([(
+                1,
+                WaitGenerationRecord {
+                    owner: SchedulerOwner::WorkItem {
+                        work_item_id: "work-2".into(),
+                    },
+                    state: WaitState::Resolved,
+                    trigger: None,
+                    consuming_activation_id: None,
+                },
+            )]),
+        },
+    );
+    assert_invariants(&ownership_conflict_snapshot).unwrap();
+    let ownership_conflict = reduce_command(&ownership_conflict_snapshot, &rearm_command);
+    assert_eq!(ownership_conflict.outcome.decision, Decision::Rejected);
+    assert_eq!(
+        ownership_conflict.conflict.expect("typed conflict").kind,
+        ProtocolConflictKind::IdentityConflict
+    );
+
+    let mut reusable_wait_snapshot = adopted.outcome.snapshot.clone();
+    reusable_wait_snapshot.waits.insert(
+        "wait-2".into(),
+        WaitRecord {
+            current_generation: 1,
+            generations: BTreeMap::from([(
+                1,
+                WaitGenerationRecord {
+                    owner: SchedulerOwner::WorkItem {
+                        work_item_id: "work-1".into(),
+                    },
+                    state: WaitState::Resolved,
+                    trigger: None,
+                    consuming_activation_id: None,
+                },
+            )]),
+        },
+    );
+    assert_invariants(&reusable_wait_snapshot).unwrap();
+    let reusable_wait = reduce_command(&reusable_wait_snapshot, &rearm_command);
+    assert_eq!(
+        reusable_wait.outcome.decision,
+        Decision::LegacyWorkStateAdopted
+    );
+    assert_eq!(
+        reusable_wait.outcome.snapshot.waits["wait-2"].current_generation,
+        3
+    );
+    assert_eq!(
+        reusable_wait.outcome.snapshot.waits["wait-2"].generations[&1].state,
+        WaitState::Resolved
+    );
+    assert_invariants(&reusable_wait.outcome.snapshot).unwrap();
+
+    let rearmed = reduce_command(&adopted.outcome.snapshot, &rearm_command);
+    assert_eq!(rearmed.outcome.decision, Decision::LegacyWorkStateAdopted);
+    assert_eq!(
+        rearmed.outcome.snapshot.work["work-1"].status,
+        WorkStatus::Waiting {
+            wait_id: "wait-2".into(),
+        }
+    );
+    assert_eq!(
+        rearmed.outcome.snapshot.waits["wait-1"].generations[&2].state,
+        WaitState::Resolved
+    );
+    assert_eq!(
+        rearmed.outcome.snapshot.waits["wait-2"].generations[&3].state,
+        WaitState::Active
+    );
+    assert_eq!(
+        rearmed.outcome.snapshot.dispatch,
+        AgentDispatchState::Awaiting {
+            wait: WaitIdentity {
+                id: "wait-2".into(),
+                generation: 3,
+            },
+        }
+    );
+    assert_invariants(&rearmed.outcome.snapshot).unwrap();
+
+    let mut reused_wait_command = rearm_command.clone();
+    let ProtocolCommand::AdoptActivationWorkState(reused_wait) = &mut reused_wait_command else {
+        unreachable!("fixture is an activation adoption command");
+    };
+    reused_wait.source_work_item_revision = 4;
+    reused_wait.wait.generation = 4;
+    reused_wait.wait.source_updated_at = "2026-07-30T00:00:03Z".into();
+    let reused_wait = reduce_command(&rearmed.outcome.snapshot, &reused_wait_command);
+    assert_eq!(
+        reused_wait.outcome.decision,
+        Decision::LegacyWorkStateAdopted
+    );
+    let wait = &reused_wait.outcome.snapshot.waits["wait-2"];
+    assert_eq!(wait.current_generation, 4);
+    assert_eq!(wait.generations[&3].state, WaitState::Resolved);
+    assert_eq!(wait.generations[&4].state, WaitState::Active);
+    assert_invariants(&reused_wait.outcome.snapshot).unwrap();
+
+    let mut release_dispatch_command = rearm_command;
+    let ProtocolCommand::AdoptActivationWorkState(release_dispatch) = &mut release_dispatch_command
+    else {
+        unreachable!("fixture is an activation adoption command");
+    };
+    release_dispatch.source_work_item_revision = 5;
+    release_dispatch.wait.wait_id = "wait-3".into();
+    release_dispatch.wait.generation = 5;
+    release_dispatch.wait.source_updated_at = "2026-07-30T00:00:04Z".into();
+    release_dispatch.reserve_dispatch = false;
+    let released = reduce_command(&reused_wait.outcome.snapshot, &release_dispatch_command);
+    assert_eq!(released.outcome.decision, Decision::LegacyWorkStateAdopted);
+    assert_eq!(released.outcome.snapshot.dispatch, AgentDispatchState::Open);
+    assert_eq!(
+        released.outcome.snapshot.dispatch_revision,
+        reused_wait.outcome.snapshot.dispatch_revision + 1
+    );
+    assert_invariants(&released.outcome.snapshot).unwrap();
+}
+
+#[test]
+fn lifecycle_wait_handoff_atomically_replaces_exact_reservation() {
+    let source_wait = WaitIdentity {
+        id: "wait-lifecycle".into(),
+        generation: 1,
+    };
+    let lifecycle_owner = SchedulerOwner::AgentLifecycle {
+        agent_id: "agent-1".into(),
+    };
+    let mut snapshot = minimal_snapshot(1);
+    snapshot.focus = None;
+    snapshot.work.clear();
+    snapshot.dispatch = AgentDispatchState::Awaiting {
+        wait: source_wait.clone(),
+    };
+    snapshot.dispatch_revision = 4;
+    snapshot.waits.insert(
+        source_wait.id.clone(),
+        WaitRecord {
+            current_generation: source_wait.generation,
+            generations: BTreeMap::from([(
+                source_wait.generation,
+                WaitGenerationRecord {
+                    owner: lifecycle_owner.clone(),
+                    state: WaitState::Active,
+                    trigger: None,
+                    consuming_activation_id: None,
+                },
+            )]),
+        },
+    );
+
+    let activation_id = "activation:message:msg-handoff";
+    let admitted = reduce_command(
+        &snapshot,
+        &ProtocolCommand::AdmitActivation(AdmitActivationCommand {
+            authority_id: "authority-lifecycle-handoff".into(),
+            activation: AgentActivation {
+                id: activation_id.into(),
+                agent_id: "agent-1".into(),
+                state: ActivationLifecycleState::Admitted,
+                cause: ActivationCause::LifecycleExternalNudge {
+                    message_id: "msg-handoff".into(),
+                },
+                binding: ActivationBinding::Lifecycle {
+                    agent_id: "agent-1".into(),
+                },
+                priority: ActivationPriority::Normal,
+                preemption: PreemptionPolicy::NonPreemptive,
+                source_revision: None,
+                idempotency_key: "lifecycle-msg-handoff".into(),
+                provenance: ActivationProvenance {
+                    origin: ActivationOrigin::Operator,
+                    trust: ActivationTrust::OperatorInstruction,
+                    source_id: "msg-handoff".into(),
+                    correlation_id: None,
+                    causation_id: None,
+                },
+            },
+            expected_scheduling_generation: 2,
+            expected_dispatch_revision: 4,
+        }),
+    );
+    assert_eq!(admitted.outcome.decision, Decision::Admitted);
+    let settled = reduce_command(
+        &admitted.outcome.snapshot,
+        &ProtocolCommand::SettleActivation(SettleActivationCommand {
+            settlement: ActivationSettlement {
+                id: "settlement:message:msg-handoff".into(),
+                activation_id: activation_id.into(),
+                turn_terminal: Some("turn-handoff".into()),
+                disposition: ActivationDisposition::WorkContinues,
+                agent_dispatch: AgentDispatchDisposition::Open,
+                operator_delivery: None,
+                evidence: vec!["message:msg-handoff".into()],
+                created_at: "2026-08-01T00:00:00Z".into(),
+            },
+        }),
+    );
+    assert_eq!(settled.outcome.decision, Decision::Settled);
+    assert_eq!(
+        settled.outcome.snapshot.dispatch,
+        AgentDispatchState::Awaiting {
+            wait: source_wait.clone(),
+        }
+    );
+
+    let command = ProtocolCommand::AdoptActivationWorkState(AdoptActivationWorkStateCommand {
+        source_activation_id: activation_id.into(),
+        source_message_id: "msg-handoff".into(),
+        source_turn_id: "turn-handoff".into(),
+        source_admitted_generation: 2,
+        work_item_id: "work-handoff".into(),
+        source_work_item_revision: 3,
+        wait: LegacyWaitAdoption {
+            wait_id: "wait-work".into(),
+            generation: 3,
+            owner_work_item_id: "work-handoff".into(),
+            source_updated_at: "2026-08-01T00:00:01Z".into(),
+        },
+        source_lifecycle_wait: Some(LifecycleWaitHandoffProof {
+            wait: source_wait.clone(),
+            expected_dispatch_revision: 4,
+        }),
+        focus: true,
+        reserve_dispatch: true,
+    });
+
+    let adopted = reduce_command(&settled.outcome.snapshot, &command);
+    assert_eq!(adopted.outcome.decision, Decision::LegacyWorkStateAdopted);
+    assert_eq!(
+        adopted.outcome.snapshot.waits[&source_wait.id].generations[&source_wait.generation].state,
+        WaitState::Resolved
+    );
+    assert_eq!(
+        adopted.outcome.snapshot.waits["wait-work"].generations[&3].owner,
+        SchedulerOwner::WorkItem {
+            work_item_id: "work-handoff".into(),
+        }
+    );
+    assert_eq!(
+        adopted.outcome.snapshot.dispatch,
+        AgentDispatchState::Awaiting {
+            wait: WaitIdentity {
+                id: "wait-work".into(),
+                generation: 3,
+            },
+        }
+    );
+    assert_eq!(adopted.outcome.snapshot.dispatch_revision, 5);
+    assert_eq!(
+        adopted.outcome.snapshot.focus.as_deref(),
+        Some("work-handoff")
+    );
+    assert_invariants(&adopted.outcome.snapshot).unwrap();
+
+    let replay = reduce_command(&adopted.outcome.snapshot, &command);
+    assert_eq!(replay.outcome.decision, Decision::DuplicateIgnored);
+    assert_eq!(replay.outcome.snapshot, adopted.outcome.snapshot);
+
+    let mut stale_command = command.clone();
+    let ProtocolCommand::AdoptActivationWorkState(stale) = &mut stale_command else {
+        unreachable!("fixture is an activation adoption command");
+    };
+    stale
+        .source_lifecycle_wait
+        .as_mut()
+        .expect("handoff proof")
+        .expected_dispatch_revision = 3;
+    let stale = reduce_command(&settled.outcome.snapshot, &stale_command);
+    assert_eq!(stale.outcome.decision, Decision::Rejected);
+    assert_eq!(
+        stale.conflict.expect("typed conflict").kind,
+        ProtocolConflictKind::BindingConflict
+    );
+    assert_eq!(stale.outcome.snapshot, settled.outcome.snapshot);
+
+    let mut foreign = settled.outcome.snapshot.clone();
+    foreign
+        .waits
+        .get_mut(&source_wait.id)
+        .unwrap()
+        .generations
+        .get_mut(&source_wait.generation)
+        .unwrap()
+        .owner = SchedulerOwner::AgentLifecycle {
+        agent_id: "agent-foreign".into(),
+    };
+    let rejected = reduce_command(&foreign, &command);
+    assert_eq!(rejected.outcome.decision, Decision::Rejected);
+    assert_eq!(
+        rejected.conflict.expect("typed conflict").kind,
+        ProtocolConflictKind::BindingConflict
+    );
+    assert_eq!(rejected.outcome.snapshot, foreign);
 }
 
 #[test]
@@ -2557,71 +2305,71 @@ fn work_demand_registration_is_typed_idempotent_and_conflict_safe() {
 }
 
 #[test]
-fn activation_authority_is_issued_once_and_cannot_have_an_unconsumed_alias() {
+fn admission_authority_id_is_unique_and_cannot_have_an_alias() {
     let admission = typed_admission("a1", "key-1", 1);
-    let issue = IssueActivationAuthorityCommand {
-        authority_id: admission.authority_id.clone(),
-        activation: admission.activation.clone(),
-        expected_scheduling_generation: admission.expected_scheduling_generation,
-        expected_dispatch_revision: admission.expected_dispatch_revision,
-    };
-    let issued = reduce_command(
+    let admitted = reduce_command(
         &minimal_snapshot(1),
-        &ProtocolCommand::IssueActivationAuthority(issue.clone()),
+        &ProtocolCommand::AdmitActivation(admission.clone()),
     );
-    assert_eq!(issued.outcome.decision, Decision::AuthorityIssued);
-    assert_eq!(
-        issued.outcome.snapshot.activation_authorities["authority-a1"].authority_id,
-        "authority-a1"
-    );
-    assert_invariants(&issued.outcome.snapshot).expect("issued authority must be canonical");
+    assert_eq!(admitted.outcome.decision, Decision::Admitted);
+    assert_invariants(&admitted.outcome.snapshot).expect("admission must be canonical");
 
     let replay = reduce_command(
-        &issued.outcome.snapshot,
-        &ProtocolCommand::IssueActivationAuthority(issue.clone()),
+        &admitted.outcome.snapshot,
+        &ProtocolCommand::AdmitActivation(admission.clone()),
     );
     assert_eq!(replay.outcome.decision, Decision::DuplicateIgnored);
-    assert_eq!(replay.outcome.snapshot, issued.outcome.snapshot);
+    assert_eq!(replay.outcome.snapshot, admitted.outcome.snapshot);
 
-    let mut duplicate_identity = issue;
-    duplicate_identity.authority_id = "authority-alias".into();
+    let mut duplicate_identity = typed_admission("a2", "key-2", 2);
+    duplicate_identity.authority_id = admission.authority_id;
     let rejected = reduce_command(
-        &issued.outcome.snapshot,
-        &ProtocolCommand::IssueActivationAuthority(duplicate_identity),
+        &admitted.outcome.snapshot,
+        &ProtocolCommand::AdmitActivation(duplicate_identity),
     );
     assert_eq!(rejected.outcome.decision, Decision::Rejected);
     assert_eq!(
         rejected.conflict.expect("typed conflict").kind,
-        ProtocolConflictKind::IdentityConflict
+        ProtocolConflictKind::AuthorityConflict
     );
     assert_eq!(
         rejected.outcome.diagnostics,
-        ["activation_authority_identity_conflict"]
+        ["activation_authority_id_command_conflict"]
     );
-    assert_eq!(rejected.outcome.snapshot, issued.outcome.snapshot);
+    assert_eq!(rejected.outcome.snapshot, admitted.outcome.snapshot);
 
-    let mut unconsumed_alias = issued.outcome.snapshot;
-    let authority = unconsumed_alias.activation_authorities["authority-a1"].clone();
-    unconsumed_alias
-        .activation_authorities
-        .insert("authority-alias".into(), authority);
-    assert_eq!(
-        assert_invariants(&unconsumed_alias),
-        Err("activation authority map key disagrees with authority identity".into())
+    let mut aliased = admitted.outcome.snapshot;
+    let mut alias = typed_admission("a2", "key-2", 2);
+    alias.authority_id = aliased.activation_admissions["a1"].authority_id.clone();
+    aliased.activation_admissions.insert("a2".into(), alias);
+    aliased.activations.insert(
+        "a2".into(),
+        ActivationRecord {
+            owner: SchedulerOwner::WorkItem {
+                work_item_id: "w1".into(),
+            },
+            admitted_generation: 2,
+            state: ActivationState::Settled,
+            recovery_for: None,
+        },
     );
-    let encoded = serde_json::to_value(unconsumed_alias).expect("serialize invalid snapshot");
-    let error =
-        serde_json::from_value::<Snapshot>(encoded).expect_err("reject aliased authority snapshot");
+    aliased.admitted_generations.insert("work:w1:2".into());
+    assert_eq!(
+        assert_invariants(&aliased),
+        Err("canonical activation admissions reuse authority identity".into())
+    );
+    let encoded = serde_json::to_value(aliased).expect("serialize invalid snapshot");
+    let error = serde_json::from_value::<Snapshot>(encoded)
+        .expect_err("reject aliased admission authority id");
     assert!(error
         .to_string()
-        .contains("activation authority map key disagrees with authority identity"));
+        .contains("canonical activation admissions reuse authority identity"));
 }
 
 #[test]
 fn typed_wait_settlement_rejects_empty_wait_identity_without_mutation() {
     let command = typed_admission("a1", "key-1", 1);
-    let mut snapshot = minimal_snapshot(1);
-    authorize_admission(&mut snapshot, &command);
+    let snapshot = minimal_snapshot(1);
     let admitted = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
     let snapshot = admitted.outcome.snapshot;
     let rejected = reduce_command(
@@ -2653,7 +2401,6 @@ fn already_admitted_generation_is_classified_as_duplicate() {
     let mut snapshot = minimal_snapshot(1);
     snapshot.admitted_generations.insert("work:w1:1".into());
     let command = typed_admission("a2", "key-2", 1);
-    authorize_admission(&mut snapshot, &command);
     let rejected = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
     assert_eq!(rejected.outcome.decision, Decision::Rejected);
     assert_eq!(
@@ -2669,8 +2416,7 @@ fn already_admitted_generation_is_classified_as_duplicate() {
 #[test]
 fn wait_history_rejects_future_generations_and_rearm_never_overwrites_them() {
     let command = typed_admission("a1", "key-1", 3);
-    let mut snapshot = minimal_snapshot(3);
-    authorize_admission(&mut snapshot, &command);
+    let snapshot = minimal_snapshot(3);
     let admitted = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
     let mut snapshot = admitted.outcome.snapshot;
     snapshot.waits.insert(
@@ -2771,8 +2517,7 @@ fn wait_history_rejects_future_generations_and_rearm_never_overwrites_them() {
 #[test]
 fn canonical_admissions_rebuild_exact_unique_reservation_fences() {
     let command = typed_admission("a1", "key-1", 1);
-    let mut snapshot = minimal_snapshot(1);
-    authorize_admission(&mut snapshot, &command);
+    let snapshot = minimal_snapshot(1);
     let admitted = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
     let snapshot = admitted.outcome.snapshot;
 
@@ -2792,16 +2537,6 @@ fn canonical_admissions_rebuild_exact_unique_reservation_fences() {
 
     let mut duplicate = snapshot;
     let duplicate_command = typed_admission("a2", "key-2", 1);
-    duplicate.activation_authorities.insert(
-        duplicate_command.authority_id.clone(),
-        ActivationAdmissionAuthority {
-            authority_id: duplicate_command.authority_id.clone(),
-            activation: duplicate_command.activation.clone(),
-            expected_scheduling_generation: 1,
-            expected_dispatch_revision: 0,
-            consumed_by: Some("a2".into()),
-        },
-    );
     duplicate
         .activation_admissions
         .insert("a2".into(), duplicate_command);
@@ -2823,10 +2558,9 @@ fn canonical_admissions_rebuild_exact_unique_reservation_fences() {
 }
 
 #[test]
-fn canonical_admission_recovery_rejects_future_dispatch_fences_and_alias_authorities() {
+fn canonical_admission_recovery_rejects_future_dispatch_fences_and_alias_authority_ids() {
     let command = typed_admission("a1", "key-1", 1);
-    let mut snapshot = minimal_snapshot(1);
-    authorize_admission(&mut snapshot, &command);
+    let snapshot = minimal_snapshot(1);
     let admitted = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
     let snapshot = admitted.outcome.snapshot;
 
@@ -2836,42 +2570,47 @@ fn canonical_admission_recovery_rejects_future_dispatch_fences_and_alias_authori
         .get_mut("a1")
         .expect("admission")
         .expected_dispatch_revision = 99;
-    future_dispatch_fence
-        .activation_authorities
-        .get_mut("authority-a1")
-        .expect("authority")
-        .expected_dispatch_revision = 99;
     assert_eq!(
         assert_invariants(&future_dispatch_fence),
-        Err("canonical activation admission record disagrees with authority state".into())
+        Err("canonical activation admission record is invalid".into())
     );
 
     let mut aliased_authority = snapshot;
-    let mut authority = aliased_authority
-        .activation_authorities
-        .get("authority-a1")
-        .expect("authority")
+    let mut alias = typed_admission("a2", "key-2", 2);
+    alias.authority_id = aliased_authority.activation_admissions["a1"]
+        .authority_id
         .clone();
-    authority.authority_id = "authority-alias".into();
     aliased_authority
-        .activation_authorities
-        .insert("authority-alias".into(), authority);
+        .activation_admissions
+        .insert("a2".into(), alias);
+    aliased_authority.activations.insert(
+        "a2".into(),
+        ActivationRecord {
+            owner: SchedulerOwner::WorkItem {
+                work_item_id: "w1".into(),
+            },
+            admitted_generation: 2,
+            state: ActivationState::Settled,
+            recovery_for: None,
+        },
+    );
+    aliased_authority
+        .admitted_generations
+        .insert("work:w1:2".into());
     assert_eq!(
         assert_invariants(&aliased_authority),
-        Err("activation authorities reuse activation identity".into())
+        Err("canonical activation admissions reuse authority identity".into())
     );
 }
 
 #[test]
 fn every_activation_requires_a_canonical_admission_and_terminal_record() {
     let command = typed_admission("a1", "key-1", 1);
-    let mut snapshot = minimal_snapshot(1);
-    authorize_admission(&mut snapshot, &command);
+    let snapshot = minimal_snapshot(1);
     let admitted = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
 
     let mut running_without_admission = admitted.outcome.snapshot.clone();
     running_without_admission.activation_admissions.clear();
-    running_without_admission.activation_authorities.clear();
     running_without_admission.admitted_generations.clear();
     assert_eq!(
         assert_invariants(&running_without_admission),
@@ -2916,7 +2655,6 @@ fn completion_continuation_requires_a_runnable_caller() {
         "caller-wait".into(),
         wait_record("caller", 1, WaitState::Active, None, None),
     );
-    authorize_admission(&mut snapshot, &command);
     let admitted = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
     assert_invariants(&admitted.outcome.snapshot).expect("waiting caller prestate is canonical");
 
@@ -2984,7 +2722,6 @@ fn canonical_continuation_records_are_exact_and_preserve_the_caller_prestate_fen
             cost_class: "standard".into(),
         },
     );
-    authorize_admission(&mut snapshot, &command);
     let admitted = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
     let completed = reduce_command(
         &admitted.outcome.snapshot,
@@ -3031,8 +2768,7 @@ fn canonical_continuation_records_are_exact_and_preserve_the_caller_prestate_fen
 #[test]
 fn canonical_typed_records_must_match_authoritative_activation_and_wait_facts() {
     let command = typed_admission("a1", "key-1", 1);
-    let mut snapshot = minimal_snapshot(1);
-    authorize_admission(&mut snapshot, &command);
+    let snapshot = minimal_snapshot(1);
     let admitted = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
 
     let mut mismatched_admission = admitted.outcome.snapshot.clone();
@@ -3072,8 +2808,7 @@ fn canonical_typed_records_must_match_authoritative_activation_and_wait_facts() 
     assert!(assert_invariants(&runnable_settlement_with_terminal_work).is_err());
 
     let command = typed_admission("a2", "key-2", 1);
-    let mut snapshot = minimal_snapshot(1);
-    authorize_admission(&mut snapshot, &command);
+    let snapshot = minimal_snapshot(1);
     let admitted = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
     let completed = reduce_command(
         &admitted.outcome.snapshot,
@@ -3094,8 +2829,7 @@ fn canonical_typed_records_must_match_authoritative_activation_and_wait_facts() 
     assert!(assert_invariants(&completed_with_runnable_work).is_err());
 
     let command = typed_admission("a3", "key-3", 1);
-    let mut snapshot = minimal_snapshot(1);
-    authorize_admission(&mut snapshot, &command);
+    let snapshot = minimal_snapshot(1);
     let admitted = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
     let mut wait_settlement = typed_settlement(
         "s3",
@@ -3137,8 +2871,7 @@ fn canonical_typed_records_must_match_authoritative_activation_and_wait_facts() 
     assert!(assert_invariants(&waiting_with_resolved_current_generation).is_err());
 
     let command = typed_admission("a4", "key-4", 1);
-    let mut snapshot = minimal_snapshot(1);
-    authorize_admission(&mut snapshot, &command);
+    let snapshot = minimal_snapshot(1);
     let admitted = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
     let missing = reduce_command(
         &admitted.outcome.snapshot,
@@ -3212,8 +2945,7 @@ fn reducer_rejections_have_explicit_stable_conflict_kinds() {
         },
     );
     let command = typed_admission("a2", "key-2", 1);
-    let mut snapshot = missing.snapshot;
-    authorize_admission(&mut snapshot, &command);
+    let snapshot = missing.snapshot;
     let rejected = reduce_command(&snapshot, &ProtocolCommand::AdmitActivation(command));
     assert_eq!(
         rejected.conflict.expect("typed conflict").kind,
@@ -3223,6 +2955,103 @@ fn reducer_rejections_have_explicit_stable_conflict_kinds() {
         rejected.outcome.diagnostics,
         ["settlement_recovery_pending"]
     );
+}
+
+#[test]
+fn legacy_recovery_adoption_reconciles_the_work_items_dispatch_reservation() {
+    let mut snapshot = minimal_snapshot(4);
+    snapshot.work.get_mut("w1").unwrap().status = WorkStatus::Waiting {
+        wait_id: "wait-1".into(),
+    };
+    snapshot.waits.insert(
+        "wait-1".into(),
+        wait_record("w1", 4, WaitState::Active, None, None),
+    );
+    snapshot.dispatch = AgentDispatchState::Awaiting {
+        wait: WaitIdentity {
+            id: "wait-1".into(),
+            generation: 4,
+        },
+    };
+    snapshot.dispatch_revision = 7;
+    assert_invariants(&snapshot).expect("waiting recovery prestate is canonical");
+
+    let rearm = ProtocolCommand::AdoptLegacyWorkState(AdoptLegacyWorkStateCommand {
+        work_item_id: "w1".into(),
+        source_work_item_revision: 5,
+        demand: WorkDemand {
+            metadata_revision: 5,
+            scheduling_generation: 5,
+            status: WorkStatus::Waiting {
+                wait_id: "wait-1".into(),
+            },
+            capabilities: BTreeSet::new(),
+            locks: BTreeSet::new(),
+            locality: "runtime".into(),
+            cost_class: "default".into(),
+        },
+        wait: Some(LegacyWaitAdoption {
+            wait_id: "wait-1".into(),
+            generation: 5,
+            owner_work_item_id: "w1".into(),
+            source_updated_at: "2026-08-01T00:00:00Z".into(),
+        }),
+        focus: true,
+        reserve_dispatch: false,
+        replace_completed_focus: None,
+    });
+    let rearmed = reduce_command(&snapshot, &rearm);
+    assert_eq!(rearmed.outcome.decision, Decision::LegacyWorkStateAdopted);
+    assert_eq!(
+        rearmed.outcome.snapshot.waits["wait-1"].generations[&4].state,
+        WaitState::Resolved
+    );
+    assert_eq!(
+        rearmed.outcome.snapshot.waits["wait-1"].generations[&5].state,
+        WaitState::Active
+    );
+    assert_eq!(
+        rearmed.outcome.snapshot.dispatch,
+        AgentDispatchState::Awaiting {
+            wait: WaitIdentity {
+                id: "wait-1".into(),
+                generation: 5,
+            },
+        }
+    );
+    assert_eq!(rearmed.outcome.snapshot.dispatch_revision, 8);
+    assert_invariants(&rearmed.outcome.snapshot).expect("rearmed recovery state is canonical");
+
+    let replay = reduce_command(&rearmed.outcome.snapshot, &rearm);
+    assert_eq!(replay.outcome.decision, Decision::DuplicateIgnored);
+    assert_eq!(replay.outcome.snapshot, rearmed.outcome.snapshot);
+
+    let release = ProtocolCommand::AdoptLegacyWorkState(AdoptLegacyWorkStateCommand {
+        work_item_id: "w1".into(),
+        source_work_item_revision: 6,
+        demand: WorkDemand {
+            metadata_revision: 6,
+            scheduling_generation: 6,
+            status: WorkStatus::Runnable,
+            capabilities: BTreeSet::new(),
+            locks: BTreeSet::new(),
+            locality: "runtime".into(),
+            cost_class: "default".into(),
+        },
+        wait: None,
+        focus: true,
+        reserve_dispatch: false,
+        replace_completed_focus: None,
+    });
+    let released = reduce_command(&rearmed.outcome.snapshot, &release);
+    assert_eq!(released.outcome.decision, Decision::LegacyWorkStateAdopted);
+    assert_eq!(
+        released.outcome.snapshot.waits["wait-1"].generations[&5].state,
+        WaitState::Resolved
+    );
+    assert_eq!(released.outcome.snapshot.dispatch, AgentDispatchState::Open);
+    assert_eq!(released.outcome.snapshot.dispatch_revision, 9);
+    assert_invariants(&released.outcome.snapshot).expect("released recovery state is canonical");
 }
 
 fn typed_admission(
@@ -3258,19 +3087,6 @@ fn typed_admission(
         expected_scheduling_generation: generation,
         expected_dispatch_revision: 0,
     }
-}
-
-fn authorize_admission(snapshot: &mut Snapshot, command: &AdmitActivationCommand) {
-    snapshot.activation_authorities.insert(
-        command.authority_id.clone(),
-        ActivationAdmissionAuthority {
-            authority_id: command.authority_id.clone(),
-            activation: command.activation.clone(),
-            expected_scheduling_generation: command.expected_scheduling_generation,
-            expected_dispatch_revision: command.expected_dispatch_revision,
-            consumed_by: None,
-        },
-    );
 }
 
 fn typed_settlement(
@@ -3336,11 +3152,9 @@ fn minimal_snapshot(scheduling_generation: u64) -> Snapshot {
         )]),
         waits: BTreeMap::new(),
         activations: BTreeMap::new(),
-        activation_authorities: BTreeMap::new(),
         activation_admissions: BTreeMap::new(),
         settlements: BTreeMap::new(),
         missing_settlements: BTreeMap::new(),
-        rollout: Default::default(),
         admitted_generations: Default::default(),
         continuation_admissions: Default::default(),
         activation_inputs: Default::default(),

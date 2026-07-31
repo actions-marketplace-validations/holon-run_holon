@@ -656,6 +656,15 @@ impl RuntimeHandle {
         message.work_item_id = work_item_id;
         message.correlation_id = correlation_id;
         message.causation_id = causation_id;
+        if let Some((wait_id, wait_generation)) = self
+            .exact_external_wait_correlation(pending.external_trigger_id.as_deref())
+            .await?
+        {
+            message.source_refs.insert("wait_id".into(), wait_id);
+            message
+                .source_refs
+                .insert("wait_generation".into(), wait_generation.to_string());
+        }
         self.inner.storage.append_event(&AuditEvent::legacy(
             "system_tick_emitted",
             serde_json::json!({
@@ -800,13 +809,6 @@ impl RuntimeHandle {
                     created_at: message.created_at,
                     updated_at: Utc::now(),
                 };
-                let scheduler_rollout_expectations = self
-                    .inner
-                    .runtime_db
-                    .transitions()
-                    .scheduler_rollout_expectations(&[
-                        scheduler::WORK_ITEM_AUTONOMOUS_CONTINUATION_SCENARIO,
-                    ])?;
                 let commit_result = self.inner.runtime_db.transitions().commit_queue(
                     &crate::runtime_db::transitions::QueueTransitionCommand {
                         agent_id: message.agent_id.clone(),
@@ -817,7 +819,6 @@ impl RuntimeHandle {
                         scheduler_claim_work_item: None,
                         scheduler_protocol_bootstrap: None,
                         scheduler_protocol_commands: Vec::new(),
-                        scheduler_rollout_expectations,
                         agent_state: Some(crate::runtime_db::transitions::AgentStateMutation {
                             expected: Some(Box::new(expected_persisted_state)),
                             record: Box::new(committed_state.clone()),
@@ -1060,29 +1061,6 @@ mod tests {
             _dir: dir,
             _workspace: workspace,
         }
-    }
-
-    fn enable_scheduler_shadow_scenario(test_runtime: &TestRuntime, scenario_class: &str) {
-        let connection = test_runtime.runtime.inner.runtime_db.connection().unwrap();
-        connection
-            .execute(
-                "UPDATE scheduler_protocol_config
-                 SET protocol_mode = 'shadow',
-                     config_revision = config_revision + 1,
-                     updated_at = CURRENT_TIMESTAMP
-                 WHERE config_id = 1",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO scheduler_scenario_authorities (
-                   scenario_class, mode, rollback_target,
-                   manifest_revision, preflight_revision, updated_at
-                 ) VALUES (?1, 'shadow', 'off', NULL, NULL, CURRENT_TIMESTAMP)",
-                [scenario_class],
-            )
-            .unwrap();
     }
 
     fn set_agent_idle(test_runtime: &TestRuntime) {
@@ -1609,9 +1587,8 @@ mod tests {
             TransitionFaultPoint::BeforeCommit,
         ] {
             let test_runtime = test_runtime();
-            enable_scheduler_shadow_scenario(&test_runtime, "work_item_autonomous_continuation");
             set_agent_idle(&test_runtime);
-            add_queued_work_item(&test_runtime, "wi-shadow-fault", "shadow-target");
+            add_queued_work_item(&test_runtime, "wi-fault", "fault-target");
             let initial_state = test_runtime
                 .runtime
                 .inner
@@ -1657,19 +1634,6 @@ mod tests {
                     .unwrap(),
                 Some(initial_state.clone())
             );
-            let comparison_count: i64 = test_runtime
-                .runtime
-                .inner
-                .runtime_db
-                .connection()
-                .unwrap()
-                .query_row(
-                    "SELECT COUNT(*) FROM scheduler_shadow_comparisons",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(comparison_count, 0);
             assert!(get_emitted_system_ticks(&test_runtime).is_empty());
             let events = test_runtime
                 .runtime

@@ -82,10 +82,10 @@ mod tests {
             ActivationPriority, ActivationProvenance, ActivationSettlement, ActivationSlot,
             ActivationTrust, AdmitActivationCommand, AgentActivation, AgentDispatchDisposition,
             AgentDispatchState, AttachActivationInputCommand, Continuation, Decision,
-            IssueActivationAuthorityCommand, PreemptionPolicy, ProtocolCommand, ProtocolMode,
-            RegisterWorkDemandCommand, RolloutCommand, SchedulerOwner, SettleActivationCommand,
-            Snapshot, TriggerWaitCommand, WaitGenerationRecord, WaitIdentity, WaitRecord,
-            WaitResumeClaim, WaitState, WaitTrigger, WorkDemand, WorkStatus,
+            PreemptionPolicy, ProtocolCommand, RegisterWorkDemandCommand, SchedulerOwner,
+            SettleActivationCommand, Snapshot, TriggerWaitCommand, WaitGenerationRecord,
+            WaitIdentity, WaitRecord, WaitResumeClaim, WaitState, WaitTrigger, WorkDemand,
+            WorkStatus,
         },
         runtime_db::repositories::{enum_string, slim_task_record_for_payload},
         runtime_db::transitions::{
@@ -329,11 +329,9 @@ mod tests {
             )]),
             waits: BTreeMap::new(),
             activations: BTreeMap::new(),
-            activation_authorities: BTreeMap::new(),
             activation_admissions: BTreeMap::new(),
             settlements: BTreeMap::new(),
             missing_settlements: BTreeMap::new(),
-            rollout: Default::default(),
             admitted_generations: BTreeSet::new(),
             continuation_admissions: BTreeMap::new(),
             activation_inputs: BTreeMap::new(),
@@ -391,11 +389,11 @@ mod tests {
         Ok(())
     }
 
-    fn scheduler_protocol_authority_command(
+    fn scheduler_protocol_admission_command(
         agent_id: &str,
         scheduling_generation: u64,
     ) -> ProtocolCommand {
-        ProtocolCommand::IssueActivationAuthority(IssueActivationAuthorityCommand {
+        ProtocolCommand::AdmitActivation(AdmitActivationCommand {
             authority_id: "authority-a".into(),
             activation: AgentActivation {
                 id: "activation-a".into(),
@@ -422,23 +420,6 @@ mod tests {
             },
             expected_scheduling_generation: scheduling_generation,
             expected_dispatch_revision: 0,
-        })
-    }
-
-    fn scheduler_protocol_admission_command(
-        agent_id: &str,
-        scheduling_generation: u64,
-    ) -> ProtocolCommand {
-        let ProtocolCommand::IssueActivationAuthority(authority) =
-            scheduler_protocol_authority_command(agent_id, scheduling_generation)
-        else {
-            unreachable!("scheduler authority helper must issue authority")
-        };
-        ProtocolCommand::AdmitActivation(AdmitActivationCommand {
-            authority_id: authority.authority_id,
-            activation: authority.activation,
-            expected_scheduling_generation: authority.expected_scheduling_generation,
-            expected_dispatch_revision: authority.expected_dispatch_revision,
         })
     }
 
@@ -512,11 +493,13 @@ mod tests {
             "scheduler_protocol_command_conflict_attempts",
             "scheduler_protocol_migrations",
             "scheduler_protocol_config",
+            "scheduler_rollout_command_results",
             "scheduler_rollout_preflights",
             "scheduler_rollout_manifests",
             "scheduler_scenario_authorities",
             "scheduler_scenario_hard_blockers",
             "scheduler_shadow_comparisons",
+            "scheduler_semantic_shadow_decisions",
         ] {
             let count: i64 = connection.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -719,6 +702,52 @@ INSERT INTO scheduler_scenario_authorities (
             normalized,
             ("authoritative".into(), None, None, "shadow".into())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn retired_rollout_metadata_does_not_block_canonical_snapshot_reopen() -> Result<()> {
+        let (_temp_dir, db_path, lock_path) = temp_paths()?;
+        let db = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
+        db.transitions()
+            .initialize_scheduler_protocol_partition("agent-a", &scheduler_protocol_snapshot(1))?;
+        db.connection()?.execute(
+            "INSERT INTO scheduler_scenario_authorities (
+               scenario_class,
+               mode,
+               rollback_target,
+               manifest_revision,
+               preflight_revision,
+               updated_at
+             ) VALUES (
+               'delivery',
+               'authoritative',
+               'shadow',
+               NULL,
+               NULL,
+               ?1
+             )
+             ON CONFLICT(scenario_class) DO UPDATE SET
+               mode = excluded.mode,
+               rollback_target = excluded.rollback_target,
+               manifest_revision = excluded.manifest_revision,
+               preflight_revision = excluded.preflight_revision,
+               updated_at = excluded.updated_at",
+            [Utc::now().to_rfc3339()],
+        )?;
+        drop(db);
+
+        let reopened = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
+        let snapshot = reopened
+            .transitions()
+            .load_scheduler_protocol_snapshot("agent-a")?;
+        assert_eq!(snapshot.work["work-a"].scheduling_generation, 1);
+        let retired = reopened
+            .transitions()
+            .inspect_retired_scheduler_rollout_metadata()?;
+        assert!(retired.retirement_marked);
+        assert!(retired.authoritative_scenario_count > 0);
+        assert!(retired.stale_authoritative_scenario_count > 0);
         Ok(())
     }
 
@@ -1282,7 +1311,7 @@ INSERT INTO scheduler_scenario_authorities (
         let (_temp_dir, db_path, lock_path) = temp_paths()?;
         let agent_id = "agent-a";
         let initial = scheduler_protocol_snapshot(1);
-        let command = scheduler_protocol_authority_command(agent_id, 1);
+        let command = scheduler_protocol_admission_command(agent_id, 1);
 
         let db = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
         db.transitions()
@@ -1298,7 +1327,7 @@ INSERT INTO scheduler_scenario_authorities (
             .commit_scheduler_protocol_command_unchecked_for_test(agent_id, &command, None)?;
         assert!(committed.applied);
         assert!(!committed.replayed);
-        assert_eq!(committed.result.decision, Decision::AuthorityIssued);
+        assert_eq!(committed.result.decision, Decision::Admitted);
         drop(db);
 
         let reopened = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
@@ -1369,13 +1398,6 @@ INSERT INTO scheduler_scenario_authorities (
             },
         };
         let authority_id = "authority-wait-resume";
-        let authority =
-            ProtocolCommand::IssueActivationAuthority(IssueActivationAuthorityCommand {
-                authority_id: authority_id.into(),
-                activation: activation.clone(),
-                expected_scheduling_generation: scheduling_generation,
-                expected_dispatch_revision: dispatch_revision,
-            });
         let admission = ProtocolCommand::AdmitActivation(AdmitActivationCommand {
             authority_id: authority_id.into(),
             activation,
@@ -1417,9 +1439,7 @@ INSERT INTO scheduler_scenario_authorities (
         let db = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
         db.transitions()
             .initialize_scheduler_protocol_partition(agent_id, &initial)?;
-        db.transitions()
-            .commit_scheduler_protocol_command_unchecked_for_test(agent_id, &authority, None)?;
-        let after_authority = db
+        let before_admission = db
             .transitions()
             .load_scheduler_protocol_snapshot(agent_id)?;
         let error = db
@@ -1439,7 +1459,7 @@ INSERT INTO scheduler_scenario_authorities (
         assert_eq!(
             db.transitions()
                 .load_scheduler_protocol_snapshot(agent_id)?,
-            after_authority
+            before_admission
         );
         let rolled_back: (String, Option<String>) = db.connection()?.query_row(
             "SELECT lifecycle_state, consuming_activation_id
@@ -1522,13 +1542,6 @@ INSERT INTO scheduler_scenario_authorities (
             },
         };
         let authority_id = "authority-task-rejoin";
-        let authority =
-            ProtocolCommand::IssueActivationAuthority(IssueActivationAuthorityCommand {
-                authority_id: authority_id.into(),
-                activation: activation.clone(),
-                expected_scheduling_generation: scheduling_generation,
-                expected_dispatch_revision: dispatch_revision,
-            });
         let trigger = ProtocolCommand::TriggerWait(TriggerWaitCommand {
             wait_id: wait_id.into(),
             wait_generation,
@@ -1573,8 +1586,6 @@ INSERT INTO scheduler_scenario_authorities (
         let db = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
         db.transitions()
             .initialize_scheduler_protocol_partition(agent_id, &initial)?;
-        db.transitions()
-            .commit_scheduler_protocol_command_unchecked_for_test(agent_id, &authority, None)?;
         db.transitions()
             .commit_scheduler_protocol_command_unchecked_for_test(agent_id, &trigger, None)?;
         db.transitions()
@@ -1633,13 +1644,6 @@ INSERT INTO scheduler_scenario_authorities (
             },
         };
         let authority_id = "authority-operator-input";
-        let authority =
-            ProtocolCommand::IssueActivationAuthority(IssueActivationAuthorityCommand {
-                authority_id: authority_id.into(),
-                activation: activation.clone(),
-                expected_scheduling_generation: scheduling_generation,
-                expected_dispatch_revision: 0,
-            });
         let admission = ProtocolCommand::AdmitActivation(AdmitActivationCommand {
             authority_id: authority_id.into(),
             activation,
@@ -1651,8 +1655,6 @@ INSERT INTO scheduler_scenario_authorities (
             agent_id,
             &scheduler_protocol_snapshot(scheduling_generation),
         )?;
-        db.transitions()
-            .commit_scheduler_protocol_command_unchecked_for_test(agent_id, &authority, None)?;
         db.transitions()
             .commit_scheduler_protocol_command_unchecked_for_test(agent_id, &admission, None)?;
         drop(db);
@@ -1681,24 +1683,12 @@ INSERT INTO scheduler_scenario_authorities (
         let (_temp_dir, db_path, lock_path) = temp_paths()?;
         let agent_id = "agent-a";
         let initial = scheduler_protocol_snapshot(1);
-        let authority = scheduler_protocol_authority_command(agent_id, 1);
-        let ProtocolCommand::IssueActivationAuthority(authority_payload) = &authority else {
+        let ProtocolCommand::AdmitActivation(mut admission_payload) =
+            scheduler_protocol_admission_command(agent_id, 1)
+        else {
             unreachable!()
         };
-        let mut admission_payload = AdmitActivationCommand {
-            authority_id: authority_payload.authority_id.clone(),
-            activation: authority_payload.activation.clone(),
-            expected_scheduling_generation: 1,
-            expected_dispatch_revision: 0,
-        };
         admission_payload.activation.preemption = PreemptionPolicy::AllowOperatorInterjection;
-        let authority =
-            ProtocolCommand::IssueActivationAuthority(IssueActivationAuthorityCommand {
-                authority_id: admission_payload.authority_id.clone(),
-                activation: admission_payload.activation.clone(),
-                expected_scheduling_generation: 1,
-                expected_dispatch_revision: 0,
-            });
         let admission = ProtocolCommand::AdmitActivation(admission_payload);
         let attachment = ActivationInputAttachment {
             id: "attachment-a".into(),
@@ -1727,8 +1717,6 @@ INSERT INTO scheduler_scenario_authorities (
         let db = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
         db.transitions()
             .initialize_scheduler_protocol_partition(agent_id, &initial)?;
-        db.transitions()
-            .commit_scheduler_protocol_command_unchecked_for_test(agent_id, &authority, None)?;
         db.transitions()
             .commit_scheduler_protocol_command_unchecked_for_test(agent_id, &admission, None)?;
         let committed = db
@@ -1786,15 +1774,12 @@ INSERT INTO scheduler_scenario_authorities (
         let (_temp_dir, db_path, lock_path) = temp_paths()?;
         let agent_id = "agent-a";
         let initial = scheduler_protocol_snapshot(1);
-        let authority = scheduler_protocol_authority_command(agent_id, 1);
         let admission = scheduler_protocol_admission_command(agent_id, 1);
         let completion = scheduler_protocol_completion_command("settlement-a", None);
 
         let db = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
         db.transitions()
             .initialize_scheduler_protocol_partition(agent_id, &initial)?;
-        db.transitions()
-            .commit_scheduler_protocol_command_unchecked_for_test(agent_id, &authority, None)?;
         db.transitions()
             .commit_scheduler_protocol_command_unchecked_for_test(agent_id, &admission, None)?;
         let committed = db
@@ -1827,7 +1812,6 @@ INSERT INTO scheduler_scenario_authorities (
                 cost_class: "standard".into(),
             },
         );
-        let authority = scheduler_protocol_authority_command(agent_id, 1);
         let admission = scheduler_protocol_admission_command(agent_id, 1);
         let completion = scheduler_protocol_completion_command(
             "settlement-a",
@@ -1841,8 +1825,6 @@ INSERT INTO scheduler_scenario_authorities (
         let db = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
         db.transitions()
             .initialize_scheduler_protocol_partition(agent_id, &initial)?;
-        db.transitions()
-            .commit_scheduler_protocol_command_unchecked_for_test(agent_id, &authority, None)?;
         db.transitions()
             .commit_scheduler_protocol_command_unchecked_for_test(agent_id, &admission, None)?;
         let committed = db
@@ -1874,7 +1856,7 @@ INSERT INTO scheduler_scenario_authorities (
             let (_temp_dir, db_path, lock_path) = temp_paths()?;
             let agent_id = "agent-a";
             let initial = scheduler_protocol_snapshot(1);
-            let command = scheduler_protocol_authority_command(agent_id, 1);
+            let command = scheduler_protocol_admission_command(agent_id, 1);
             let db = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
             db.transitions()
                 .initialize_scheduler_protocol_partition(agent_id, &initial)?;
@@ -1941,7 +1923,7 @@ INSERT INTO scheduler_scenario_authorities (
         let (_temp_dir, db_path, lock_path) = temp_paths()?;
         let agent_id = "agent-a";
         let initial = scheduler_protocol_snapshot(1);
-        let command = scheduler_protocol_authority_command(agent_id, 1);
+        let command = scheduler_protocol_admission_command(agent_id, 1);
         let db = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
         db.transitions()
             .initialize_scheduler_protocol_partition(agent_id, &initial)?;
@@ -1949,12 +1931,11 @@ INSERT INTO scheduler_scenario_authorities (
             .commit_scheduler_protocol_command_unchecked_for_test(agent_id, &command, None)?;
 
         let mut conflicting_command = command.clone();
-        let ProtocolCommand::IssueActivationAuthority(conflicting_authority) =
-            &mut conflicting_command
+        let ProtocolCommand::AdmitActivation(conflicting_admission) = &mut conflicting_command
         else {
-            unreachable!("fixture is an authority command");
+            unreachable!("fixture is an admission command");
         };
-        conflicting_authority.expected_dispatch_revision = 1;
+        conflicting_admission.expected_dispatch_revision = 1;
         let error = db
             .transitions()
             .commit_scheduler_protocol_command_unchecked_for_test(
@@ -1968,8 +1949,8 @@ INSERT INTO scheduler_scenario_authorities (
             .expect("agent command conflict should retain its protocol type");
         assert_eq!(conflict.partition_kind, "agent");
         assert_eq!(conflict.partition_key, agent_id);
-        assert_eq!(conflict.command_kind, "issue_activation_authority");
-        assert_eq!(conflict.command_identity, "authority-a");
+        assert_eq!(conflict.command_kind, "admit_activation");
+        assert_eq!(conflict.command_identity, "activation-a");
         assert_ne!(
             conflict.existing_payload_hash,
             conflict.incoming_payload_hash
@@ -1979,34 +1960,6 @@ INSERT INTO scheduler_scenario_authorities (
             scheduler_protocol::ProtocolConflictKind::PayloadConflict
         );
         assert_eq!(conflict.conflict.code, "command_identity_payload_conflict");
-
-        let rollout_command = RolloutCommand::ConfigureProtocol {
-            expected_config_revision: 0,
-            mode: ProtocolMode::Legacy,
-        };
-        db.transitions().commit_scheduler_rollout_command(
-            "rollout-config-identity",
-            &rollout_command,
-            None,
-        )?;
-        let rollout_error = db
-            .transitions()
-            .commit_scheduler_rollout_command(
-                "rollout-config-identity",
-                &RolloutCommand::ConfigureProtocol {
-                    expected_config_revision: 1,
-                    mode: ProtocolMode::Legacy,
-                },
-                None,
-            )
-            .unwrap_err();
-        let rollout_conflict = rollout_error
-            .downcast_ref::<SchedulerProtocolCommandIdentityConflict>()
-            .expect("rollout conflict should retain its protocol type");
-        assert_eq!(rollout_conflict.partition_kind, "global_rollout");
-        assert_eq!(rollout_conflict.partition_key, "global");
-        assert_eq!(rollout_conflict.command_kind, "configure_protocol");
-        assert_eq!(rollout_conflict.command_identity, "rollout-config-identity");
 
         drop(db);
         let reopened = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
@@ -2023,35 +1976,20 @@ INSERT INTO scheduler_scenario_authorities (
             .collect::<std::result::Result<_, _>>()?;
         assert_eq!(
             attempts,
-            vec![
-                (
-                    "agent".into(),
-                    agent_id.into(),
-                    "issue_activation_authority".into(),
-                    "authority-a".into(),
-                ),
-                (
-                    "global_rollout".into(),
-                    "global".into(),
-                    "configure_protocol".into(),
-                    "rollout-config-identity".into(),
-                ),
-            ]
+            vec![(
+                "agent".into(),
+                agent_id.into(),
+                "admit_activation".into(),
+                "activation-a".into(),
+            ),]
         );
         let agent_results: i64 = connection.query_row(
             "SELECT COUNT(*) FROM scheduler_protocol_command_results
-             WHERE agent_id = ?1 AND command_identity = 'authority-a'",
+             WHERE agent_id = ?1 AND command_identity = 'activation-a'",
             [agent_id],
             |row| row.get(0),
         )?;
-        let rollout_results: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM scheduler_rollout_command_results
-             WHERE command_identity = 'rollout-config-identity'",
-            [],
-            |row| row.get(0),
-        )?;
         assert_eq!(agent_results, 1);
-        assert_eq!(rollout_results, 1);
         Ok(())
     }
 
@@ -2088,7 +2026,6 @@ INSERT INTO scheduler_scenario_authorities (
                         scheduler_claim_work_item: None,
                         scheduler_protocol_bootstrap: None,
                         scheduler_protocol_commands: Vec::new(),
-                        scheduler_rollout_expectations: Vec::new(),
                         agent_state: None,
                         message_evidence: Vec::new(),
                         transcript_entries: Vec::new(),
@@ -2125,14 +2062,9 @@ INSERT INTO scheduler_scenario_authorities (
 
         let reopened = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
         assert_counts(&reopened)?;
-        assert_eq!(
-            reopened
-                .transitions()
-                .load_scheduler_protocol_snapshot("agent-a")?
-                .rollout
-                .protocol_mode,
-            ProtocolMode::Authoritative
-        );
+        reopened
+            .transitions()
+            .load_scheduler_protocol_snapshot("agent-a")?;
         Ok(())
     }
 

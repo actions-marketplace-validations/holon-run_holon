@@ -11,29 +11,30 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{inject_fault, RuntimeTransitionRepository, TransitionFaultPoint};
 use crate::domain::scheduler_protocol::{
-    self, ActivationAdmissionAuthority, ActivationCause, ActivationInputAttachment,
-    ActivationRecord, ActivationSlot, ActivationState, AdmitActivationCommand,
-    AdoptLegacyWorkStateCommand, AgentDispatchState, ContinuationAdmissionRecord, Decision,
-    LegacyWaitAdoption, MissingSettlementRecord, ProtocolCommand, ProtocolConflict,
-    ProtocolConflictKind, ProtocolMode, ReplaceCompletedFocusProof, RollbackAction,
-    RollbackTrigger, RolloutCommand, RolloutManifest, RolloutPreflightRecord,
-    RolloutPreflightState, RolloutState, ScenarioAuthority, ScenarioHardBlockerRecord,
-    ScenarioMode, SchedulerOwner, SchedulerScenarioClass, Snapshot, WaitGenerationRecord,
-    WaitIdentity, WaitRecord, WaitState, WaitTrigger, WorkDemand, WorkStatus,
+    self, ActivationCause, ActivationInputAttachment, ActivationRecord, ActivationSlot,
+    ActivationState, AdmitActivationCommand, AdoptActivationWorkStateCommand,
+    AdoptLegacyWorkStateCommand, AgentActivation, AgentDispatchState, ContinuationAdmissionRecord,
+    Decision, LegacyWaitAdoption, MissingSettlementRecord, ProtocolCommand, ProtocolConflict,
+    ProtocolConflictKind, ReplaceCompletedFocusProof, SchedulerOwner, Snapshot,
+    WaitGenerationRecord, WaitIdentity, WaitRecord, WaitState, WaitTrigger, WorkDemand, WorkStatus,
 };
 
 const CANONICAL_COMMAND_SCHEMA_VERSION: i64 = 1;
+const LEGACY_ADOPTION_REPLACEMENT_SCHEMA_VERSION: i64 = 2;
+const ACTIVATION_WAIT_HANDOFF_SCHEMA_VERSION: i64 = 2;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SchedulerRolloutExpectation {
-    pub scenario_class: SchedulerScenarioClass,
-    pub mode: ScenarioMode,
+#[derive(Serialize)]
+struct LegacyActivationAuthorityPayload<'a> {
+    authority_id: &'a str,
+    activation: &'a AgentActivation,
+    expected_scheduling_generation: u64,
+    expected_dispatch_revision: u64,
+    consumed_by: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +44,20 @@ pub(crate) struct LegacySchedulerAdoptionCandidate {
     pub eligible: bool,
     pub reason: String,
     pub command: Option<ProtocolCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetiredSchedulerRolloutMetadata {
+    pub retirement_marked: bool,
+    pub protocol_mode: String,
+    pub config_revision: u64,
+    pub preflight_count: u64,
+    pub manifest_count: u64,
+    pub scenario_count: u64,
+    pub authoritative_scenario_count: u64,
+    pub stale_authoritative_scenario_count: u64,
+    pub hard_blocker_count: u64,
+    pub command_result_count: u64,
 }
 
 pub(super) struct PreparedProtocolCommands {
@@ -60,6 +75,7 @@ impl PreparedProtocolCommands {
 struct PreparedProtocolCommandResult {
     command_kind: &'static str,
     command_identity: String,
+    schema_version: i64,
     payload_hash: String,
     result: SchedulerProtocolCommandResult,
 }
@@ -78,13 +94,6 @@ pub(crate) struct SchedulerProtocolCommandResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SchedulerProtocolTransitionCommit {
-    pub applied: bool,
-    pub replayed: bool,
-    pub result: SchedulerProtocolCommandResult,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SchedulerRolloutTransitionCommit {
     pub applied: bool,
     pub replayed: bool,
     pub result: SchedulerProtocolCommandResult,
@@ -148,91 +157,6 @@ enum CommandTransactionOutcome<T> {
     Conflict(SchedulerProtocolCommandIdentityConflict),
 }
 
-pub(super) fn validate_protocol_command_authority_tx(
-    commands: &[ProtocolCommand],
-    expectations: &[SchedulerRolloutExpectation],
-) -> Result<()> {
-    validate_rollout_expectations(expectations)?;
-    for required_scenario in required_protocol_command_scenarios(commands) {
-        let expectation = expectations
-            .iter()
-            .find(|expectation| expectation.scenario_class == required_scenario)
-            .ok_or_else(|| {
-                anyhow!(
-                    "scheduler protocol production command is missing rollout expectation for {}",
-                    required_scenario.as_str()
-                )
-            })?;
-        if expectation.mode != ScenarioMode::Authoritative {
-            bail!(
-                "scheduler protocol production commands require authoritative scenario {}, got {:?}",
-                required_scenario.as_str(),
-                expectation.mode
-            );
-        }
-    }
-    Ok(())
-}
-
-fn required_protocol_command_scenarios(
-    commands: &[ProtocolCommand],
-) -> BTreeSet<SchedulerScenarioClass> {
-    let mut required_scenarios = BTreeSet::new();
-    for command in commands {
-        match command {
-            ProtocolCommand::RegisterWorkDemand(_) => {
-                required_scenarios.insert(SchedulerScenarioClass::WorkItemAutonomousContinuation);
-            }
-            ProtocolCommand::AdoptLegacyWorkState(_) => {}
-            ProtocolCommand::IssueActivationAuthority(command) => {
-                required_scenarios.insert(activation_authority_scenario(&command.activation));
-                required_scenarios.insert(SchedulerScenarioClass::Settlement);
-            }
-            ProtocolCommand::AdmitActivation(command) => {
-                required_scenarios.insert(activation_authority_scenario(&command.activation));
-                required_scenarios.insert(SchedulerScenarioClass::Settlement);
-            }
-            ProtocolCommand::TriggerWait(_) => {}
-            ProtocolCommand::AttachActivationInput(_) => {
-                required_scenarios.insert(SchedulerScenarioClass::OperatorInterjection);
-            }
-            ProtocolCommand::SettleActivation(_) | ProtocolCommand::RecordMissingSettlement(_) => {
-                // Terminal commands drain authority granted when the activation was admitted.
-            }
-        }
-    }
-    required_scenarios
-}
-
-fn activation_authority_scenario(
-    activation: &scheduler_protocol::AgentActivation,
-) -> SchedulerScenarioClass {
-    match &activation.cause {
-        ActivationCause::OperatorInput { .. } => match activation.binding {
-            scheduler_protocol::ActivationBinding::WorkItem { .. } => {
-                SchedulerScenarioClass::ExplicitlyBoundOperatorInput
-            }
-            _ => SchedulerScenarioClass::OrdinarySemanticOperatorBinding,
-        },
-        ActivationCause::OperatorInterjection { .. } => {
-            SchedulerScenarioClass::OperatorInterjection
-        }
-        ActivationCause::MessageIngress { .. } => SchedulerScenarioClass::ReducerOnlyCandidates,
-        ActivationCause::TaskRejoin { .. } => SchedulerScenarioClass::ExactTaskRejoin,
-        ActivationCause::WaitResume { .. } | ActivationCause::LifecycleExternalNudge { .. } => {
-            SchedulerScenarioClass::ExactWaitResume
-        }
-        ActivationCause::WorkItemRunnable { .. }
-        | ActivationCause::WorkItemRecheck { .. }
-        | ActivationCause::InternalFollowup { .. } => {
-            SchedulerScenarioClass::WorkItemAutonomousContinuation
-        }
-        ActivationCause::RuntimeRecovery { .. } | ActivationCause::SettlementRecovery { .. } => {
-            SchedulerScenarioClass::Settlement
-        }
-    }
-}
-
 pub(super) fn validate_protocol_commands_tx(
     tx: &Transaction<'_>,
     agent_id: &str,
@@ -248,11 +172,10 @@ pub(super) fn validate_protocol_commands_tx(
 
     let initialized_partition = !scheduler_protocol_partition_exists_tx(tx, agent_id)?;
     let mut snapshot = if initialized_partition {
-        let mut snapshot = bootstrap
+        let snapshot = bootstrap
             .cloned()
             .ok_or_else(|| anyhow!("canonical scheduler claim requires bootstrap state"))?;
         validate_agent_partition(agent_id, &snapshot)?;
-        snapshot.rollout = load_rollout(tx)?;
         scheduler_protocol::assert_invariants(&snapshot)
             .map_err(|error| anyhow!("invalid scheduler protocol bootstrap: {error}"))?;
         snapshot
@@ -262,11 +185,8 @@ pub(super) fn validate_protocol_commands_tx(
     let mut results = Vec::new();
 
     for command in commands {
-        if let ProtocolCommand::AdoptLegacyWorkState(command) = command {
-            validate_legacy_adoption_source_tx(tx, agent_id, command)?;
-        }
         let (command_kind, command_identity) = command_identity(command)?;
-        let payload_hash = canonical_command_hash(command_kind, command)?;
+        let (schema_version, payload_hash) = canonical_command_hash(command_kind, command)?;
         if let Some(stored) =
             stored_command_result_tx(tx, agent_id, command_kind, &command_identity)?
         {
@@ -279,6 +199,12 @@ pub(super) fn validate_protocol_commands_tx(
                 );
             }
             continue;
+        }
+        if let ProtocolCommand::AdoptLegacyWorkState(command) = command {
+            validate_legacy_adoption_source_tx(tx, agent_id, command)?;
+        }
+        if let ProtocolCommand::AdoptActivationWorkState(command) = command {
+            validate_activation_adoption_source_tx(tx, agent_id, command)?;
         }
 
         let pre_state_fence = snapshot_fence(&snapshot)?;
@@ -310,6 +236,7 @@ pub(super) fn validate_protocol_commands_tx(
         results.push(PreparedProtocolCommandResult {
             command_kind,
             command_identity,
+            schema_version,
             payload_hash,
             result,
         });
@@ -339,6 +266,7 @@ pub(super) fn persist_protocol_commands_tx(
             agent_id,
             result.command_kind,
             &result.command_identity,
+            result.schema_version,
             &result.payload_hash,
             &result.result,
         )?;
@@ -346,86 +274,7 @@ pub(super) fn persist_protocol_commands_tx(
     Ok(())
 }
 
-fn effective_scenario_mode(
-    rollout: &RolloutState,
-    scenario_class: SchedulerScenarioClass,
-) -> Result<ScenarioMode> {
-    let scenario_mode = rollout
-        .scenarios
-        .get(scenario_class.as_str())
-        .map(|scenario| scenario.mode)
-        .unwrap_or(ScenarioMode::Off);
-    match (rollout.protocol_mode, scenario_mode) {
-        (ProtocolMode::Legacy, _) | (_, ScenarioMode::Off) => Ok(ScenarioMode::Off),
-        (ProtocolMode::Shadow, ScenarioMode::Shadow)
-        | (ProtocolMode::Authoritative, ScenarioMode::Shadow) => Ok(ScenarioMode::Shadow),
-        (ProtocolMode::Authoritative, ScenarioMode::Authoritative) => {
-            Ok(ScenarioMode::Authoritative)
-        }
-        (ProtocolMode::Shadow, ScenarioMode::Authoritative) => {
-            bail!("scheduler scenario authority exceeds the protocol mode ceiling")
-        }
-    }
-}
-
-fn rollout_expectation(
-    scenario_class: SchedulerScenarioClass,
-) -> Result<SchedulerRolloutExpectation> {
-    Ok(SchedulerRolloutExpectation {
-        scenario_class,
-        mode: ScenarioMode::Authoritative,
-    })
-}
-
-fn validate_rollout_expectations(expectations: &[SchedulerRolloutExpectation]) -> Result<()> {
-    let mut scenario_classes = BTreeSet::new();
-    for expectation in expectations {
-        if !scenario_classes.insert(expectation.scenario_class) {
-            bail!(
-                "duplicate scheduler rollout expectation for {}",
-                expectation.scenario_class.as_str()
-            );
-        }
-        let current = rollout_expectation(expectation.scenario_class)?;
-        if &current != expectation {
-            bail!(
-                "stale scheduler rollout expectation for {}",
-                expectation.scenario_class.as_str()
-            );
-        }
-    }
-    Ok(())
-}
-
-fn effective_scenario_mode_tx(tx: &Transaction<'_>, scenario_class: &str) -> Result<ScenarioMode> {
-    let scenario_class = scenario_class
-        .parse::<SchedulerScenarioClass>()
-        .map_err(|_| anyhow!("unknown scheduler scenario class {scenario_class}"))?;
-    effective_scenario_mode(&load_rollout(tx)?, scenario_class)
-}
-
 impl RuntimeTransitionRepository<'_> {
-    pub(crate) fn scheduler_rollout_expectations(
-        &self,
-        scenario_classes: &[SchedulerScenarioClass],
-    ) -> Result<Vec<SchedulerRolloutExpectation>> {
-        let mut unique = BTreeSet::new();
-        scenario_classes
-            .iter()
-            .copied()
-            .filter(|scenario_class| unique.insert(*scenario_class))
-            .map(rollout_expectation)
-            .collect()
-    }
-
-    pub(crate) fn scheduler_scenario_mode(
-        &self,
-        scenario_class: SchedulerScenarioClass,
-    ) -> Result<ScenarioMode> {
-        self.db
-            .transaction(|tx| effective_scenario_mode_tx(tx, scenario_class.as_str()))
-    }
-
     pub(crate) fn initialize_scheduler_protocol_partition(
         &self,
         agent_id: &str,
@@ -436,11 +285,9 @@ impl RuntimeTransitionRepository<'_> {
             if scheduler_protocol_partition_exists_tx(tx, agent_id)? {
                 bail!("scheduler protocol partition for agent {agent_id} is already initialized");
             }
-            let mut initialized = snapshot.clone();
-            initialized.rollout = load_rollout(tx)?;
-            scheduler_protocol::assert_invariants(&initialized)
+            scheduler_protocol::assert_invariants(snapshot)
                 .map_err(|error| anyhow!("invalid scheduler protocol snapshot: {error}"))?;
-            persist_agent_snapshot_tx(tx, agent_id, &initialized)?;
+            persist_agent_snapshot_tx(tx, agent_id, snapshot)?;
             Ok(())
         })
     }
@@ -464,9 +311,80 @@ impl RuntimeTransitionRepository<'_> {
         Ok(Some(snapshot))
     }
 
-    pub(crate) fn load_scheduler_rollout_state(&self) -> Result<RolloutState> {
+    pub(crate) fn activation_work_state_adoption_was_applied(
+        &self,
+        agent_id: &str,
+        activation_id: &str,
+        work_item_id: &str,
+    ) -> Result<bool> {
         let connection = self.db.connection()?;
-        load_rollout(&connection)
+        let command_identity = format!("{activation_id}:{work_item_id}");
+        let decision = enum_token(&Decision::LegacyWorkStateAdopted)?;
+        Ok(connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1
+               FROM scheduler_protocol_command_results
+               WHERE agent_id = ?1
+                 AND command_kind = 'adopt_activation_work_state'
+                 AND command_identity = ?2
+                 AND decision = ?3
+             )",
+            params![agent_id, command_identity, decision],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn inspect_retired_scheduler_rollout_metadata(
+        &self,
+    ) -> Result<RetiredSchedulerRolloutMetadata> {
+        let connection = self.db.connection()?;
+        let retirement_marked = connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM scheduler_rollout_retirement WHERE retirement_id = 1
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        let (protocol_mode, config_revision): (String, i64) = connection.query_row(
+            "SELECT protocol_mode, config_revision
+             FROM scheduler_protocol_config
+             WHERE config_id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let count = |sql: &str| -> Result<u64> {
+            let value: i64 = connection.query_row(sql, [], |row| row.get(0))?;
+            to_u64(value, "retired scheduler rollout metadata count")
+        };
+        Ok(RetiredSchedulerRolloutMetadata {
+            retirement_marked,
+            protocol_mode,
+            config_revision: to_u64(config_revision, "rollout config revision")?,
+            preflight_count: count("SELECT COUNT(*) FROM scheduler_rollout_preflights")?,
+            manifest_count: count("SELECT COUNT(*) FROM scheduler_rollout_manifests")?,
+            scenario_count: count("SELECT COUNT(*) FROM scheduler_scenario_authorities")?,
+            authoritative_scenario_count: count(
+                "SELECT COUNT(*) FROM scheduler_scenario_authorities
+                 WHERE mode = 'authoritative'",
+            )?,
+            stale_authoritative_scenario_count: count(
+                "SELECT COUNT(*)
+                 FROM scheduler_scenario_authorities AS authority
+                 LEFT JOIN scheduler_rollout_manifests AS manifest
+                   ON manifest.manifest_revision = authority.manifest_revision
+                 LEFT JOIN scheduler_rollout_preflights AS preflight
+                   ON preflight.preflight_revision = authority.preflight_revision
+                 WHERE authority.mode = 'authoritative'
+                   AND (
+                     authority.manifest_revision IS NULL
+                     OR authority.preflight_revision IS NULL
+                     OR manifest.manifest_revision IS NULL
+                     OR preflight.preflight_revision IS NULL
+                   )",
+            )?,
+            hard_blocker_count: count("SELECT COUNT(*) FROM scheduler_scenario_hard_blockers")?,
+            command_result_count: count("SELECT COUNT(*) FROM scheduler_rollout_command_results")?,
+        })
     }
 
     pub(crate) fn legacy_scheduler_adoption_candidates(
@@ -489,14 +407,10 @@ impl RuntimeTransitionRepository<'_> {
             for command in commands {
                 match command {
                     ProtocolCommand::AdoptLegacyWorkState(_)
+                    | ProtocolCommand::AdoptActivationWorkState(_)
                     | ProtocolCommand::RegisterWorkDemand(_)
                     | ProtocolCommand::SettleActivation(_)
                     | ProtocolCommand::RecordMissingSettlement(_) => {}
-                    ProtocolCommand::IssueActivationAuthority(command)
-                        if matches!(
-                            command.activation.cause,
-                            ActivationCause::SettlementRecovery { .. }
-                        ) => {}
                     ProtocolCommand::AdmitActivation(command)
                         if matches!(
                             command.activation.cause,
@@ -506,7 +420,7 @@ impl RuntimeTransitionRepository<'_> {
                 }
             }
             let bootstrap = (!scheduler_protocol_partition_exists_tx(tx, agent_id)?)
-                .then(|| rollout_snapshot(load_rollout(tx).expect("rollout state is readable")));
+                .then(canonical_empty_snapshot);
             let prepared =
                 validate_protocol_commands_tx(tx, agent_id, bootstrap.as_ref(), commands)?;
             let changed = prepared
@@ -536,7 +450,7 @@ impl RuntimeTransitionRepository<'_> {
         command: &ProtocolCommand,
         fault: Option<TransitionFaultPoint>,
     ) -> Result<SchedulerProtocolTransitionCommit> {
-        self.commit_scheduler_protocol_command_inner(agent_id, command, fault, true)
+        self.commit_scheduler_protocol_command_inner(agent_id, command, fault)
     }
 
     #[cfg(test)]
@@ -546,7 +460,7 @@ impl RuntimeTransitionRepository<'_> {
         command: &ProtocolCommand,
         fault: Option<TransitionFaultPoint>,
     ) -> Result<SchedulerProtocolTransitionCommit> {
-        self.commit_scheduler_protocol_command_inner(agent_id, command, fault, false)
+        self.commit_scheduler_protocol_command_inner(agent_id, command, fault)
     }
 
     fn commit_scheduler_protocol_command_inner(
@@ -554,24 +468,12 @@ impl RuntimeTransitionRepository<'_> {
         agent_id: &str,
         command: &ProtocolCommand,
         fault: Option<TransitionFaultPoint>,
-        enforce_authority: bool,
     ) -> Result<SchedulerProtocolTransitionCommit> {
         validate_command_agent(agent_id, command)?;
         let (command_kind, command_identity) = command_identity(command)?;
-        let payload_hash = canonical_command_hash(command_kind, command)?;
+        let (schema_version, payload_hash) = canonical_command_hash(command_kind, command)?;
 
         let outcome = self.db.transaction(|tx| {
-            if enforce_authority {
-                let expectations =
-                    required_protocol_command_scenarios(std::slice::from_ref(command))
-                        .into_iter()
-                        .map(rollout_expectation)
-                        .collect::<Result<Vec<_>>>()?;
-                validate_protocol_command_authority_tx(
-                    std::slice::from_ref(command),
-                    &expectations,
-                )?;
-            }
             if let Some(stored) =
                 stored_command_result_tx(tx, agent_id, command_kind, &command_identity)?
             {
@@ -582,6 +484,7 @@ impl RuntimeTransitionRepository<'_> {
                         agent_id,
                         command_kind,
                         &command_identity,
+                        schema_version,
                         &stored.payload_hash,
                         &payload_hash,
                     )?;
@@ -599,6 +502,9 @@ impl RuntimeTransitionRepository<'_> {
             let snapshot = load_snapshot_tx(tx, agent_id)?;
             if let ProtocolCommand::AdoptLegacyWorkState(command) = command {
                 validate_legacy_adoption_source_tx(tx, agent_id, command)?;
+            }
+            if let ProtocolCommand::AdoptActivationWorkState(command) = command {
+                validate_activation_adoption_source_tx(tx, agent_id, command)?;
             }
             let outcome = scheduler_protocol::reduce_command(&snapshot, command);
             scheduler_protocol::assert_invariants(&outcome.outcome.snapshot).map_err(|error| {
@@ -627,6 +533,7 @@ impl RuntimeTransitionRepository<'_> {
                 agent_id,
                 command_kind,
                 &command_identity,
+                schema_version,
                 &payload_hash,
                 &result,
             )?;
@@ -645,177 +552,6 @@ impl RuntimeTransitionRepository<'_> {
             CommandTransactionOutcome::Conflict(conflict) => Err(conflict.into()),
         }
     }
-
-    pub(crate) fn commit_scheduler_rollout_command(
-        &self,
-        command_identity: &str,
-        command: &RolloutCommand,
-        fault: Option<TransitionFaultPoint>,
-    ) -> Result<SchedulerRolloutTransitionCommit> {
-        let outcome = self.db.transaction(|tx| {
-            if rollout_command_grants_authority(command) {
-                adopt_legacy_scheduler_state_tx(tx)?;
-            }
-            apply_scheduler_rollout_command_tx(tx, command_identity, command, fault)
-        })?;
-        match outcome {
-            CommandTransactionOutcome::Commit(commit) => Ok(commit),
-            CommandTransactionOutcome::Conflict(conflict) => Err(conflict.into()),
-        }
-    }
-
-    pub(crate) fn commit_scheduler_rollout_commands(
-        &self,
-        commands: &[(String, RolloutCommand)],
-        fault: Option<TransitionFaultPoint>,
-    ) -> Result<Vec<SchedulerRolloutTransitionCommit>> {
-        if commands.is_empty() {
-            bail!("scheduler rollout command list must not be empty");
-        }
-        self.db.transaction(|tx| {
-            if commands
-                .iter()
-                .any(|(_, command)| rollout_command_grants_authority(command))
-            {
-                adopt_legacy_scheduler_state_tx(tx)?;
-            }
-            let mut commits = Vec::with_capacity(commands.len());
-            for (command_identity, command) in commands {
-                let commit =
-                    match apply_scheduler_rollout_command_tx(tx, command_identity, command, fault)?
-                    {
-                        CommandTransactionOutcome::Commit(commit) => commit,
-                        CommandTransactionOutcome::Conflict(conflict) => {
-                            return Err(conflict.into());
-                        }
-                    };
-                if commit.result.decision == Decision::Rejected {
-                    let detail = commit
-                        .result
-                        .conflict
-                        .as_ref()
-                        .map(|conflict| format!("{:?}: {}", conflict.kind, conflict.code))
-                        .unwrap_or_else(|| "reducer rejected command".to_string());
-                    bail!(
-                        "scheduler rollout command {} was rejected: {}",
-                        command_identity,
-                        detail
-                    );
-                }
-                commits.push(commit);
-            }
-            Ok(commits)
-        })
-    }
-}
-
-fn apply_scheduler_rollout_command_tx(
-    tx: &Transaction<'_>,
-    command_identity: &str,
-    command: &RolloutCommand,
-    fault: Option<TransitionFaultPoint>,
-) -> Result<CommandTransactionOutcome<SchedulerRolloutTransitionCommit>> {
-    if command_identity.is_empty() {
-        bail!("scheduler rollout command requires a non-empty identity");
-    }
-    let command_kind = rollout_command_kind(command);
-    let payload_hash = canonical_rollout_command_hash(command_kind, command)?;
-
-    if let Some(stored) = stored_rollout_command_result_tx(tx, command_kind, command_identity)? {
-        if stored.payload_hash != payload_hash {
-            let conflict = insert_command_identity_conflict_attempt_tx(
-                tx,
-                "global_rollout",
-                "global",
-                command_kind,
-                command_identity,
-                &stored.payload_hash,
-                &payload_hash,
-            )?;
-            return Ok(CommandTransactionOutcome::Conflict(conflict));
-        }
-        return Ok(CommandTransactionOutcome::Commit(
-            SchedulerRolloutTransitionCommit {
-                applied: false,
-                replayed: true,
-                result: stored.result,
-            },
-        ));
-    }
-
-    let rollout = load_rollout(tx)?;
-    let snapshot = rollout_snapshot(rollout.clone());
-    let outcome = scheduler_protocol::reduce_rollout_command(&snapshot, command);
-    scheduler_protocol::assert_invariants(&outcome.outcome.snapshot)
-        .map_err(|error| anyhow!("scheduler rollout reducer produced invalid state: {error}"))?;
-    inject_fault(fault, TransitionFaultPoint::AfterValidation)?;
-
-    if outcome.outcome.decision != Decision::Rejected {
-        persist_rollout_tx(tx, &rollout, &outcome.outcome.snapshot.rollout)?;
-    }
-    inject_fault(fault, TransitionFaultPoint::AfterCanonicalWrites)?;
-
-    let decision = outcome.outcome.decision.clone();
-    let result = SchedulerProtocolCommandResult {
-        decision: decision.clone(),
-        conflict: outcome.conflict,
-        transitions: outcome.outcome.transitions,
-        diagnostics: outcome.outcome.diagnostics,
-        fact_references: decision_fact_references(
-            &decision,
-            rollout_command_fact_references(command, &outcome.outcome.snapshot.rollout),
-        ),
-        pre_state_fence: rollout_fence(&rollout),
-        post_state_fence: rollout_fence(&outcome.outcome.snapshot.rollout),
-    };
-    insert_rollout_command_result_tx(tx, command_kind, command_identity, &payload_hash, &result)?;
-    inject_fault(fault, TransitionFaultPoint::BeforeCommit)?;
-
-    Ok(CommandTransactionOutcome::Commit(
-        SchedulerRolloutTransitionCommit {
-            applied: true,
-            replayed: false,
-            result,
-        },
-    ))
-}
-
-fn rollout_command_grants_authority(command: &RolloutCommand) -> bool {
-    matches!(
-        command,
-        RolloutCommand::ChangeScenarioAuthority {
-            mode: ScenarioMode::Authoritative,
-            ..
-        } | RolloutCommand::ChangeScenarioAuthorityFromExplicitMode { .. }
-    )
-}
-
-fn adopt_legacy_scheduler_state_tx(tx: &Transaction<'_>) -> Result<()> {
-    let candidates = legacy_scheduler_adoption_candidates_tx(tx, None)?;
-    if let Some(candidate) = candidates.iter().find(|candidate| !candidate.eligible) {
-        bail!(
-            "scheduler authoritative promotion blocked by legacy state {}:{}: {}",
-            candidate.agent_id,
-            candidate.work_item_id,
-            candidate.reason
-        );
-    }
-    let mut by_agent = BTreeMap::<String, Vec<ProtocolCommand>>::new();
-    for candidate in candidates {
-        if let Some(command) = candidate.command {
-            by_agent
-                .entry(candidate.agent_id)
-                .or_default()
-                .push(command);
-        }
-    }
-    for (agent_id, commands) in by_agent {
-        let bootstrap = (!scheduler_protocol_partition_exists_tx(tx, &agent_id)?)
-            .then(|| rollout_snapshot(load_rollout(tx).expect("rollout state was just readable")));
-        let prepared = validate_protocol_commands_tx(tx, &agent_id, bootstrap.as_ref(), &commands)?;
-        persist_protocol_commands_tx(tx, &agent_id, prepared)?;
-    }
-    Ok(())
 }
 
 fn legacy_scheduler_adoption_candidates_tx(
@@ -1138,6 +874,96 @@ fn validate_legacy_adoption_source_tx(
     Ok(())
 }
 
+fn validate_activation_adoption_source_tx(
+    tx: &Transaction<'_>,
+    agent_id: &str,
+    command: &AdoptActivationWorkStateCommand,
+) -> Result<()> {
+    let work_item = tx
+        .query_row(
+            "SELECT payload_json FROM work_items
+             WHERE work_item_id = ?1 AND agent_id = ?2 AND state = 'open'",
+            [command.work_item_id.as_str(), agent_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|payload| crate::runtime_db::repositories::decode_work_item_payload(&payload))
+        .transpose()?
+        .ok_or_else(|| anyhow!("activation adoption source WorkItem is missing or closed"))?;
+    if work_item.revision != command.source_work_item_revision {
+        bail!(
+            "activation adoption WorkItem source changed for {}:{}",
+            agent_id,
+            command.work_item_id
+        );
+    }
+    let (wait_turn_id, wait_updated_at) = tx
+        .query_row(
+            "SELECT last_turn_id, updated_at FROM wait_conditions
+             WHERE wait_condition_id = ?1
+               AND agent_id = ?2
+               AND work_item_id = ?3
+               AND status = 'active'",
+            [
+                command.wait.wait_id.as_str(),
+                agent_id,
+                command.work_item_id.as_str(),
+            ],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("activation adoption source wait is missing or inactive"))?;
+    if wait_turn_id.as_deref() != Some(command.source_turn_id.as_str()) {
+        bail!(
+            "activation adoption wait turn changed for {}:{}",
+            agent_id,
+            command.wait.wait_id
+        );
+    }
+    if crate::runtime_db::repositories::parse_timestamp(&wait_updated_at)?
+        != crate::runtime_db::repositories::parse_timestamp(&command.wait.source_updated_at)?
+    {
+        bail!(
+            "activation adoption wait revision changed for {}:{}",
+            agent_id,
+            command.wait.wait_id
+        );
+    }
+    let (owner_kind, owner_id, admitted_generation) = tx
+        .query_row(
+            "SELECT owner_kind, owner_id, admitted_generation
+             FROM scheduler_activations
+             WHERE agent_id = ?1 AND activation_id = ?2",
+            [agent_id, command.source_activation_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("activation adoption source activation is missing"))?;
+    if command.source_activation_id != format!("activation:message:{}", command.source_message_id)
+        || to_u64(
+            admitted_generation,
+            "activation adoption admitted generation",
+        )? != command.source_admitted_generation
+        || scheduler_owner_from_columns(&owner_kind, owner_id, agent_id)?
+            != (SchedulerOwner::AgentLifecycle {
+                agent_id: agent_id.to_string(),
+            })
+    {
+        bail!(
+            "activation adoption source activation changed for {}:{}",
+            agent_id,
+            command.source_activation_id
+        );
+    }
+    Ok(())
+}
+
 fn decision_fact_references(decision: &Decision, references: Vec<String>) -> Vec<String> {
     if *decision == Decision::Rejected {
         Vec::new()
@@ -1146,7 +972,7 @@ fn decision_fact_references(decision: &Decision, references: Vec<String>) -> Vec
     }
 }
 
-fn rollout_snapshot(rollout: RolloutState) -> Snapshot {
+fn canonical_empty_snapshot() -> Snapshot {
     Snapshot {
         slot: ActivationSlot::Idle,
         dispatch: AgentDispatchState::Open,
@@ -1155,72 +981,12 @@ fn rollout_snapshot(rollout: RolloutState) -> Snapshot {
         work: BTreeMap::new(),
         waits: BTreeMap::new(),
         activations: BTreeMap::new(),
-        activation_authorities: BTreeMap::new(),
         activation_admissions: BTreeMap::new(),
         settlements: BTreeMap::new(),
         missing_settlements: BTreeMap::new(),
-        rollout,
         admitted_generations: BTreeSet::new(),
         continuation_admissions: BTreeMap::new(),
         activation_inputs: BTreeMap::new(),
-    }
-}
-
-fn rollout_fence(rollout: &RolloutState) -> serde_json::Value {
-    serde_json::json!({
-        "config_revision": rollout.config_revision,
-        "latest_preflight_revision": rollout.latest_preflight_revision,
-        "manifest_revision": rollout.manifest.as_ref().map(|manifest| manifest.revision),
-    })
-}
-
-fn rollout_command_kind(command: &RolloutCommand) -> &'static str {
-    match command {
-        RolloutCommand::ConfigureProtocol { .. } => "configure_protocol",
-        RolloutCommand::OpenPreflight { .. } => "open_rollout_preflight",
-        RolloutCommand::CompletePreflight { .. } => "complete_rollout_preflight",
-        RolloutCommand::InstallManifest { .. } => "install_rollout_manifest",
-        RolloutCommand::ChangeScenarioAuthority { .. } => "change_scenario_authority",
-        RolloutCommand::ChangeScenarioAuthorityFromExplicitMode { .. } => {
-            "change_scenario_authority_from_explicit_mode"
-        }
-        RolloutCommand::ReportScenarioHardBlocker { .. } => "report_scenario_hard_blocker",
-    }
-}
-
-fn canonical_rollout_command_hash(command_kind: &str, command: &RolloutCommand) -> Result<String> {
-    let canonical = serde_json::to_vec(&serde_json::json!({
-        "schema_version": CANONICAL_COMMAND_SCHEMA_VERSION,
-        "command_kind": command_kind,
-        "command": command,
-    }))?;
-    Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
-}
-
-fn rollout_command_fact_references(
-    command: &RolloutCommand,
-    rollout: &RolloutState,
-) -> Vec<String> {
-    match command {
-        RolloutCommand::ConfigureProtocol { .. } => vec!["rollout:config".into()],
-        RolloutCommand::OpenPreflight { .. } => rollout
-            .preflights
-            .get(&rollout.latest_preflight_revision)
-            .map(|preflight| format!("rollout:preflight:{}", preflight.revision))
-            .into_iter()
-            .collect(),
-        RolloutCommand::CompletePreflight {
-            expected_preflight_revision,
-            ..
-        } => vec![format!("rollout:preflight:{expected_preflight_revision}")],
-        RolloutCommand::InstallManifest { manifest, .. } => {
-            vec![format!("rollout:manifest:{}", manifest.revision)]
-        }
-        RolloutCommand::ChangeScenarioAuthority { scenario_class, .. }
-        | RolloutCommand::ChangeScenarioAuthorityFromExplicitMode { scenario_class, .. }
-        | RolloutCommand::ReportScenarioHardBlocker { scenario_class, .. } => {
-            vec![format!("rollout:scenario:{scenario_class}")]
-        }
     }
 }
 
@@ -1260,9 +1026,10 @@ fn command_identity(command: &ProtocolCommand) -> Result<(&'static str, String)>
                 command.work_item_id, command.source_work_item_revision
             ),
         ),
-        ProtocolCommand::IssueActivationAuthority(command) => {
-            ("issue_activation_authority", command.authority_id.clone())
-        }
+        ProtocolCommand::AdoptActivationWorkState(command) => (
+            "adopt_activation_work_state",
+            format!("{}:{}", command.source_activation_id, command.work_item_id),
+        ),
         ProtocolCommand::AdmitActivation(command) => {
             ("admit_activation", command.activation.id.clone())
         }
@@ -1282,13 +1049,41 @@ fn command_identity(command: &ProtocolCommand) -> Result<(&'static str, String)>
     })
 }
 
-fn canonical_command_hash(command_kind: &str, command: &ProtocolCommand) -> Result<String> {
+fn canonical_command_hash(command_kind: &str, command: &ProtocolCommand) -> Result<(i64, String)> {
+    let schema_version = match command {
+        ProtocolCommand::AdoptLegacyWorkState(command)
+            if command.replace_completed_focus.is_some() =>
+        {
+            LEGACY_ADOPTION_REPLACEMENT_SCHEMA_VERSION
+        }
+        ProtocolCommand::AdoptActivationWorkState(command)
+            if command.source_lifecycle_wait.is_some() =>
+        {
+            ACTIVATION_WAIT_HANDOFF_SCHEMA_VERSION
+        }
+        _ => CANONICAL_COMMAND_SCHEMA_VERSION,
+    };
+    let mut command_value = serde_json::to_value(command)?;
+    if matches!(
+        command,
+        ProtocolCommand::AdoptLegacyWorkState(AdoptLegacyWorkStateCommand {
+            replace_completed_focus: None,
+            ..
+        })
+    ) {
+        if let Some(payload) = command_value.as_object_mut() {
+            payload.remove("replace_completed_focus");
+        }
+    }
     let canonical = serde_json::to_vec(&serde_json::json!({
-        "schema_version": CANONICAL_COMMAND_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "command_kind": command_kind,
-        "command": command,
+        "command": command_value,
     }))?;
-    Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
+    Ok((
+        schema_version,
+        format!("sha256:{:x}", Sha256::digest(canonical)),
+    ))
 }
 
 fn command_fact_references(command: &ProtocolCommand) -> Vec<String> {
@@ -1309,9 +1104,14 @@ fn command_fact_references(command: &ProtocolCommand) -> Vec<String> {
             }
             references
         }
-        ProtocolCommand::IssueActivationAuthority(command) => {
-            vec![format!("activation_authority:{}", command.authority_id)]
-        }
+        ProtocolCommand::AdoptActivationWorkState(command) => vec![
+            format!("activation:{}", command.source_activation_id),
+            format!("work:{}", command.work_item_id),
+            format!(
+                "wait:{}:generation:{}",
+                command.wait.wait_id, command.wait.generation
+            ),
+        ],
         ProtocolCommand::AdmitActivation(command) => vec![
             format!("activation:{}", command.activation.id),
             format!("activation_authority:{}", command.authority_id),
@@ -1337,8 +1137,9 @@ fn command_fact_references(command: &ProtocolCommand) -> Vec<String> {
 
 fn validate_command_agent(agent_id: &str, command: &ProtocolCommand) -> Result<()> {
     let command_agent_id = match command {
-        ProtocolCommand::RegisterWorkDemand(_) | ProtocolCommand::AdoptLegacyWorkState(_) => None,
-        ProtocolCommand::IssueActivationAuthority(command) => Some(&command.activation.agent_id),
+        ProtocolCommand::RegisterWorkDemand(_)
+        | ProtocolCommand::AdoptLegacyWorkState(_)
+        | ProtocolCommand::AdoptActivationWorkState(_) => None,
         ProtocolCommand::AdmitActivation(command) => Some(&command.activation.agent_id),
         ProtocolCommand::SettleActivation(_)
         | ProtocolCommand::RecordMissingSettlement(_)
@@ -1354,14 +1155,6 @@ fn validate_command_agent(agent_id: &str, command: &ProtocolCommand) -> Result<(
 fn validate_agent_partition(agent_id: &str, snapshot: &Snapshot) -> Result<()> {
     if agent_id.is_empty() {
         bail!("scheduler protocol partition requires a non-empty agent id");
-    }
-    for authority in snapshot.activation_authorities.values() {
-        if authority.activation.agent_id != agent_id {
-            bail!(
-                "activation authority {} belongs to another agent",
-                authority.authority_id
-            );
-        }
     }
     for admission in snapshot.activation_admissions.values() {
         if admission.activation.agent_id != agent_id {
@@ -1464,81 +1257,13 @@ fn stored_command_result_tx(
     .transpose()
 }
 
-fn stored_rollout_command_result_tx(
-    tx: &Transaction<'_>,
-    command_kind: &str,
-    command_identity: &str,
-) -> Result<Option<StoredCommandResult>> {
-    tx.query_row(
-        "SELECT
-           payload_hash,
-           decision,
-           conflict_kind,
-           conflict_code,
-           result_references_json,
-           pre_state_fence_json,
-           post_state_fence_json,
-           outcome_json
-         FROM scheduler_rollout_command_results
-         WHERE command_kind = ?1 AND command_identity = ?2",
-        params![command_kind, command_identity],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-            ))
-        },
-    )
-    .optional()?
-    .map(
-        |(
-            payload_hash,
-            decision,
-            conflict_kind,
-            conflict_code,
-            result_references_json,
-            pre_state_fence_json,
-            post_state_fence_json,
-            outcome_json,
-        )| {
-            let mut result: SchedulerProtocolCommandResult = serde_json::from_str(&outcome_json)?;
-            if decision != enum_token(&result.decision)? {
-                bail!("stored scheduler rollout decision column disagrees with outcome");
-            }
-            let stored_conflict = result
-                .conflict
-                .as_ref()
-                .map(|conflict| {
-                    Ok::<_, anyhow::Error>((enum_token(&conflict.kind)?, conflict.code.clone()))
-                })
-                .transpose()?;
-            if stored_conflict != conflict_kind.zip(conflict_code) {
-                bail!("stored scheduler rollout conflict columns disagree with outcome");
-            }
-            result.fact_references = serde_json::from_str(&result_references_json)?;
-            result.pre_state_fence = serde_json::from_str(&pre_state_fence_json)?;
-            result.post_state_fence = serde_json::from_str(&post_state_fence_json)?;
-            Ok(StoredCommandResult {
-                payload_hash,
-                result,
-            })
-        },
-    )
-    .transpose()
-}
-
 fn insert_command_identity_conflict_attempt_tx(
     tx: &Transaction<'_>,
     partition_kind: &str,
     partition_key: &str,
     command_kind: &str,
     command_identity: &str,
+    schema_version: i64,
     existing_payload_hash: &str,
     incoming_payload_hash: &str,
 ) -> Result<SchedulerProtocolCommandIdentityConflict> {
@@ -1564,7 +1289,7 @@ fn insert_command_identity_conflict_attempt_tx(
             partition_key,
             command_kind,
             command_identity,
-            CANONICAL_COMMAND_SCHEMA_VERSION,
+            schema_version,
             existing_payload_hash,
             incoming_payload_hash,
             enum_token(&conflict.kind)?,
@@ -1589,6 +1314,7 @@ fn insert_command_result_tx(
     agent_id: &str,
     command_kind: &str,
     command_identity: &str,
+    schema_version: i64,
     payload_hash: &str,
     result: &SchedulerProtocolCommandResult,
 ) -> Result<()> {
@@ -1621,56 +1347,7 @@ fn insert_command_result_tx(
             agent_id,
             command_kind,
             command_identity,
-            CANONICAL_COMMAND_SCHEMA_VERSION,
-            payload_hash,
-            enum_token(&result.decision)?,
-            conflict_kind,
-            conflict_code,
-            serde_json::to_string(&result.fact_references)?,
-            serde_json::to_string(&result.pre_state_fence)?,
-            serde_json::to_string(&result.post_state_fence)?,
-            serde_json::to_string(result)?,
-            Utc::now().to_rfc3339(),
-        ],
-    )?;
-    Ok(())
-}
-
-fn insert_rollout_command_result_tx(
-    tx: &Transaction<'_>,
-    command_kind: &str,
-    command_identity: &str,
-    payload_hash: &str,
-    result: &SchedulerProtocolCommandResult,
-) -> Result<()> {
-    let conflict_kind = result
-        .conflict
-        .as_ref()
-        .map(|conflict| enum_token(&conflict.kind))
-        .transpose()?;
-    let conflict_code = result
-        .conflict
-        .as_ref()
-        .map(|conflict| conflict.code.as_str());
-    tx.execute(
-        "INSERT INTO scheduler_rollout_command_results (
-           command_kind,
-           command_identity,
-           canonical_schema_version,
-           payload_hash,
-           decision,
-           conflict_kind,
-           conflict_code,
-           result_references_json,
-           pre_state_fence_json,
-           post_state_fence_json,
-           outcome_json,
-           created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![
-            command_kind,
-            command_identity,
-            CANONICAL_COMMAND_SCHEMA_VERSION,
+            schema_version,
             payload_hash,
             enum_token(&result.decision)?,
             conflict_kind,
@@ -1690,11 +1367,6 @@ fn enum_token<T: Serialize>(value: &T) -> Result<String> {
         .as_str()
         .map(ToOwned::to_owned)
         .ok_or_else(|| anyhow!("expected scheduler protocol enum to serialize as a string"))
-}
-
-fn enum_from_token<T: DeserializeOwned>(token: &str, field: &str) -> Result<T> {
-    serde_json::from_value(serde_json::Value::String(token.to_string()))
-        .with_context(|| format!("invalid {field} token {token}"))
 }
 
 fn persist_agent_snapshot_tx(
@@ -1878,9 +1550,16 @@ fn persist_agent_snapshot_tx(
         }
     }
 
-    for (authority_id, authority) in &snapshot.activation_authorities {
-        let owner = activation_owner(&authority.activation)?;
+    for admission in snapshot.activation_admissions.values() {
+        let owner = activation_owner(&admission.activation)?;
         let (owner_kind, owner_id, work_item_id) = scheduler_owner_columns(&owner);
+        let authority = LegacyActivationAuthorityPayload {
+            authority_id: &admission.authority_id,
+            activation: &admission.activation,
+            expected_scheduling_generation: admission.expected_scheduling_generation,
+            expected_dispatch_revision: admission.expected_dispatch_revision,
+            consumed_by: None,
+        };
         tx.execute(
             "INSERT INTO scheduler_activation_authorities (
                agent_id,
@@ -1906,20 +1585,20 @@ fn persist_agent_snapshot_tx(
                payload_json = excluded.payload_json",
             params![
                 agent_id,
-                authority_id,
-                &authority.activation.id,
+                &admission.authority_id,
+                &admission.activation.id,
                 owner_kind,
                 owner_id,
                 work_item_id,
                 to_i64(
-                    authority.expected_scheduling_generation,
+                    admission.expected_scheduling_generation,
                     "authority scheduling generation",
                 )?,
                 to_i64(
-                    authority.expected_dispatch_revision,
+                    admission.expected_dispatch_revision,
                     "authority dispatch revision",
                 )?,
-                serde_json::to_string(authority)?,
+                serde_json::to_string(&authority)?,
                 &now,
             ],
         )?;
@@ -2020,19 +1699,27 @@ fn persist_agent_snapshot_tx(
         }
     }
 
-    for (authority_id, authority) in &snapshot.activation_authorities {
+    for admission in snapshot.activation_admissions.values() {
+        let authority = LegacyActivationAuthorityPayload {
+            authority_id: &admission.authority_id,
+            activation: &admission.activation,
+            expected_scheduling_generation: admission.expected_scheduling_generation,
+            expected_dispatch_revision: admission.expected_dispatch_revision,
+            consumed_by: Some(&admission.activation.id),
+        };
         tx.execute(
             "UPDATE scheduler_activation_authorities
              SET consumed_by_activation_id = ?3, payload_json = ?4
              WHERE agent_id = ?1 AND authority_id = ?2",
             params![
                 agent_id,
-                authority_id,
-                authority.consumed_by.as_deref(),
-                serde_json::to_string(authority)?,
+                &admission.authority_id,
+                &admission.activation.id,
+                serde_json::to_string(&authority)?,
             ],
         )?;
     }
+
     for (wait_id, wait) in &snapshot.waits {
         for (generation, record) in &wait.generations {
             tx.execute(
@@ -2220,230 +1907,6 @@ fn persist_agent_snapshot_tx(
     Ok(())
 }
 
-fn persist_rollout_tx(
-    tx: &Transaction<'_>,
-    previous: &RolloutState,
-    next: &RolloutState,
-) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
-    let changed = tx.execute(
-        "UPDATE scheduler_protocol_config
-         SET protocol_mode = ?1,
-             config_revision = ?2,
-             latest_preflight_revision = ?3,
-             updated_at = ?4
-         WHERE config_id = 1
-           AND protocol_mode = ?5
-           AND config_revision = ?6
-           AND latest_preflight_revision = ?7",
-        params![
-            enum_token(&next.protocol_mode)?,
-            to_i64(next.config_revision, "rollout config revision")?,
-            to_i64(
-                next.latest_preflight_revision,
-                "latest rollout preflight revision",
-            )?,
-            &now,
-            enum_token(&previous.protocol_mode)?,
-            to_i64(previous.config_revision, "expected rollout config revision")?,
-            to_i64(
-                previous.latest_preflight_revision,
-                "expected latest rollout preflight revision",
-            )?,
-        ],
-    )?;
-    if changed != 1 {
-        bail!("scheduler rollout config compare-and-swap failed");
-    }
-
-    for (revision, preflight) in &next.preflights {
-        let manifest_json = preflight
-            .manifest
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-        match previous.preflights.get(revision) {
-            None => {
-                tx.execute(
-                    "INSERT INTO scheduler_rollout_preflights (
-                       preflight_revision,
-                       manifest_revision,
-                       state,
-                       manifest_json,
-                       created_at,
-                       updated_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                    params![
-                        to_i64(*revision, "rollout preflight revision")?,
-                        to_i64(preflight.manifest_revision, "preflight manifest revision")?,
-                        enum_token(&preflight.state)?,
-                        manifest_json,
-                        &now,
-                    ],
-                )?;
-            }
-            Some(old) if old == preflight => {}
-            Some(old) => {
-                let old_manifest_json = old
-                    .manifest
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()?;
-                let changed = tx.execute(
-                    "UPDATE scheduler_rollout_preflights
-                     SET manifest_revision = ?1,
-                         state = ?2,
-                         manifest_json = ?3,
-                         updated_at = ?4
-                     WHERE preflight_revision = ?5
-                       AND manifest_revision = ?6
-                       AND state = ?7
-                       AND manifest_json IS ?8",
-                    params![
-                        to_i64(preflight.manifest_revision, "preflight manifest revision")?,
-                        enum_token(&preflight.state)?,
-                        manifest_json,
-                        &now,
-                        to_i64(*revision, "rollout preflight revision")?,
-                        to_i64(
-                            old.manifest_revision,
-                            "expected preflight manifest revision"
-                        )?,
-                        enum_token(&old.state)?,
-                        old_manifest_json,
-                    ],
-                )?;
-                if changed != 1 {
-                    bail!("scheduler rollout preflight compare-and-swap failed");
-                }
-            }
-        }
-    }
-
-    if next.manifest != previous.manifest {
-        let manifest = next
-            .manifest
-            .as_ref()
-            .ok_or_else(|| anyhow!("scheduler rollout manifest cannot be removed"))?;
-        tx.execute(
-            "INSERT INTO scheduler_rollout_manifests (
-               manifest_revision, preflight_revision, payload_json, installed_at
-             ) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                to_i64(manifest.revision, "rollout manifest revision")?,
-                to_i64(
-                    manifest.preflight_revision,
-                    "rollout manifest preflight revision",
-                )?,
-                serde_json::to_string(manifest)?,
-                &now,
-            ],
-        )?;
-    }
-
-    for (scenario_class, authority) in &next.scenarios {
-        let manifest_revision = authority
-            .manifest_revision
-            .map(|revision| to_i64(revision, "scenario manifest revision"))
-            .transpose()?;
-        let preflight_revision = authority
-            .preflight_revision
-            .map(|revision| to_i64(revision, "scenario preflight revision"))
-            .transpose()?;
-        match previous.scenarios.get(scenario_class) {
-            None => {
-                tx.execute(
-                    "INSERT INTO scheduler_scenario_authorities (
-                       scenario_class,
-                       mode,
-                       rollback_target,
-                       manifest_revision,
-                       preflight_revision,
-                       updated_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        scenario_class,
-                        enum_token(&authority.mode)?,
-                        enum_token(&authority.rollback_target)?,
-                        manifest_revision,
-                        preflight_revision,
-                        &now,
-                    ],
-                )?;
-            }
-            Some(old) if old == authority => {}
-            Some(old) => {
-                let old_manifest_revision = old
-                    .manifest_revision
-                    .map(|revision| to_i64(revision, "expected scenario manifest revision"))
-                    .transpose()?;
-                let old_preflight_revision = old
-                    .preflight_revision
-                    .map(|revision| to_i64(revision, "expected scenario preflight revision"))
-                    .transpose()?;
-                let changed = tx.execute(
-                    "UPDATE scheduler_scenario_authorities
-                     SET mode = ?1,
-                         rollback_target = ?2,
-                         manifest_revision = ?3,
-                         preflight_revision = ?4,
-                         updated_at = ?5
-                     WHERE scenario_class = ?6
-                       AND mode = ?7
-                       AND rollback_target = ?8
-                       AND manifest_revision IS ?9
-                       AND preflight_revision IS ?10",
-                    params![
-                        enum_token(&authority.mode)?,
-                        enum_token(&authority.rollback_target)?,
-                        manifest_revision,
-                        preflight_revision,
-                        &now,
-                        scenario_class,
-                        enum_token(&old.mode)?,
-                        enum_token(&old.rollback_target)?,
-                        old_manifest_revision,
-                        old_preflight_revision,
-                    ],
-                )?;
-                if changed != 1 {
-                    bail!("scheduler scenario authority compare-and-swap failed");
-                }
-            }
-        }
-    }
-
-    for blocker in next.hard_blockers.difference(&previous.hard_blockers) {
-        tx.execute(
-            "INSERT INTO scheduler_scenario_hard_blockers (
-               scenario_class,
-               blocker_code,
-               config_revision,
-               manifest_revision,
-               preflight_revision,
-               trigger_kind,
-               action_json,
-               created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                &blocker.scenario_class,
-                &blocker.blocker_code,
-                to_i64(blocker.config_revision, "hard blocker config revision")?,
-                to_i64(blocker.manifest_revision, "hard blocker manifest revision")?,
-                to_i64(
-                    blocker.preflight_revision,
-                    "hard blocker preflight revision",
-                )?,
-                enum_token(&blocker.trigger)?,
-                serde_json::to_string(&blocker.action)?,
-                &now,
-            ],
-        )?;
-    }
-
-    Ok(())
-}
-
 fn load_snapshot_connection(connection: &Connection, agent_id: &str) -> Result<Snapshot> {
     load_snapshot_connection_with_hook(connection, agent_id, || Ok(()))
 }
@@ -2471,11 +1934,6 @@ fn load_snapshot_connection_with_hook(
         agent_id,
     )?;
     let waits = load_waits(connection, agent_id)?;
-    let activation_authorities = load_payload_map::<ActivationAdmissionAuthority>(
-        connection,
-        "SELECT authority_id, payload_json FROM scheduler_activation_authorities WHERE agent_id = ?1",
-        agent_id,
-    )?;
     let activation_admissions = load_payload_map::<AdmitActivationCommand>(
         connection,
         "SELECT activation_id, payload_json FROM scheduler_activations WHERE agent_id = ?1",
@@ -2502,7 +1960,6 @@ fn load_snapshot_connection_with_hook(
         "SELECT attachment_id, payload_json FROM scheduler_activation_inputs WHERE agent_id = ?1",
         agent_id,
     )?;
-    let rollout = load_rollout(connection)?;
     let admitted_generations = activation_admissions
         .values()
         .map(persisted_admission_fence)
@@ -2515,11 +1972,9 @@ fn load_snapshot_connection_with_hook(
         work,
         waits,
         activations,
-        activation_authorities,
         activation_admissions,
         settlements,
         missing_settlements,
-        rollout,
         admitted_generations,
         continuation_admissions,
         activation_inputs,
@@ -2528,188 +1983,6 @@ fn load_snapshot_connection_with_hook(
     scheduler_protocol::assert_invariants(&snapshot)
         .map_err(|error| anyhow!("invalid persisted scheduler protocol snapshot: {error}"))?;
     Ok(snapshot)
-}
-
-fn load_rollout(connection: &Connection) -> Result<RolloutState> {
-    let (protocol_mode, config_revision, latest_preflight_revision) = connection
-        .query_row(
-            "SELECT protocol_mode, config_revision, latest_preflight_revision
-             FROM scheduler_protocol_config
-             WHERE config_id = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
-        )
-        .optional()?
-        .ok_or_else(|| anyhow!("scheduler protocol rollout config is not initialized"))?;
-
-    let mut preflight_statement = connection.prepare(
-        "SELECT preflight_revision, manifest_revision, state, manifest_json
-         FROM scheduler_rollout_preflights
-         ORDER BY preflight_revision",
-    )?;
-    let preflight_rows = preflight_statement.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Option<String>>(3)?,
-        ))
-    })?;
-    let mut preflights = BTreeMap::new();
-    for row in preflight_rows {
-        let (revision, manifest_revision, state, manifest_json) = row?;
-        let revision = to_u64(revision, "rollout preflight revision")?;
-        let manifest = manifest_json
-            .as_deref()
-            .map(serde_json::from_str::<RolloutManifest>)
-            .transpose()?;
-        preflights.insert(
-            revision,
-            RolloutPreflightRecord {
-                revision,
-                manifest_revision: to_u64(manifest_revision, "preflight manifest revision")?,
-                state: enum_from_token::<RolloutPreflightState>(&state, "rollout preflight state")?,
-                manifest,
-            },
-        );
-    }
-
-    let manifest = connection
-        .query_row(
-            "SELECT manifest_revision, preflight_revision, payload_json
-             FROM scheduler_rollout_manifests
-             ORDER BY manifest_revision DESC
-             LIMIT 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .optional()?
-        .map(|(manifest_revision, preflight_revision, payload_json)| {
-            let manifest: RolloutManifest = serde_json::from_str(&payload_json)?;
-            if manifest.revision != to_u64(manifest_revision, "rollout manifest revision")?
-                || manifest.preflight_revision
-                    != to_u64(preflight_revision, "rollout manifest preflight revision")?
-            {
-                bail!("rollout manifest columns disagree with payload");
-            }
-            Ok(manifest)
-        })
-        .transpose()?;
-
-    let mut scenario_statement = connection.prepare(
-        "SELECT
-           scenario_class,
-           mode,
-           rollback_target,
-           manifest_revision,
-           preflight_revision
-         FROM scheduler_scenario_authorities
-         ORDER BY scenario_class",
-    )?;
-    let scenario_rows = scenario_statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Option<i64>>(3)?,
-            row.get::<_, Option<i64>>(4)?,
-        ))
-    })?;
-    let mut scenarios = BTreeMap::new();
-    for row in scenario_rows {
-        let (scenario_class, mode, rollback_target, manifest_revision, preflight_revision) = row?;
-        scenarios.insert(
-            scenario_class,
-            ScenarioAuthority {
-                mode: enum_from_token::<ScenarioMode>(&mode, "scenario authority mode")?,
-                rollback_target: enum_from_token::<ScenarioMode>(
-                    &rollback_target,
-                    "scenario rollback target",
-                )?,
-                manifest_revision: manifest_revision
-                    .map(|revision| to_u64(revision, "scenario manifest revision"))
-                    .transpose()?,
-                preflight_revision: preflight_revision
-                    .map(|revision| to_u64(revision, "scenario preflight revision"))
-                    .transpose()?,
-            },
-        );
-    }
-
-    let mut blocker_statement = connection.prepare(
-        "SELECT
-           scenario_class,
-           blocker_code,
-           config_revision,
-           manifest_revision,
-           preflight_revision,
-           trigger_kind,
-           action_json
-         FROM scheduler_scenario_hard_blockers
-         ORDER BY
-           scenario_class,
-           blocker_code,
-           config_revision,
-           manifest_revision,
-           preflight_revision",
-    )?;
-    let blocker_rows = blocker_statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-        ))
-    })?;
-    let mut hard_blockers = BTreeSet::new();
-    for row in blocker_rows {
-        let (
-            scenario_class,
-            blocker_code,
-            config_revision,
-            manifest_revision,
-            preflight_revision,
-            trigger_kind,
-            action_json,
-        ) = row?;
-        hard_blockers.insert(ScenarioHardBlockerRecord {
-            scenario_class,
-            blocker_code,
-            config_revision: to_u64(config_revision, "hard blocker config revision")?,
-            manifest_revision: to_u64(manifest_revision, "hard blocker manifest revision")?,
-            preflight_revision: to_u64(preflight_revision, "hard blocker preflight revision")?,
-            trigger: enum_from_token::<RollbackTrigger>(&trigger_kind, "hard blocker trigger")?,
-            action: serde_json::from_str::<RollbackAction>(&action_json)?,
-        });
-    }
-
-    Ok(RolloutState {
-        protocol_mode: enum_from_token::<ProtocolMode>(&protocol_mode, "protocol mode")?,
-        config_revision: to_u64(config_revision, "rollout config revision")?,
-        latest_preflight_revision: to_u64(
-            latest_preflight_revision,
-            "latest rollout preflight revision",
-        )?,
-        preflights,
-        manifest,
-        scenarios,
-        hard_blockers,
-    })
 }
 
 fn load_snapshot_tx(tx: &Transaction<'_>, agent_id: &str) -> Result<Snapshot> {
@@ -3300,4 +2573,120 @@ fn load_activations(
         );
     }
     Ok(activations)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::scheduler_protocol::LifecycleWaitHandoffProof;
+
+    fn legacy_adoption_command(replacement: Option<ReplaceCompletedFocusProof>) -> ProtocolCommand {
+        ProtocolCommand::AdoptLegacyWorkState(AdoptLegacyWorkStateCommand {
+            work_item_id: "work-a".into(),
+            source_work_item_revision: 3,
+            demand: WorkDemand {
+                metadata_revision: 3,
+                scheduling_generation: 3,
+                status: WorkStatus::Runnable,
+                capabilities: BTreeSet::new(),
+                locks: BTreeSet::new(),
+                locality: "runtime".into(),
+                cost_class: "default".into(),
+            },
+            wait: None,
+            focus: true,
+            reserve_dispatch: false,
+            replace_completed_focus: replacement,
+        })
+    }
+
+    fn activation_adoption_command(
+        source_lifecycle_wait: Option<LifecycleWaitHandoffProof>,
+    ) -> ProtocolCommand {
+        ProtocolCommand::AdoptActivationWorkState(AdoptActivationWorkStateCommand {
+            source_activation_id: "activation:message:message-a".into(),
+            source_message_id: "message-a".into(),
+            source_turn_id: "turn-a".into(),
+            source_admitted_generation: 2,
+            work_item_id: "work-a".into(),
+            source_work_item_revision: 3,
+            wait: LegacyWaitAdoption {
+                wait_id: "wait-work-a".into(),
+                generation: 3,
+                owner_work_item_id: "work-a".into(),
+                source_updated_at: "2026-08-01T00:00:00Z".into(),
+            },
+            source_lifecycle_wait,
+            focus: true,
+            reserve_dispatch: true,
+        })
+    }
+
+    #[test]
+    fn legacy_adoption_default_field_preserves_v1_command_hash() -> Result<()> {
+        let command = legacy_adoption_command(None);
+        let (schema_version, payload_hash) =
+            canonical_command_hash("adopt_legacy_work_state", &command)?;
+        assert_eq!(schema_version, 1);
+
+        let ProtocolCommand::AdoptLegacyWorkState(command) = command else {
+            unreachable!("fixture is a legacy adoption command");
+        };
+        let old_wire_payload = serde_json::json!({
+            "kind": "adopt_legacy_work_state",
+            "work_item_id": command.work_item_id,
+            "source_work_item_revision": command.source_work_item_revision,
+            "demand": command.demand,
+            "wait": command.wait,
+            "focus": command.focus,
+            "reserve_dispatch": command.reserve_dispatch,
+        });
+        let canonical = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "command_kind": "adopt_legacy_work_state",
+            "command": old_wire_payload,
+        }))?;
+        assert_eq!(
+            payload_hash,
+            format!("sha256:{:x}", Sha256::digest(canonical))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_adoption_replacement_uses_command_specific_v2_hash() -> Result<()> {
+        let v1 = legacy_adoption_command(None);
+        let v2 = legacy_adoption_command(Some(ReplaceCompletedFocusProof {
+            work_item_id: "work-old".into(),
+            source_work_item_revision: 5,
+            expected_metadata_revision: 4,
+            expected_scheduling_generation: 4,
+        }));
+
+        let (v1_schema, v1_hash) = canonical_command_hash("adopt_legacy_work_state", &v1)?;
+        let (v2_schema, v2_hash) = canonical_command_hash("adopt_legacy_work_state", &v2)?;
+        assert_eq!(v1_schema, 1);
+        assert_eq!(v2_schema, LEGACY_ADOPTION_REPLACEMENT_SCHEMA_VERSION);
+        assert_ne!(v1_hash, v2_hash);
+        Ok(())
+    }
+
+    #[test]
+    fn activation_wait_handoff_uses_command_specific_v2_hash() -> Result<()> {
+        let v1 = activation_adoption_command(None);
+        let v2 = activation_adoption_command(Some(LifecycleWaitHandoffProof {
+            wait: WaitIdentity {
+                id: "wait-lifecycle-a".into(),
+                generation: 1,
+            },
+            expected_dispatch_revision: 4,
+        }));
+
+        let (v1_schema, v1_hash) = canonical_command_hash("adopt_activation_work_state", &v1)?;
+        let (v2_schema, v2_hash) = canonical_command_hash("adopt_activation_work_state", &v2)?;
+        assert_eq!(v1_schema, 1);
+        assert_eq!(v2_schema, ACTIVATION_WAIT_HANDOFF_SCHEMA_VERSION);
+        assert_ne!(v1_hash, v2_hash);
+        Ok(())
+    }
 }

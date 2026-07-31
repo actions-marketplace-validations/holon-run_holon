@@ -6,6 +6,7 @@
 pub(crate) mod scheduler_protocol_repository;
 
 use anyhow::{anyhow, bail, Result};
+use chrono::Utc;
 use rusqlite::{OptionalExtension, Transaction};
 use std::collections::BTreeMap;
 
@@ -183,8 +184,6 @@ pub(crate) struct QueueTransitionCommand {
     pub scheduler_claim_work_item: Option<WorkItemRecord>,
     pub scheduler_protocol_bootstrap: Option<crate::domain::scheduler_protocol::Snapshot>,
     pub scheduler_protocol_commands: Vec<crate::domain::scheduler_protocol::ProtocolCommand>,
-    pub scheduler_rollout_expectations:
-        Vec<scheduler_protocol_repository::SchedulerRolloutExpectation>,
     pub agent_state: Option<AgentStateMutation>,
     pub message_evidence: Vec<MessageEnvelope>,
     pub transcript_entries: Vec<TranscriptEntry>,
@@ -218,64 +217,70 @@ impl RuntimeDb {
         RuntimeTransitionRepository { db: self }
     }
 
-    pub fn apply_scheduler_rollout_command(
-        &self,
-        command_identity: &str,
-        command: &crate::domain::scheduler_protocol::RolloutCommand,
-    ) -> Result<SchedulerRolloutCommandReceipt> {
-        let committed =
-            self.transitions()
-                .commit_scheduler_rollout_command(command_identity, command, None)?;
-        Ok(SchedulerRolloutCommandReceipt {
-            command_identity: command_identity.to_string(),
-            applied: committed.applied,
-            replayed: committed.replayed,
-            decision: committed.result.decision,
-            conflict: committed.result.conflict,
-            diagnostics: committed.result.diagnostics,
-            fact_references: committed.result.fact_references,
-            pre_state_fence: committed.result.pre_state_fence,
-            post_state_fence: committed.result.post_state_fence,
+    pub(crate) fn recover_orphaned_dequeued_claims_at_startup(&self) -> Result<Vec<String>> {
+        self.transaction(|tx| {
+            let mut statement = tx.prepare(
+                "SELECT q.payload_json
+                 FROM queue_entries q
+                 JOIN agent_identities i
+                   ON i.agent_id = q.agent_id
+                  AND i.status = 'active'
+                 WHERE q.status = 'dequeued'
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM scheduler_activations a
+                     WHERE a.agent_id = q.agent_id
+                       AND a.activation_id = 'activation:message:' || q.message_id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM turn_records t
+                     WHERE t.agent_id = q.agent_id
+                       AND t.trigger_message_id = q.message_id
+                       AND t.terminal_kind IS NOT NULL
+                   )
+                 ORDER BY q.agent_id, q.updated_at, q.message_id",
+            )?;
+            let candidates = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .map(|row| Ok(serde_json::from_str::<QueueEntryRecord>(&row?)?))
+                .collect::<Result<Vec<_>>>()?;
+            drop(statement);
+
+            let recovered_at = Utc::now();
+            let mut recovered_agents = Vec::new();
+            for expected in candidates {
+                let mut recovered = expected.clone();
+                recovered.status = QueueEntryStatus::Interrupted;
+                recovered.updated_at = recovered_at;
+                if !compare_and_set_queue_entry_tx(tx, &expected, &recovered)? {
+                    continue;
+                }
+                let event = AuditEvent {
+                    id: format!("audit:orphaned-queue-claim:{}", expected.message_id),
+                    event_seq: 0,
+                    event_log_epoch: String::new(),
+                    created_at: recovered_at,
+                    kind: "orphaned_queue_claim_recovered".into(),
+                    contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
+                    payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.to_string(),
+                    payload_schema_version: 1,
+                    data: serde_json::json!({
+                        "message_id": expected.message_id,
+                        "agent_id": expected.agent_id,
+                        "reason": "no_canonical_activation_or_terminal_turn",
+                        "previous_status": "dequeued",
+                        "next_status": "interrupted",
+                    }),
+                };
+                append_audit_event_tx(tx, Some(&recovered.agent_id), &event)?;
+                recovered_agents.push(recovered.agent_id);
+            }
+            recovered_agents.sort();
+            recovered_agents.dedup();
+            Ok(recovered_agents)
         })
     }
-
-    pub fn apply_scheduler_rollout_commands(
-        &self,
-        commands: &[(String, crate::domain::scheduler_protocol::RolloutCommand)],
-    ) -> Result<Vec<SchedulerRolloutCommandReceipt>> {
-        self.transitions()
-            .commit_scheduler_rollout_commands(commands, None)?
-            .into_iter()
-            .zip(commands)
-            .map(|(committed, (command_identity, _))| {
-                Ok(SchedulerRolloutCommandReceipt {
-                    command_identity: command_identity.clone(),
-                    applied: committed.applied,
-                    replayed: committed.replayed,
-                    decision: committed.result.decision,
-                    conflict: committed.result.conflict,
-                    diagnostics: committed.result.diagnostics,
-                    fact_references: committed.result.fact_references,
-                    pre_state_fence: committed.result.pre_state_fence,
-                    post_state_fence: committed.result.post_state_fence,
-                })
-            })
-            .collect()
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SchedulerRolloutCommandReceipt {
-    pub command_identity: String,
-    pub applied: bool,
-    pub replayed: bool,
-    pub decision: crate::domain::scheduler_protocol::Decision,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conflict: Option<crate::domain::scheduler_protocol::ProtocolConflict>,
-    pub diagnostics: Vec<String>,
-    pub fact_references: Vec<String>,
-    pub pre_state_fence: serde_json::Value,
-    pub post_state_fence: serde_json::Value,
 }
 
 impl RuntimeTransitionRepository<'_> {
@@ -489,10 +494,6 @@ impl RuntimeTransitionRepository<'_> {
                 &command.agent_id,
                 command.operation,
                 command.scheduler_claim_work_item.as_ref(),
-            )?;
-            scheduler_protocol_repository::validate_protocol_command_authority_tx(
-                &command.scheduler_protocol_commands,
-                &command.scheduler_rollout_expectations,
             )?;
             let scheduler_protocol = scheduler_protocol_repository::validate_protocol_commands_tx(
                 tx,
@@ -1457,7 +1458,6 @@ mod tests {
                     scheduler_claim_work_item: None,
                     scheduler_protocol_bootstrap: None,
                     scheduler_protocol_commands: Vec::new(),
-                    scheduler_rollout_expectations: Vec::new(),
                     agent_state: Some(AgentStateMutation {
                         expected: Some(Box::new(initial_state.clone())),
                         record: Box::new(settled_state),
@@ -1512,7 +1512,6 @@ mod tests {
             scheduler_claim_work_item: None,
             scheduler_protocol_bootstrap: None,
             scheduler_protocol_commands: Vec::new(),
-            scheduler_rollout_expectations: Vec::new(),
             agent_state: None,
             message_evidence: Vec::new(),
             transcript_entries: Vec::new(),
@@ -1565,7 +1564,6 @@ mod tests {
                 scheduler_claim_work_item: Some(work_item.clone()),
                 scheduler_protocol_bootstrap: None,
                 scheduler_protocol_commands: Vec::new(),
-                scheduler_rollout_expectations: Vec::new(),
                 agent_state: None,
                 message_evidence: Vec::new(),
                 transcript_entries: Vec::new(),

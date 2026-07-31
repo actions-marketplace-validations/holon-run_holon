@@ -62,17 +62,11 @@ pub async fn scheduler_repair_inspect(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
     authorize_control(&headers, &state).map_err(|err| auth_required(err.to_string()))?;
-    let runtime = state
+    let inspection = state
         .host
-        .get_public_agent(&agent_id)
-        .await
+        .public_agent_scheduler_repair_inspection(&agent_id)
         .map_err(agent_access_error)?;
-    Ok(Json(
-        runtime
-            .inspect_scheduler_repair()
-            .await
-            .map_err(error_response)?,
-    ))
+    Ok(Json(inspection))
 }
 
 pub async fn scheduler_repair_apply(
@@ -1070,6 +1064,7 @@ mod tests {
     fn runtime_mutable_config_keys_include_visual_model_defaults() {
         assert!(is_runtime_mutable_config_key("vision.default"));
         assert!(is_runtime_mutable_config_key("image_generation.default"));
+        assert!(!is_runtime_mutable_config_key("runtime.scheduler"));
     }
 
     fn encoded(bytes: &[u8]) -> String {

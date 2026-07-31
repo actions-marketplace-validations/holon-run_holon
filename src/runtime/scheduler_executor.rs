@@ -81,9 +81,6 @@ struct CanonicalClaimPlan {
     scheduler_claim_work_item: Option<crate::types::WorkItemRecord>,
     bootstrap: Option<crate::domain::scheduler_protocol::Snapshot>,
     commands: Vec<crate::domain::scheduler_protocol::ProtocolCommand>,
-    rollout_expectations: Vec<
-        crate::runtime_db::transitions::scheduler_protocol_repository::SchedulerRolloutExpectation,
-    >,
 }
 
 enum CanonicalClaimOutcome {
@@ -118,6 +115,12 @@ impl RuntimeHandle {
         continuation_resolution: Option<&ContinuationResolution>,
         task: Option<&TaskRecord>,
     ) -> Result<ExecutionAdmissionProvenance> {
+        if !self.inner.scheduler_engine.is_canonical() {
+            return Ok(ExecutionAdmissionProvenance::LegacyCompat {
+                scenario_class: None,
+                effective_mode: crate::domain::scheduler_protocol::ScenarioMode::Off,
+            });
+        }
         let scenario_class = if matches!(
             message.kind,
             crate::types::MessageKind::TaskStatus | crate::types::MessageKind::TaskResult
@@ -384,6 +387,11 @@ impl<'a> SchedulerDecisionExecutor<'a> {
             candidate.queue_len,
             self.runtime.now(),
         )?;
+        let projection = if self.runtime.inner.scheduler_engine.is_canonical() {
+            projection
+        } else {
+            projection.without_canonical_authority()
+        };
         let legacy_decision = scheduler::decide_next_action(
             &projection,
             scheduler::SchedulerBoundary::RunLoop,
@@ -393,17 +401,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
                 continuation_resolution: dispatch_plan.continuation_resolution.as_ref(),
             },
         );
-        let scheduler_authority_scenarios = scheduler::authority_scenarios_for_message_claim(
-            &projection,
-            &candidate.message,
-            dispatch_plan.continuation_resolution.as_ref(),
-        );
-        let mut scheduler_rollout_expectations = self
-            .runtime
-            .inner
-            .runtime_db
-            .transitions()
-            .scheduler_rollout_expectations(&scheduler_authority_scenarios)?;
         let scheduler_decision_events =
             scheduler::scheduler_decision_events(&candidate.message.agent_id, &legacy_decision)?;
         let persisted_message = self
@@ -412,7 +409,7 @@ impl<'a> SchedulerDecisionExecutor<'a> {
             .storage
             .read_message_by_id(&candidate.message.id)?
             .ok_or_else(|| anyhow!("claimed message is missing persisted ingress evidence"))?;
-        let canonical_claim =
+        let canonical_claim = if self.runtime.inner.scheduler_engine.is_canonical() {
             match self.canonical_activation_plan(&projection, &persisted_message, &dispatch_plan) {
                 Ok(CanonicalClaimOutcome::NotApplicable) => None,
                 Ok(CanonicalClaimOutcome::Plan(plan)) => Some(plan),
@@ -458,21 +455,16 @@ impl<'a> SchedulerDecisionExecutor<'a> {
                     }
                     return Err(error);
                 }
-            };
+            }
+        } else {
+            None
+        };
         if let Some(plan) = canonical_claim.as_ref() {
             dispatch_plan.execution_admission_provenance =
                 ExecutionAdmissionProvenance::Canonical {
                     scenario_class: plan.scenario_class,
                     activation_id: canonical_activation_id(&persisted_message.id),
                 };
-            for expectation in &plan.rollout_expectations {
-                if !scheduler_rollout_expectations
-                    .iter()
-                    .any(|candidate| candidate.scenario_class == expectation.scenario_class)
-                {
-                    scheduler_rollout_expectations.push(expectation.clone());
-                }
-            }
         }
         let effective_decision = canonical_claim
             .as_ref()
@@ -564,7 +556,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
                             .as_ref()
                             .map(|plan| plan.commands.clone())
                             .unwrap_or_default(),
-                        scheduler_rollout_expectations: scheduler_rollout_expectations.clone(),
                         agent_state: Some(crate::runtime_db::transitions::AgentStateMutation {
                             expected: Some(Box::new(guard.state.clone())),
                             record: Box::new(running_state.clone()),
@@ -656,20 +647,10 @@ impl<'a> SchedulerDecisionExecutor<'a> {
             return Ok(CanonicalClaimOutcome::NotApplicable);
         };
         let scenario_class = candidate.scenario_class();
-        let mut rollout_expectations = self
-            .runtime
-            .inner
-            .runtime_db
-            .transitions()
-            .scheduler_rollout_expectations(&[
-                candidate.scenario_class(),
-                scheduler::SETTLEMENT_SCENARIO,
-            ])?;
         let Some(mut scenario) =
             scheduler::resolve_canonical_activation_scenario(projection, message, candidate)?
         else {
             return Ok(canonical_claim_hard_blocker(
-                &rollout_expectations,
                 scenario_class,
                 "canonical_activation_scenario_unresolved",
             )?);
@@ -688,7 +669,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
                 message,
                 scenario,
                 existing,
-                rollout_expectations,
                 scenario_class,
             );
         }
@@ -750,7 +730,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
                     });
                 }
                 return Ok(canonical_claim_hard_blocker(
-                    &rollout_expectations,
                     scenario_class,
                     "canonical_work_item_missing",
                 )?);
@@ -766,7 +745,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
             Ok(work_projection) => work_projection,
             Err(_) => {
                 return Ok(canonical_claim_hard_blocker(
-                    &rollout_expectations,
                     scenario_class,
                     "canonical_work_item_projection_missing",
                 )?);
@@ -776,7 +754,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
             || work_item.state != crate::types::WorkItemState::Open
         {
             return Ok(canonical_claim_hard_blocker(
-                &rollout_expectations,
                 scenario_class,
                 "canonical_work_item_not_open_same_agent",
             )?);
@@ -787,7 +764,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
         ) && work_projection.scheduling_state != crate::types::WorkItemSchedulingState::Runnable
         {
             return Ok(canonical_claim_hard_blocker(
-                &rollout_expectations,
                 scenario_class,
                 "canonical_autonomous_work_item_not_runnable",
             )?);
@@ -797,10 +773,9 @@ impl<'a> SchedulerDecisionExecutor<'a> {
         use crate::domain::scheduler_protocol::{
             ActivationBinding, ActivationCause, ActivationLifecycleState, ActivationOrigin,
             ActivationPriority, ActivationProvenance, ActivationSlot, ActivationTrust,
-            AdmitActivationCommand, AgentActivation, AgentDispatchState,
-            IssueActivationAuthorityCommand, PreemptionPolicy, ProtocolCommand,
-            RegisterWorkDemandCommand, RolloutState, Snapshot, TriggerWaitCommand, WaitResumeClaim,
-            WorkDemand,
+            AdmitActivationCommand, AgentActivation, AgentDispatchState, PreemptionPolicy,
+            ProtocolCommand, RegisterWorkDemandCommand, Snapshot, TriggerWaitCommand,
+            WaitResumeClaim, WorkDemand,
         };
 
         if let Some(snapshot) = existing.as_ref() {
@@ -836,11 +811,9 @@ impl<'a> SchedulerDecisionExecutor<'a> {
                         .then_some(work_item),
                         bootstrap: None,
                         commands: Vec::new(),
-                        rollout_expectations,
                     }));
                 }
                 return Ok(canonical_claim_hard_blocker(
-                    &rollout_expectations,
                     scenario_class,
                     "canonical_activation_replay_conflict",
                 )?);
@@ -875,7 +848,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
                 if let Some(demand) = snapshot.work.get(work_item_id) {
                     if wait_id.is_none() && demand.status != WorkStatus::Runnable {
                         return Ok(canonical_claim_hard_blocker(
-                            &rollout_expectations,
                             scenario_class,
                             "canonical_work_demand_not_runnable",
                         )?);
@@ -889,7 +861,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
                 } else {
                     if wait_id.is_some() {
                         return Ok(canonical_claim_hard_blocker(
-                            &rollout_expectations,
                             scenario_class,
                             "canonical_wait_resume_work_demand_missing",
                         )?);
@@ -910,7 +881,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
             } else {
                 if wait_id.is_some() {
                     return Ok(canonical_claim_hard_blocker(
-                        &rollout_expectations,
                         scenario_class,
                         "canonical_wait_resume_partition_uninitialized",
                     )?);
@@ -925,11 +895,9 @@ impl<'a> SchedulerDecisionExecutor<'a> {
                         work: Default::default(),
                         waits: Default::default(),
                         activations: Default::default(),
-                        activation_authorities: Default::default(),
                         activation_admissions: Default::default(),
                         settlements: Default::default(),
                         missing_settlements: Default::default(),
-                        rollout: RolloutState::default(),
                         admitted_generations: Default::default(),
                         continuation_admissions: Default::default(),
                         activation_inputs: Default::default(),
@@ -948,35 +916,30 @@ impl<'a> SchedulerDecisionExecutor<'a> {
         let resume = if let Some(wait_id) = wait_id {
             let Some(snapshot) = existing.as_ref() else {
                 return Ok(canonical_claim_hard_blocker(
-                    &rollout_expectations,
                     scenario_class,
                     "canonical_wait_resume_partition_uninitialized",
                 )?);
             };
             let Some(wait) = snapshot.waits.get(wait_id) else {
                 return Ok(canonical_claim_hard_blocker(
-                    &rollout_expectations,
                     scenario_class,
                     "canonical_wait_missing",
                 )?);
             };
             let Some(generation) = wait.generations.get(&wait.current_generation) else {
                 return Ok(canonical_claim_hard_blocker(
-                    &rollout_expectations,
                     scenario_class,
                     "canonical_wait_generation_missing",
                 )?);
             };
             if generation.owner.work_item_id() != Some(work_item_id) {
                 return Ok(canonical_claim_hard_blocker(
-                    &rollout_expectations,
                     scenario_class,
                     "canonical_wait_owner_mismatch",
                 )?);
             }
             let Some(trigger_generation) = message.message_seq else {
                 return Ok(canonical_claim_hard_blocker(
-                    &rollout_expectations,
                     scenario_class,
                     "canonical_trigger_sequence_missing",
                 )?);
@@ -1090,12 +1053,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
             },
         };
         let authority_id = format!("authority:{activation_id}");
-        let authority = IssueActivationAuthorityCommand {
-            authority_id: authority_id.clone(),
-            activation: activation.clone(),
-            expected_scheduling_generation: scheduling_generation,
-            expected_dispatch_revision,
-        };
         let admission = AdmitActivationCommand {
             authority_id,
             activation,
@@ -1103,24 +1060,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
             expected_dispatch_revision,
         };
         let mut commands = Vec::with_capacity(4);
-        if register.is_some() {
-            let autonomous_expectations = self
-                .runtime
-                .inner
-                .runtime_db
-                .transitions()
-                .scheduler_rollout_expectations(&[
-                    scheduler::WORK_ITEM_AUTONOMOUS_CONTINUATION_SCENARIO,
-                ])?;
-            for expectation in autonomous_expectations {
-                if !rollout_expectations
-                    .iter()
-                    .any(|current| current.scenario_class == expectation.scenario_class)
-                {
-                    rollout_expectations.push(expectation);
-                }
-            }
-        }
         commands.extend(register);
         if let Some(resume) = resume {
             commands.push(ProtocolCommand::TriggerWait(TriggerWaitCommand {
@@ -1130,7 +1069,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
                 trigger_generation: resume.trigger_generation,
             }));
         }
-        commands.push(ProtocolCommand::IssueActivationAuthority(authority));
         commands.push(ProtocolCommand::AdmitActivation(admission));
 
         Ok(CanonicalClaimOutcome::Plan(CanonicalClaimPlan {
@@ -1146,7 +1084,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
             .then_some(work_item),
             bootstrap,
             commands,
-            rollout_expectations,
         }))
     }
 
@@ -1155,16 +1092,13 @@ impl<'a> SchedulerDecisionExecutor<'a> {
         message: &MessageEnvelope,
         scenario: scheduler::CanonicalActivationScenario,
         existing: Option<crate::domain::scheduler_protocol::Snapshot>,
-        rollout_expectations: Vec<
-            crate::runtime_db::transitions::scheduler_protocol_repository::SchedulerRolloutExpectation,
-        >,
         scenario_class: crate::domain::scheduler_protocol::SchedulerScenarioClass,
     ) -> Result<CanonicalClaimOutcome> {
         use crate::domain::scheduler_protocol::{
             ActivationBinding, ActivationCause, ActivationLifecycleState, ActivationPriority,
             ActivationProvenance, ActivationSlot, AdmitActivationCommand, AgentActivation,
-            AgentDispatchState, IssueActivationAuthorityCommand, PreemptionPolicy, ProtocolCommand,
-            RolloutState, SchedulerOwner, Snapshot, TriggerWaitCommand, WaitResumeClaim,
+            AgentDispatchState, PreemptionPolicy, ProtocolCommand, SchedulerOwner, Snapshot,
+            TriggerWaitCommand, WaitResumeClaim,
         };
 
         let owner = SchedulerOwner::AgentLifecycle {
@@ -1197,11 +1131,9 @@ impl<'a> SchedulerDecisionExecutor<'a> {
                         scheduler_claim_work_item: None,
                         bootstrap: None,
                         commands: Vec::new(),
-                        rollout_expectations,
                     }));
                 }
                 return Ok(canonical_claim_hard_blocker(
-                    &rollout_expectations,
                     scenario_class,
                     "canonical_activation_replay_conflict",
                 )?);
@@ -1216,11 +1148,9 @@ impl<'a> SchedulerDecisionExecutor<'a> {
             work: Default::default(),
             waits: Default::default(),
             activations: Default::default(),
-            activation_authorities: Default::default(),
             activation_admissions: Default::default(),
             settlements: Default::default(),
             missing_settlements: Default::default(),
-            rollout: RolloutState::default(),
             admitted_generations: Default::default(),
             continuation_admissions: Default::default(),
             activation_inputs: Default::default(),
@@ -1235,35 +1165,30 @@ impl<'a> SchedulerDecisionExecutor<'a> {
             } if expected_owner == &owner => {
                 let Some(snapshot) = existing.as_ref() else {
                     return Ok(canonical_claim_hard_blocker(
-                        &rollout_expectations,
                         scenario_class,
                         "canonical_wait_resume_partition_uninitialized",
                     )?);
                 };
                 let Some(wait) = snapshot.waits.get(wait_id) else {
                     return Ok(canonical_claim_hard_blocker(
-                        &rollout_expectations,
                         scenario_class,
                         "canonical_wait_missing",
                     )?);
                 };
                 let Some(generation) = wait.generations.get(&wait.current_generation) else {
                     return Ok(canonical_claim_hard_blocker(
-                        &rollout_expectations,
                         scenario_class,
                         "canonical_wait_generation_missing",
                     )?);
                 };
                 if generation.owner != owner {
                     return Ok(canonical_claim_hard_blocker(
-                        &rollout_expectations,
                         scenario_class,
                         "canonical_wait_owner_mismatch",
                     )?);
                 }
                 let Some(trigger_generation) = message.message_seq else {
                     return Ok(canonical_claim_hard_blocker(
-                        &rollout_expectations,
                         scenario_class,
                         "canonical_trigger_sequence_missing",
                     )?);
@@ -1321,7 +1246,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
             }
             _ => {
                 return Ok(canonical_claim_hard_blocker(
-                    &rollout_expectations,
                     scenario_class,
                     "canonical_lifecycle_binding_mismatch",
                 )?)
@@ -1362,14 +1286,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
                 trigger_generation: resume.trigger_generation,
             }));
         }
-        commands.push(ProtocolCommand::IssueActivationAuthority(
-            IssueActivationAuthorityCommand {
-                authority_id: authority_id.clone(),
-                activation: activation.clone(),
-                expected_scheduling_generation: expected_generation,
-                expected_dispatch_revision,
-            },
-        ));
         commands.push(ProtocolCommand::AdmitActivation(AdmitActivationCommand {
             authority_id,
             activation,
@@ -1382,7 +1298,6 @@ impl<'a> SchedulerDecisionExecutor<'a> {
             scheduler_claim_work_item: None,
             bootstrap,
             commands,
-            rollout_expectations,
         }))
     }
 
@@ -1435,7 +1350,6 @@ pub(super) fn canonical_activation_id(message_id: &str) -> String {
 }
 
 fn canonical_claim_hard_blocker(
-    _expectations: &[crate::runtime_db::transitions::scheduler_protocol_repository::SchedulerRolloutExpectation],
     scenario_class: crate::domain::scheduler_protocol::SchedulerScenarioClass,
     blocker_code: &'static str,
 ) -> Result<CanonicalClaimOutcome> {
