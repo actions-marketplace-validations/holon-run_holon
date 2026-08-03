@@ -8,7 +8,8 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
+use chrono::Utc;
 use serde_json::{json, Value};
 use tokio::{
     sync::{Notify, RwLock},
@@ -49,12 +50,12 @@ use crate::{
     },
     tool::{apply_patch::ApplyPatchSurface, ToolRegistry},
     types::{
-        AdmissionContext, AgentDeletionJob, AgentIdentityRecord, AgentIdentityView, AgentKind,
-        AgentLifecycleHint, AgentListEntry, AgentOwnership, AgentProfilePreset,
-        AgentRegistryStatus, AgentState, AgentStatus, AgentSummary, AgentTokenUsageSummary,
-        AgentVisibility, AuthorityClass, ChildAgentSummary, ClosureOutcome, ExternalTriggerRecord,
-        ExternalTriggerStatus, ExternalTriggerSummary, LoadedAgentsMdView, MessageBody,
-        MessageDeliverySurface, MessageEnvelope, MessageKind, MessageOrigin,
+        AdmissionContext, AgentDeletionJob, AgentDurability, AgentIdentityRecord,
+        AgentIdentityView, AgentKind, AgentLifecycleHint, AgentListEntry, AgentOwnership,
+        AgentProfilePreset, AgentRegistryStatus, AgentState, AgentStatus, AgentSummary,
+        AgentTokenUsageSummary, AgentVisibility, AuthorityClass, ChildAgentSummary, ClosureOutcome,
+        ExternalTriggerRecord, ExternalTriggerStatus, ExternalTriggerSummary, LoadedAgentsMdView,
+        MessageBody, MessageDeliverySurface, MessageEnvelope, MessageKind, MessageOrigin,
         OperatorNotificationRecord, Priority, QueueEntryStatus, RuntimeFailureSummary,
         SpawnAgentModelResolution, SpawnAgentModelResolutionStatus, TaskKind, TaskRecord,
         TaskStatus, TimerRecord, TokenUsage, TranscriptEntry, TranscriptEntryKind,
@@ -1567,8 +1568,42 @@ impl RuntimeHost {
             other => ids::runtime_id(&format!("{TEMP_AGENT_PREFIX}{other}")),
         };
         self.validate_agent_id(&agent_id)?;
-        let (runtime, runtime_task) = self.spawn_runtime(&agent_id)?;
+        let mut identity = AgentIdentityRecord::new(
+            agent_id.clone(),
+            AgentKind::Named,
+            AgentVisibility::Private,
+            AgentOwnership::SelfOwned,
+            AgentProfilePreset::PublicNamed,
+            None,
+            None,
+        );
+        identity.durability = Some(AgentDurability::Ephemeral);
+        self.append_agent_identity(&identity)?;
+        let (runtime, runtime_task) = match self.spawn_runtime(&agent_id) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                let _ = self.archive_temporary_runtime_identity(&agent_id);
+                return Err(error);
+            }
+        };
         Ok((agent_id, runtime, runtime_task))
+    }
+
+    pub(crate) fn archive_temporary_runtime_identity(&self, agent_id: &str) -> Result<()> {
+        if !Self::is_temporary_agent_id(agent_id) {
+            bail!("agent {agent_id} is not a temporary runtime");
+        }
+        let Some(mut identity) = self.agent_identity_record(agent_id)? else {
+            bail!("temporary runtime {agent_id} is missing its host identity");
+        };
+        if identity.status != AgentRegistryStatus::Deleted {
+            identity.status = AgentRegistryStatus::Deleted;
+            identity.revision = identity.revision.saturating_add(1);
+            identity.deleted_at = Some(Utc::now());
+            identity.updated_at = Utc::now();
+            self.append_agent_identity(&identity)?;
+        }
+        Ok(())
     }
 
     pub fn workspace_entries(&self) -> Result<Vec<WorkspaceEntry>> {
@@ -2312,7 +2347,7 @@ impl RuntimeHost {
             crate::types::MessageOrigin::Task {
                 task_id: task.id.clone(),
             },
-            authority_class,
+            authority_class.clone(),
             crate::types::Priority::Normal,
             crate::types::MessageBody::Text { text: prompt },
         )
@@ -2327,6 +2362,7 @@ impl RuntimeHost {
             "parent_agent_id": parent_state.id,
             "child_agent_id": child_identity.agent_id,
             "parent_supervised": true,
+            "delegated_authority_class": authority_class,
         }));
         child_runtime.enqueue(message).await?;
 
@@ -2896,7 +2932,7 @@ impl RuntimeHostBridge {
             crate::types::MessageOrigin::Task {
                 task_id: task_id.to_string(),
             },
-            authority_class,
+            authority_class.clone(),
             crate::types::Priority::Normal,
             crate::types::MessageBody::Text {
                 text: input.to_string(),
@@ -2911,6 +2947,7 @@ impl RuntimeHostBridge {
             "parent_agent_id": parent_agent_id,
             "child_agent_id": child_agent_id,
             "followup_via": "task_input",
+            "delegated_authority_class": authority_class,
         }));
         runtime.enqueue(message).await.map(|_| true)
     }
@@ -3055,6 +3092,16 @@ mod tests {
         let home = tempdir().unwrap();
         write_test_model_config(home.path());
         let config = AppConfig::load_with_home(Some(home.path().to_path_buf())).unwrap();
+        let host =
+            RuntimeHost::new_with_provider(config, Arc::new(StubProvider::new("done"))).unwrap();
+        (home, host)
+    }
+
+    fn canonical_test_host() -> (tempfile::TempDir, RuntimeHost) {
+        let home = tempdir().unwrap();
+        write_test_model_config(home.path());
+        let mut config = AppConfig::load_with_home(Some(home.path().to_path_buf())).unwrap();
+        config.scheduler_engine = crate::config::SchedulerEngineMode::Canonical;
         let host =
             RuntimeHost::new_with_provider(config, Arc::new(StubProvider::new("done"))).unwrap();
         (home, host)
@@ -3603,12 +3650,13 @@ mod tests {
     async fn private_child_initial_message_sets_task_label_and_supervision_provenance() {
         let (_home, host) = test_host();
         let parent = host.default_runtime().await.unwrap();
+        let parent_agent_id = parent.agent_state().await.unwrap().id;
         let initial_message = "  investigate   remote\nTUI  access ".to_string();
 
         let spawned = parent
             .spawn_agent(
                 Some(initial_message.clone()),
-                AuthorityClass::OperatorInstruction,
+                AuthorityClass::ExternalEvidence,
                 AgentProfilePreset::PrivateChild,
                 None,
                 false,
@@ -3650,6 +3698,7 @@ mod tests {
                 task_id: task_id.clone()
             }
         );
+        assert_eq!(delegated.authority_class, AuthorityClass::ExternalEvidence);
         assert_eq!(
             delegated.metadata.as_ref().unwrap()["parent_supervised"],
             true
@@ -3663,6 +3712,35 @@ mod tests {
             MessageBody::Text {
                 text: initial_message
             }
+        );
+
+        assert!(host
+            .bridge()
+            .deliver_child_followup(
+                &parent_agent_id,
+                &task_id,
+                &spawned.agent_id,
+                "additional untrusted evidence",
+                AuthorityClass::ExternalEvidence,
+            )
+            .await
+            .unwrap());
+        let messages = child.storage().read_recent_messages(10).unwrap();
+        let followup = messages
+            .iter()
+            .find(|message| {
+                message
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("followup_via"))
+                    .and_then(|value| value.as_str())
+                    == Some("task_input")
+            })
+            .expect("child should receive the task input follow-up");
+        assert_eq!(followup.authority_class, AuthorityClass::ExternalEvidence);
+        assert_eq!(
+            followup.metadata.as_ref().unwrap()["delegated_authority_class"],
+            serde_json::json!("external_evidence")
         );
     }
 
@@ -5305,7 +5383,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_loop_failure_preserves_canonical_claim_and_reconciles_on_next_host_access() {
-        let (_home, host) = test_host();
+        let (_home, host) = canonical_test_host();
         let agent_id = host.config().default_agent_id.clone();
         let runtime = host.default_runtime().await.unwrap();
         runtime.inject_runtime_loop_failure_after_next_claim();
@@ -5383,7 +5461,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|entry| {
-                    entry.message_id == message.id && entry.status == QueueEntryStatus::Aborted
+                    entry.message_id == message.id && entry.status == QueueEntryStatus::Interrupted
                 });
             let recovery_recorded = rebuilt
                 .storage()
@@ -5393,7 +5471,8 @@ mod tests {
                 .any(|event| {
                     event.kind == "scheduler_bootstrap_claim_recovered"
                         && event.data["message_id"].as_str() == Some(message.id.as_str())
-                        && event.data["recovery_outcome"].as_str() == Some("settlement_missing")
+                        && event.data["recovery_outcome"].as_str()
+                            == Some("attempt_interrupted_for_reentry")
                 });
             if queue_reconciled && recovery_recorded {
                 break;
