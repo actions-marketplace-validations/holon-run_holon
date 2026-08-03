@@ -27,11 +27,14 @@ from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = ROOT / "tests/e2e/docker/manifest.json"
+OPENAI_STUB_ROOT = ROOT / "tests/e2e/docker/openai_stub"
+OPENAI_STUB_IMAGE = "holon-openai-responses-stub:local"
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 OFFLINE_MODEL_CREDENTIAL_ENV = "DEEPSEEK_API_KEY"
 OFFLINE_MODEL_CREDENTIAL = "docker-e2e-offline-provider-unused"
 EVIDENCE_SCHEMA_VERSION = 1
 SCHEDULER_ACCEPTANCE_REPORT_SCHEMA_VERSION = 1
+SCHEDULER_COVERAGE_REPORT_SCHEMA_VERSION = 1
 SCHEDULER_ENGINES = ("legacy", "canonical")
 TERMINAL_STATUSES = {"awake_idle", "asleep", "awaiting_task"}
 RUNTIME_DB_COPY_TIMEOUT_SECONDS = 120
@@ -173,6 +176,8 @@ class CaseHarness:
         evidence_root: Path,
         timeout_seconds: int,
         keep: bool,
+        provider_mode: str = "live",
+        stub_scenario: str | None = None,
         resource_names: dict[str, str] | None = None,
         control_token: str | None = None,
     ) -> None:
@@ -195,10 +200,15 @@ class CaseHarness:
         self.evidence = evidence_root / case_id
         self.timeout_seconds = timeout_seconds
         self.keep = keep
+        self.provider_mode = provider_mode
+        self.stub_scenario = stub_scenario
         names = resource_names or {}
         self.volume = names.get("volume", f"holon-live-{case_id}-{suffix}")
         self.network = names.get("network", f"holon-live-{case_id}-{suffix}")
         self.container = names.get("container", f"holon-live-{case_id}-{suffix}")
+        self.stub_container = names.get(
+            "stub_container", f"holon-openai-stub-{case_id}-{suffix}"
+        )
         self.token = control_token or secrets.token_urlsafe(24)
         self.base_url = ""
         self.agent_id = ""
@@ -445,6 +455,55 @@ class CaseHarness:
         self.docker("volume", "create", self.volume)
         if self.docker("network", "inspect", self.network, check=False).returncode != 0:
             self.docker("network", "create", self.network)
+        if self.provider_mode == "stub":
+            require(bool(self.stub_scenario), "stub provider mode requires stub_scenario")
+            stub_state = self.docker(
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                self.stub_container,
+                check=False,
+            )
+            if stub_state.returncode != 0:
+                self.docker(
+                    "run",
+                    "--detach",
+                    "--name",
+                    self.stub_container,
+                    "--network",
+                    self.network,
+                    "--network-alias",
+                    "provider-stub",
+                    "--volume",
+                    f"{self.evidence}:/data",
+                    OPENAI_STUB_IMAGE,
+                    "--scenario",
+                    self.stub_scenario,
+                )
+            else:
+                require(
+                    stub_state.stdout.strip() == "true",
+                    "deterministic provider stub stopped during case restart",
+                )
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                ready = self.docker(
+                    "exec",
+                    self.stub_container,
+                    "python",
+                    "-c",
+                    "import urllib.request;"
+                    "urllib.request.urlopen('http://127.0.0.1:8080/healthz')",
+                    check=False,
+                )
+                if ready.returncode == 0:
+                    break
+                time.sleep(0.2)
+            else:
+                raise TimeoutError("deterministic provider stub did not become ready")
+            self.model = "openai/gpt-5.4"
+            self.runtime_env["HOLON_OPENAI_BASE_URL"] = "http://provider-stub:8080/v1"
+            self.runtime_env["OPENAI_API_KEY"] = "deterministic-test-key"
         args = [
             "run",
             "--detach",
@@ -586,6 +645,8 @@ class CaseHarness:
             return {"status": "retained", "errors": []}
         errors: list[str] = []
         self.docker("rm", "-f", self.container, check=False)
+        if self.provider_mode == "stub":
+            self.docker("rm", "-f", self.stub_container, check=False)
         self.docker("volume", "rm", self.volume, check=False)
         self.docker("network", "rm", self.network, check=False)
         residuals = [
@@ -605,10 +666,37 @@ class CaseHarness:
                 self.docker("network", "inspect", self.network, check=False),
             ),
         ]
+        if self.provider_mode == "stub":
+            residuals.append(
+                (
+                    "container",
+                    self.stub_container,
+                    self.docker("inspect", self.stub_container, check=False),
+                )
+            )
         for kind, name, result in residuals:
             if result.returncode == 0:
                 errors.append(f"{kind} still exists after cleanup: {name}")
         return {"status": "fail" if errors else "completed", "errors": errors}
+
+    def assert_stub_complete(self) -> None:
+        if self.provider_mode != "stub":
+            return
+        result = self.docker(
+            "exec",
+            self.stub_container,
+            "python",
+            "-c",
+            "import json,urllib.request;"
+            "print(json.dumps(json.load(urllib.request.urlopen('http://127.0.0.1:8080/status'))))",
+        )
+        status = json.loads(result.stdout)
+        write_json(self.evidence / "stub-status.json", status)
+        require(status.get("complete") is True, f"stub transcript was not fully consumed: {status}")
+        require(
+            status.get("extra_requests") == 0,
+            f"stub received requests after transcript exhaustion: {status}",
+        )
 
     def capture_logs(self) -> None:
         result = self.docker("logs", self.container, check=False)
@@ -2248,18 +2336,55 @@ def run_scheduler_external_wait_resume_case(
         for row in snapshot["wait_conditions"]
         if row["work_item_id"] == work_item_id
     ]
-    require(
-        len(waits) == 1
-        and waits[0]["kind"] == "external"
-        and waits[0]["status"] == "resolved",
-        f"external wait condition did not resolve: {waits}",
-    )
     if harness.canonical_scheduler_enabled:
+        require(
+            len(waits) == 1
+            and waits[0]["kind"] == "external"
+            and waits[0]["status"] == "resolved",
+            f"canonical external wait condition did not resolve: {waits}",
+        )
         require_lifecycle_wait_adoption(
             snapshot,
             agent_id=harness.agent_id,
             work_item_id=work_item_id,
             wait=waits[0],
+        )
+    else:
+        cancellation_events = [
+            json.loads(row["data_json"])["data"]
+            for row in snapshot["audit_events"]
+            if row["kind"] == "wait_conditions_cancelled"
+        ]
+        callback_events = [
+            json.loads(row["data_json"])["data"]
+            for row in snapshot["audit_events"]
+            if row["kind"] == "callback_delivered"
+        ]
+        resume_messages = [
+            row
+            for row in snapshot["messages"]
+            if row["work_item_id"] == work_item_id and row["kind"] == "system_tick"
+        ]
+        require(
+            len(waits) == 1
+            and waits[0]["kind"] == "external"
+            and waits[0]["status"] == "cancelled"
+            and any(
+                event.get("work_item_id") == work_item_id
+                and event.get("reason") == "work_item_completed"
+                and waits[0]["wait_condition_id"]
+                in event.get("wait_condition_ids", [])
+                for event in cancellation_events
+            )
+            and any(
+                event.get("disposition") == "triggered"
+                for event in callback_events
+            )
+            and len(resume_messages) == 1,
+            "legacy external wait did not follow wake-hint then completion "
+            f"cancellation semantics: waits={waits}, "
+            f"cancellations={cancellation_events}, "
+            f"callbacks={callback_events}, resumes={resume_messages}",
         )
     require_scheduler_engine_wait_resolution(
         harness,
@@ -3101,6 +3226,32 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     )
     cases = manifest.get("cases")
     require(isinstance(cases, list) and cases, "manifest cases must be non-empty")
+    profiles = manifest.get("profiles", {})
+    require(isinstance(profiles, dict), "manifest profiles must be an object")
+    for profile_id, profile in profiles.items():
+        require(
+            isinstance(profile_id, str) and profile_id,
+            "profile id must be non-empty",
+        )
+        require(isinstance(profile, dict), f"profile {profile_id} must be an object")
+        require(
+            profile.get("provider_mode", "live") in {"live", "stub"},
+            f"profile {profile_id} has invalid provider_mode",
+        )
+        required = profile.get("required_coverage_ids", [])
+        require(
+            isinstance(required, list)
+            and len(required) == len(set(required))
+            and all(isinstance(value, str) and value for value in required),
+            f"profile {profile_id} required_coverage_ids must be unique strings",
+        )
+        case_ids = profile.get("case_ids", [])
+        require(
+            isinstance(case_ids, list)
+            and len(case_ids) == len(set(case_ids))
+            and all(isinstance(value, str) and value for value in case_ids),
+            f"profile {profile_id} case_ids must be unique strings",
+        )
     seen: set[str] = set()
     for case in cases:
         case_id = case.get("id")
@@ -3125,6 +3276,24 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             require(
                 isinstance(case["requires_model"], bool),
                 f"{case_id} requires_model must be boolean",
+            )
+        coverage_ids = case.get("coverage_ids", [])
+        require(
+            isinstance(coverage_ids, list)
+            and len(coverage_ids) == len(set(coverage_ids))
+            and all(isinstance(value, str) and value for value in coverage_ids),
+            f"{case_id} coverage_ids must be unique strings",
+        )
+        provider_mode = case.get("provider_mode", "live")
+        require(
+            provider_mode in {"live", "stub"},
+            f"{case_id} has invalid provider_mode",
+        )
+        if provider_mode == "stub":
+            require(
+                isinstance(case.get("stub_scenario"), str)
+                and case["stub_scenario"],
+                f"{case_id} stub provider mode requires stub_scenario",
             )
         runtime_env = case.get("runtime_env", {})
         require(isinstance(runtime_env, dict), f"{case_id} runtime_env must be an object")
@@ -3168,6 +3337,10 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
                 not set(required).intersection(forbidden),
                 f"{case_id}/{phase_id} has required/forbidden tool overlap",
             )
+    known_case_ids = {case["id"] for case in cases}
+    for profile_id, profile in profiles.items():
+        unknown = sorted(set(profile.get("case_ids", [])) - known_case_ids)
+        require(not unknown, f"profile {profile_id} has unknown cases: {unknown}")
 
 
 def select_cases(
@@ -3190,6 +3363,16 @@ def select_cases(
         ]
     require(selected, "case selection is empty")
     return selected
+
+
+def resolve_profile(
+    manifest: dict[str, Any], profile_id: str | None
+) -> dict[str, Any]:
+    if profile_id is None:
+        return {"provider_mode": "live", "required_coverage_ids": []}
+    profiles = manifest.get("profiles", {})
+    require(profile_id in profiles, f"unknown profile: {profile_id}")
+    return profiles[profile_id]
 
 
 def expand_case_matrix(
@@ -3333,13 +3516,14 @@ def scheduler_acceptance_report(
     run_record: dict[str, Any],
     case_results: list[dict[str, Any]],
     fixture_corpus_revision: str,
+    required_coverage_ids: set[str],
 ) -> dict[str, Any]:
     scheduler_results = [
         result
         for result in case_results
         if result.get("scheduler_engine") in SCHEDULER_ENGINES
     ]
-    expected_cases = {result["base_id"] for result in scheduler_results}
+    expected_cases = set(required_coverage_ids)
     engines = []
     all_revisions = set()
     diagnostics = []
@@ -3347,9 +3531,13 @@ def scheduler_acceptance_report(
         results = [
             result for result in scheduler_results if result["scheduler_engine"] == engine
         ]
-        actual_cases = {result["base_id"] for result in results}
-        matrix_complete = (
-            actual_cases == expected_cases and len(results) == len(expected_cases)
+        coverage_counts: dict[str, int] = {}
+        for result in results:
+            for coverage_id in result.get("coverage_ids", [result["base_id"]]):
+                coverage_counts[coverage_id] = coverage_counts.get(coverage_id, 0) + 1
+        actual_cases = set(coverage_counts)
+        matrix_complete = actual_cases == expected_cases and all(
+            count == 1 for count in coverage_counts.values()
         )
         revisions = {
             result["schema_revision"]
@@ -3428,6 +3616,43 @@ def scheduler_acceptance_report(
     }
 
 
+def scheduler_coverage_report(
+    *,
+    run_record: dict[str, Any],
+    case_results: list[dict[str, Any]],
+    required_coverage_ids: set[str],
+    secret_scan_status: str,
+) -> dict[str, Any]:
+    observed: dict[str, list[str]] = {}
+    for result in case_results:
+        for coverage_id in result.get("coverage_ids", []):
+            observed.setdefault(coverage_id, []).append(result["id"])
+    missing = sorted(required_coverage_ids - observed.keys())
+    invalid_counts = {
+        coverage_id: evidence_ids
+        for coverage_id, evidence_ids in sorted(observed.items())
+        if coverage_id in required_coverage_ids
+        and len(evidence_ids) != len(SCHEDULER_ENGINES)
+    }
+    failed = sorted(result["id"] for result in case_results if result["status"] != "pass")
+    return {
+        "schema_version": SCHEDULER_COVERAGE_REPORT_SCHEMA_VERSION,
+        "status": "pass" if not missing and not invalid_counts and not failed and secret_scan_status == "pass" else "fail",
+        "git_sha": run_record["git_sha"],
+        "image_digest": run_record["image_digest"],
+        "manifest_sha256": run_record["manifest_sha256"],
+        "profile": run_record["profile"],
+        "engines": list(SCHEDULER_ENGINES),
+        "required_coverage_ids": sorted(required_coverage_ids),
+        "observed": observed,
+        "missing_coverage_ids": missing,
+        "duplicate_or_incomplete_coverage_ids": invalid_counts,
+        "unexpected_coverage_ids": sorted(observed.keys() - required_coverage_ids),
+        "failed_evidence_ids": failed,
+        "secret_scan": secret_scan_status,
+    }
+
+
 def write_junit(path: Path, cases: list[dict[str, Any]], duration: float) -> None:
     suite = ElementTree.Element(
         "testsuite",
@@ -3465,10 +3690,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--case", action="append", dest="cases")
     parser.add_argument("--tag", action="append", default=[])
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument("--profile")
     parser.add_argument("--env-file", type=Path)
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument("--keep-on-failure", action="store_true")
+    parser.add_argument("--timeout", type=int)
     parser.add_argument("--scheduler-matrix", action="store_true")
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--validate-manifest", action="store_true")
@@ -3479,6 +3706,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     manifest = json.loads(args.manifest.read_text())
     validate_manifest(manifest)
+    profile = resolve_profile(manifest, args.profile)
     if args.validate_manifest:
         print(f"valid manifest: {args.manifest}")
         return 0
@@ -3491,7 +3719,7 @@ def main(argv: list[str] | None = None) -> int:
     require(shutil.which("docker") is not None, "docker is required")
     selected = select_cases(
         manifest,
-        requested=args.cases,
+        requested=args.cases or profile.get("case_ids") or None,
         suite=args.suite,
         tags=args.tag,
     )
@@ -3500,7 +3728,11 @@ def main(argv: list[str] | None = None) -> int:
             any("scheduler" in case.get("tags", []) for case in selected),
             "--scheduler-matrix requires at least one scheduler-tagged case",
         )
-    requires_model = any(case.get("requires_model", True) for case in selected)
+    requires_model = any(
+        case.get("requires_model", True)
+        and case.get("provider_mode", profile.get("provider_mode", "live")) == "live"
+        for case in selected
+    )
     model = args.model or first_env(
         "HOLON_E2E_MODEL", "HOLON_LIVE_MODEL", default=DEFAULT_MODEL
     )
@@ -3573,10 +3805,12 @@ def main(argv: list[str] | None = None) -> int:
         "env_file_used": env_file is not None,
         "manifest_sha256": hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
         "scheduler_matrix": args.scheduler_matrix,
+        "profile": args.profile,
+        "provider_mode": profile.get("provider_mode", "live"),
     }
     write_json(evidence_root / "run.json", run_record)
 
-    timeout_override = first_env(
+    timeout_override = args.timeout or first_env(
         "HOLON_E2E_TIMEOUT_SECONDS", "HOLON_LIVE_TIMEOUT_SECONDS"
     )
     keep_on_failure = args.keep_on_failure or env_flag(
@@ -3588,6 +3822,20 @@ def main(argv: list[str] | None = None) -> int:
         selected,
         scheduler_matrix=args.scheduler_matrix,
     )
+    if any(
+        case.get("provider_mode", profile.get("provider_mode", "live")) == "stub"
+        for case, _ in expanded_cases
+    ):
+        run(
+            [
+                "docker",
+                "build",
+                "--tag",
+                OPENAI_STUB_IMAGE,
+                str(OPENAI_STUB_ROOT),
+            ],
+            capture=False,
+        )
     for case, scheduler_engine in expanded_cases:
         case_id = case["id"]
         evidence_id = (
@@ -3616,11 +3864,16 @@ def main(argv: list[str] | None = None) -> int:
                 else int(case["timeout_seconds"])
             ),
             keep=False,
+            provider_mode=case.get(
+                "provider_mode", profile.get("provider_mode", "live")
+            ),
+            stub_scenario=case.get("stub_scenario", profile.get("stub_scenario")),
         )
         control_tokens.append(harness.token)
         error_text = ""
         try:
             CASE_RUNNERS[case_id](harness, case)
+            harness.assert_stub_complete()
             harness.capture_context("final")
             status = "pass"
             print(f"PASS {case_id}")
@@ -3660,6 +3913,7 @@ def main(argv: list[str] | None = None) -> int:
             "cleanup": cleanup_result["status"],
             "cleanup_errors": cleanup_result["errors"],
             "schema_revision": collect_case_schema_revision(harness.evidence),
+            "coverage_ids": case.get("coverage_ids", []),
             **collect_case_metrics(harness.evidence),
         }
         write_json(harness.evidence / "case.json", result)
@@ -3697,13 +3951,33 @@ def main(argv: list[str] | None = None) -> int:
         "secret_scan": scan["status"],
     }
     write_json(evidence_root / "summary.json", summary)
+    report_failures: list[str] = []
     if args.scheduler_matrix:
+        required_coverage_ids = set(profile.get("required_coverage_ids", []))
+        if not required_coverage_ids:
+            required_coverage_ids = {
+                coverage_id
+                for case in selected
+                for coverage_id in case.get("coverage_ids", [])
+            }
+        coverage_report = scheduler_coverage_report(
+            run_record=run_record,
+            case_results=case_results,
+            required_coverage_ids=required_coverage_ids,
+            secret_scan_status=scan["status"],
+        )
+        write_json(evidence_root / "scheduler-coverage-report.json", coverage_report)
+        if coverage_report["status"] != "pass":
+            report_failures.append("scheduler-coverage-report: fail")
         report = scheduler_acceptance_report(
             run_record=run_record,
             case_results=case_results,
             fixture_corpus_revision=manifest["scheduler_fixture_corpus_revision"],
+            required_coverage_ids=required_coverage_ids,
         )
         write_json(evidence_root / "scheduler-acceptance-report.json", report)
+        if report["status"] != "pass":
+            report_failures.append("scheduler-acceptance-report: fail")
     write_junit(evidence_root / "junit.xml", case_results, duration)
 
     print(f"Evidence: {evidence_root}")
@@ -3711,7 +3985,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{case['id']}: {case['error']}"
         for case in case_results
         if case["status"] != "pass"
-    ]
+    ] + report_failures
     if failures:
         print("\n".join(failures), file=sys.stderr)
         return 1

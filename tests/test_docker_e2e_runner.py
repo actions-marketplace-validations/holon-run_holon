@@ -18,6 +18,11 @@ SPEC = importlib.util.spec_from_file_location("docker_e2e_runner", RUNNER_PATH)
 assert SPEC is not None and SPEC.loader is not None
 runner = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runner)
+STUB_PATH = ROOT / "tests/e2e/docker/openai_stub/server.py"
+STUB_SPEC = importlib.util.spec_from_file_location("openai_stub", STUB_PATH)
+assert STUB_SPEC is not None and STUB_SPEC.loader is not None
+stub = importlib.util.module_from_spec(STUB_SPEC)
+STUB_SPEC.loader.exec_module(stub)
 
 
 class DockerE2ERunnerTests(unittest.TestCase):
@@ -123,6 +128,197 @@ class DockerE2ERunnerTests(unittest.TestCase):
         invalid["cases"][0]["id"] = "not-implemented"
         with self.assertRaisesRegex(AssertionError, "no registered runner"):
             runner.validate_manifest(invalid)
+
+    def test_profile_exposes_explicit_scheduler_required_set(self) -> None:
+        profile = runner.resolve_profile(self.manifest, "scheduler-acceptance")
+        self.assertEqual(profile["provider_mode"], "live")
+        self.assertEqual(
+            set(profile["required_coverage_ids"]),
+            {
+                case["id"]
+                for case in self.manifest["cases"]
+                if "scheduler" in case.get("tags", [])
+            },
+        )
+
+    def test_scheduler_required_profile_selects_three_stub_cases(self) -> None:
+        profile = runner.resolve_profile(self.manifest, "scheduler-required")
+        selected = runner.select_cases(
+            self.manifest,
+            requested=profile["case_ids"],
+            suite="core",
+            tags=[],
+        )
+        self.assertEqual(profile["provider_mode"], "stub")
+        self.assertEqual(
+            [case["id"] for case in selected],
+            [
+                "scheduler-multi-workitem-scheduling",
+                "scheduler-external-wait-resume",
+                "scheduler-operator-wait-resume",
+            ],
+        )
+        self.assertTrue(all(case.get("stub_scenario") for case in selected))
+
+    def test_scheduler_coverage_reports_missing_and_duplicate_ids(self) -> None:
+        report = runner.scheduler_coverage_report(
+            run_record={
+                "git_sha": "git-sha",
+                "image_digest": "image@sha256:digest",
+                "manifest_sha256": "manifest-hash",
+                "profile": "scheduler-required",
+            },
+            case_results=[
+                {"id": "a-legacy", "coverage_ids": ["a"], "status": "pass"},
+                {"id": "a-canonical", "coverage_ids": ["a"], "status": "pass"},
+                {"id": "a-extra", "coverage_ids": ["a"], "status": "pass"},
+            ],
+            required_coverage_ids={"a", "b"},
+            secret_scan_status="pass",
+        )
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(report["missing_coverage_ids"], ["b"])
+        self.assertEqual(
+            report["duplicate_or_incomplete_coverage_ids"]["a"],
+            ["a-legacy", "a-canonical", "a-extra"],
+        )
+
+    def test_openai_stub_consumes_transcript_deterministically(self) -> None:
+        scenario = stub.Scenario("scheduler-external")
+        status, response = scenario.consume(
+            {
+                "instructions": "Reply with exactly OK.",
+                "input": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {"type": "input_text", "text": "Reply with exactly OK."}
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][0]["content"][0]["text"], "OK")
+        self.assertEqual(scenario.phase, 0)
+        status, response = scenario.consume(
+            {
+                "instructions": "normal agent instructions mentioning Reply with exactly OK.",
+                "input": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "## recent_turns\nThis is the first run of Holon\n"
+                                    "## current_input\nCurrent input:\n"
+                                    "- [operator] SCHEDULER-EXTERNAL-WAIT-abcd "
+                                    "SCHEDULER-EXTERNAL-COMPLETE-abcd docker-e2e:abcd"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][0]["name"], "CreateWorkItem")
+        self.assertEqual(scenario.phase, 1)
+        scenario.phase = 0
+        status, response = scenario.consume(
+            {
+                "input": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "## current_input\nCurrent input:\n"
+                                    "- [system][runtime_system][runtime_owned]"
+                                    "[trigger:internal_followup][runtime_instruction]"
+                                    "[InternalFollowup]\n"
+                                    "  This is the first run of Holon"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            response["output"][0]["content"][0]["text"],
+            "Deterministic Holon test runtime ready.",
+        )
+        self.assertEqual(scenario.phase, 0)
+        status, response = scenario.consume(
+            {"input": [{"type": "message", "content": [{"type": "input_text", "text": "SCHEDULER-EXTERNAL-WAIT-abcd SCHEDULER-EXTERNAL-COMPLETE-abcd docker-e2e:abcd"}]}]}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][0]["name"], "CreateWorkItem")
+        status, response = scenario.consume({"input": [{"type": "function_call_output", "output": "{\"work_item\":{\"id\":\"work_0123456789abcde\"}}"}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][0]["name"], "PickWorkItem")
+        scenario.phase = 6
+        status, response = scenario.consume({"input": []})
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            response["output"][0]["content"][0]["text"],
+            "Deterministic scheduler scenario complete.",
+        )
+        self.assertEqual(scenario.phase, 7)
+        self.assertTrue(scenario.status()["complete"])
+        status, response = scenario.consume({"input": []})
+        self.assertEqual(status, 409)
+        self.assertEqual(response["error"]["type"], "transcript_exhausted")
+        self.assertEqual(scenario.status()["extra_requests"], 1)
+        self.assertFalse(scenario.status()["complete"])
+
+    def test_openai_stub_multi_waits_for_second_autonomous_turn(self) -> None:
+        scenario = stub.Scenario("scheduler-multi")
+        scenario.phase = 7
+        scenario.work_ids = [
+            "work_0123456789abcde",
+            "work_fedcba987654321",
+        ]
+        scenario.markers = {
+            "multi_a": "SCHEDULER-MULTI-A-abcd",
+            "multi_b": "SCHEDULER-MULTI-B-abcd",
+        }
+        status, response = scenario.consume({"input": []})
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            response["output"][0]["content"][0]["text"],
+            "Completed the first deterministic WorkItem.",
+        )
+        self.assertEqual(scenario.phase, 7)
+        status, response = scenario.consume({"input": []})
+        self.assertEqual(status, 409)
+        self.assertEqual(response["error"]["type"], "transcript_exhausted")
+        status, response = scenario.consume(
+            {
+                "input": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "## current_input\nCurrent input:\n"
+                                    "- [system][trigger:system_tick] "
+                                    "SCHEDULER-MULTI-B-abcd"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][0]["name"], "GetWorkspaceState")
+        self.assertEqual(scenario.phase, 8)
 
     def test_secret_scan_reports_value_without_echoing_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -685,6 +881,7 @@ class DockerE2ERunnerTests(unittest.TestCase):
             run_record=run_record,
             case_results=case_results,
             fixture_corpus_revision="scheduler-release-acceptance-v1",
+            required_coverage_ids={"scheduler-task-wait-resume"},
         )
         self.assertEqual(
             report["schema_version"],
@@ -727,6 +924,7 @@ class DockerE2ERunnerTests(unittest.TestCase):
             run_record=run_record,
             case_results=case_results,
             fixture_corpus_revision="scheduler-release-acceptance-v1",
+            required_coverage_ids={"scheduler-task-wait-resume"},
         )
         self.assertEqual(report["status"], "fail")
         self.assertIsNone(report["runtime_schema_revision"])
