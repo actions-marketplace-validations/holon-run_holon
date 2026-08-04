@@ -35,6 +35,7 @@ OFFLINE_MODEL_CREDENTIAL = "docker-e2e-offline-provider-unused"
 EVIDENCE_SCHEMA_VERSION = 1
 SCHEDULER_ACCEPTANCE_REPORT_SCHEMA_VERSION = 1
 SCHEDULER_COVERAGE_REPORT_SCHEMA_VERSION = 1
+SCHEDULER_LIVE_CANARY_REPORT_SCHEMA_VERSION = 1
 SCHEDULER_ENGINES = ("legacy", "canonical")
 TERMINAL_STATUSES = {"awake_idle", "asleep", "awaiting_task"}
 RUNTIME_DB_COPY_TIMEOUT_SECONDS = 120
@@ -178,6 +179,8 @@ class CaseHarness:
         keep: bool,
         provider_mode: str = "live",
         stub_scenario: str | None = None,
+        model_runtime_override: dict[str, int] | None = None,
+        tool_assertion_mode: str = "strict",
         resource_names: dict[str, str] | None = None,
         control_token: str | None = None,
     ) -> None:
@@ -202,6 +205,10 @@ class CaseHarness:
         self.keep = keep
         self.provider_mode = provider_mode
         self.stub_scenario = stub_scenario
+        self.stub_provider_base_url: str | None = None
+        self.model_runtime_override = dict(model_runtime_override or {})
+        self._model_runtime_override_seeded = False
+        self.tool_assertion_mode = tool_assertion_mode
         names = resource_names or {}
         self.volume = names.get("volume", f"holon-live-{case_id}-{suffix}")
         self.network = names.get("network", f"holon-live-{case_id}-{suffix}")
@@ -503,8 +510,33 @@ class CaseHarness:
             else:
                 raise TimeoutError("deterministic provider stub did not become ready")
             self.model = "openai/gpt-5.4"
-            self.runtime_env["HOLON_OPENAI_BASE_URL"] = "http://provider-stub:8080/v1"
+            self.runtime_env["HOLON_OPENAI_BASE_URL"] = (
+                self.stub_provider_base_url or "http://provider-stub:8080/v1"
+            )
             self.runtime_env["OPENAI_API_KEY"] = "deterministic-test-key"
+        if self.model_runtime_override and not self._model_runtime_override_seeded:
+            config = {
+                "models": {
+                    "catalog": {
+                        self.model: self.model_runtime_override,
+                    }
+                }
+            }
+            self.docker(
+                "run",
+                "--rm",
+                "--volume",
+                f"{self.volume}:/var/lib/holon",
+                "--entrypoint",
+                "bash",
+                self.image,
+                "-lc",
+                "set -euo pipefail; umask 077; "
+                "printf '%s' \"$1\" > /var/lib/holon/config.json",
+                "bash",
+                json.dumps(config, separators=(",", ":")),
+            )
+            self._model_runtime_override_seeded = True
         args = [
             "run",
             "--detach",
@@ -1265,8 +1297,21 @@ class CaseHarness:
         )
         actual = [event["payload"].get("tool_name") for event in events]
         missing = [name for name in expected if name not in actual]
-        require(not missing, f"{label} missing successful tools {missing}; got {actual}")
         forbidden_actual = [name for name in (forbidden or []) if name in actual]
+        if self.tool_assertion_mode == "observe":
+            write_json(
+                self.evidence / f"{label}-tool-observation.json",
+                {
+                    "mode": "observe",
+                    "expected": expected,
+                    "forbidden": forbidden or [],
+                    "actual": actual,
+                    "missing": missing,
+                    "forbidden_actual": forbidden_actual,
+                },
+            )
+            return events
+        require(not missing, f"{label} missing successful tools {missing}; got {actual}")
         require(
             not forbidden_actual,
             f"{label} used forbidden tools {forbidden_actual}; got {actual}",
@@ -1456,8 +1501,7 @@ def require_turn_local_compaction(
         if row["kind"] == "turn_local_compaction_applied"
     ]
     require(
-        events
-        and any(int(event.get("compacted_rounds") or 0) > 0 for event in events),
+        events and any(int(event.get("compacted_rounds") or 0) > 0 for event in events),
         f"{label} compaction stimulus did not produce compacted rounds: {events}",
     )
     return events
@@ -1559,12 +1603,12 @@ def require_scheduler_wait_terminal(
             wait["status"] == "resolved",
             f"canonical {wait_kind} wait did not resolve: {wait}",
         )
-        return waits
-    require(
-        wait["status"] in {"resolved", "cancelled"},
-        f"legacy {wait_kind} wait did not reach a terminal state: {wait}",
-    )
-    if wait["status"] == "cancelled":
+    else:
+        require(
+            wait["status"] in {"resolved", "cancelled"},
+            f"legacy {wait_kind} wait did not reach a terminal state: {wait}",
+        )
+    if not harness.canonical_scheduler_enabled and wait["status"] == "cancelled":
         cancellation_events = [
             json.loads(row["data_json"])["data"]
             for row in snapshot["audit_events"]
@@ -1676,6 +1720,70 @@ def require_scheduler_activation_chain(
         f"canonical activation slot was not released: {slots}",
     )
     return activations
+
+
+def require_checkpoint_restart_activation_lineage(
+    before_restart_snapshot: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    work_item_id: str,
+    wait_id: str,
+) -> None:
+    before_restart_activations = [
+        row
+        for row in before_restart_snapshot["scheduler_activations"]
+        if row["work_item_id"] == work_item_id
+    ]
+    require(
+        len(before_restart_activations) == 1
+        and before_restart_activations[0]["admitted_generation"] == 1
+        and before_restart_activations[0]["admission_kind"] == "scheduling"
+        and str(before_restart_activations[0]["idempotency_key"]).startswith(
+            "work-queue-attempt:"
+        ),
+        "checkpoint replay restart boundary did not preserve exactly the initial "
+        f"scheduling activation: {before_restart_activations}",
+    )
+    activations = sorted(
+        (
+            row
+            for row in snapshot["scheduler_activations"]
+            if row["work_item_id"] == work_item_id
+        ),
+        key=lambda row: row["admitted_generation"],
+    )
+    require(
+        len(activations) == 2,
+        f"checkpoint replay expected exactly two WorkItem activations: {activations}",
+    )
+    scheduling, wait_resume = activations
+    require(
+        scheduling["admitted_generation"] == 1
+        and scheduling["admission_kind"] == "scheduling"
+        and str(scheduling["idempotency_key"]).startswith("work-queue-attempt:"),
+        f"checkpoint replay initial scheduling activation mismatch: {scheduling}",
+    )
+    expected_wait_resume_key = (
+        f"wait-resume:{wait_id}:2:{wait_resume['activation_id']}"
+    )
+    require(
+        wait_resume["admitted_generation"] == 2
+        and wait_resume["admission_kind"] == "wait_resume"
+        and wait_resume["idempotency_key"] == expected_wait_resume_key,
+        f"checkpoint replay wait-resume activation mismatch: {wait_resume}",
+    )
+    wait_generations = [
+        row
+        for row in snapshot["scheduler_wait_generations"]
+        if row["wait_id"] == wait_id
+    ]
+    require(
+        len(wait_generations) == 1
+        and wait_generations[0]["owner_work_item_id"] == work_item_id
+        and wait_generations[0]["generation"] == 2
+        and wait_generations[0]["lifecycle_state"] == "resolved",
+        f"checkpoint replay wait generation mismatch: {wait_generations}",
+    )
 
 
 def require_lifecycle_wait_adoption(
@@ -2213,6 +2321,23 @@ def work_queue_message_evidence(
     return evidence
 
 
+def recovered_retry_ticks(
+    failed_ticks: list[dict[str, Any]],
+    recovered_ticks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    failed_keys = {
+        tick["idempotency_key"]
+        for tick in failed_ticks
+        if tick["status"] in {"aborted", "interrupted"}
+    }
+    return [
+        tick
+        for tick in recovered_ticks
+        if tick["status"] == "processed"
+        and tick["idempotency_key"] in failed_keys
+    ]
+
+
 def run_scheduler_task_wait_resume_case(
     harness: CaseHarness, case: dict[str, Any]
 ) -> None:
@@ -2235,6 +2360,7 @@ def run_scheduler_task_wait_resume_case(
         f"{completion_marker} immediately followed by CompleteWorkItem for the "
         "exact current item. Do not create another WorkItem."
     )
+    callback = harness.reset_callback("scheduler-task-wait-callback")
     phase = case["phases"][0]
     baseline, _ = harness.prompt(
         "scheduler-task-wait-seed",
@@ -2258,7 +2384,7 @@ def run_scheduler_task_wait_resume_case(
         external_waiting["id"] == task_waiting["id"],
         "task-result rejoin changed WorkItem identity",
     )
-    callback = harness.reset_callback("scheduler-task-wait-callback")
+    harness.wait_agent_asleep()
     harness.fire_callback(
         "scheduler-task-wait-wake",
         callback["trigger_url"],
@@ -2343,23 +2469,38 @@ def run_scheduler_task_wait_resume_case(
         harness,
         snapshot,
         work_item_id=work_item_id,
-        expected_admission_kinds=("scheduling", "task_rejoin", "wait_resume"),
+        expected_admission_kinds=("scheduling", "wait_resume", "wait_resume"),
         lifecycle_message_ids={
             harness.prompt_scope("scheduler-task-wait-seed")["message_id"]
         },
     )
-    waits = [
-        row
-        for row in snapshot["wait_conditions"]
-        if row["work_item_id"] == work_item_id
-    ]
-    require(
-        len(waits) == 2
-        and {row["kind"] for row in waits} == {"task", "external"}
-        and {row["kind"]: row["status"] for row in waits}
-        == {"task": "resolved", "external": "cancelled"},
-        f"task/external waits did not reach terminal states: {waits}",
+    if harness.canonical_scheduler_enabled:
+        activation_causes = [
+            json.loads(row["payload_json"])["activation"]["cause"]["kind"]
+            for row in snapshot["scheduler_activations"]
+            if row["work_item_id"] == work_item_id
+        ]
+        require(
+            sorted(activation_causes)
+            == ["task_rejoin", "wait_resume", "work_item_runnable"],
+            "canonical task/wait activation causes did not preserve scheduling, "
+            f"task-rejoin, and external-resume provenance: {activation_causes}",
+        )
+    task_waits = require_scheduler_wait_terminal(
+        harness,
+        snapshot,
+        work_item_id=work_item_id,
+        wait_kind="task",
     )
+    external_waits = require_scheduler_wait_terminal(
+        harness,
+        snapshot,
+        work_item_id=work_item_id,
+        wait_kind="external",
+        require_callback_trigger=True,
+        callback_external_trigger_id=callback["external_trigger_id"],
+    )
+    waits = task_waits + external_waits
     require_scheduler_engine_wait_resolution(
         harness,
         snapshot,
@@ -2381,8 +2522,9 @@ def run_scheduler_provider_failure_retry_case(
 ) -> None:
     harness.initialize_workspace()
     base_url_env = provider_base_url_env(harness.model)
-    original_base_url = harness.runtime_env.get(base_url_env)
     harness.start()
+    original_base_url = harness.runtime_env.get(base_url_env)
+    original_stub_provider_base_url = harness.stub_provider_base_url
 
     harness.request(
         "POST",
@@ -2414,7 +2556,10 @@ def run_scheduler_provider_failure_retry_case(
     write_json(harness.evidence / "provider-retry-picked.json", picked)
     failure_event_cursor = harness.event_cursor()
     harness.stop()
-    harness.runtime_env[base_url_env] = "http://127.0.0.1:9"
+    if harness.provider_mode == "stub":
+        harness.stub_provider_base_url = "http://127.0.0.1:9"
+    else:
+        harness.runtime_env[base_url_env] = "http://127.0.0.1:9"
     harness.start(wait_idle=False)
     harness.request(
         "POST",
@@ -2488,7 +2633,9 @@ def run_scheduler_provider_failure_retry_case(
     )
 
     harness.stop()
-    if original_base_url is None:
+    if harness.provider_mode == "stub":
+        harness.stub_provider_base_url = original_stub_provider_base_url
+    elif original_base_url is None:
         harness.runtime_env.pop(base_url_env, None)
     else:
         harness.runtime_env[base_url_env] = original_base_url
@@ -2519,12 +2666,12 @@ def run_scheduler_provider_failure_retry_case(
         work_item_id=work_item_id,
         reason="continue_active",
     )
-    processed_ticks = [
-        tick for tick in recovered_ticks if tick["status"] == "processed"
-    ]
+    processed_ticks = recovered_retry_ticks(failed_ticks, recovered_ticks)
     require(
-        len(recovered_ticks) > len(failed_ticks) and processed_ticks,
-        f"provider recovery did not process a retry tick: {recovered_ticks}",
+        processed_ticks,
+        "provider recovery did not process a stable-idempotency retry after "
+        f"an aborted/interrupted attempt: failed={failed_ticks}, "
+        f"recovered={recovered_ticks}",
     )
     require(
         {tick["idempotency_key"] for tick in recovered_ticks} == failed_keys,
@@ -2963,17 +3110,12 @@ def run_scheduler_concurrent_claim_fencing_case(
         label="scheduler-concurrent-waiting",
     )
     harness.wait_agent_asleep()
-    interject_text = (
-        f"Scheduler Docker E2E case {case['id']} interject. Create exactly one "
-        f"WorkItem whose objective is "
-        f"{json.dumps(objective_b, ensure_ascii=False)}, "
-        f"with plan_status ready and exactly these todos: concurrent-b-seed "
-        f"completed, concurrent-b-complete pending. The expected completion "
-        f"marker is {completion_b}. Do not PickWorkItem, WaitFor, or "
-        "CompleteWorkItem in this turn. After CreateWorkItem succeeds, end "
-        "with a concise acknowledgement."
+    created_b = harness.request(
+        "POST",
+        harness.agent_path("work-items", control=True),
+        {"objective": objective_b},
     )
-    harness.prompt("scheduler-concurrent-interject", interject_text)
+    write_json(harness.evidence / "scheduler-concurrent-created-b.json", created_b)
     item_b = harness.wait_work_item(
         objective_marker=objective_b_marker,
         expected_state="completed",
@@ -2999,17 +3141,12 @@ def run_scheduler_concurrent_claim_fencing_case(
             "message_id"
         ],
     )
-    harness.assert_tools(
-        "scheduler-concurrent-interject",
-        baseline,
-        ["CreateWorkItem"],
-        forbidden + ["PickWorkItem", "WaitFor", "CompleteWorkItem"],
-        message_id=harness.prompt_scope("scheduler-concurrent-interject")[
-            "message_id"
-        ],
-    )
     work_item_a_id = item_a["id"]
     work_item_b_id = item_b["id"]
+    require(
+        created_b.get("id") == work_item_b_id,
+        f"concurrent control-plane WorkItem identity mismatch: {created_b}",
+    )
     require(item_a["state"] == "completed", f"WorkItem A not completed: {item_a}")
     require(item_b["state"] == "completed", f"WorkItem B not completed: {item_b}")
     require(work_item_a_id != work_item_b_id, "WorkItem A and B share the same id")
@@ -3029,15 +3166,22 @@ def run_scheduler_concurrent_claim_fencing_case(
             f"WorkItem {letter} brief mismatch: {brief}",
         )
     snapshot = harness.runtime_db_snapshot("scheduler-concurrent")
+    messages_by_id = {
+        row["message_id"]: row for row in snapshot["messages"]
+    }
     a_turn_ids = {
         row["turn_id"]
         for row in snapshot["turn_records"]
         if row["current_work_item_id"] == work_item_a_id
+        and messages_by_id.get(row["trigger_message_id"], {}).get("work_item_id")
+        == work_item_a_id
     }
     b_turn_ids = {
         row["turn_id"]
         for row in snapshot["turn_records"]
         if row["current_work_item_id"] == work_item_b_id
+        and messages_by_id.get(row["trigger_message_id"], {}).get("work_item_id")
+        == work_item_b_id
     }
     harness.assert_tools(
         "scheduler-concurrent-a-resume",
@@ -3067,9 +3211,7 @@ def run_scheduler_concurrent_claim_fencing_case(
         snapshot,
         work_item_id=work_item_b_id,
         expected_admission_kinds=("scheduling",),
-        lifecycle_message_ids={
-            harness.prompt_scope("scheduler-concurrent-interject")["message_id"]
-        },
+        lifecycle_message_ids=set(),
     )
     waits = require_scheduler_wait_terminal(
         harness,
@@ -3379,10 +3521,26 @@ def run_scheduler_compaction_continuity_case(
         for row in snapshot["turn_records"]
         if row["current_work_item_id"] == work_item_id
     }
+    stimulus_turn_ids = {
+        row["turn_id"]
+        for row in snapshot["turn_records"]
+        if row["turn_id"] not in resume_turn_ids
+    }
+    harness.assert_tools(
+        "scheduler-compaction-stimulus",
+        baseline,
+        ["ExecCommand"],
+        forbidden,
+        turn_ids=stimulus_turn_ids,
+    )
     harness.assert_tools(
         "scheduler-compaction-resume",
         baseline,
-        [name for name in required if name not in {"CreateWorkItem", "PickWorkItem", "WaitFor"}],
+        [
+            name
+            for name in required
+            if name in {"GetWorkItem", "UpdateWorkItem", "CompleteWorkItem"}
+        ],
         forbidden + ["CreateWorkItem", "PickWorkItem", "WaitFor"],
         turn_ids=resume_turn_ids,
     )
@@ -3395,7 +3553,10 @@ def run_scheduler_compaction_continuity_case(
             harness.prompt_scope("scheduler-compaction-create")["message_id"]
         },
     )
-    require_turn_local_compaction(snapshot, label="scheduler-compaction")
+    require_turn_local_compaction(
+        snapshot,
+        label="scheduler-compaction",
+    )
     waits = require_scheduler_wait_terminal(
         harness,
         snapshot,
@@ -3657,6 +3818,9 @@ def run_scheduler_checkpoint_replay_case(
         expected_state="completed",
         label="scheduler-replay-b-completed",
     )
+    before_restart_snapshot = harness.runtime_db_snapshot(
+        "scheduler-replay-before-restart"
+    )
     harness.restart()
     restarted_items = harness.work_items("scheduler-replay-after-restart")
     restarted_a = next(
@@ -3718,7 +3882,7 @@ def run_scheduler_checkpoint_replay_case(
         harness,
         snapshot,
         work_item_id=work_item_a_id,
-        expected_admission_kinds=("wait_resume",),
+        expected_admission_kinds=("scheduling", "wait_resume"),
         lifecycle_message_ids={
             harness.prompt_scope("scheduler-replay-create")["message_id"]
         },
@@ -3732,16 +3896,13 @@ def run_scheduler_checkpoint_replay_case(
             harness.prompt_scope("scheduler-replay-create")["message_id"]
         },
     )
-    waits = [
-        row
-        for row in snapshot["wait_conditions"]
-        if row["work_item_id"] == work_item_a_id
-    ]
-    require(
-        len(waits) == 1
-        and waits[0]["kind"] == "external"
-        and waits[0]["status"] == "resolved",
-        f"replay external wait did not resolve: {waits}",
+    waits = require_scheduler_wait_terminal(
+        harness,
+        snapshot,
+        work_item_id=work_item_a_id,
+        wait_kind="external",
+        require_callback_trigger=True,
+        callback_external_trigger_id=callback["external_trigger_id"],
     )
     require_scheduler_engine_wait_resolution(
         harness,
@@ -3750,6 +3911,12 @@ def run_scheduler_checkpoint_replay_case(
         wait_ids={wait["wait_condition_id"] for wait in waits},
     )
     if harness.canonical_scheduler_enabled:
+        require_checkpoint_restart_activation_lineage(
+            before_restart_snapshot,
+            snapshot,
+            work_item_id=work_item_a_id,
+            wait_id=waits[0]["wait_condition_id"],
+        )
         demands = [
             row
             for row in snapshot["scheduler_work_demands"]
@@ -3805,6 +3972,23 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             profile.get("provider_mode", "live") in {"live", "stub"},
             f"profile {profile_id} has invalid provider_mode",
         )
+        require(
+            profile.get("gate_kind", "required") in {"required", "live_canary"},
+            f"profile {profile_id} has invalid gate_kind",
+        )
+        require(
+            profile.get("tool_assertion_mode", "strict") in {"strict", "observe"},
+            f"profile {profile_id} has invalid tool_assertion_mode",
+        )
+        if profile.get("gate_kind") == "live_canary":
+            require(
+                profile.get("provider_mode", "live") == "live",
+                f"profile {profile_id} live canary must use live provider mode",
+            )
+            require(
+                profile.get("tool_assertion_mode") == "observe",
+                f"profile {profile_id} live canary must observe tool assertions",
+            )
         required = profile.get("required_coverage_ids", [])
         require(
             isinstance(required, list)
@@ -3877,6 +4061,41 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             ),
             f"{case_id} runtime_env must contain HOLON_ string entries",
         )
+        model_runtime_override = case.get("model_runtime_override", {})
+        require(
+            isinstance(model_runtime_override, dict)
+            and all(
+                name
+                in {
+                    "prompt_budget_estimated_tokens",
+                    "compaction_trigger_estimated_tokens",
+                    "compaction_keep_recent_estimated_tokens",
+                }
+                and isinstance(value, int)
+                and value > 0
+                for name, value in model_runtime_override.items()
+            ),
+            f"{case_id} model_runtime_override must contain positive supported integers",
+        )
+        prompt_budget = model_runtime_override.get("prompt_budget_estimated_tokens")
+        compaction_trigger = model_runtime_override.get(
+            "compaction_trigger_estimated_tokens"
+        )
+        keep_recent = model_runtime_override.get(
+            "compaction_keep_recent_estimated_tokens"
+        )
+        require(
+            prompt_budget is None
+            or compaction_trigger is None
+            or compaction_trigger <= prompt_budget,
+            f"{case_id} compaction trigger exceeds prompt budget",
+        )
+        require(
+            compaction_trigger is None
+            or keep_recent is None
+            or keep_recent <= compaction_trigger,
+            f"{case_id} compaction keep-recent exceeds trigger",
+        )
         phases = case.get("phases")
         require(isinstance(phases, list) and phases, f"{case_id} needs phases")
         phase_ids: set[str] = set()
@@ -3905,9 +4124,34 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
                 f"{case_id}/{phase_id} has required/forbidden tool overlap",
             )
     known_case_ids = {case["id"] for case in cases}
+    cases_by_id = {case["id"]: case for case in cases}
+    known_coverage_ids = {
+        coverage_id
+        for case in cases
+        for coverage_id in case.get("coverage_ids", [])
+    }
     for profile_id, profile in profiles.items():
-        unknown = sorted(set(profile.get("case_ids", [])) - known_case_ids)
+        profile_case_ids = profile.get("case_ids", [])
+        unknown = sorted(set(profile_case_ids) - known_case_ids)
         require(not unknown, f"profile {profile_id} has unknown cases: {unknown}")
+        unknown_coverage = sorted(
+            set(profile.get("required_coverage_ids", [])) - known_coverage_ids
+        )
+        require(
+            not unknown_coverage,
+            f"profile {profile_id} has unknown coverage ids: {unknown_coverage}",
+        )
+        if profile.get("provider_mode", "live") == "stub":
+            missing_stub_scenarios = sorted(
+                case_id
+                for case_id in profile_case_ids
+                if not cases_by_id[case_id].get("stub_scenario")
+            )
+            require(
+                not missing_stub_scenarios,
+                f"profile {profile_id} cases require stub_scenario: "
+                f"{missing_stub_scenarios}",
+            )
 
 
 def select_cases(
@@ -3936,7 +4180,12 @@ def resolve_profile(
     manifest: dict[str, Any], profile_id: str | None
 ) -> dict[str, Any]:
     if profile_id is None:
-        return {"provider_mode": "live", "required_coverage_ids": []}
+        return {
+            "gate_kind": "suite",
+            "provider_mode": "live",
+            "tool_assertion_mode": "strict",
+            "required_coverage_ids": [],
+        }
     profiles = manifest.get("profiles", {})
     require(profile_id in profiles, f"unknown profile: {profile_id}")
     return profiles[profile_id]
@@ -4035,7 +4284,10 @@ def image_identity(image: str) -> dict[str, Any]:
 
 def collect_case_metrics(evidence: Path) -> dict[str, Any]:
     tool_counts: dict[str, int] = {}
+    behavioral_variances: list[dict[str, Any]] = []
+    provider_rounds = 0
     provider_attempts = 0
+    seen_event_seqs: set[int] = set()
     token_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     for path in evidence.glob("*-events.json"):
         try:
@@ -4043,11 +4295,17 @@ def collect_case_metrics(evidence: Path) -> dict[str, Any]:
         except (OSError, json.JSONDecodeError):
             continue
         for event in events:
+            event_seq = event.get("event_seq")
+            if isinstance(event_seq, int):
+                if event_seq in seen_event_seqs:
+                    continue
+                seen_event_seqs.add(event_seq)
             event_type = event.get("type")
             if event_type == "tool_executed":
                 name = event.get("payload", {}).get("tool_name", "unknown")
                 tool_counts[name] = tool_counts.get(name, 0) + 1
             if event_type == "provider_round_completed":
+                provider_rounds += 1
                 payload = event.get("payload", {})
                 provider_attempts += len(
                     (payload.get("provider_attempt_timeline") or {}).get("attempts") or []
@@ -4055,9 +4313,27 @@ def collect_case_metrics(evidence: Path) -> dict[str, Any]:
                 usage = payload.get("token_usage") or {}
                 for key in token_usage:
                     token_usage[key] += int(usage.get(key) or 0)
+    for path in evidence.glob("*-tool-observation.json"):
+        try:
+            observation = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        missing = list(observation.get("missing") or [])
+        forbidden_actual = list(observation.get("forbidden_actual") or [])
+        if missing or forbidden_actual:
+            behavioral_variances.append(
+                {
+                    "scope": path.name.removesuffix("-tool-observation.json"),
+                    "missing_tools": missing,
+                    "forbidden_tools_used": forbidden_actual,
+                }
+            )
     return {
         "tool_counts": tool_counts,
+        "behavioral_variances": behavioral_variances,
+        "provider_rounds": provider_rounds,
         "provider_attempts": provider_attempts,
+        "provider_retries": max(0, provider_attempts - provider_rounds),
         "token_usage": token_usage,
     }
 
@@ -4250,6 +4526,75 @@ def scheduler_coverage_report(
     }
 
 
+def scheduler_live_canary_report(
+    *,
+    run_record: dict[str, Any],
+    case_results: list[dict[str, Any]],
+    scheduler_acceptance_status: str,
+    scheduler_coverage_status: str,
+    secret_scan_status: str,
+) -> dict[str, Any]:
+    scheduler_results = [
+        result
+        for result in case_results
+        if result.get("scheduler_engine") in SCHEDULER_ENGINES
+    ]
+    return {
+        "schema_version": SCHEDULER_LIVE_CANARY_REPORT_SCHEMA_VERSION,
+        "status": (
+            "pass"
+            if scheduler_results
+            and all(result["status"] == "pass" for result in scheduler_results)
+            and scheduler_acceptance_status == "pass"
+            and scheduler_coverage_status == "pass"
+            and secret_scan_status == "pass"
+            else "fail"
+        ),
+        "git_sha": run_record["git_sha"],
+        "image_digest": run_record["image_digest"],
+        "manifest_sha256": run_record["manifest_sha256"],
+        "profile": run_record["profile"],
+        "provider_mode": run_record["provider_mode"],
+        "model_route": run_record["model_route"],
+        "tool_assertion_mode": run_record["tool_assertion_mode"],
+        "scheduler_acceptance": scheduler_acceptance_status,
+        "scheduler_coverage": scheduler_coverage_status,
+        "secret_scan": secret_scan_status,
+        "provider_rounds": sum(
+            int(result.get("provider_rounds") or 0) for result in scheduler_results
+        ),
+        "provider_attempts": sum(
+            int(result.get("provider_attempts") or 0) for result in scheduler_results
+        ),
+        "provider_retries": sum(
+            int(result.get("provider_retries") or 0) for result in scheduler_results
+        ),
+        "behavioral_variances": [
+            {
+                "case_id": result["id"],
+                **variance,
+            }
+            for result in scheduler_results
+            for variance in result.get("behavioral_variances", [])
+        ],
+        "cases": [
+            {
+                "id": result["id"],
+                "base_id": result["base_id"],
+                "scheduler_engine": result["scheduler_engine"],
+                "status": result["status"],
+                "error": result["error"],
+                "provider_rounds": result.get("provider_rounds", 0),
+                "provider_attempts": result.get("provider_attempts", 0),
+                "provider_retries": result.get("provider_retries", 0),
+                "tool_counts": result.get("tool_counts", {}),
+                "behavioral_variances": result.get("behavioral_variances", []),
+            }
+            for result in scheduler_results
+        ],
+    }
+
+
 def write_junit(path: Path, cases: list[dict[str, Any]], duration: float) -> None:
     suite = ElementTree.Element(
         "testsuite",
@@ -4403,7 +4748,9 @@ def main(argv: list[str] | None = None) -> int:
         "manifest_sha256": hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
         "scheduler_matrix": args.scheduler_matrix,
         "profile": args.profile,
+        "gate_kind": profile.get("gate_kind", "suite"),
         "provider_mode": profile.get("provider_mode", "live"),
+        "tool_assertion_mode": profile.get("tool_assertion_mode", "strict"),
     }
     write_json(evidence_root / "run.json", run_record)
 
@@ -4465,6 +4812,8 @@ def main(argv: list[str] | None = None) -> int:
                 "provider_mode", profile.get("provider_mode", "live")
             ),
             stub_scenario=case.get("stub_scenario", profile.get("stub_scenario")),
+            model_runtime_override=case.get("model_runtime_override"),
+            tool_assertion_mode=profile.get("tool_assertion_mode", "strict"),
         )
         control_tokens.append(harness.token)
         error_text = ""
@@ -4548,7 +4897,10 @@ def main(argv: list[str] | None = None) -> int:
                 "duration_seconds": 0.0,
                 "cleanup": "not-applicable",
                 "tool_counts": {},
+                "behavioral_variances": [],
+                "provider_rounds": 0,
                 "provider_attempts": 0,
+                "provider_retries": 0,
                 "token_usage": {
                     "input_tokens": 0,
                     "output_tokens": 0,
@@ -4594,6 +4946,20 @@ def main(argv: list[str] | None = None) -> int:
         write_json(evidence_root / "scheduler-acceptance-report.json", report)
         if report["status"] != "pass":
             report_failures.append("scheduler-acceptance-report: fail")
+        if profile.get("gate_kind") == "live_canary":
+            canary_report = scheduler_live_canary_report(
+                run_record=run_record,
+                case_results=case_results,
+                scheduler_acceptance_status=report["status"],
+                scheduler_coverage_status=coverage_report["status"],
+                secret_scan_status=scan["status"],
+            )
+            write_json(
+                evidence_root / "scheduler-live-canary-report.json",
+                canary_report,
+            )
+            if canary_report["status"] != "pass":
+                report_failures.append("scheduler-live-canary-report: fail")
     write_junit(evidence_root / "junit.xml", case_results, duration)
 
     print(f"Evidence: {evidence_root}")

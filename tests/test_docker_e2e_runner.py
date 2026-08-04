@@ -123,25 +123,87 @@ class DockerE2ERunnerTests(unittest.TestCase):
             ],
         )
 
+    def test_recovered_retry_ticks_accepts_existing_interrupted_tick(self) -> None:
+        key = "work_queue:continue_active:work-1:1"
+        failed = [
+            {
+                "message_id": "message-1",
+                "idempotency_key": key,
+                "status": "aborted",
+            },
+            {
+                "message_id": "message-2",
+                "idempotency_key": key,
+                "status": "interrupted",
+            },
+        ]
+        recovered = [
+            failed[0],
+            {
+                "message_id": "message-2",
+                "idempotency_key": key,
+                "status": "processed",
+            },
+        ]
+
+        self.assertEqual(
+            runner.recovered_retry_ticks(failed, recovered),
+            [recovered[1]],
+        )
+
+    def test_recovered_retry_ticks_rejects_changed_idempotency(self) -> None:
+        failed = [
+            {
+                "message_id": "message-1",
+                "idempotency_key": "work_queue:continue_active:work-1:1",
+                "status": "aborted",
+            }
+        ]
+        recovered = [
+            {
+                "message_id": "message-2",
+                "idempotency_key": "work_queue:continue_active:work-1:2",
+                "status": "processed",
+            }
+        ]
+
+        self.assertEqual(runner.recovered_retry_ticks(failed, recovered), [])
+
     def test_manifest_rejects_unregistered_case(self) -> None:
         invalid = json.loads(json.dumps(self.manifest))
         invalid["cases"][0]["id"] = "not-implemented"
         with self.assertRaisesRegex(AssertionError, "no registered runner"):
             runner.validate_manifest(invalid)
 
-    def test_profile_exposes_explicit_scheduler_required_set(self) -> None:
-        profile = runner.resolve_profile(self.manifest, "scheduler-acceptance")
+    def test_scheduler_live_canary_profile_is_observational(self) -> None:
+        profile = runner.resolve_profile(self.manifest, "scheduler-live-canary")
+        self.assertEqual(profile["gate_kind"], "live_canary")
         self.assertEqual(profile["provider_mode"], "live")
+        self.assertEqual(profile["tool_assertion_mode"], "observe")
         self.assertEqual(
-            set(profile["required_coverage_ids"]),
-            {
-                case["id"]
-                for case in self.manifest["cases"]
-                if "scheduler" in case.get("tags", [])
-            },
+            profile["case_ids"],
+            ["scheduler-external-wait-resume"],
         )
 
-    def test_scheduler_required_profile_selects_three_stub_cases(self) -> None:
+    def test_workflows_keep_required_gate_independent_and_publish_canary(self) -> None:
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        nightly = (ROOT / ".github/workflows/e2e-scheduler-nightly.yml").read_text()
+        release = (ROOT / ".github/workflows/release-e2e.yml").read_text()
+
+        self.assertLess(
+            nightly.index("Run deterministic scheduler matrix"),
+            nightly.index("Prepare provider environment"),
+        )
+        self.assertIn("if: steps.provider-env.outcome == 'success'", nightly)
+        self.assertIn("continue-on-error: true", nightly)
+        for workflow in (ci, nightly, release):
+            self.assertIn("scheduler-live-canary-report.json", workflow)
+            self.assertIn("behavioral_variances", workflow)
+            self.assertIn("tool_counts", workflow)
+        self.assertIn("name: scheduler-live-canary", ci)
+        self.assertIn("name: scheduler-e2e-nightly", nightly)
+
+    def test_scheduler_required_profile_selects_all_stub_cases(self) -> None:
         profile = runner.resolve_profile(self.manifest, "scheduler-required")
         selected = runner.select_cases(
             self.manifest,
@@ -149,16 +211,143 @@ class DockerE2ERunnerTests(unittest.TestCase):
             suite="core",
             tags=[],
         )
+        expected = [
+            case["id"]
+            for case in self.manifest["cases"]
+            if "scheduler" in case.get("tags", [])
+        ]
+        self.assertEqual(profile["gate_kind"], "required")
         self.assertEqual(profile["provider_mode"], "stub")
+        self.assertEqual(profile["tool_assertion_mode"], "strict")
+        self.assertEqual([case["id"] for case in selected], expected)
+        self.assertEqual(profile["required_coverage_ids"], expected)
+        self.assertTrue(all(case.get("stub_scenario") for case in selected))
+        self.assertTrue(
+            all(case["timeout_seconds"] <= 120 for case in selected)
+        )
+
+    def test_manifest_rejects_live_canary_with_strict_tools(self) -> None:
+        invalid = json.loads(json.dumps(self.manifest))
+        invalid["profiles"]["scheduler-live-canary"][
+            "tool_assertion_mode"
+        ] = "strict"
+        with self.assertRaisesRegex(
+            AssertionError,
+            "live canary must observe tool assertions",
+        ):
+            runner.validate_manifest(invalid)
+
+    def test_manifest_rejects_required_case_without_stub_scenario(self) -> None:
+        invalid = json.loads(json.dumps(self.manifest))
+        invalid["cases"][-1].pop("stub_scenario")
+        with self.assertRaisesRegex(
+            AssertionError,
+            "cases require stub_scenario",
+        ):
+            runner.validate_manifest(invalid)
+
+    def test_scheduler_live_canary_report_records_model_and_retries(self) -> None:
+        report = runner.scheduler_live_canary_report(
+            run_record={
+                "git_sha": "git-sha",
+                "image_digest": "image@sha256:digest",
+                "manifest_sha256": "manifest-hash",
+                "profile": "scheduler-live-canary",
+                "provider_mode": "live",
+                "model_route": "provider/model",
+                "tool_assertion_mode": "observe",
+            },
+            case_results=[
+                {
+                    "id": "scheduler-external-wait-resume-legacy",
+                    "base_id": "scheduler-external-wait-resume",
+                    "scheduler_engine": "legacy",
+                    "status": "pass",
+                    "error": "",
+                    "provider_rounds": 2,
+                    "provider_attempts": 3,
+                    "provider_retries": 1,
+                    "tool_counts": {"WaitFor": 1},
+                    "behavioral_variances": [
+                        {
+                            "scope": "scheduler-external-resume",
+                            "missing_tools": ["GetWorkItem"],
+                            "forbidden_tools_used": [],
+                        }
+                    ],
+                },
+                {
+                    "id": "scheduler-external-wait-resume-canonical",
+                    "base_id": "scheduler-external-wait-resume",
+                    "scheduler_engine": "canonical",
+                    "status": "pass",
+                    "error": "",
+                    "provider_rounds": 2,
+                    "provider_attempts": 2,
+                    "provider_retries": 0,
+                    "tool_counts": {"WaitFor": 1},
+                    "behavioral_variances": [],
+                },
+            ],
+            scheduler_acceptance_status="pass",
+            scheduler_coverage_status="pass",
+            secret_scan_status="pass",
+        )
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["model_route"], "provider/model")
+        self.assertEqual(report["provider_rounds"], 4)
+        self.assertEqual(report["provider_attempts"], 5)
+        self.assertEqual(report["provider_retries"], 1)
         self.assertEqual(
-            [case["id"] for case in selected],
+            report["behavioral_variances"],
             [
-                "scheduler-multi-workitem-scheduling",
-                "scheduler-external-wait-resume",
-                "scheduler-operator-wait-resume",
+                {
+                    "case_id": "scheduler-external-wait-resume-legacy",
+                    "scope": "scheduler-external-resume",
+                    "missing_tools": ["GetWorkItem"],
+                    "forbidden_tools_used": [],
+                }
             ],
         )
-        self.assertTrue(all(case.get("stub_scenario") for case in selected))
+
+    def test_collect_case_metrics_deduplicates_overlapping_event_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            events = [
+                {
+                    "event_seq": 10,
+                    "type": "tool_executed",
+                    "payload": {"tool_name": "WaitFor"},
+                },
+                {
+                    "event_seq": 11,
+                    "type": "provider_round_completed",
+                    "payload": {
+                        "provider_attempt_timeline": {
+                            "attempts": [{"status": "failed"}, {"status": "success"}]
+                        },
+                        "token_usage": {
+                            "input_tokens": 3,
+                            "output_tokens": 2,
+                            "total_tokens": 5,
+                        },
+                    },
+                },
+            ]
+            (evidence / "first-events.json").write_text(
+                json.dumps({"events": events})
+            )
+            (evidence / "second-events.json").write_text(
+                json.dumps({"events": events})
+            )
+
+            metrics = runner.collect_case_metrics(evidence)
+
+        self.assertEqual(metrics["tool_counts"], {"WaitFor": 1})
+        self.assertEqual(metrics["provider_rounds"], 1)
+        self.assertEqual(metrics["provider_attempts"], 2)
+        self.assertEqual(metrics["provider_retries"], 1)
+        self.assertEqual(metrics["token_usage"]["total_tokens"], 5)
 
     def test_scheduler_coverage_reports_missing_and_duplicate_ids(self) -> None:
         report = runner.scheduler_coverage_report(
@@ -319,6 +508,207 @@ class DockerE2ERunnerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(response["output"][0]["name"], "GetWorkspaceState")
         self.assertEqual(scenario.phase, 8)
+
+    def test_openai_stub_operator_wait_uses_operator_input_wake(self) -> None:
+        scenario = stub.Scenario("scheduler-operator")
+        scenario.phase = 2
+        scenario.work_ids = ["work_0123456789abcde"]
+
+        status, response = scenario.consume({"input": []})
+
+        self.assertEqual(status, 200)
+        call = response["output"][0]
+        self.assertEqual(call["name"], "WaitFor")
+        self.assertEqual(json.loads(call["arguments"])["wake"], "operator_input")
+
+    def test_openai_stub_task_wait_closes_creation_turn(self) -> None:
+        scenario = stub.Scenario("scheduler-task-wait")
+        scenario.phase = 1
+        scenario.work_ids = ["work_0123456789abcde"]
+        scenario.markers = {"task_result": "SCHEDULER-TASK-RESULT-abcd"}
+
+        status, response = scenario.consume({"input": []})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][0]["type"], "message")
+        self.assertEqual(scenario.phase, 2)
+
+        status, response = scenario.consume({"input": []})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][0]["name"], "ExecCommand")
+
+    def test_openai_stub_concurrent_callback_starts_a_resume_tools(self) -> None:
+        scenario = stub.Scenario("scheduler-concurrent")
+        scenario.phase = 5
+        scenario.work_ids = [
+            "work_0123456789abcde",
+            "work_fedcba987654321",
+        ]
+        scenario.markers = {"concurrent_a": "SCHEDULER-CONCURRENT-A-abcd"}
+        callback = {
+            "input": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "## current_input\nCurrent input:\n"
+                                "- [system][trigger:system_tick] "
+                                "SCHEDULER-CONCURRENT-A-abcd"
+                            ),
+                        }
+                    ],
+                }
+            ]
+        }
+
+        status, response = scenario.consume({"input": []})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][-1]["name"], "CompleteWorkItem")
+        self.assertEqual(scenario.phase, 6)
+
+        status, response = scenario.consume(callback)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][0]["name"], "GetWorkItem")
+        self.assertEqual(scenario.phase, 8)
+
+    def test_openai_stub_registers_every_required_scenario(self) -> None:
+        profile = runner.resolve_profile(self.manifest, "scheduler-required")
+        selected = runner.select_cases(
+            self.manifest,
+            requested=profile["case_ids"],
+            suite="core",
+            tags=[],
+        )
+        self.assertEqual(
+            {case["stub_scenario"] for case in selected},
+            set(stub.SCENARIOS),
+        )
+        for case in selected:
+            scenario = stub.Scenario(case["stub_scenario"])
+            self.assertGreater(scenario.expected_phase(), 0)
+
+    def test_openai_stub_required_scenarios_reach_exact_completion(self) -> None:
+        expected_calls = {
+            "scheduler-task-wait": [
+                "CreateWorkItem", "ExecCommand", "WaitFor", "GetWorkItem",
+                "WaitFor", "GetWorkItem", "UpdateWorkItem", "CompleteWorkItem",
+            ],
+            "scheduler-provider-retry": ["ListWorkItems", "CompleteWorkItem"],
+            "scheduler-multi": [
+                "CreateWorkItem", "CreateWorkItem", "AgentGet", "ListWorkItems",
+                "UpdateWorkItem", "CompleteWorkItem", "GetWorkspaceState",
+                "ListWorkItems", "UpdateWorkItem", "CompleteWorkItem",
+            ],
+            "scheduler-external": [
+                "CreateWorkItem", "PickWorkItem", "WaitFor", "GetWorkItem",
+                "UpdateWorkItem", "CompleteWorkItem",
+            ],
+            "scheduler-operator": [
+                "CreateWorkItem", "PickWorkItem", "WaitFor", "GetWorkItem",
+                "UpdateWorkItem", "CompleteWorkItem",
+            ],
+            "scheduler-concurrent": [
+                "CreateWorkItem", "PickWorkItem", "WaitFor",
+                "ListWorkItems", "UpdateWorkItem", "CompleteWorkItem",
+                "GetWorkItem", "UpdateWorkItem", "CompleteWorkItem",
+            ],
+            "scheduler-interject": [
+                "CreateWorkItem", "PickWorkItem", "WaitFor", "CreateWorkItem",
+                "ListWorkItems", "UpdateWorkItem", "CompleteWorkItem",
+                "GetWorkItem", "UpdateWorkItem", "CompleteWorkItem",
+            ],
+            "scheduler-compaction": [
+                "CreateWorkItem", "PickWorkItem", "ExecCommand", "ExecCommand",
+                "ExecCommand", "WaitFor", "GetWorkItem", "UpdateWorkItem",
+                "CompleteWorkItem",
+            ],
+            "scheduler-worktree": [
+                "CreateWorkItem", "PickWorkItem", "GetWorkspaceState",
+                "CreateWorktree", "GetWorkspaceState", "SwitchWorkspace",
+                "GetWorkspaceState", "RemoveWorktree", "GetWorkspaceState",
+                "UpdateWorkItem", "CompleteWorkItem",
+            ],
+            "scheduler-spawn": [
+                "CreateWorkItem", "PickWorkItem", "SpawnAgent", "TaskStatus",
+                "UpdateWorkItem", "CompleteWorkItem",
+            ],
+            "scheduler-checkpoint": [
+                "CreateWorkItem", "CreateWorkItem", "ListWorkItems", "WaitFor",
+                "ListWorkItems", "UpdateWorkItem", "CompleteWorkItem",
+                "GetWorkItem", "UpdateWorkItem", "CompleteWorkItem",
+            ],
+        }
+        transcript = (
+            "## current_input\nCurrent input:\n"
+            "- [system][trigger:system_tick] Scheduler Docker E2E case "
+            "SCHEDULER-TASK-WAIT-abcd SCHEDULER-TASK-RESULT-abcd "
+            "SCHEDULER-TASK-WAIT-COMPLETE-abcd "
+            "SCHEDULER-PROVIDER-RETRY-abcd "
+            "SCHEDULER-PROVIDER-RETRY-COMPLETE-abcd "
+            "SCHEDULER-MULTI-A-abcd SCHEDULER-MULTI-B-abcd "
+            "SCHEDULER-MULTI-COMPLETE-A-abcd "
+            "SCHEDULER-MULTI-COMPLETE-B-abcd "
+            "SCHEDULER-EXTERNAL-WAIT-abcd "
+            "SCHEDULER-EXTERNAL-COMPLETE-abcd "
+            "SCHEDULER-OPERATOR-WAIT-abcd "
+            "SCHEDULER-OPERATOR-COMPLETE-abcd "
+            "SCHEDULER-CONCURRENT-A-abcd SCHEDULER-CONCURRENT-B-abcd "
+            "SCHEDULER-CONCURRENT-COMPLETE-A-abcd "
+            "SCHEDULER-CONCURRENT-COMPLETE-B-abcd "
+            "SCHEDULER-INTERJECT-A-abcd SCHEDULER-INTERJECT-B-abcd "
+            "SCHEDULER-INTERJECT-COMPLETE-A-abcd "
+            "SCHEDULER-INTERJECT-COMPLETE-B-abcd "
+            "SCHEDULER-COMPACTION-abcd "
+            "SCHEDULER-COMPACTION-COMPLETE-abcd "
+            "SCHEDULER-WORKTREE-abcd "
+            "SCHEDULER-WORKTREE-COMPLETE-abcd "
+            "SCHEDULER-SPAWN-abcd SCHEDULER-SPAWN-CHILD-abcd "
+            "SCHEDULER-SPAWN-COMPLETE-abcd "
+            "SCHEDULER-REPLAY-A-abcd SCHEDULER-REPLAY-B-abcd "
+            "SCHEDULER-REPLAY-COMPLETE-A-abcd "
+            "SCHEDULER-REPLAY-COMPLETE-B-abcd "
+            "docker-e2e:abcd e2e-worktree-abcd "
+            "work_0123456789abcde work_fedcba987654321 "
+            "task_0123456789abcde ws_0123456789abcdef "
+            "git_worktree_root:deterministic"
+        )
+        request = {
+            "input": [{
+                "type": "message",
+                "content": [{"type": "input_text", "text": transcript}],
+            }]
+        }
+        for name, expected in expected_calls.items():
+            scenario = stub.Scenario(name)
+            actual = []
+            for _ in range(scenario.expected_phase()):
+                phase_request = request
+                if name == "scheduler-concurrent" and scenario.phase == 6:
+                    phase_request = {
+                        "input": [
+                            {
+                                "type": "function_call_output",
+                                "output": "{}",
+                            }
+                        ]
+                    }
+                status, value = scenario.consume(phase_request)
+                self.assertEqual(status, 200, name)
+                actual.extend(
+                    item["name"]
+                    for item in value["output"]
+                    if item["type"] == "function_call"
+                )
+            self.assertEqual(actual, expected, name)
+            self.assertTrue(scenario.status()["complete"], name)
+            status, value = scenario.consume(request)
+            self.assertEqual(status, 409, name)
+            self.assertEqual(value["error"]["type"], "transcript_exhausted")
 
     def test_secret_scan_reports_value_without_echoing_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -977,6 +1367,70 @@ class DockerE2ERunnerTests(unittest.TestCase):
                 docker_run,
             )
 
+    def test_stub_start_forces_endpoint_and_seeds_model_override_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = runner.CaseHarness(
+                case_id="stub-model-override",
+                image="holon:test",
+                model="external/model",
+                credential_envs=[],
+                env_file=None,
+                runtime_env={
+                    "HOLON_OPENAI_BASE_URL": "https://external.invalid/v1",
+                },
+                evidence_root=Path(directory),
+                timeout_seconds=1,
+                keep=True,
+                provider_mode="stub",
+                stub_scenario="scheduler-compaction",
+                model_runtime_override={
+                    "prompt_budget_estimated_tokens": 80_000,
+                    "compaction_trigger_estimated_tokens": 70_000,
+                    "compaction_keep_recent_estimated_tokens": 8_000,
+                },
+            )
+            commands: list[tuple[str, ...]] = []
+
+            def fake_docker(
+                *args: str, **_: object
+            ) -> subprocess.CompletedProcess[str]:
+                commands.append(args)
+                if args[:2] in {
+                    ("network", "inspect"),
+                    ("inspect", "--format"),
+                }:
+                    return subprocess.CompletedProcess(["docker", *args], 1, "", "")
+                if args[:2] == ("port", harness.container):
+                    return subprocess.CompletedProcess(
+                        ["docker", *args], 0, "127.0.0.1:49152\n", ""
+                    )
+                return subprocess.CompletedProcess(["docker", *args], 0, "", "")
+
+            harness.docker = fake_docker
+            harness.wait_readiness = lambda: None
+            harness.wait_agent_idle = lambda: None
+
+            harness.start()
+            harness.start()
+
+            self.assertEqual(harness.model, "openai/gpt-5.4")
+            self.assertEqual(
+                harness.runtime_env["HOLON_OPENAI_BASE_URL"],
+                "http://provider-stub:8080/v1",
+            )
+            seed_runs = [
+                command
+                for command in commands
+                if command[0] == "run"
+                and "/var/lib/holon/config.json" in " ".join(command)
+            ]
+            self.assertEqual(len(seed_runs), 1)
+            seeded = json.loads(seed_runs[0][-1])
+            self.assertEqual(
+                seeded["models"]["catalog"]["openai/gpt-5.4"],
+                harness.model_runtime_override,
+            )
+
     def test_scheduler_extended_cases_use_real_lifecycle_fixtures(self) -> None:
         selected = runner.select_cases(
             self.manifest, requested=None, suite="extended", tags=["scheduler"]
@@ -1083,12 +1537,11 @@ class DockerE2ERunnerTests(unittest.TestCase):
             if case["id"] == "scheduler-compaction-continuity"
         )
         self.assertEqual(
-            compaction["runtime_env"],
+            compaction["model_runtime_override"],
             {
-                "HOLON_COMPACTION_TRIGGER_MESSAGES": "3",
-                "HOLON_COMPACTION_KEEP_RECENT_MESSAGES": "2",
-                "HOLON_COMPACTION_TRIGGER_ESTIMATED_TOKENS": "1",
-                "HOLON_COMPACTION_KEEP_RECENT_ESTIMATED_TOKENS": "1",
+                "prompt_budget_estimated_tokens": 80000,
+                "compaction_trigger_estimated_tokens": 70000,
+                "compaction_keep_recent_estimated_tokens": 8000,
             },
         )
 
@@ -1383,6 +1836,60 @@ class DockerE2ERunnerTests(unittest.TestCase):
                 callback_external_trigger_id="trigger-target",
             )
 
+    def test_canonical_wait_terminal_requires_callback_evidence(self) -> None:
+        harness = type(
+            "CanonicalHarness",
+            (),
+            {"canonical_scheduler_enabled": True},
+        )()
+        snapshot = {
+            "wait_conditions": [
+                {
+                    "wait_condition_id": "wait-1",
+                    "work_item_id": "work-1",
+                    "kind": "external",
+                    "status": "resolved",
+                }
+            ],
+            "audit_events": [],
+        }
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "lacked callback trigger evidence",
+        ):
+            runner.require_scheduler_wait_terminal(
+                harness,
+                snapshot,
+                work_item_id="work-1",
+                wait_kind="external",
+                require_callback_trigger=True,
+                callback_external_trigger_id="trigger-target",
+            )
+
+        snapshot["audit_events"] = [
+            {
+                "kind": "callback_delivered",
+                "data_json": json.dumps(
+                    {
+                        "data": {
+                            "disposition": "triggered",
+                            "external_trigger_id": "trigger-target",
+                        }
+                    }
+                ),
+            }
+        ]
+        waits = runner.require_scheduler_wait_terminal(
+            harness,
+            snapshot,
+            work_item_id="work-1",
+            wait_kind="external",
+            require_callback_trigger=True,
+            callback_external_trigger_id="trigger-target",
+        )
+        self.assertEqual(waits[0]["status"], "resolved")
+
     def test_canonical_activation_oracle_distinguishes_lifecycle_and_work_item(self) -> None:
         harness = type(
             "CanonicalHarness",
@@ -1444,7 +1951,7 @@ class DockerE2ERunnerTests(unittest.TestCase):
                 lifecycle_message_ids={"message-create"},
             )
 
-    def test_compaction_oracle_requires_actual_compacted_rounds(self) -> None:
+    def test_compaction_oracle_requires_actual_compaction_evidence(self) -> None:
         event = {
             "kind": "turn_local_compaction_applied",
             "data_json": json.dumps(
@@ -1465,8 +1972,78 @@ class DockerE2ERunnerTests(unittest.TestCase):
             "compaction stimulus did not produce compacted rounds",
         ):
             runner.require_turn_local_compaction(
-                {"audit_events": [event]},
+                {
+                    "audit_events": [
+                        event,
+                        {
+                            "kind": "provider_round_completed",
+                            "data_json": json.dumps(
+                                {"data": {"compression_epoch": 1}}
+                            ),
+                        },
+                    ]
+                },
                 label="test",
+            )
+
+    def test_checkpoint_restart_lineage_binds_wait_generation(self) -> None:
+        before_restart_snapshot = {
+            "scheduler_activations": [
+                {
+                    "activation_id": "activation:schedule",
+                    "work_item_id": "work-1",
+                    "admitted_generation": 1,
+                    "admission_kind": "scheduling",
+                    "idempotency_key": "work-queue-attempt:activation:schedule",
+                }
+            ]
+        }
+        snapshot = {
+            "scheduler_activations": [
+                {
+                    "activation_id": "activation:schedule",
+                    "work_item_id": "work-1",
+                    "admitted_generation": 1,
+                    "admission_kind": "scheduling",
+                    "idempotency_key": "work-queue-attempt:activation:schedule",
+                },
+                {
+                    "activation_id": "activation:resume",
+                    "work_item_id": "work-1",
+                    "admitted_generation": 2,
+                    "admission_kind": "wait_resume",
+                    "idempotency_key": "wait-resume:wait-1:2:activation:resume",
+                },
+            ],
+            "scheduler_wait_generations": [
+                {
+                    "wait_id": "wait-1",
+                    "owner_work_item_id": "work-1",
+                    "generation": 2,
+                    "lifecycle_state": "resolved",
+                }
+            ],
+        }
+
+        runner.require_checkpoint_restart_activation_lineage(
+            before_restart_snapshot,
+            snapshot,
+            work_item_id="work-1",
+            wait_id="wait-1",
+        )
+
+        snapshot["scheduler_activations"][1]["idempotency_key"] = (
+            "wait-resume:other-wait:2:activation:resume"
+        )
+        with self.assertRaisesRegex(
+            AssertionError,
+            "wait-resume activation mismatch",
+        ):
+            runner.require_checkpoint_restart_activation_lineage(
+                before_restart_snapshot,
+                snapshot,
+                work_item_id="work-1",
+                wait_id="wait-1",
             )
 
     def test_wait_work_item_fails_fast_on_duplicate_objective_marker(self) -> None:
