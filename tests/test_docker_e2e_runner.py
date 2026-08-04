@@ -2,8 +2,10 @@
 
 import importlib.util
 import io
+import inspect
 import json
 import copy
+import os
 import subprocess
 import tempfile
 import unittest
@@ -90,6 +92,36 @@ class DockerE2ERunnerTests(unittest.TestCase):
             path.write_text("[]")
             with self.assertRaisesRegex(AssertionError, "JSON object"):
                 runner.load_runtime_config(path)
+
+    def test_provider_file_paths_accept_new_names_before_legacy_aliases(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HOLON_E2E_PROVIDER_ENV_FILE": "provider.env",
+                "HOLON_E2E_DOCKER_ENV_FILE": "legacy.env",
+                "HOLON_E2E_PROVIDER_CONFIG_FILE": "provider.json",
+                "HOLON_E2E_CONFIG_FILE": "legacy.json",
+            },
+            clear=True,
+        ):
+            env_file, config_file = runner.provider_file_paths(None, None)
+
+        self.assertEqual(env_file, Path("provider.env").resolve())
+        self.assertEqual(config_file, Path("provider.json").resolve())
+
+    def test_provider_file_paths_keep_legacy_aliases(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HOLON_E2E_DOCKER_ENV_FILE": "legacy.env",
+                "HOLON_E2E_CONFIG_FILE": "legacy.json",
+            },
+            clear=True,
+        ):
+            env_file, config_file = runner.provider_file_paths(None, None)
+
+        self.assertEqual(env_file, Path("legacy.env").resolve())
+        self.assertEqual(config_file, Path("legacy.json").resolve())
 
     def test_work_queue_message_evidence_extracts_retry_identity(self) -> None:
         snapshot = {
@@ -231,6 +263,25 @@ class DockerE2ERunnerTests(unittest.TestCase):
         self.assertIn("Unable to detect scheduler code changes", nightly)
         self.assertIn("comparison.data.truncation === true", nightly)
         self.assertIn("files.length >= 300", nightly)
+        self.assertIn("Require dispatched live canary success", nightly)
+        self.assertIn('test "${LIVE_CANARY_OUTCOME}" = success', nightly)
+        self.assertIn("HOLON_E2E_PROVIDER_CONFIG_FILE:", nightly)
+        self.assertNotIn("HOLON_E2E_CONFIG_FILE:", nightly)
+        for workflow in (ci, nightly, release):
+            live_step = workflow.split(
+                "      - name: Run scheduler live canary\n", 1
+            )[1].split("      - name:", 1)[0]
+            self.assertNotIn("HOLON_E2E_PROVIDER_CONFIG_FILE", live_step)
+            self.assertIn("config_file=/tmp/holon-e2e-config.json", live_step)
+        nightly_job_env = nightly.split("  nightly:\n", 1)[1].split(
+            "    steps:\n", 1
+        )[0]
+        release_job_env = release.split("  core:\n", 1)[1].split(
+            "    steps:\n", 1
+        )[0]
+        for job_env in (nightly_job_env, release_job_env):
+            self.assertNotIn("HOLON_E2E_PROVIDER_ENV_FILE", job_env)
+            self.assertNotIn("HOLON_E2E_PROVIDER_CONFIG_FILE", job_env)
 
     def test_scheduler_required_profile_selects_all_stub_cases(self) -> None:
         profile = runner.resolve_profile(self.manifest, "scheduler-required")
@@ -1979,6 +2030,13 @@ class DockerE2ERunnerTests(unittest.TestCase):
                 expected_admission_kinds=("wait_resume",),
                 lifecycle_message_ids={"message-create"},
             )
+
+    def test_external_wait_resume_drains_queue_before_runtime_snapshot(self) -> None:
+        source = inspect.getsource(runner.run_scheduler_external_wait_resume_case)
+        self.assertLess(
+            source.index("harness.wait_queue_drained()"),
+            source.index('harness.runtime_db_snapshot("scheduler-external")'),
+        )
 
     def test_compaction_oracle_requires_actual_compaction_evidence(self) -> None:
         event = {
