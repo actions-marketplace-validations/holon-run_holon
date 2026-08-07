@@ -54,6 +54,7 @@ pub(crate) enum CanonicalActivationScenario {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CanonicalActivationCandidate {
+    UnboundTaskResultWaitOrReduce,
     WorkItemAutonomousContinuation {
         work_item_id: String,
     },
@@ -110,6 +111,7 @@ impl CanonicalActivationScenario {
 impl CanonicalActivationCandidate {
     pub(crate) fn scenario_class(&self) -> SchedulerScenarioClass {
         match self {
+            Self::UnboundTaskResultWaitOrReduce => EXACT_WAIT_RESUME_SCENARIO,
             Self::WorkItemAutonomousContinuation { .. } | Self::InternalFollowup { .. } => {
                 WORK_ITEM_AUTONOMOUS_CONTINUATION_SCENARIO
             }
@@ -123,6 +125,7 @@ impl CanonicalActivationCandidate {
 
     fn expected_work_item_id(&self) -> Option<&str> {
         match self {
+            Self::UnboundTaskResultWaitOrReduce => None,
             Self::WorkItemAutonomousContinuation { work_item_id }
             | Self::InternalFollowup { work_item_id }
             | Self::ExactTaskRejoin { work_item_id, .. }
@@ -1186,7 +1189,9 @@ pub(crate) fn canonical_activation_candidate(
                 agent_id: message.agent_id.clone(),
             }));
         }
-        return Ok(None);
+        return Ok(Some(
+            CanonicalActivationCandidate::UnboundTaskResultWaitOrReduce,
+        ));
     }
 
     if message.kind == MessageKind::OperatorPrompt {
@@ -1430,6 +1435,7 @@ fn matching_wait_conditions_for_work_item<'a>(
                         && condition.status == WaitConditionStatus::Resolved
                         && condition.kind == WaitConditionKind::Task
                         && condition.work_item_id == message.work_item_id
+                        && condition.trigger_message_id() == Some(message.id.as_str())
                         && resolved_task_wait_is_current(projection, condition)))
                 && message_matches_wait_condition(message, condition)
                 && (!(message.kind == MessageKind::TaskResult
@@ -1447,7 +1453,7 @@ fn resolved_task_wait_is_current(
         return true;
     };
     let Some(work_item_id) = condition.work_item_id.as_deref() else {
-        return false;
+        return condition.trigger_message_id().is_some();
     };
     matches!(
         states.get(work_item_id),

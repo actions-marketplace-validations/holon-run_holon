@@ -998,6 +998,11 @@ impl<'a> SchedulerDecisionExecutor<'a> {
             }
         }
         let Some(mut scenario) = scenario else {
+            if original_candidate
+                == scheduler::CanonicalActivationCandidate::UnboundTaskResultWaitOrReduce
+            {
+                return Ok(CanonicalClaimOutcome::ReduceOnly);
+            }
             if stale_task_rejoin {
                 return Ok(CanonicalClaimOutcome::RejectQueued {
                     scenario_class,
@@ -1262,7 +1267,11 @@ impl<'a> SchedulerDecisionExecutor<'a> {
                         condition.id == *wait_id
                             && condition.agent_id == message.agent_id
                             && condition.work_item_id.is_none()
-                            && condition.status == crate::types::WaitConditionStatus::Triggered
+                            && matches!(
+                                condition.status,
+                                crate::types::WaitConditionStatus::Triggered
+                                    | crate::types::WaitConditionStatus::Resolved
+                            )
                             && condition.trigger_message_id() == Some(message.id.as_str())
                             && scheduler::message_matches_wait_condition(message, condition)
                     });
