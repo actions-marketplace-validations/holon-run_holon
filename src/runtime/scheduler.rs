@@ -153,6 +153,7 @@ pub(crate) struct SchedulerProjection {
     now: DateTime<Utc>,
     pub status: AgentStatus,
     pub queue_len: usize,
+    pub has_interrupted_replay: bool,
     pub active_run_id: Option<String>,
     pub active_tasks: Vec<TaskRecord>,
     pub has_blocking_active_tasks: bool,
@@ -278,6 +279,15 @@ impl SchedulerProjection {
     ) -> Result<Self> {
         let active_tasks =
             storage.latest_active_task_records_for_agent(&snapshot.id, usize::MAX)?;
+        let has_interrupted_replay = storage
+            .runtime_db()?
+            .map(|runtime_db| {
+                runtime_db
+                    .queue_entries()
+                    .has_interrupted_for_agent(&snapshot.id)
+            })
+            .transpose()?
+            .unwrap_or(false);
         let has_blocking_active_tasks = active_tasks.iter().any(TaskRecord::is_blocking);
         let queued_runnable_work_items = work_queue
             .queued_runnable
@@ -367,6 +377,7 @@ impl SchedulerProjection {
             now,
             status: snapshot.status.clone(),
             queue_len,
+            has_interrupted_replay,
             active_run_id: snapshot.active_run_id.clone(),
             active_tasks,
             has_blocking_active_tasks,
@@ -1635,6 +1646,9 @@ pub(crate) fn idle_noop_decision(projection: &SchedulerProjection) -> SchedulerD
 pub(crate) fn wait_decision_for_projection(
     projection: &SchedulerProjection,
 ) -> Option<SchedulerDecision> {
+    if projection.has_interrupted_replay {
+        return None;
+    }
     if projection.work_reactivation_signal().is_some() {
         return None;
     }
