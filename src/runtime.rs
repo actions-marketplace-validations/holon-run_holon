@@ -535,11 +535,12 @@ fn canonical_queue_settlement_commands_from_facts(
     let Some(message) = storage.read_message_by_id(&record.message_id)? else {
         return Ok(Vec::new());
     };
+    use crate::domain::scheduler::SchedulerOwner;
     use crate::domain::scheduler_protocol::{
         ActivationDisposition, ActivationSettlement, AdoptActivationWorkStateCommand,
         AgentDispatchDisposition, AgentDispatchState, LegacyWaitAdoption,
-        LifecycleWaitHandoffProof, ProtocolCommand, SchedulerOwner, SettleActivationCommand,
-        WaitIdentity, WaitState,
+        LifecycleWaitHandoffProof, ProtocolCommand, SettleActivationCommand, WaitIdentity,
+        WaitState,
     };
 
     let Some(snapshot) = runtime_db
@@ -1360,10 +1361,11 @@ fn canonical_authority_convergence_command(
     snapshot: &crate::domain::scheduler_protocol::Snapshot,
     agent_id: &str,
 ) -> Result<Option<crate::domain::scheduler_protocol::ProtocolCommand>> {
+    use crate::domain::scheduler::SchedulerOwner;
     use crate::domain::scheduler_protocol::{
         AgentDispatchState, AuthoritativeWaitState, AuthoritativeWorkState,
         AuthorityWaitConvergence, AuthorityWorkConvergence, ConvergeAuthorityCommand,
-        ProtocolCommand, SchedulerOwner, WaitState,
+        ProtocolCommand, WaitState,
     };
 
     let dispatch_wait = match &snapshot.dispatch {
@@ -3615,7 +3617,7 @@ impl RuntimeHandle {
         } else {
             ExecutionAdmissionProvenance::LegacyCompat {
                 scenario_class: None,
-                effective_mode: crate::domain::scheduler_protocol::ScenarioMode::Off,
+                effective_mode: crate::domain::scheduler::ScenarioMode::Off,
             }
         };
         self.begin_interactive_turn_with_provenance(
@@ -3639,7 +3641,7 @@ impl RuntimeHandle {
             operator_reply_route_id,
             ExecutionAdmissionProvenance::LegacyCompat {
                 scenario_class: None,
-                effective_mode: crate::domain::scheduler_protocol::ScenarioMode::Off,
+                effective_mode: crate::domain::scheduler::ScenarioMode::Off,
             },
         )
         .await
