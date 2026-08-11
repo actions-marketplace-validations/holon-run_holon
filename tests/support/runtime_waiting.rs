@@ -646,7 +646,7 @@ pub async fn wake_hint_coalesces_while_running_and_reenters_once() -> Result<()>
         ))
         .await?;
 
-    sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(10), provider.wait_for_first_call()).await?;
     let first = runtime
         .submit_wake_hint(WakeHint {
             agent_id: "default".into(),
@@ -679,9 +679,19 @@ pub async fn wake_hint_coalesces_while_running_and_reenters_once() -> Result<()>
         .await?;
     assert_eq!(first, WakeDisposition::Coalesced);
     assert_eq!(second, WakeDisposition::Coalesced);
+    provider.release_first_call();
 
     wait_until_async_for(Duration::from_secs(10), || async {
-        Ok(provider.calls().await == 2)
+        if provider.calls().await != 2 {
+            return Ok(false);
+        }
+        let state = runtime.storage().read_agent()?;
+        Ok(state
+            .and_then(|state| state.last_continuation)
+            .is_some_and(|continuation| {
+                continuation.class == holon::types::ContinuationClass::ResumeExpectedWait
+                    && continuation.model_reentry
+            }))
     })
     .await?;
 
