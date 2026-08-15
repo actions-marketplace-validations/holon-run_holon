@@ -1926,6 +1926,30 @@ test("summarizeHolonTokenOptimization reports non-material zero cache reads accu
   );
 });
 
+test("summarizeHolonTokenOptimization classifies matching stable-prefix cache drops as server-side", () => {
+  const diagnostics = summarizeHolonTokenOptimization([
+    anthropicProviderRound({
+      round: 1,
+      cacheRead: 18_000,
+      createdAt: "2026-04-28T00:00:00Z",
+      stablePrefixFingerprint: "stable-x"
+    }),
+    anthropicProviderRound({
+      round: 2,
+      cacheRead: 0,
+      createdAt: "2026-04-28T00:00:20Z",
+      stablePrefixFingerprint: "stable-x"
+    })
+  ]);
+
+  assert.equal(diagnostics.rounds[1].cache_break_classification, "likely_server_side_drop");
+  assert.equal(diagnostics.rounds[1].stable_prefix_matches_cache_baseline, true);
+  assert.equal(
+    diagnostics.rounds[1].cache_break_reason,
+    "provider-visible stable prefix matched the positive cache-read baseline"
+  );
+});
+
 test("summarizeHolonTokenOptimization classifies stable-prefix cache drop as likely server-side", () => {
   const diagnostics = summarizeHolonTokenOptimization([
     anthropicProviderRound({
@@ -1966,6 +1990,48 @@ test("summarizeHolonTokenOptimization classifies client prefix cache drops", () 
   assert.equal(diagnostics.rounds[1].stable_shape_segment_id, 1);
   assert.equal(diagnostics.rounds[1].request_shape_changed, true);
   assert.deepEqual(diagnostics.rounds[1].shape_changed_fields, ["anthropic_cache.system_hash"]);
+});
+
+test("summarizeHolonTokenOptimization explains stable-prefix component changes", () => {
+  const diagnostics = summarizeHolonTokenOptimization([
+    anthropicProviderRound({
+      round: 1,
+      cacheRead: 18_000,
+      stablePrefixFingerprint: "stable-a"
+    }),
+    anthropicProviderRound({
+      round: 2,
+      cacheRead: 0,
+      stablePrefixFingerprint: "stable-b",
+      stablePrefixComponents: [
+        { name: "contract", fingerprint: "contract" },
+        { name: "request_controls", fingerprint: "controls" },
+        { name: "system", fingerprint: "system" },
+        { name: "tools", fingerprint: "tools-changed" },
+        { name: "history_prefix", fingerprint: "history" }
+      ]
+    })
+  ]);
+
+  assert.equal(diagnostics.rounds[0].stable_prefix.status, "available");
+  assert.deepEqual(diagnostics.rounds[1].stable_prefix_changed_components, ["tools"]);
+  assert.equal(diagnostics.rounds[1].cache_break_classification, "client_prefix_changed");
+  assert.equal(
+    diagnostics.rounds[1].shape_changed_fields.includes("stable_prefix.components.tools"),
+    true
+  );
+  assert.equal(diagnostics.summary.stable_prefix_available_rounds, 2);
+  assert.equal(diagnostics.summary.stable_prefix_changed_rounds, 1);
+});
+
+test("summarizeHolonTokenOptimization keeps missing stable-prefix diagnostics unavailable", () => {
+  const diagnostics = summarizeHolonTokenOptimization([
+    anthropicProviderRound({ round: 1, cacheRead: 18_000 })
+  ]);
+
+  assert.equal(diagnostics.rounds[0].stable_prefix.status, "unavailable");
+  assert.equal(diagnostics.rounds[0].stable_prefix_changed_components, null);
+  assert.equal(diagnostics.summary.stable_prefix_available_rounds, 0);
 });
 
 test("summarizeHolonTokenOptimization reports client prefix changes inside a segment", () => {
@@ -2105,7 +2171,9 @@ function anthropicProviderRound({
   breakpointStability = "conversation_tail",
   workingMemoryRevision = 4,
   compressionEpoch = 1,
-  appliedEdits = []
+  appliedEdits = [],
+  stablePrefixFingerprint = null,
+  stablePrefixComponents = null
 }) {
   return {
     kind: "provider_round_completed",
@@ -2122,6 +2190,26 @@ function anthropicProviderRound({
       compression_epoch: compressionEpoch,
       provider_request_diagnostics: {
         request_lowering_mode: "prompt_cache_blocks",
+        ...(stablePrefixFingerprint
+          ? {
+              stable_prefix: {
+                schema_version: 1,
+                algorithm: "sha256",
+                full_request_fingerprint: `full-${round}`,
+                stable_prefix_fingerprint: stablePrefixFingerprint,
+                history_prefix_items: 3,
+                dynamic_tail_items: 1,
+                components:
+                  stablePrefixComponents ?? [
+                    { name: "contract", fingerprint: "contract" },
+                    { name: "request_controls", fingerprint: "controls" },
+                    { name: "system", fingerprint: "system" },
+                    { name: "tools", fingerprint: "tools" },
+                    { name: "history_prefix", fingerprint: "history" }
+                  ]
+              }
+            }
+          : {}),
         anthropic_cache: {
           tools_count: 3,
           tools_hash: toolsHash,
