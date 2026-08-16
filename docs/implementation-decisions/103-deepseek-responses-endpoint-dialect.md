@@ -49,3 +49,8 @@ runner execution, cooldown, and disabled provider fallback. Running that paid
 suite and using `deepseek-v4-pro` for route confirmation/default-route evidence
 remain separate operator-authorized steps. Benchmark infrastructure does not
 change `deepseek@default`.
+
+The final 2026-08-15 evaluation kept the Responses route opt-in. See
+[DeepSeek Responses Transport Benchmark](../providers/deepseek-responses-benchmark-2026-08-15.md)
+for the protocol, aggregate results, compaction evidence, and re-evaluation
+criteria.
