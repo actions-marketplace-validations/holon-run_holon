@@ -1540,24 +1540,33 @@ fn exact_triggered_or_resolved_task_result_wait(
     })
 }
 
-fn exact_resolved_task_result_wait(
+fn exact_task_result_claim_wait(
     storage: &AppStorage,
     message: &MessageEnvelope,
     task_id: &str,
     work_item_id: &str,
 ) -> Result<Option<WaitConditionRecord>> {
     exact_task_result_wait_with_status(storage, message, task_id, work_item_id, |status| {
-        status == &WaitConditionStatus::Resolved
+        matches!(
+            status,
+            WaitConditionStatus::Resolved | WaitConditionStatus::Cancelled
+        )
     })
 }
 
 enum TaskResultClaimRecovery {
-    Eligible {
+    Replayable {
         transition: crate::runtime_db::transitions::ExecutionProtocolTransition,
         reason: &'static str,
     },
+    Revoked {
+        wait: WaitConditionRecord,
+        reason: &'static str,
+    },
     RequiresInactiveRuntime,
-    Ineligible,
+    Ineligible {
+        reason: &'static str,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -1585,7 +1594,9 @@ fn exact_task_result_claim_recovery(
         result_message_id,
     } = &attempt.source.identity
     else {
-        return Ok(TaskResultClaimRecovery::Ineligible);
+        return Ok(TaskResultClaimRecovery::Ineligible {
+            reason: "execution_source_not_task_result",
+        });
     };
     if result_message_id != &message.id
         || message.kind != MessageKind::TaskResult
@@ -1596,33 +1607,54 @@ fn exact_task_result_claim_recovery(
         || message.work_item_id.as_deref() != Some(work_item_id)
         || !matches!(&message.origin, MessageOrigin::Task { task_id: origin } if origin == task_id)
     {
-        return Ok(TaskResultClaimRecovery::Ineligible);
+        return Ok(TaskResultClaimRecovery::Ineligible {
+            reason: "task_result_message_identity_mismatch",
+        });
     }
     let Some(task) = storage.latest_task_record(task_id)? else {
-        return Ok(TaskResultClaimRecovery::Ineligible);
+        return Ok(TaskResultClaimRecovery::Ineligible {
+            reason: "task_result_task_missing",
+        });
     };
     let Ok(rejoin) = task.rejoin_fence() else {
-        return Ok(TaskResultClaimRecovery::Ineligible);
+        return Ok(TaskResultClaimRecovery::Ineligible {
+            reason: "task_result_rejoin_fence_missing",
+        });
     };
     if task.agent_id != message.agent_id
         || task.work_item_id.as_deref() != Some(work_item_id)
         || task.parent_message_id.as_deref() != Some(message.id.as_str())
         || attempt.admitted_fences.rejoin.as_ref() != Some(&rejoin)
     {
-        return Ok(TaskResultClaimRecovery::Ineligible);
+        return Ok(TaskResultClaimRecovery::Ineligible {
+            reason: "task_result_rejoin_identity_mismatch",
+        });
     }
-    let Some(wait) = exact_resolved_task_result_wait(storage, message, task_id, work_item_id)?
-    else {
-        return Ok(TaskResultClaimRecovery::Ineligible);
+    let Some(wait) = exact_task_result_claim_wait(storage, message, task_id, work_item_id)? else {
+        return Ok(TaskResultClaimRecovery::Ineligible {
+            reason: "task_result_wait_missing_or_ambiguous",
+        });
     };
+    if wait.status == WaitConditionStatus::Cancelled {
+        return Ok(TaskResultClaimRecovery::Revoked {
+            wait,
+            reason: "task_result_wait_cancelled",
+        });
+    }
     let Some(work_item) = runtime_db.work_items().latest(work_item_id)? else {
-        return Ok(TaskResultClaimRecovery::Ineligible);
+        return Ok(TaskResultClaimRecovery::Ineligible {
+            reason: "task_result_work_item_missing",
+        });
     };
     let Some(expected_source_revision) = attempt.admitted_fences.work_item_source_revision else {
-        return Ok(TaskResultClaimRecovery::Ineligible);
+        return Ok(TaskResultClaimRecovery::Ineligible {
+            reason: "task_result_work_item_revision_fence_missing",
+        });
     };
     if work_item.state != WorkItemState::Open || work_item.blocked_by.is_some() {
-        return Ok(TaskResultClaimRecovery::Ineligible);
+        return Ok(TaskResultClaimRecovery::Ineligible {
+            reason: "task_result_work_item_not_runnable",
+        });
     }
     let (command, reason) = match work_item.revision.cmp(&expected_source_revision) {
         std::cmp::Ordering::Greater => (
@@ -1673,9 +1705,13 @@ fn exact_task_result_claim_recovery(
                 "unadvanced_task_result_claim",
             )
         }
-        std::cmp::Ordering::Less => return Ok(TaskResultClaimRecovery::Ineligible),
+        std::cmp::Ordering::Less => {
+            return Ok(TaskResultClaimRecovery::Ineligible {
+                reason: "task_result_work_item_revision_regressed",
+            });
+        }
     };
-    Ok(TaskResultClaimRecovery::Eligible {
+    Ok(TaskResultClaimRecovery::Replayable {
         transition: crate::runtime_db::transitions::ExecutionProtocolTransition {
             bootstrap: None,
             commands: vec![command],
@@ -1717,6 +1753,14 @@ fn scheduler_task_result_claim_recovery_candidates(
                 activation_id: attempt.attempt_id.clone(),
                 work_item_id: work_item_id.clone(),
                 queue_status: entry.status.clone(),
+                health: SchedulerUnsettledClaimHealth::Unhealthy,
+                lane_blocked: true,
+                // Queue entries currently expose the latest durable update, not a
+                // distinct claimed-at timestamp, so this is a diagnostic approximation.
+                claim_age_seconds: Utc::now()
+                    .signed_duration_since(entry.updated_at)
+                    .num_seconds()
+                    .max(0) as u64,
                 expected_queue_entry: None,
                 eligible: false,
                 reason: "task_result_claim_evidence_incomplete".into(),
@@ -1740,12 +1784,43 @@ fn scheduler_task_result_claim_recovery_candidates(
                 candidate.reason = "message_missing".into();
                 return Ok(candidate);
             };
+            let recovery = exact_task_result_claim_recovery(
+                storage,
+                runtime_db,
+                &message,
+                attempt,
+                work_item_id,
+                Utc::now(),
+                TaskResultClaimRecoveryAuthority::Diagnostic,
+            )?;
+            let replay_fence = match &recovery {
+                TaskResultClaimRecovery::Replayable { .. }
+                | TaskResultClaimRecovery::RequiresInactiveRuntime => {
+                    unsettled_claim::ReplayFence::ExactReplayable
+                }
+                TaskResultClaimRecovery::Revoked { wait, reason } => {
+                    candidate.reason = (*reason).into();
+                    candidate
+                        .evidence
+                        .push(format!("cancelled_wait:{}", wait.id));
+                    unsettled_claim::ReplayFence::Revoked
+                }
+                TaskResultClaimRecovery::Ineligible { reason } => {
+                    candidate.reason = (*reason).into();
+                    unsettled_claim::ReplayFence::Ambiguous
+                }
+            };
+            if replay_fence == unsettled_claim::ReplayFence::Ambiguous
+                && attempt.recovery_of_attempt_id.is_none()
+            {
+                return Ok(candidate);
+            }
             let decision =
                 unsettled_claim::plan_unsettled_claim(&unsettled_claim::UnsettledClaimFacts {
                     queue_status: entry.status.clone(),
                     attempt_state: attempt.state,
                     terminal_turn_completed: None,
-                    replay_is_exactly_fenced: true,
+                    replay_fence,
                     recovery_of_attempt_id: attempt.recovery_of_attempt_id.clone(),
                 });
             if let unsettled_claim::UnsettledClaimDecision::InterruptAndQuarantine { reason } =
@@ -1755,6 +1830,7 @@ fn scheduler_task_result_claim_recovery_candidates(
                 proposed_entry.status = QueueEntryStatus::Quarantined;
                 proposed_entry.updated_at = Utc::now();
                 candidate.eligible = true;
+                candidate.health = SchedulerUnsettledClaimHealth::Recoverable;
                 candidate.reason = reason.into();
                 candidate.recovery_decision = "interrupt_and_quarantine".into();
                 candidate.evidence.push("recovery_generation=1".to_string());
@@ -1778,6 +1854,7 @@ fn scheduler_task_result_claim_recovery_candidates(
                 proposed_entry.status = QueueEntryStatus::Quarantined;
                 proposed_entry.updated_at = Utc::now();
                 candidate.eligible = true;
+                candidate.health = SchedulerUnsettledClaimHealth::Recoverable;
                 candidate.reason = reason.into();
                 candidate.recovery_decision = "quarantine_settled".into();
                 candidate.evidence.push("recovery_generation=1".to_string());
@@ -1786,22 +1863,14 @@ fn scheduler_task_result_claim_recovery_candidates(
                 candidate.proposed_command = None;
                 return Ok(candidate);
             }
-            let recovery = exact_task_result_claim_recovery(
-                storage,
-                runtime_db,
-                &message,
-                attempt,
-                work_item_id,
-                Utc::now(),
-                TaskResultClaimRecoveryAuthority::Diagnostic,
-            )?;
             let (transition, reason) = match recovery {
-                TaskResultClaimRecovery::Eligible { transition, reason } => (transition, reason),
+                TaskResultClaimRecovery::Replayable { transition, reason } => (transition, reason),
                 TaskResultClaimRecovery::RequiresInactiveRuntime => {
                     candidate.reason = "requires_inactive_runtime_recovery".into();
                     return Ok(candidate);
                 }
-                TaskResultClaimRecovery::Ineligible => return Ok(candidate),
+                TaskResultClaimRecovery::Revoked { .. }
+                | TaskResultClaimRecovery::Ineligible { .. } => return Ok(candidate),
             };
             let [command] = transition.commands.as_slice() else {
                 return Ok(candidate);
@@ -1810,6 +1879,7 @@ fn scheduler_task_result_claim_recovery_candidates(
             proposed_entry.status = QueueEntryStatus::Queued;
             proposed_entry.updated_at = Utc::now();
             candidate.eligible = true;
+            candidate.health = SchedulerUnsettledClaimHealth::Recoverable;
             candidate.reason = reason.into();
             candidate.recovery_decision = "interrupt_and_requeue".into();
             candidate.evidence.push(format!(
@@ -1847,6 +1917,9 @@ pub struct SchedulerTaskResultClaimRecoveryCandidate {
     pub activation_id: String,
     pub work_item_id: String,
     pub queue_status: QueueEntryStatus,
+    pub health: SchedulerUnsettledClaimHealth,
+    pub lane_blocked: bool,
+    pub claim_age_seconds: u64,
     pub expected_queue_entry: Option<QueueEntryRecord>,
     pub eligible: bool,
     pub reason: String,
@@ -1855,6 +1928,13 @@ pub struct SchedulerTaskResultClaimRecoveryCandidate {
     pub evidence: Vec<String>,
     pub proposed_queue_entry: Option<QueueEntryRecord>,
     pub proposed_command: Option<crate::domain::execution_protocol::ExecutionProtocolCommand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerUnsettledClaimHealth {
+    Recoverable,
+    Unhealthy,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6031,7 +6111,9 @@ impl RuntimeHandle {
                         if subsystem == "work_queue"
                 ) && message.work_item_id.as_deref() == Some(work_item_id)
             });
-            let task_result_recovery = if let Some(work_item_id) = work_item_id.as_deref() {
+            let (task_result_recovery, task_result_replay_fence) = if let Some(work_item_id) =
+                work_item_id.as_deref()
+            {
                 let task_result_recovery = exact_task_result_claim_recovery(
                     &self.inner.storage,
                     &self.inner.runtime_db,
@@ -6042,15 +6124,29 @@ impl RuntimeHandle {
                     TaskResultClaimRecoveryAuthority::RuntimeTerminatedBootstrap,
                 )?;
                 match task_result_recovery {
-                    TaskResultClaimRecovery::Eligible { transition, .. } => Some(transition),
-                    TaskResultClaimRecovery::RequiresInactiveRuntime => {
-                        unreachable!("bootstrap authority permits equal-revision recovery")
+                    TaskResultClaimRecovery::Replayable { transition, .. } => (
+                        Some(transition),
+                        unsettled_claim::ReplayFence::ExactReplayable,
+                    ),
+                    TaskResultClaimRecovery::Revoked { .. } => {
+                        (None, unsettled_claim::ReplayFence::Revoked)
                     }
-                    TaskResultClaimRecovery::Ineligible if !work_queue_claim => continue,
-                    TaskResultClaimRecovery::Ineligible => None,
+                    TaskResultClaimRecovery::RequiresInactiveRuntime => {
+                        tracing::error!(
+                            agent_id = %agent_id,
+                            message_id = %entry.message_id,
+                            activation_id = %activation_id,
+                            "bootstrap task-result recovery unexpectedly required an inactive runtime"
+                        );
+                        continue;
+                    }
+                    TaskResultClaimRecovery::Ineligible { .. } if !work_queue_claim => continue,
+                    TaskResultClaimRecovery::Ineligible { .. } => {
+                        (None, unsettled_claim::ReplayFence::Ambiguous)
+                    }
                 }
             } else {
-                None
+                (None, unsettled_claim::ReplayFence::Ambiguous)
             };
 
             let terminal_turn = turns.iter().find(|turn| {
@@ -6075,9 +6171,15 @@ impl RuntimeHandle {
                     queue_status: entry.status.clone(),
                     attempt_state: attempt.state,
                     terminal_turn_completed: terminal_turn.map(|_| terminal_is_completed),
-                    replay_is_exactly_fenced: task_result_recovery.is_some()
-                        || work_queue_claim
-                        || canonical_first_attempt,
+                    replay_fence: if task_result_replay_fence
+                        == unsettled_claim::ReplayFence::Revoked
+                    {
+                        unsettled_claim::ReplayFence::Revoked
+                    } else if work_queue_claim || canonical_first_attempt {
+                        unsettled_claim::ReplayFence::ExactReplayable
+                    } else {
+                        task_result_replay_fence
+                    },
                     recovery_of_attempt_id: attempt.recovery_of_attempt_id.clone(),
                 });
             if let unsettled_claim::UnsettledClaimDecision::QuarantineSettled { reason } = decision
