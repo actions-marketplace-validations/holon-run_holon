@@ -1909,10 +1909,19 @@ async fn late_terminal_task_result_for_completed_work_item_settles_without_model
         .complete_work_item(work_item.id.clone(), Vec::new())
         .await
         .unwrap();
+    let mut parent_turn = crate::types::TurnRecord::new("default", "turn-parent-completed", 1);
+    parent_turn.terminal = Some(crate::types::TurnTerminalSummary {
+        kind: TurnTerminalKind::Completed,
+        reason: Some("parent_completed".into()),
+        completed_at: Utc::now(),
+        duration_ms: 1,
+    });
+    runtime.storage().append_turn(&parent_turn).unwrap();
     let mut result = task_result_message("task-late-child-result").with_admission(
         MessageDeliverySurface::TaskRejoin,
         AdmissionContext::RuntimeOwned,
     );
+    result.turn_id = Some(parent_turn.turn_id.clone());
     result.metadata = Some(serde_json::json!({
         "task_id": "task-late-child-result",
         "task_kind": "child_agent_task",
@@ -1948,9 +1957,80 @@ async fn late_terminal_task_result_for_completed_work_item_settles_without_model
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    runner.abort();
 
     assert_eq!(provider.call_count().await, 0);
+    let terminal_turn = runtime
+        .inner
+        .runtime_db
+        .turn_records()
+        .recent_for_agent("default", 10)
+        .unwrap()
+        .into_iter()
+        .find(|turn| {
+            turn.terminal.as_ref().is_some_and(|terminal| {
+                terminal.reason.as_deref() == Some("reducer_only/task_result_without_model_reentry")
+            })
+        })
+        .expect("suppressed TaskResult should persist a matching terminal Turn");
+    assert_eq!(
+        terminal_turn
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.kind.clone()),
+        Some(TurnTerminalKind::Completed)
+    );
+    assert_eq!(terminal_turn.produced_brief_ids.len(), 1);
+    let result_briefs = runtime
+        .storage()
+        .read_briefs_by_ids(&terminal_turn.produced_brief_ids)
+        .unwrap();
+    assert_eq!(result_briefs.len(), 1);
+    assert_eq!(result_briefs[0].kind, BriefKind::Result);
+    assert_ne!(terminal_turn.turn_id, parent_turn.turn_id);
+    assert_eq!(
+        runtime
+            .storage()
+            .read_turn_by_id(&parent_turn.turn_id)
+            .unwrap(),
+        Some(parent_turn)
+    );
+
+    let operator = runtime
+        .enqueue(trusted_operator_prompt(
+            None,
+            "continue after late task result",
+        ))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if runner.is_finished() {
+            panic!(
+                "runtime exited before processing the following operator prompt: {:?}",
+                (&mut runner).await
+            );
+        }
+        let processed = runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest_all()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == operator.id)
+            .is_some_and(|entry| entry.status == QueueEntryStatus::Processed);
+        if processed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "operator prompt remained blocked after TaskResult settlement"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    runner.abort();
+
+    assert_eq!(provider.call_count().await, 1);
     let events = runtime.storage().read_recent_events(usize::MAX).unwrap();
     assert!(events.iter().any(|event| {
         event.kind == "task_result_received" && event.data["task_id"] == "task-late-child-result"
