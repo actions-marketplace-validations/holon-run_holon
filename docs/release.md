@@ -85,6 +85,9 @@ Before pushing the tag, verify:
   rebuilding a new image
 - when an upgrade case is available, it used the current recommended release
   image as `previous_image`
+- the host real-data upgrade verification passed for the previous release ->
+  candidate pair (`scripts/upgrade-verify-realdata/README.md`): migration,
+  preservation, and cross-upgrade memory recall with a real model
 - the GHCR image is currently declared as Linux amd64 only
 - `Formula/holon.rb` will be generated, and either pushed to
   `holon-run/homebrew-tap` or retained as a workflow artifact when
