@@ -667,14 +667,11 @@ class DockerE2ERunnerTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(response["output"][0]["name"], "PickWorkItem")
-        scenario.phase = 6
+        scenario.phase = 5
         status, response = scenario.consume({"input": []})
         self.assertEqual(status, 200)
-        self.assertEqual(
-            response["output"][0]["content"][0]["text"],
-            "Deterministic scheduler scenario complete.",
-        )
-        self.assertEqual(scenario.phase, 7)
+        self.assertEqual(response["output"][1]["name"], "CompleteWorkItem")
+        self.assertEqual(scenario.phase, 6)
         self.assertTrue(scenario.status()["complete"])
         status, response = scenario.consume({"input": []})
         self.assertEqual(status, 409)
@@ -2336,6 +2333,17 @@ class DockerE2ERunnerTests(unittest.TestCase):
             source.index('harness.runtime_db_snapshot("scheduler-external")'),
         )
 
+    def test_checkpoint_replay_tracks_wait_and_completion_continuations(self) -> None:
+        source = inspect.getsource(runner.run_scheduler_checkpoint_replay_case)
+        self.assertIn(
+            'expected_source_kinds=(\n'
+            '            "work_item_continuation",\n'
+            '            "work_item_continuation",\n'
+            '            "triggered_wait",\n'
+            "        )",
+            source,
+        )
+
     def test_result_brief_waits_for_its_source_turn_to_reach_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             harness = runner.CaseHarness(
@@ -2496,6 +2504,19 @@ class DockerE2ERunnerTests(unittest.TestCase):
                                 "kind": "triggered_wait",
                                 "wait_id": "wait-1",
                                 "trigger_message_id": "message-resume",
+                            },
+                        )
+                    ),
+                },
+                {
+                    "payload_json": json.dumps(
+                        attempt(
+                            "attempt-completion",
+                            "message-completion",
+                            3,
+                            {
+                                "kind": "work_item_continuation",
+                                "work_item_id": "work-1",
                             },
                         )
                     ),
