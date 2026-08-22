@@ -655,6 +655,14 @@ mod tests {
             .brief_by_id("agent-a", &brief.id)?
             .expect("brief stored");
         assert_eq!(stored.created_event_seq, Some(commit.event.event_seq));
+
+        drop(db);
+        let reopened = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
+        assert!(
+            reopened
+                .observer_sync_foundations()?
+                .brief_atomic_linkage_verified
+        );
         Ok(())
     }
 
@@ -732,7 +740,10 @@ mod tests {
             let ambiguous = seed_brief("brief-ambiguous", "two candidates")?;
             let missing_seq = seed_brief("brief-missing-seq", "candidate without sequence")?;
             let seed_event =
-                |audit_event_id: &str, event_seq: Option<i64>, brief_id: &str| -> Result<()> {
+                |audit_event_id: &str, event_seq: Option<i64>, brief: &BriefRecord| -> Result<()> {
+                    let mut event = crate::types::brief_created_event_for(brief)?;
+                    event.id = audit_event_id.into();
+                    event.event_seq = event_seq.unwrap_or_default() as u64;
                     connection.execute(
                         "INSERT INTO audit_events (
                            audit_event_id, event_seq, agent_id, kind, created_at, data_json
@@ -742,19 +753,15 @@ mod tests {
                             event_seq,
                             "agent-a",
                             timestamp(Utc::now()),
-                            serde_json::json!({
-                                "brief_id": brief_id,
-                                "agent_id": "agent-a",
-                            })
-                            .to_string()
+                            serde_json::to_string(&event)?
                         ],
                     )?;
                     Ok(())
                 };
-            seed_event("event-linked", Some(11), &linked.id)?;
-            seed_event("event-ambiguous-a", Some(21), &ambiguous.id)?;
-            seed_event("event-ambiguous-b", Some(22), &ambiguous.id)?;
-            seed_event("event-missing-seq", None, &missing_seq.id)?;
+            seed_event("event-linked", Some(11), &linked)?;
+            seed_event("event-ambiguous-a", Some(21), &ambiguous)?;
+            seed_event("event-ambiguous-b", Some(22), &ambiguous)?;
+            seed_event("event-missing-seq", None, &missing_seq)?;
 
             apply_migration(&mut connection, &MIGRATIONS[48])?;
 
@@ -826,6 +833,9 @@ mod tests {
                     None,
                 );
                 brief.id = evidence_id.clone();
+                let mut event = crate::types::brief_created_event_for(&brief)?;
+                event.id = format!("event-bounded-{index}");
+                event.event_seq = (index + 1) as u64;
                 transaction.execute(
                     "INSERT INTO briefs (
                        evidence_id, agent_id, created_at, kind, preview, payload_json
@@ -844,15 +854,11 @@ mod tests {
                        audit_event_id, event_seq, agent_id, kind, created_at, data_json
                      ) VALUES (?1, ?2, ?3, 'brief_created', ?4, ?5)",
                     params![
-                        format!("event-bounded-{index}"),
+                        event.id,
                         index + 1,
                         "agent-a",
                         timestamp(Utc::now()),
-                        serde_json::json!({
-                            "brief_id": brief.id,
-                            "agent_id": "agent-a",
-                        })
-                        .to_string()
+                        serde_json::to_string(&event)?
                     ],
                 )?;
             }
@@ -879,8 +885,8 @@ mod tests {
              SELECT audit_event_id,
                     event_seq,
                     agent_id AS agent_id_col,
-                    COALESCE(json_extract(data_json, '$.agent_id'), '') AS agent_id_json,
-                    COALESCE(json_extract(data_json, '$.brief_id'), '') AS brief_id
+                    COALESCE(json_extract(data_json, '$.data.agent_id'), '') AS agent_id_json,
+                    COALESCE(json_extract(data_json, '$.data.brief_id'), '') AS brief_id
              FROM audit_events
              WHERE kind = 'brief_created';
              CREATE INDEX _idx_brief_created_candidates_lookup
@@ -6612,6 +6618,27 @@ CREATE TABLE working_memory_deltas (
     }
 
     #[test]
+    fn observer_sync_agent_identity_verification_accepts_persisted_agent_state_shape() -> Result<()>
+    {
+        let (_temp_dir, db_path, lock_path) = temp_paths()?;
+        {
+            let db = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
+            db.agent_identities()
+                .upsert(&agent_identity("agent-state-shape", 0))?;
+            db.agent_states()
+                .upsert(&AgentState::new("agent-state-shape"))?;
+        }
+
+        let reopened = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
+        assert!(
+            reopened
+                .observer_sync_foundations()?
+                .agent_identity_reserved
+        );
+        Ok(())
+    }
+
+    #[test]
     fn observer_sync_retired_agent_ids_are_never_reusable() -> Result<()> {
         let (_temp_dir, db_path, lock_path) = temp_paths()?;
         let db = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
@@ -6695,7 +6722,7 @@ CREATE TABLE working_memory_deltas (
             )?;
             connection.execute(
                 "INSERT INTO agent_states (agent_id, status, updated_at, payload_json) VALUES
-                    ('agent-state-only', 'idle', ?1, '{\"agent_id\":\"agent-state-only\"}')",
+                    ('agent-state-only', 'idle', ?1, '{\"id\":\"agent-state-only\"}')",
                 [now],
             )?;
             connection.execute(
@@ -6778,7 +6805,7 @@ CREATE TABLE working_memory_deltas (
             let now = "2026-01-01T00:00:00.000Z";
             connection.execute(
                 "INSERT INTO agent_states (agent_id, status, updated_at, payload_json) VALUES
-                    ('agent-broken', 'idle', ?1, '{\"agent_id\":\"agent-other\"}')",
+                    ('agent-broken', 'idle', ?1, '{\"id\":\"agent-other\"}')",
                 [now],
             )?;
             connection.execute(
