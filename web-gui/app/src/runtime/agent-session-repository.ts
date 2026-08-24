@@ -114,6 +114,7 @@ interface RuntimeClientLike {
     oldest_seq?: number | null;
     has_older?: boolean;
     has_newer?: boolean;
+    responseBytes?: number;
   }>;
   getAgentProjectionSnapshot: (
     agentId: string,
@@ -415,6 +416,7 @@ export class AgentSessionRepository<State extends AgentSessionRepositoryState> {
             eventHeadSeq: page.newest_seq ?? page.cursor_seq ?? undefined,
             oldestRetainedSeq: page.oldest_seq ?? null,
             hasNewer: page.has_newer,
+            responseBytes: page.responseBytes,
           };
         } catch (error) {
           const cursorNotFound = cursorNotFoundPayload(error);
@@ -1181,7 +1183,7 @@ export function recoverySnapshotFromDto(
     eventLogEpoch: snapshot.event_log_epoch,
     snapshotThroughSeq: snapshot.snapshot_through_seq,
     eventHeadSeq: snapshot.event_head_seq,
-    oldestRetainedSeq: snapshot.oldest_retained_seq ?? null,
+    oldestRetainedSeq: snapshot.oldest_retained_seq,
     canonicalRecords: brief
       ? [
           {
