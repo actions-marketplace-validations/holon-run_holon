@@ -28,6 +28,20 @@ pub fn build_provider_from_model_chain(
     config: &AppConfig,
     provider_chain: &[ModelRouteRef],
 ) -> Result<Arc<dyn AgentProvider>> {
+    build_provider_from_model_chain_with_override(config, provider_chain, None)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ModelRouteReasoningEffortOverride<'a> {
+    pub(crate) route_ref: &'a ModelRouteRef,
+    pub(crate) reasoning_effort: &'a str,
+}
+
+pub(crate) fn build_provider_from_model_chain_with_override(
+    config: &AppConfig,
+    provider_chain: &[ModelRouteRef],
+    reasoning_effort_override: Option<ModelRouteReasoningEffortOverride<'_>>,
+) -> Result<Arc<dyn AgentProvider>> {
     let mut candidates = Vec::new();
     let mut errors = Vec::new();
     let disable_fallback = config.provider_fallback_disabled();
@@ -37,7 +51,7 @@ pub fn build_provider_from_model_chain(
     } else {
         provider_chain.len()
     }) {
-        match build_candidate(config, model_ref) {
+        match build_candidate_with_override(config, model_ref, reasoning_effort_override) {
             Ok(candidate) => {
                 if !candidates
                     .iter()
@@ -63,9 +77,38 @@ pub(crate) fn build_candidate(
     config: &AppConfig,
     route_ref: &ModelRouteRef,
 ) -> Result<ProviderCandidate> {
-    let route =
+    build_candidate_with_override(config, route_ref, None)
+}
+
+fn build_candidate_with_override(
+    config: &AppConfig,
+    route_ref: &ModelRouteRef,
+    reasoning_effort_override: Option<ModelRouteReasoningEffortOverride<'_>>,
+) -> Result<ProviderCandidate> {
+    let mut route =
         resolve_explicit_model_route_for_candidate(config, route_ref, ModelRouteCapability::Turn)?;
+    apply_reasoning_effort_override(config, &mut route, reasoning_effort_override);
     build_candidate_from_model_route(&config.home_dir, &route)
+}
+
+fn apply_reasoning_effort_override(
+    config: &AppConfig,
+    route: &mut ResolvedModelRoute,
+    reasoning_effort_override: Option<ModelRouteReasoningEffortOverride<'_>>,
+) {
+    let reasoning_effort_override = reasoning_effort_override.map(|reasoning_effort| {
+        (
+            RuntimeModelCatalog::from_config(config)
+                .canonicalize_model_route_ref(reasoning_effort.route_ref),
+            reasoning_effort.reasoning_effort,
+        )
+    });
+    if let Some(reasoning_effort_override) =
+        reasoning_effort_override.filter(|(route_ref, _)| route.route_ref == *route_ref)
+    {
+        route.endpoint.runtime_config.reasoning_effort =
+            Some(reasoning_effort_override.1.to_string());
+    }
 }
 
 pub(crate) fn build_candidate_from_model_route(
@@ -193,5 +236,86 @@ mod tests {
             .expect("unsupported effort should fail provider construction");
         assert!(error.to_string().contains("openai-codex/gpt-5.5"));
         assert!(error.to_string().contains("low, medium, high, xhigh"));
+    }
+
+    #[test]
+    fn model_route_effort_override_does_not_filter_same_provider_fallback() {
+        let mut config = codex_config("gpt-5.6-luna", "medium");
+        let primary = config.default_model.clone();
+        let fallback = ModelRouteRef::parse_compatible("openai-codex/gpt-5.5").unwrap();
+        config.fallback_models.push(fallback.clone());
+
+        let provider = build_provider_from_model_chain_with_override(
+            &config,
+            &config.provider_chain(),
+            Some(ModelRouteReasoningEffortOverride {
+                route_ref: &primary,
+                reasoning_effort: "max",
+            }),
+        )
+        .expect("route-scoped effort should not affect the fallback model");
+
+        assert_eq!(
+            provider.configured_model_refs(),
+            vec![primary.as_string(), fallback.as_string()]
+        );
+    }
+
+    #[test]
+    fn provider_effort_still_filters_each_model_candidate() {
+        let mut config = codex_config("gpt-5.6-luna", "max");
+        let primary = config.default_model.clone();
+        config.fallback_models =
+            vec![ModelRouteRef::parse_compatible("openai-codex/gpt-5.5").unwrap()];
+
+        let provider = build_provider_from_model_chain(&config, &config.provider_chain())
+            .expect("the compatible primary should remain available");
+        assert_eq!(provider.configured_model_refs(), vec![primary.as_string()]);
+
+        config.default_model = ModelRouteRef::parse_compatible("openai-codex/gpt-5.5").unwrap();
+        config.fallback_models.clear();
+        let error = build_provider_from_model_chain(&config, &config.provider_chain())
+            .err()
+            .expect("an incompatible provider effort should reject every candidate");
+        assert!(error
+            .to_string()
+            .contains("no available providers for configured model chain"));
+    }
+
+    #[test]
+    fn model_route_effort_override_matches_legacy_model_alias() {
+        let mut config = codex_config("gpt-5.6-luna", "medium");
+        let mistral = crate::config::ProviderId::parse("mistral").unwrap();
+        let mut provider = config
+            .providers
+            .get(&crate::config::ProviderId::openai())
+            .unwrap()
+            .clone();
+        provider.id = mistral.clone();
+        provider.route_provider = mistral.clone();
+        config.providers.insert(mistral.clone(), provider);
+        let alias = ModelRouteRef::new(
+            mistral,
+            crate::config::ProviderEndpointId::default_endpoint(),
+            "devstral-medium-latest",
+        );
+        config.default_model = alias.clone();
+
+        let mut route =
+            resolve_explicit_model_route_for_candidate(&config, &alias, ModelRouteCapability::Turn)
+                .expect("the legacy alias should resolve");
+        apply_reasoning_effort_override(
+            &config,
+            &mut route,
+            Some(ModelRouteReasoningEffortOverride {
+                route_ref: &alias,
+                reasoning_effort: "high",
+            }),
+        );
+
+        assert_eq!(
+            route.endpoint.runtime_config.reasoning_effort.as_deref(),
+            Some("high")
+        );
     }
 }
