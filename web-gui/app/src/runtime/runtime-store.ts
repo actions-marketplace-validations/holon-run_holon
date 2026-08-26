@@ -2175,7 +2175,7 @@ export const useRuntimeStore = create<RuntimeStoreState>((set, get) => {
     const request = captureClientRequest();
     set({ modelCatalogLoading: true, modelCatalogError: undefined });
     try {
-      const modelCatalog = freshModelCatalog(await request.client.getModels());
+      const modelCatalog = freshModelCatalog(await request.client.refreshModels());
       if (!isCurrentClientRequest(request)) return;
       set({ modelCatalog, modelCatalogLoading: false, modelCatalogError: modelCatalog.error });
       persistModelCatalog(runtimeConnectionConfig, modelCatalog);
@@ -2707,7 +2707,7 @@ export const useRuntimeStore = create<RuntimeStoreState>((set, get) => {
       const [credentialStore, runtimeConfig, fetchedModelCatalog] = await Promise.all([
         request.client.listCredentials(),
         request.client.getRuntimeConfig(),
-        request.client.getModels(),
+        request.client.refreshModels(),
       ]);
       if (!isCurrentClientRequest(request)) return undefined;
       const modelCatalog = freshModelCatalog(fetchedModelCatalog);
@@ -2736,7 +2736,7 @@ export const useRuntimeStore = create<RuntimeStoreState>((set, get) => {
       const [credentialStore, runtimeConfig, fetchedModelCatalog] = await Promise.all([
         request.client.listCredentials(),
         request.client.getRuntimeConfig(),
-        request.client.getModels(),
+        request.client.refreshModels(),
       ]);
       if (!isCurrentClientRequest(request)) return;
       const modelCatalog = freshModelCatalog(fetchedModelCatalog);
@@ -2790,7 +2790,7 @@ export const useRuntimeStore = create<RuntimeStoreState>((set, get) => {
             const [credentialStore, runtimeConfig, fetchedModelCatalog] = await Promise.all([
               request.client.listCredentials(),
               request.client.getRuntimeConfig(),
-              request.client.getModels(),
+              request.client.refreshModels(),
             ]);
             if (!isCurrentClientRequest(request)) return;
             const modelCatalog = freshModelCatalog(fetchedModelCatalog);
