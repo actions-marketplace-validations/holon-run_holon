@@ -17,8 +17,8 @@ use crate::{
     host::RuntimeHostBridge,
     model_discovery::{
         discovery_cache_needs_refresh, discovery_cache_path, discovery_cache_status_for_provider,
-        load_discovery_cache_at, refresh_provider_models, ModelDiscoveryCacheFile,
-        ModelDiscoveryCacheStatus, DEFAULT_DISCOVERY_CACHE_TTL,
+        load_discovery_cache_at, provider_discovers_model_capabilities, refresh_provider_models,
+        ModelDiscoveryCacheFile, ModelDiscoveryCacheStatus, DEFAULT_DISCOVERY_CACHE_TTL,
     },
     provider::{
         build_candidate_from_model_route, build_provider_from_model_chain,
@@ -103,6 +103,58 @@ impl ConfigSnapshot {
             web_config: config.web_config.clone(),
             x_search_config: crate::config::XSearchRuntimeConfig::from_app_config(config)?,
         })
+    }
+}
+
+pub(super) struct ModelDiscoveryRefreshGuard {
+    runtime: RuntimeHandle,
+    provider_id: crate::config::ProviderId,
+    released: bool,
+}
+
+impl ModelDiscoveryRefreshGuard {
+    pub(super) fn new(runtime: RuntimeHandle, provider_id: crate::config::ProviderId) -> Self {
+        Self {
+            runtime,
+            provider_id,
+            released: false,
+        }
+    }
+
+    async fn release(mut self) {
+        self.runtime
+            .inner
+            .model_discovery_refreshes
+            .lock()
+            .await
+            .remove(&self.provider_id);
+        self.runtime
+            .inner
+            .model_discovery_refresh_notify
+            .notify_waiters();
+        self.released = true;
+    }
+}
+
+impl Drop for ModelDiscoveryRefreshGuard {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let runtime = self.runtime.clone();
+        let provider_id = self.provider_id.clone();
+        tokio::spawn(async move {
+            runtime
+                .inner
+                .model_discovery_refreshes
+                .lock()
+                .await
+                .remove(&provider_id);
+            runtime
+                .inner
+                .model_discovery_refresh_notify
+                .notify_waiters();
+        });
     }
 }
 
@@ -396,6 +448,7 @@ impl RuntimeHandle {
                 builtin_web_search_probe_cache: Mutex::new(HashMap::new()),
                 view_image_observation_cache: Mutex::new(HashMap::new()),
                 model_discovery_refreshes: Mutex::new(HashSet::new()),
+                model_discovery_refresh_notify: Notify::new(),
                 callback_base_url,
                 tools: ToolRegistry::new(PathBuf::new()),
                 system: Arc::new(LocalSystem::new()),
@@ -613,6 +666,31 @@ impl RuntimeHandle {
     pub(crate) async fn current_view_image_vision_selection(
         &self,
     ) -> Result<crate::types::ViewImageVisionSelection> {
+        let selection = self.view_image_vision_selection().await?;
+        if selection.selected_mode
+            == crate::types::ViewImageSelectedMode::NativeImageWithObservation
+        {
+            return Ok(selection);
+        }
+        let failures = self
+            .refresh_view_image_discovery_candidates(&selection)
+            .await?;
+        let mut selection = self.view_image_vision_selection().await?;
+        for (provider, error) in failures {
+            selection
+                .candidates
+                .push(crate::types::ViewImageVisionCandidate {
+                    provider: provider.as_str().to_string(),
+                    model: "*".to_string(),
+                    model_ref: format!("{}/*", provider.as_str()),
+                    image_input: false,
+                    reason: format!("provider_model_discovery_failed: {error}"),
+                });
+        }
+        Ok(selection)
+    }
+
+    async fn view_image_vision_selection(&self) -> Result<crate::types::ViewImageVisionSelection> {
         let state = self.agent_state().await?;
         let fallback_model = self.inner.turn_fallback_model.read().await.clone();
         let snap = self.inner.config_snapshot.load();
@@ -621,6 +699,107 @@ impl RuntimeHandle {
             state.model_override.as_ref(),
             fallback_model.as_ref(),
         ))
+    }
+
+    async fn refresh_view_image_discovery_candidates(
+        &self,
+        selection: &crate::types::ViewImageVisionSelection,
+    ) -> Result<Vec<(crate::config::ProviderId, String)>> {
+        let snap = self.inner.config_snapshot.load();
+        let Some(reconfig) = snap.provider_reconfig.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let config = reconfig.config.clone();
+        let cache_path = discovery_cache_path(&config.home_dir);
+        let cache_path_for_load = cache_path.clone();
+        let cache =
+            tokio::task::spawn_blocking(move || load_discovery_cache_at(&cache_path_for_load))
+                .await??;
+        let candidate_providers = selection
+            .candidates
+            .iter()
+            .filter_map(|candidate| crate::config::ProviderId::parse(&candidate.provider).ok())
+            .collect::<HashSet<_>>();
+        let providers = config
+            .providers
+            .values()
+            .filter(|provider| {
+                provider_discovers_model_capabilities(provider)
+                    && (candidate_providers.contains(&provider.id)
+                        || crate::provider::provider_definition(provider.id.as_str()).is_some_and(
+                            |definition| {
+                                definition.catalog_policy
+                                    == crate::provider::ProviderCatalogPolicy::DiscoveryOnly
+                            },
+                        ))
+                    && (provider.auth.kind == crate::config::CredentialKind::None
+                        || provider.has_configured_credential())
+                    && discovery_cache_needs_refresh(provider, &cache, DEFAULT_DISCOVERY_CACHE_TTL)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut failures = Vec::new();
+        for provider in providers {
+            if let Err(error) = self
+                .refresh_model_discovery_provider(provider.clone(), &cache_path)
+                .await
+            {
+                tracing::warn!(
+                    provider = %provider.id.as_str(),
+                    error = %error,
+                    "ViewImage model discovery refresh failed"
+                );
+                failures.push((provider.id, error.to_string()));
+            }
+        }
+        self.reload_model_discovery_cache_snapshot().await?;
+        Ok(failures)
+    }
+
+    async fn refresh_model_discovery_provider(
+        &self,
+        provider: crate::config::ProviderRuntimeConfig,
+        cache_path: &std::path::Path,
+    ) -> Result<()> {
+        loop {
+            let notified = self.inner.model_discovery_refresh_notify.notified();
+            let should_refresh = {
+                let mut in_flight = self.inner.model_discovery_refreshes.lock().await;
+                if in_flight.contains(&provider.id) {
+                    false
+                } else {
+                    in_flight.insert(provider.id.clone());
+                    true
+                }
+            };
+            if should_refresh {
+                let refresh_guard =
+                    ModelDiscoveryRefreshGuard::new(self.clone(), provider.id.clone());
+                let result = refresh_provider_models(&provider, cache_path).await;
+                refresh_guard.release().await;
+                result?;
+                return Ok(());
+            }
+            notified.await;
+            if self
+                .inner
+                .model_discovery_refreshes
+                .lock()
+                .await
+                .contains(&provider.id)
+            {
+                continue;
+            }
+            let cache_path = cache_path.to_path_buf();
+            let cache =
+                tokio::task::spawn_blocking(move || load_discovery_cache_at(&cache_path)).await??;
+            if !discovery_cache_needs_refresh(&provider, &cache, DEFAULT_DISCOVERY_CACHE_TTL) {
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "concurrent provider model discovery did not produce a fresh cache entry"
+            ));
+        }
     }
 
     pub(crate) async fn cached_view_image_observation(
@@ -790,6 +969,8 @@ impl RuntimeHandle {
 
             let runtime = self.clone();
             let cache_path = discovery_cache_path(&config.home_dir);
+            let refresh_guard =
+                ModelDiscoveryRefreshGuard::new(runtime.clone(), provider_id.clone());
             tokio::spawn(async move {
                 let result = refresh_provider_models(&provider, &cache_path).await;
                 match result {
@@ -814,12 +995,7 @@ impl RuntimeHandle {
                         );
                     }
                 }
-                runtime
-                    .inner
-                    .model_discovery_refreshes
-                    .lock()
-                    .await
-                    .remove(&provider_id);
+                refresh_guard.release().await;
             });
         }
     }
