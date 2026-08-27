@@ -999,20 +999,6 @@ fn exact_triggered_or_resolved_task_result_wait(
     })
 }
 
-fn exact_task_result_claim_wait(
-    storage: &AppStorage,
-    message: &MessageEnvelope,
-    task_id: &str,
-    work_item_id: &str,
-) -> Result<Option<WaitConditionRecord>> {
-    exact_task_result_wait_with_status(storage, message, task_id, work_item_id, |status| {
-        matches!(
-            status,
-            WaitConditionStatus::Resolved | WaitConditionStatus::Cancelled
-        )
-    })
-}
-
 enum TaskResultClaimRecovery {
     Replayable {
         transition: crate::runtime_db::transitions::ExecutionProtocolTransition,
@@ -1022,6 +1008,7 @@ enum TaskResultClaimRecovery {
         wait: WaitConditionRecord,
         reason: &'static str,
     },
+    MissingWait,
     RequiresInactiveRuntime,
     Ineligible {
         reason: &'static str,
@@ -1089,16 +1076,43 @@ fn exact_task_result_claim_recovery(
             reason: "task_result_rejoin_identity_mismatch",
         });
     }
-    let Some(wait) = exact_task_result_claim_wait(storage, message, task_id, work_item_id)? else {
-        return Ok(TaskResultClaimRecovery::Ineligible {
-            reason: "task_result_wait_missing_or_ambiguous",
-        });
+    let matching_waits = storage
+        .latest_wait_conditions()?
+        .into_iter()
+        .filter(|wait| {
+            wait.agent_id == message.agent_id
+                && wait.work_item_id.as_deref() == Some(work_item_id)
+                && matches!(
+                    wait.status,
+                    WaitConditionStatus::Resolved | WaitConditionStatus::Cancelled
+                )
+                && wait.kind == crate::types::WaitConditionKind::Task
+                && wait.trigger_message_id() == Some(message.id.as_str())
+                && wait.wake_sources.iter().any(|source| {
+                    matches!(
+                        source,
+                        crate::types::WakeSource::TaskResult { task_id: expected }
+                            if expected == task_id
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    let wait = match matching_waits.as_slice() {
+        [] => None,
+        [wait] => Some(wait.clone()),
+        _ => {
+            return Ok(TaskResultClaimRecovery::Ineligible {
+                reason: "task_result_wait_ambiguous",
+            });
+        }
     };
-    if wait.status == WaitConditionStatus::Cancelled {
-        return Ok(TaskResultClaimRecovery::Revoked {
-            wait,
-            reason: "task_result_wait_cancelled",
-        });
+    if let Some(wait) = wait.as_ref() {
+        if wait.status == WaitConditionStatus::Cancelled {
+            return Ok(TaskResultClaimRecovery::Revoked {
+                wait: wait.clone(),
+                reason: "task_result_wait_cancelled",
+            });
+        }
     }
     let Some(work_item) = runtime_db.work_items().latest(work_item_id)? else {
         return Ok(TaskResultClaimRecovery::Ineligible {
@@ -1115,6 +1129,9 @@ fn exact_task_result_claim_recovery(
             reason: "task_result_work_item_not_runnable",
         });
     }
+    let Some(wait) = wait else {
+        return Ok(TaskResultClaimRecovery::MissingWait);
+    };
     let (command, reason) = match work_item.revision.cmp(&expected_source_revision) {
         std::cmp::Ordering::Greater => (
             crate::domain::execution_protocol::ExecutionProtocolCommand::
@@ -1265,6 +1282,13 @@ fn scheduler_task_result_claim_recovery_candidates(
                         .push(format!("cancelled_wait:{}", wait.id));
                     unsettled_claim::ReplayFence::Revoked
                 }
+                TaskResultClaimRecovery::MissingWait => {
+                    candidate.reason = "task_result_wait_missing".into();
+                    candidate
+                        .evidence
+                        .push("task_result_wait:missing".to_string());
+                    unsettled_claim::ReplayFence::Missing
+                }
                 TaskResultClaimRecovery::Ineligible { reason } => {
                     candidate.reason = (*reason).into();
                     unsettled_claim::ReplayFence::Ambiguous
@@ -1330,6 +1354,7 @@ fn scheduler_task_result_claim_recovery_candidates(
                     return Ok(candidate);
                 }
                 TaskResultClaimRecovery::Revoked { .. }
+                | TaskResultClaimRecovery::MissingWait
                 | TaskResultClaimRecovery::Ineligible { .. } => return Ok(candidate),
             };
             let [command] = transition.commands.as_slice() else {
@@ -4900,6 +4925,9 @@ impl RuntimeHandle {
                     ),
                     TaskResultClaimRecovery::Revoked { .. } => {
                         (None, unsettled_claim::ReplayFence::Revoked)
+                    }
+                    TaskResultClaimRecovery::MissingWait => {
+                        (None, unsettled_claim::ReplayFence::Missing)
                     }
                     TaskResultClaimRecovery::RequiresInactiveRuntime => {
                         tracing::error!(
