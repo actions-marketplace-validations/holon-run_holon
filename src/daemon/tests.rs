@@ -1,8 +1,8 @@
 use super::lifecycle::{
     effective_config_mismatch_summary, lifecycle_lock, probe_runtime,
     runtime_status_matches_metadata, set_prepare_runtime_before_server_hook,
-    should_retry_startup_stability_probe, wait_for_startup_stability_with_probe, web_url,
-    ProbeRuntime,
+    should_retry_startup_stability_probe, validate_incompatible_runtime_identity_with_executable,
+    wait_for_startup_stability_with_probe, web_url, ProbeRuntime,
 };
 use super::state::{
     persist_last_runtime_failure, DAEMON_LOG_TAIL_LINE_CHAR_LIMIT, DAEMON_LOG_TAIL_READ_BYTE_LIMIT,
@@ -31,6 +31,7 @@ use crate::{
 use chrono::Utc;
 use std::{
     fs,
+    path::PathBuf,
     process::Command,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -151,6 +152,119 @@ fn daemon_paths_use_run_dir_convention() {
     );
 }
 
+fn replacement_metadata(
+    config: &AppConfig,
+    pid: u32,
+    executable_path: PathBuf,
+) -> RuntimeServiceMetadata {
+    RuntimeServiceMetadata {
+        pid,
+        home_dir: config.home_dir.clone(),
+        socket_path: config.socket_path.clone(),
+        http_addr: config.http_addr.clone(),
+        started_at: Utc::now(),
+        config_fingerprint: config_fingerprint(config).unwrap(),
+        product_version: "incompatible-build".into(),
+        control_protocol_version: 0,
+        lifecycle_owner: crate::daemon::DaemonLifecycleOwner::Standalone,
+        executable_path,
+        serve_args: Vec::new(),
+        control_token_env_configured: false,
+    }
+}
+
+#[test]
+fn incompatible_runtime_identity_rejects_home_or_socket_mismatch() {
+    let config = test_config();
+    let mut metadata = replacement_metadata(&config, 42, PathBuf::new());
+    metadata.home_dir = config.home_dir.join("other");
+
+    let error = validate_incompatible_runtime_identity_with_executable(
+        &config,
+        &metadata,
+        PathBuf::from("/tmp/holon").as_path(),
+    )
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("recorded home or control socket"));
+}
+
+#[test]
+fn incompatible_runtime_identity_rejects_pid_mismatch() {
+    let config = test_config();
+    fs::create_dir_all(config.run_dir()).unwrap();
+    fs::write(daemon_paths(&config).pid_path, "41\n").unwrap();
+    let metadata = replacement_metadata(&config, 42, PathBuf::new());
+
+    let error = validate_incompatible_runtime_identity_with_executable(
+        &config,
+        &metadata,
+        PathBuf::from("/tmp/holon").as_path(),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("records PID 41"));
+    assert!(error.to_string().contains("metadata records PID 42"));
+}
+
+#[test]
+fn incompatible_runtime_identity_rejects_wrong_executable_name() {
+    let config = test_config();
+    fs::create_dir_all(config.run_dir()).unwrap();
+    fs::write(daemon_paths(&config).pid_path, "42\n").unwrap();
+    let metadata = replacement_metadata(&config, 42, PathBuf::new());
+
+    let error = validate_incompatible_runtime_identity_with_executable(
+        &config,
+        &metadata,
+        PathBuf::from("/tmp/not-holon").as_path(),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("its executable is"));
+}
+
+#[test]
+fn incompatible_runtime_identity_rejects_different_executable_path() {
+    let config = test_config();
+    fs::create_dir_all(config.run_dir()).unwrap();
+    fs::write(daemon_paths(&config).pid_path, "42\n").unwrap();
+    let executable_dir = tempdir().unwrap();
+    let recorded_dir = tempdir().unwrap();
+    let actual_executable = executable_dir.path().join("holon");
+    let recorded_executable = recorded_dir.path().join("holon");
+    fs::write(&actual_executable, b"actual").unwrap();
+    fs::write(&recorded_executable, b"recorded").unwrap();
+    let metadata = replacement_metadata(&config, 42, recorded_executable);
+
+    let error = validate_incompatible_runtime_identity_with_executable(
+        &config,
+        &metadata,
+        &actual_executable,
+    )
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("does not match recorded executable"));
+}
+
+#[test]
+fn incompatible_runtime_identity_accepts_matching_identity() {
+    let config = test_config();
+    fs::create_dir_all(config.run_dir()).unwrap();
+    fs::write(daemon_paths(&config).pid_path, "42\n").unwrap();
+    let executable_dir = tempdir().unwrap();
+    let actual_executable = executable_dir.path().join("holon");
+    fs::write(&actual_executable, b"holon").unwrap();
+    let metadata = replacement_metadata(&config, 42, actual_executable.clone());
+
+    validate_incompatible_runtime_identity_with_executable(&config, &metadata, &actual_executable)
+        .unwrap();
+}
+
 #[test]
 fn daemon_web_url_uses_a_connectable_loopback_address() {
     assert_eq!(web_url("0.0.0.0:7878"), "http://127.0.0.1:7878");
@@ -228,6 +342,46 @@ async fn daemon_status_reports_old_live_metadata_as_version_mismatch() {
     assert_eq!(status.state, DaemonLifecycleState::VersionMismatch);
     assert_eq!(status.control_protocol_version, None);
     assert!(status.message.contains("control protocol version 0"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_status_accepts_different_product_build_with_compatible_protocol() {
+    let config = test_config();
+    let paths = daemon_paths(&config);
+    fs::create_dir_all(config.run_dir()).unwrap();
+    fs::write(&paths.pid_path, format!("{}\n", std::process::id())).unwrap();
+    fs::write(
+        &paths.metadata_path,
+        serde_json::to_vec(&RuntimeServiceMetadata {
+            pid: std::process::id(),
+            home_dir: config.home_dir.clone(),
+            socket_path: config.socket_path.clone(),
+            http_addr: config.http_addr.clone(),
+            started_at: Utc::now(),
+            config_fingerprint: config_fingerprint(&config).unwrap(),
+            product_version: "0.32.0 (old-build)".into(),
+            control_protocol_version: crate::daemon::DAEMON_CONTROL_PROTOCOL_VERSION,
+            lifecycle_owner: crate::daemon::DaemonLifecycleOwner::Standalone,
+            executable_path: std::env::current_exe().unwrap(),
+            serve_args: Vec::new(),
+            control_token_env_configured: false,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let status = daemon_status(&config).await.unwrap();
+    assert_eq!(status.state, DaemonLifecycleState::Degraded);
+    assert_eq!(
+        status.product_version.as_deref(),
+        Some("0.32.0 (old-build)")
+    );
+    assert_eq!(
+        status.control_protocol_version,
+        Some(crate::daemon::DAEMON_CONTROL_PROTOCOL_VERSION)
+    );
+    assert!(!status.message.contains("product version"));
 }
 
 #[test]
