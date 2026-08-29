@@ -2,9 +2,9 @@ use super::super::*;
 use super::support::*;
 use crate::domain::scheduler::SchedulerOwner;
 use crate::types::{
-    AgentPostureProjection, AgentSchedulingPosture, ToolExecutionStatus, WaitConditionKind,
-    WaitConditionRecord, WaitConditionStatus, WakeSource, WorkItemPlanStatus,
-    WorkItemSchedulingState, WorkItemState, WorkReactivationMode,
+    AdmissionContext, AgentPostureProjection, AgentSchedulingPosture, MessageDeliverySurface,
+    ToolExecutionStatus, WaitConditionKind, WaitConditionRecord, WaitConditionStatus, WakeSource,
+    WorkItemPlanStatus, WorkItemSchedulingState, WorkItemState, WorkReactivationMode,
 };
 use chrono::DateTime;
 use serde::de::DeserializeOwned;
@@ -1778,6 +1778,105 @@ fn unbound_operator_input_exactly_resumes_agent_wait_or_becomes_nudge() {
         .unwrap();
     assert_eq!(
         scheduler::resolve_canonical_activation_scenario(&projection, &message, candidate).unwrap(),
+        Some(
+            scheduler::CanonicalActivationScenario::LifecycleExternalNudge {
+                agent_id: "default".into(),
+            }
+        )
+    );
+}
+
+#[test]
+fn explicitly_bound_operator_input_resumes_work_item_wait() {
+    let dir = tempdir().unwrap();
+    let storage = AppStorage::new_for_test(dir.path()).unwrap();
+    let agent = AgentState::new("default");
+    storage.write_agent(&agent).unwrap();
+    append_open_work_item(&storage, "wi-operator", "default");
+    append_operator_wait_condition(&storage, "wait-operator", "default", Some("wi-operator"));
+
+    let mut projection = scheduler::SchedulerProjection::from_state(&storage, &agent).unwrap();
+    projection.enable_canonical_authority_for_test();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator {
+            actor_id: Some("operator".into()),
+        },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "continue".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::CliPrompt,
+        AdmissionContext::LocalProcess,
+    );
+    message.message_seq = Some(1);
+    message.work_item_id = Some("wi-operator".into());
+    let candidate = scheduler::canonical_activation_candidate(&message, None, None)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        scheduler::resolve_canonical_activation_scenario(&projection, &message, candidate).unwrap(),
+        Some(
+            scheduler::CanonicalActivationScenario::ExplicitlyBoundOperatorInput {
+                work_item_id: "wi-operator".into(),
+                wait_id: Some("wait-operator".into()),
+            },
+        )
+    );
+}
+
+#[test]
+fn normal_operator_input_resumes_work_item_wait_but_interject_does_not() {
+    let dir = tempdir().unwrap();
+    let storage = AppStorage::new_for_test(dir.path()).unwrap();
+    let agent = AgentState::new("default");
+    storage.write_agent(&agent).unwrap();
+    append_open_work_item(&storage, "wi-operator", "default");
+    append_operator_wait_condition(&storage, "wait-operator", "default", Some("wi-operator"));
+
+    let mut projection = scheduler::SchedulerProjection::from_state(&storage, &agent).unwrap();
+    projection.enable_canonical_authority_for_test();
+    let message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator {
+            actor_id: Some("operator".into()),
+        },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "continue".into(),
+        },
+    );
+    let candidate = scheduler::canonical_activation_candidate(&message, None, None)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        scheduler::resolve_canonical_activation_scenario(&projection, &message, candidate).unwrap(),
+        Some(scheduler::CanonicalActivationScenario::ExactWaitResume {
+            owner: SchedulerOwner::WorkItem {
+                work_item_id: "wi-operator".into(),
+            },
+            wait_id: "wait-operator".into(),
+        })
+    );
+
+    let interject = MessageEnvelope {
+        priority: Priority::Interject,
+        ..message
+    };
+    let candidate = scheduler::canonical_activation_candidate(&interject, None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        scheduler::resolve_canonical_activation_scenario(&projection, &interject, candidate)
+            .unwrap(),
         Some(
             scheduler::CanonicalActivationScenario::LifecycleExternalNudge {
                 agent_id: "default".into(),
