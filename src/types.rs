@@ -4682,7 +4682,12 @@ pub struct LegacyToolResultBlock {
 #[serde(untagged)]
 pub enum ToolResultData {
     /// New ref-backed format with explicit wrapper
-    RefsWithWrapper { refs: Vec<ToolResultRef> },
+    RefsWithWrapper {
+        /// The owning turn for new transcript entries; absent in legacy data.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        refs: Vec<ToolResultRef>,
+    },
     /// Legacy format with explicit wrapper
     LegacyWithWrapper { results: Vec<LegacyToolResultBlock> },
 }
