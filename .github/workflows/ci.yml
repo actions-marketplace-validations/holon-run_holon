@@ -26,6 +26,7 @@ on:
       - ".github/workflows/release-e2e.yml"
       - "tests/e2e/scheduler/**"
       - "apps/macos/**"
+      - "scripts/create-macos-dmg.sh"
       - "scripts/package-macos-menu-app.sh"
       - "scripts/verify-macos-menu-app.sh"
   pull_request:
@@ -53,6 +54,7 @@ on:
       - ".github/workflows/release-e2e.yml"
       - "tests/e2e/scheduler/**"
       - "apps/macos/**"
+      - "scripts/create-macos-dmg.sh"
       - "scripts/package-macos-menu-app.sh"
       - "scripts/verify-macos-menu-app.sh"
   workflow_dispatch:
