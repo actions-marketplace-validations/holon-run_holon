@@ -4,6 +4,8 @@ web-gui/app/dist-e2e/
 build/
 coverage/
 .DS_Store
+# Intentional DMG volume layout asset, see scripts/create-macos-dmg.sh.
+!apps/macos/dmg-layout/.DS_Store
 target/
 web-gui/app/playwright-report/
 web-gui/app/test-results/

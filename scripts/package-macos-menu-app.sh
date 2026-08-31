@@ -145,7 +145,7 @@ fi
 
 dmg_path="$output_dir/Holon-${version}.dmg"
 rm -f "$dmg_path"
-hdiutil create -quiet -volname Holon -srcfolder "$app_dir" -ov -format UDZO "$dmg_path"
+"$repo_root/scripts/create-macos-dmg.sh" "$app_dir" "$dmg_path"
 
 if $notary_configured; then
   submit_notarization "$dmg_path"

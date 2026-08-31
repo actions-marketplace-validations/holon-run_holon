@@ -9,6 +9,9 @@ native SwiftUI menu bar control plane and bundles the matching Rust runtime at
 `Contents/Resources/bin/holon`.
 The DMG is a universal (x86_64 + arm64) artifact, so one download supports
 Apple Silicon and Intel Macs.
+The DMG volume opens with `Holon.app` beside an `/Applications` symlink and a
+baked-in Finder layout, so installing is the usual drag-to-Applications step;
+`scripts/create-macos-dmg.sh` builds and verifies that layout.
 
 Local packaging:
 
