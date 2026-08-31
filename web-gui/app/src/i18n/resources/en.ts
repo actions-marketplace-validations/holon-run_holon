@@ -651,6 +651,8 @@ const en = {
     contextPanel: "Context side panel",
     showOverview: "Show agent overview",
     closePanel: "Close side panel",
+    expandPanel: "Expand side panel",
+    restorePanel: "Restore side panel",
     manageSkills: "Manage agent skills",
     workItemDetail: "Work item detail",
     taskDetail: "Task detail",
@@ -1013,7 +1015,7 @@ const en = {
     title: "Developer diagnostics",
     enabled: "Developer diagnostics enabled",
     disabled: "Developer diagnostics disabled",
-    description: "Show Debug and Timeline Events for agents and collect bounded runtime traces in this browser.",
+    description: "Show the agent Debug, Timeline Events, and Trace controls, and collect bounded runtime traces in this browser.",
     enable: "Enable developer diagnostics in this browser",
   },
 
