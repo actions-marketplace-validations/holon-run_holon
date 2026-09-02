@@ -1062,6 +1062,7 @@ pub(crate) fn scheduler_diagnostic_event(
 pub(crate) fn scheduler_invariant_diagnostic_event(
     agent_id: &str,
     code: &str,
+    boundary: &'static str,
     work_item_id: Option<String>,
     message_id: Option<String>,
     evidence: Vec<String>,
@@ -1072,7 +1073,7 @@ pub(crate) fn scheduler_invariant_diagnostic_event(
             agent_id: agent_id.to_string(),
             decision: "InvariantViolation".into(),
             reason: code.to_string(),
-            boundary: Some("bootstrap_recovery".into()),
+            boundary: Some(boundary.into()),
             scenario_class: None,
             work_item_id,
             message_id,
@@ -1276,7 +1277,9 @@ pub(crate) fn canonical_activation_candidate(
     }
 
     if message.kind == MessageKind::OperatorPrompt {
-        if trusted_explicit_operator_binding(message) {
+        let operator_ingress =
+            trusted_operator_prompt(message) || authenticated_operator_ingress(message);
+        if operator_ingress && message.work_item_id.is_some() {
             let work_item_id = message
                 .work_item_id
                 .clone()
@@ -1285,9 +1288,7 @@ pub(crate) fn canonical_activation_candidate(
                 CanonicalActivationCandidate::ExplicitlyBoundOperatorInput { work_item_id },
             ));
         }
-        if message.authority_class == AuthorityClass::OperatorInstruction
-            && matches!(message.origin, MessageOrigin::Operator { .. })
-        {
+        if operator_ingress {
             return Ok(Some(CanonicalActivationCandidate::ExactWaitResume {
                 expected_work_item_id: None,
                 correlated_wait: None,
@@ -1325,6 +1326,11 @@ pub(crate) fn canonical_activation_candidate(
     }
 
     Ok(None)
+}
+
+fn trusted_operator_prompt(message: &MessageEnvelope) -> bool {
+    message.authority_class == AuthorityClass::OperatorInstruction
+        && matches!(message.origin, MessageOrigin::Operator { .. })
 }
 
 pub(crate) fn runtime_owned_internal_followup(message: &MessageEnvelope) -> bool {
@@ -1561,12 +1567,10 @@ fn resolved_task_wait_is_current(
     )
 }
 
-fn trusted_explicit_operator_binding(message: &MessageEnvelope) -> bool {
+pub(crate) fn authenticated_operator_ingress(message: &MessageEnvelope) -> bool {
     message
         .message_seq
         .is_some_and(|message_seq| message_seq > 0)
-        && message.work_item_id.is_some()
-        && message.authority_class == AuthorityClass::OperatorInstruction
         && matches!(message.origin, MessageOrigin::Operator { .. })
         && matches!(
             (message.delivery_surface, message.admission_context),
