@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     fs,
-    io::{IsTerminal, Write},
+    io::{IsTerminal, Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
@@ -30,7 +30,11 @@ use holon::{
     },
     fd_limit::{apply_nofile_limit_policy, DEFAULT_NOFILE_TARGET},
     host::RuntimeHost,
-    http::{self, AppState, ControlRequest, CreateCommandTaskRequest},
+    http::{
+        self, AppState, CompleteWorkItemRequest, ControlRequest, CreateCommandTaskRequest,
+        CreateWorkItemRequest, PickWorkItemRequest, TaskInputRequest, TaskStopRequest,
+        UpdateWorkItemRequest,
+    },
     memory::{rebuild_memory_index, request_memory_index_rebuild},
     model_discovery::{discovery_cache_path, refresh_provider_models},
     onboarding::{
@@ -48,8 +52,9 @@ use holon::{
     storage::AppStorage,
     tui::run_tui,
     types::{
-        AgentDeletionPhase, AgentDeletionStatus, AgentRegistryStatus, AuditEvent, AuthorityClass,
-        ControlAction, TimerStatus,
+        AgentDeletionPhase, AgentDeletionStatus, AgentInvocationContext, AgentRegistryStatus,
+        AuditEvent, AuthorityClass, ControlAction, TimerStatus, TodoItem, WorkItemPlanStatus,
+        HOLON_CALLER_AUTHORITY_CLASS_ENV,
     },
 };
 use tokio::net::TcpListener;
@@ -188,6 +193,16 @@ async fn run_runtime_command(command: Commands) -> Result<()> {
         AppConfig::load()?
     };
     match command {
+        Commands::Context => {
+            let context = AgentInvocationContext::from_env().map_err(|error| anyhow!(error))?;
+            print_json(&serde_json::json!({
+                "mode": if context.is_some() { "agent" } else { "operator" },
+                "context": context,
+                "declaration_based": true,
+                "authenticated": false,
+            }))
+        }
+        Commands::Commands => print_json(&serde_json::to_value(holon::cli::collect_snapshot())?),
         Commands::Serve { options } => serve(config, options).await,
         Commands::Daemon { command } => handle_daemon_command(config, command).await,
         Commands::Prompt { text, agent } => {
@@ -281,13 +296,17 @@ async fn run_runtime_command(command: Commands) -> Result<()> {
 fn runtime_command_uses_config_inspection(command: &Commands) -> bool {
     matches!(
         command,
-        Commands::Events {
-            command: EventsCommands::Tail { offline: true, .. }
-        } | Commands::Debug {
-            command: DebugCommands::SchedulerRecovery { .. }
-                | DebugCommands::SchedulerRecoveryFixture { .. }
-                | DebugCommands::SchedulerRestartFixture { .. }
-        } | Commands::ModelsDev { .. }
+        Commands::Context
+            | Commands::Commands
+            | Commands::Events {
+                command: EventsCommands::Tail { offline: true, .. }
+            }
+            | Commands::Debug {
+                command: DebugCommands::SchedulerRecovery { .. }
+                    | DebugCommands::SchedulerRecoveryFixture { .. }
+                    | DebugCommands::SchedulerRestartFixture { .. }
+            }
+            | Commands::ModelsDev { .. }
     )
 }
 
@@ -1125,6 +1144,30 @@ mod tests {
     }
 
     #[test]
+    fn agent_cli_context_without_inherited_authority_rejects_operator_fallback() {
+        let error = authority_class_for_cli_context(Some(AgentInvocationContext {
+            caller_agent_id: "agent-a".into(),
+            source_task_id: None,
+            source_turn_id: None,
+            source_work_item_id: None,
+            source_activation_id: None,
+            inherited_authority_class: None,
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains(HOLON_CALLER_AUTHORITY_CLASS_ENV));
+        assert!(error.to_string().contains("operator authority"));
+    }
+
+    #[test]
+    fn context_free_cli_uses_operator_authority() {
+        assert_eq!(
+            authority_class_for_cli_context(None).unwrap(),
+            AuthorityClass::OperatorInstruction
+        );
+    }
+
+    #[test]
     fn tailnet_host_is_client_visible_not_listen_socket() {
         let mut config = test_config();
         let advertise = apply_serve_options(
@@ -1423,6 +1466,17 @@ mod tests {
 
     #[test]
     fn task_lifecycle_commands_parse_with_agent_options() {
+        let cli = Cli::parse_from(["holon", "task", "list", "--limit", "12"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Task {
+                command: TaskCommands::List {
+                    limit: 12,
+                    agent: None
+                }
+            }
+        ));
+
         let cli = Cli::parse_from(["holon", "task", "status", "task-1", "--agent", "runner"]);
         let Commands::Task {
             command: TaskCommands::Status { task_id, agent },
@@ -1529,6 +1583,28 @@ mod tests {
         };
         assert_eq!(work_item_id, "work_123");
         assert_eq!(agent, None);
+
+        assert!(Cli::try_parse_from(["holon", "work-item", "complete", "work_123"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "holon",
+            "work-item",
+            "complete",
+            "work_123",
+            "--report",
+            "completed"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "holon",
+            "work-item",
+            "complete",
+            "work_123",
+            "--report",
+            "completed",
+            "--report-file",
+            "-"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -1740,6 +1816,8 @@ mod tests {
     #[test]
     fn hidden_offline_scheduler_commands_skip_runtime_model_resolution() {
         for args in [
+            vec!["holon", "context"],
+            vec!["holon", "commands"],
             vec!["holon", "events", "tail", "--agent", "runner", "--offline"],
             vec!["holon", "debug", "scheduler-recovery"],
             vec![
@@ -3977,6 +4055,12 @@ async fn handle_workspace_command(config: &AppConfig, command: WorkspaceCommands
 async fn handle_task_command(config: &AppConfig, command: TaskCommands) -> Result<()> {
     let client = LocalClient::new(config.clone())?;
     match command {
+        TaskCommands::List { limit, agent } => {
+            let agent = cli_target_agent(config, agent)?;
+            print_json(&serde_json::to_value(
+                client.agent_tasks(&agent, limit).await?,
+            )?)
+        }
         TaskCommands::Run {
             summary,
             cmd,
@@ -3988,7 +4072,7 @@ async fn handle_task_command(config: &AppConfig, command: TaskCommands) -> Resul
             max_output_tokens,
             agent,
         } => {
-            let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
+            let agent = cli_target_agent(config, agent)?;
             post_control_json(
                 config,
                 &format!("/control/agents/{agent}/tasks"),
@@ -4002,13 +4086,14 @@ async fn handle_task_command(config: &AppConfig, command: TaskCommands) -> Resul
                     yield_time_ms,
                     max_output_tokens,
                     accepts_input: Some(false),
-                    authority_class: Some(AuthorityClass::OperatorInstruction),
+                    authority_class: Some(cli_authority_class()?),
+                    invocation_context: cli_invocation_context()?,
                 },
             )
             .await
         }
         TaskCommands::Status { task_id, agent } => {
-            let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
+            let agent = cli_target_agent(config, agent)?;
             print_json(&serde_json::to_value(
                 client.task_status(&agent, &task_id).await?,
             )?)
@@ -4019,7 +4104,7 @@ async fn handle_task_command(config: &AppConfig, command: TaskCommands) -> Resul
             timeout_ms,
             agent,
         } => {
-            let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
+            let agent = cli_target_agent(config, agent)?;
             print_json(&serde_json::to_value(
                 client
                     .task_output(&agent, &task_id, block, timeout_ms)
@@ -4031,16 +4116,29 @@ async fn handle_task_command(config: &AppConfig, command: TaskCommands) -> Resul
             text,
             agent,
         } => {
-            let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
-            print_json(&serde_json::to_value(
-                client.task_input(&agent, &task_id, text).await?,
-            )?)
+            let agent = cli_target_agent(config, agent)?;
+            post_control_json(
+                config,
+                &format!("/control/agents/{agent}/tasks/{task_id}/input"),
+                &TaskInputRequest {
+                    text,
+                    authority_class: Some(cli_authority_class()?),
+                    invocation_context: cli_invocation_context()?,
+                },
+            )
+            .await
         }
         TaskCommands::Stop { task_id, agent } => {
-            let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
-            print_json(&serde_json::to_value(
-                client.task_stop(&agent, &task_id).await?,
-            )?)
+            let agent = cli_target_agent(config, agent)?;
+            post_control_json(
+                config,
+                &format!("/control/agents/{agent}/tasks/{task_id}/stop"),
+                &TaskStopRequest {
+                    authority_class: Some(cli_authority_class()?),
+                    invocation_context: cli_invocation_context()?,
+                },
+            )
+            .await
         }
     }
 }
@@ -4075,7 +4173,7 @@ async fn handle_work_item_command(config: &AppConfig, command: WorkItemCommands)
     let client = LocalClient::new(config.clone())?;
     match command {
         WorkItemCommands::List { limit, agent } => {
-            let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
+            let agent = cli_target_agent(config, agent)?;
             print_json(&serde_json::to_value(
                 client.agent_work_items(&agent, limit).await?,
             )?)
@@ -4084,12 +4182,160 @@ async fn handle_work_item_command(config: &AppConfig, command: WorkItemCommands)
             work_item_id,
             agent,
         } => {
-            let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
+            let agent = cli_target_agent(config, agent)?;
             print_json(&serde_json::to_value(
                 client.work_item(&agent, &work_item_id).await?,
             )?)
         }
+        WorkItemCommands::Create { objective, agent } => {
+            let agent = cli_target_agent(config, agent)?;
+            post_control_json(
+                config,
+                &format!("/control/agents/{agent}/work-items"),
+                &CreateWorkItemRequest {
+                    objective,
+                    authority_class: Some(cli_authority_class()?),
+                    invocation_context: cli_invocation_context()?,
+                },
+            )
+            .await
+        }
+        WorkItemCommands::Pick {
+            work_item_id,
+            reason,
+            clear_blocker,
+            agent,
+        } => {
+            let agent = cli_target_agent(config, agent)?;
+            post_control_json(
+                config,
+                &format!("/control/agents/{agent}/work-items/{work_item_id}/pick"),
+                &PickWorkItemRequest {
+                    reason,
+                    clear_blocker,
+                    authority_class: Some(cli_authority_class()?),
+                    invocation_context: cli_invocation_context()?,
+                },
+            )
+            .await
+        }
+        WorkItemCommands::Update {
+            work_item_id,
+            objective,
+            plan_status,
+            todo_json,
+            blocked_by_json,
+            recheck_after,
+            agent,
+        } => {
+            let agent = cli_target_agent(config, agent)?;
+            let plan_status = plan_status
+                .map(|value| parse_work_item_plan_status(&value))
+                .transpose()?;
+            let todo_list = todo_json
+                .map(|value| serde_json::from_str::<Vec<TodoItem>>(&value))
+                .transpose()
+                .context("--todo-json must contain a JSON array of todo items")?;
+            let blocked_by = blocked_by_json
+                .map(|value| serde_json::from_str::<serde_json::Value>(&value))
+                .transpose()
+                .context("--blocked-by-json must contain valid JSON")?;
+            post_control_json(
+                config,
+                &format!("/control/agents/{agent}/work-items/{work_item_id}"),
+                &UpdateWorkItemRequest {
+                    objective,
+                    plan_status,
+                    todo_list,
+                    blocked_by,
+                    recheck_after,
+                    authority_class: Some(cli_authority_class()?),
+                    invocation_context: cli_invocation_context()?,
+                },
+            )
+            .await
+        }
+        WorkItemCommands::Complete {
+            work_item_id,
+            report,
+            report_file,
+            agent,
+        } => {
+            let agent = cli_target_agent(config, agent)?;
+            let report_text = read_report_input(report, report_file)?;
+            post_control_json(
+                config,
+                &format!("/control/agents/{agent}/work-items/{work_item_id}/complete"),
+                &CompleteWorkItemRequest {
+                    report_text,
+                    authority_class: Some(cli_authority_class()?),
+                    invocation_context: cli_invocation_context()?,
+                },
+            )
+            .await
+        }
     }
+}
+
+fn cli_target_agent(config: &AppConfig, explicit: Option<String>) -> Result<String> {
+    let context = cli_invocation_context()?;
+    if let Some(agent) = explicit {
+        return Ok(agent);
+    }
+    Ok(context
+        .map(|context| context.caller_agent_id)
+        .unwrap_or_else(|| config.default_agent_id.clone()))
+}
+
+fn cli_invocation_context() -> Result<Option<AgentInvocationContext>> {
+    AgentInvocationContext::from_env().map_err(|error| anyhow!(error))
+}
+
+fn cli_authority_class() -> Result<AuthorityClass> {
+    authority_class_for_cli_context(cli_invocation_context()?)
+}
+
+fn authority_class_for_cli_context(
+    context: Option<AgentInvocationContext>,
+) -> Result<AuthorityClass> {
+    match context {
+        Some(context) => context.inherited_authority_class.ok_or_else(|| {
+            anyhow!(
+                "agent invocation context is missing {HOLON_CALLER_AUTHORITY_CLASS_ENV}; \
+                 refusing to fall back to operator authority"
+            )
+        }),
+        None => Ok(AuthorityClass::OperatorInstruction),
+    }
+}
+
+fn parse_work_item_plan_status(value: &str) -> Result<WorkItemPlanStatus> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "draft" => Ok(WorkItemPlanStatus::Draft),
+        "ready" => Ok(WorkItemPlanStatus::Ready),
+        "needs_input" | "needs-input" => Ok(WorkItemPlanStatus::NeedsInput),
+        _ => Err(anyhow!(
+            "invalid --plan-status {value:?}; expected draft, ready, or needs_input"
+        )),
+    }
+}
+
+fn read_report_input(report: Option<String>, report_file: Option<PathBuf>) -> Result<String> {
+    if let Some(report) = report {
+        return Ok(report);
+    }
+    let Some(path) = report_file else {
+        return Err(anyhow!(
+            "one of --report or --report-file <path|-> is required"
+        ));
+    };
+    if path == Path::new("-") {
+        let mut report = String::new();
+        std::io::stdin().read_to_string(&mut report)?;
+        return Ok(report);
+    }
+    fs::read_to_string(&path)
+        .with_context(|| format!("failed to read completion report {}", path.display()))
 }
 
 async fn handle_agent_command(config: &AppConfig, command: Option<AgentCommands>) -> Result<()> {
