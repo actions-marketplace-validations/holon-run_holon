@@ -116,7 +116,6 @@ jobs:
               - 'Cargo.lock'
               - 'build.rs'
               - 'src/**'
-              - 'web-gui/**'
 
   macos-app:
     name: Build macOS menu app
