@@ -17,12 +17,14 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     context::{
-        build_context_with_default_external_ingress, reproject_recent_turns, BuiltContext,
-        ContextConfig, ContextPlanEvidence, RecentTurnsReprojection,
+        build_context_with_default_external_ingress, reproject_recent_turns,
+        reproject_work_item_scoped, BuiltContext, ContextConfig, ContextPlanEvidence,
+        RecentTurnsReprojection,
     },
     projection_eval::{
-        manifest_from_effective_prompt, ProjectionBindingSummary, ProjectionEvidenceIndex,
-        ProjectionManifest, ProjectionOwner,
+        compare_prompt_history_selectors, manifest_from_effective_prompt,
+        manifest_from_effective_prompt_with_selector, HistorySelector, ProjectionBindingSummary,
+        ProjectionEvidenceIndex, ProjectionManifest, ProjectionOwner, ProjectionScorecard,
     },
     storage::AppStorage,
     system::{execution_policy_summary_lines, ExecutionSnapshot},
@@ -96,6 +98,71 @@ pub struct EffectivePrompt {
 impl EffectivePrompt {
     pub fn projection_manifest(&self) -> ProjectionManifest {
         manifest_from_effective_prompt(self)
+    }
+
+    /// Build a request-scoped manifest for selector comparison. This does not
+    /// alter the prompt, runtime state, scheduler, or provider request.
+    pub fn projection_manifest_for_selector(
+        &self,
+        selector: HistorySelector,
+    ) -> ProjectionManifest {
+        manifest_from_effective_prompt_with_selector(self, selector)
+    }
+
+    pub fn compare_history_selectors(&self) -> serde_json::Result<ProjectionScorecard> {
+        compare_prompt_history_selectors(self)
+    }
+
+    pub(crate) fn reproject_for_history_selector(
+        &self,
+        storage: &AppStorage,
+        budget: usize,
+        available_tools: &[ToolSpec],
+        selector: HistorySelector,
+    ) -> Option<Self> {
+        let reprojection = self.recent_turns_reprojection.as_ref()?;
+        let replacement = match selector {
+            HistorySelector::RecentTurns => reproject_recent_turns(storage, reprojection, budget),
+            HistorySelector::WorkItemScoped => {
+                reproject_work_item_scoped(storage, reprojection, budget)
+            }
+        };
+        // An unavailable scoped projection must fall back at the request
+        // boundary; it must never become an empty history section.
+        let replacement = replacement?;
+        let replacement_for_evidence = replacement.clone();
+        let mut context_sections = self
+            .context_sections
+            .iter()
+            .filter(|section| section.name != "recent_turns")
+            .cloned()
+            .collect::<Vec<_>>();
+        let insertion_index = self
+            .context_sections
+            .iter()
+            .position(|section| section.name == "recent_turns")
+            .unwrap_or(context_sections.len())
+            .min(context_sections.len());
+        context_sections.insert(insertion_index, replacement);
+        let rendered_context_attachment = render_sections(&context_sections);
+        if rendered_context_attachment == self.rendered_context_attachment {
+            return None;
+        }
+        let context_fingerprint = reprojected_context_fingerprint(
+            &self.cache_identity,
+            &self.execution,
+            &self.system_sections,
+            &context_sections,
+            available_tools,
+        );
+        let mut prompt = self.clone();
+        prompt.context_sections = context_sections;
+        prompt.rendered_context_attachment = rendered_context_attachment;
+        prompt.cache_identity.context_fingerprint = context_fingerprint;
+        prompt
+            .context_plan_evidence
+            .record_reprojection("recent_turns", Some(&replacement_for_evidence));
+        Some(prompt)
     }
 
     pub(crate) fn recent_turns_initial_budget(&self) -> Option<usize> {
@@ -1133,7 +1200,10 @@ mod tests {
         MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {

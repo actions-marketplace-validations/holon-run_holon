@@ -142,6 +142,35 @@ pub(crate) fn reproject_recent_turns(
     .map(|content| turn_section("recent_turns", content))
 }
 
+pub(crate) fn reproject_work_item_scoped(
+    storage: &AppStorage,
+    reprojection: &RecentTurnsReprojection,
+    budget: usize,
+) -> Option<PromptSection> {
+    let work_item_id = reprojection.current_work_item.as_ref()?.id.as_str();
+    let turn_records = reprojection
+        .turn_records
+        .iter()
+        .filter(|record| record.effective_owner().work_item_id() == Some(work_item_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if turn_records.is_empty() {
+        return None;
+    }
+    render_turn_records_with_budget(
+        storage,
+        &turn_records,
+        &reprojection.messages,
+        &reprojection.briefs,
+        &reprojection.tools,
+        &reprojection.transcript,
+        &reprojection.current_message,
+        reprojection.current_work_item.as_ref(),
+        budget,
+    )
+    .map(|content| turn_section("recent_turns", content))
+}
+
 pub fn build_context(
     storage: &AppStorage,
     agent: &AgentState,
@@ -3391,7 +3420,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             agent_id,
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -3488,6 +3520,7 @@ mod tests {
             MessageKind::OperatorPrompt,
             MessageOrigin::Operator {
                 actor_id: Some("operator:test".into()),
+                actor_display_name: None,
             },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
@@ -3518,6 +3551,7 @@ mod tests {
             MessageKind::OperatorPrompt,
             MessageOrigin::Operator {
                 actor_id: Some("operator:test".into()),
+                actor_display_name: None,
             },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
@@ -3561,6 +3595,7 @@ mod tests {
             MessageKind::OperatorPrompt,
             MessageOrigin::Operator {
                 actor_id: Some("operator:test".into()),
+                actor_display_name: None,
             },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
@@ -3587,6 +3622,7 @@ mod tests {
             MessageKind::OperatorPrompt,
             MessageOrigin::Operator {
                 actor_id: Some("operator:test".into()),
+                actor_display_name: None,
             },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
@@ -3629,7 +3665,10 @@ mod tests {
         let mut cross_turn_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -3718,7 +3757,10 @@ mod tests {
         let mut operator = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -3849,7 +3891,10 @@ mod tests {
         let mut operator = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -3980,6 +4025,7 @@ mod tests {
             kind: MessageKind::OperatorPrompt,
             origin: MessageOrigin::Operator {
                 actor_id: Some("operator:test".into()),
+                actor_display_name: None,
             },
             authority_class: AuthorityClass::OperatorInstruction,
             priority: Priority::Normal,
@@ -3993,6 +4039,7 @@ mod tests {
             MessageKind::OperatorPrompt,
             MessageOrigin::Operator {
                 actor_id: Some("operator:test".into()),
+                actor_display_name: None,
             },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
@@ -4039,6 +4086,7 @@ mod tests {
             MessageKind::OperatorPrompt,
             MessageOrigin::Operator {
                 actor_id: Some("operator:test".into()),
+                actor_display_name: None,
             },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
@@ -4056,6 +4104,7 @@ mod tests {
                     MessageKind::OperatorPrompt,
                     MessageOrigin::Operator {
                         actor_id: Some("operator:test".into()),
+                        actor_display_name: None,
                     },
                     AuthorityClass::OperatorInstruction,
                     Priority::Normal,
@@ -4120,6 +4169,7 @@ mod tests {
             MessageKind::OperatorPrompt,
             MessageOrigin::Operator {
                 actor_id: Some("operator:test".into()),
+                actor_display_name: None,
             },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
@@ -4175,6 +4225,7 @@ mod tests {
             MessageKind::OperatorPrompt,
             MessageOrigin::Operator {
                 actor_id: Some("operator:test".into()),
+                actor_display_name: None,
             },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
@@ -4205,6 +4256,7 @@ mod tests {
             MessageKind::OperatorPrompt,
             MessageOrigin::Operator {
                 actor_id: Some("operator:test".into()),
+                actor_display_name: None,
             },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
@@ -4249,7 +4301,10 @@ mod tests {
         let mut message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -4299,7 +4354,10 @@ mod tests {
         let mut message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -4359,7 +4417,10 @@ mod tests {
             let msg = MessageEnvelope::new(
                 "default",
                 MessageKind::OperatorPrompt,
-                MessageOrigin::Operator { actor_id: None },
+                MessageOrigin::Operator {
+                    actor_id: None,
+                    actor_display_name: None,
+                },
                 AuthorityClass::OperatorInstruction,
                 Priority::Normal,
                 MessageBody::Text {
@@ -4384,7 +4445,10 @@ mod tests {
             let msg = MessageEnvelope::new(
                 "default",
                 MessageKind::OperatorPrompt,
-                MessageOrigin::Operator { actor_id: None },
+                MessageOrigin::Operator {
+                    actor_id: None,
+                    actor_display_name: None,
+                },
                 AuthorityClass::OperatorInstruction,
                 Priority::Normal,
                 MessageBody::Text {
@@ -4414,7 +4478,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -4455,7 +4522,10 @@ mod tests {
         let new_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -4506,7 +4576,10 @@ mod tests {
         let mut prior_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -4557,7 +4630,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -4628,7 +4704,10 @@ mod tests {
             .append_message(&MessageEnvelope::new(
                 "default",
                 MessageKind::OperatorPrompt,
-                MessageOrigin::Operator { actor_id: None },
+                MessageOrigin::Operator {
+                    actor_id: None,
+                    actor_display_name: None,
+                },
                 AuthorityClass::OperatorInstruction,
                 Priority::Normal,
                 MessageBody::Text {
@@ -4669,7 +4748,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -4836,7 +4918,10 @@ mod tests {
         let older_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -4873,7 +4958,10 @@ mod tests {
         let newer_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -4910,7 +4998,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -5036,7 +5127,10 @@ mod tests {
         let mut prior_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -5074,7 +5168,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -5130,7 +5227,10 @@ mod tests {
         let mut prior_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -5162,7 +5262,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -5203,7 +5306,10 @@ mod tests {
         let mut message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -5272,7 +5378,10 @@ mod tests {
             let mut message = MessageEnvelope::new(
                 "default",
                 MessageKind::OperatorPrompt,
-                MessageOrigin::Operator { actor_id: None },
+                MessageOrigin::Operator {
+                    actor_id: None,
+                    actor_display_name: None,
+                },
                 AuthorityClass::OperatorInstruction,
                 Priority::Normal,
                 MessageBody::Text {
@@ -5308,7 +5417,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -5343,7 +5455,10 @@ mod tests {
             let message = MessageEnvelope::new(
                 "default",
                 MessageKind::OperatorPrompt,
-                MessageOrigin::Operator { actor_id: None },
+                MessageOrigin::Operator {
+                    actor_id: None,
+                    actor_display_name: None,
+                },
                 AuthorityClass::OperatorInstruction,
                 Priority::Normal,
                 MessageBody::Text {
@@ -5363,7 +5478,10 @@ mod tests {
         let legacy_without_turn = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -5375,7 +5493,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -5427,7 +5548,10 @@ mod tests {
             .append_message(&MessageEnvelope::new(
                 "default",
                 MessageKind::OperatorPrompt,
-                MessageOrigin::Operator { actor_id: None },
+                MessageOrigin::Operator {
+                    actor_id: None,
+                    actor_display_name: None,
+                },
                 AuthorityClass::OperatorInstruction,
                 Priority::Normal,
                 MessageBody::Text {
@@ -5451,7 +5575,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -5506,7 +5633,10 @@ mod tests {
         let mut prior_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -5555,7 +5685,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -5626,7 +5759,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -5687,7 +5823,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -5783,7 +5922,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -5848,7 +5990,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -5905,7 +6050,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -6325,7 +6473,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -6372,7 +6523,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -6541,7 +6695,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -6583,7 +6740,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -6859,7 +7019,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -6938,7 +7101,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -6986,7 +7152,10 @@ mod tests {
         let operator_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -7153,7 +7322,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -7295,7 +7467,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -7363,7 +7538,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -7411,7 +7589,10 @@ mod tests {
         let operator_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -7484,7 +7665,10 @@ mod tests {
         let prior_operator = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -7496,7 +7680,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Interject,
             MessageBody::Text {
@@ -7536,7 +7723,10 @@ mod tests {
         let operator_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -7640,7 +7830,10 @@ mod tests {
         let mut legacy_without_sequence = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -7656,7 +7849,10 @@ mod tests {
         let mut sequenced = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -7733,7 +7929,10 @@ mod tests {
         let operator_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -7822,7 +8021,10 @@ mod tests {
         let operator_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -7932,7 +8134,10 @@ mod tests {
         let mut historical_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -7951,7 +8156,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -8062,7 +8270,10 @@ mod tests {
         let operator_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -8112,6 +8323,7 @@ mod tests {
             MessageKind::OperatorPrompt,
             MessageOrigin::Operator {
                 actor_id: Some("operator:jolestar".into()),
+                actor_display_name: None,
             },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
@@ -8159,7 +8371,10 @@ mod tests {
             let message = MessageEnvelope::new(
                 "default",
                 MessageKind::OperatorPrompt,
-                MessageOrigin::Operator { actor_id: None },
+                MessageOrigin::Operator {
+                    actor_id: None,
+                    actor_display_name: None,
+                },
                 AuthorityClass::OperatorInstruction,
                 Priority::Normal,
                 MessageBody::Text {
@@ -8204,7 +8419,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -8282,7 +8500,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -8388,7 +8609,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -8495,7 +8719,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -8594,7 +8821,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -8645,7 +8875,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -8797,7 +9030,10 @@ mod tests {
         let mut message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -8835,7 +9071,10 @@ mod tests {
         let mut message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -8854,7 +9093,10 @@ mod tests {
         let mut sequenced = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -8870,7 +9112,10 @@ mod tests {
         let mut legacy_without_sequence = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -8987,7 +9232,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -9030,7 +9278,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -9085,7 +9336,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -9140,7 +9394,10 @@ mod tests {
         let current_message = MessageEnvelope::new(
             "default",
             MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
+            MessageOrigin::Operator {
+                actor_id: None,
+                actor_display_name: None,
+            },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
             MessageBody::Text {
@@ -9198,6 +9455,7 @@ mod tests {
             MessageKind::OperatorPrompt,
             MessageOrigin::Operator {
                 actor_id: Some("operator:jolestar".into()),
+                actor_display_name: None,
             },
             AuthorityClass::OperatorInstruction,
             Priority::Normal,
