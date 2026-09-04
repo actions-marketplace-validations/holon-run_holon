@@ -2,15 +2,146 @@
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use std::collections::BTreeSet;
 
+use crate::domain::{
+    execution_protocol::{
+        self, AdmittedFences, ExecutionAttempt, ExecutionAttemptState, ExecutionBinding,
+        ExecutionOrigin, ExecutionPriority, ExecutionProtocolState, ExecutionProvenance,
+        ExecutionSource, ExecutionSourceIdentity, ExecutionTrust, RejoinFence,
+        WorkItemExecutionRecord, WorkItemExecutionState,
+    },
+    scheduler::SchedulerOwner,
+};
 use crate::runtime_db::evidence::content_hash;
-use crate::types::{AgentState, WaitConditionRecord, WorkItemRecord};
+use crate::runtime_db::legacy_scheduler_wire::{
+    ActivationBinding, ActivationCause, ActivationOrigin, ActivationPriority, ActivationTrust,
+    AdmitActivationCommand, WorkDemand,
+};
+use crate::runtime_db::retired_scheduler_cleanup::retired_scheduler_cleanup_inventory;
+use crate::types::{AgentState, MessageEnvelope, TaskRecord, WaitConditionRecord, WorkItemRecord};
 
 pub struct Migration {
     pub version: i64,
     pub(crate) name: &'static str,
     pub(crate) sql: &'static str,
+}
+
+pub(crate) const PUBLISHED_MIGRATION_FLOOR: i64 = 25;
+pub(crate) const RELEASE_BASELINE_TARGET: i64 = 45;
+pub(crate) const RETIRED_SCHEDULER_SCHEMA_PREDECESSOR: i64 = 46;
+const RELEASE_BASELINE_SCHEMA_TARGET: i64 = 42;
+const RELEASE_BASELINE_ID: &str = "v0.30.0-schema-25-to-schema-45";
+
+pub(crate) const RETAINED_SCHEDULER_AUDIT_TABLES: &[&str] = &[
+    "scheduler_activations",
+    "scheduler_activation_settlements",
+    "scheduler_activation_sources",
+    "scheduler_activation_inputs",
+    "scheduler_continuation_admissions",
+    "scheduler_protocol_command_results",
+    "scheduler_protocol_command_conflict_attempts",
+    "scheduler_rollout_command_results",
+];
+
+pub(crate) const RETIRED_SCHEDULER_TABLES: &[&str] = &[
+    "scheduler_scenario_hard_blockers",
+    "scheduler_scenario_authorities",
+    "scheduler_rollout_manifests",
+    "scheduler_rollout_preflights",
+    "scheduler_shadow_comparisons",
+    "scheduler_semantic_shadow_decisions",
+    "scheduler_protocol_config",
+    "scheduler_protocol_migrations",
+    "scheduler_rollout_retirement",
+    "scheduler_yield_continuations",
+    "scheduler_missing_settlements",
+    "scheduler_wait_generations",
+    "scheduler_waits",
+    "scheduler_activation_authorities",
+    "scheduler_agent_dispatch",
+    "scheduler_agent_focus",
+    "scheduler_agent_slots",
+    "scheduler_work_demands",
+];
+
+fn migrate_retired_scheduler_schema(
+    connection: &mut Connection,
+    migration: &Migration,
+) -> Result<()> {
+    let transaction = connection.transaction()?;
+    let inventory = retired_scheduler_cleanup_inventory(&transaction)?;
+    if !inventory.is_fixed_point() {
+        let open_attempts = inventory.open_execution_attempts();
+        let in_flight_work_items = inventory.in_flight_execution_work_items();
+        let dequeued_queue_entries = inventory.dequeued_queue_entries();
+        let affected_agents = inventory.affected_agents().join(",");
+        bail!(
+            "retired scheduler schema migration requires a recovery fixed point: \
+             open_execution_attempts={open_attempts}, \
+             in_flight_execution_work_items={in_flight_work_items}, \
+             dequeued_queue_entries={dequeued_queue_entries}, \
+             affected_agents={affected_agents}; \
+             stop holon, then run `holon debug scheduler-recovery --all-affected` \
+             report/apply/report and retry (v0.31.1 remains the supported rollback binary)"
+        );
+    }
+
+    transaction.execute_batch(
+        r#"
+DROP TRIGGER IF EXISTS trg_scheduler_agent_focus_insert;
+DROP TRIGGER IF EXISTS trg_scheduler_agent_focus_update;
+DROP TRIGGER IF EXISTS trg_scheduler_work_demands_preserve_focus;
+DROP TRIGGER IF EXISTS trg_scheduler_work_demands_preserve_focus_delete;
+
+DROP TABLE IF EXISTS scheduler_scenario_hard_blockers;
+DROP TABLE IF EXISTS scheduler_scenario_authorities;
+DROP TABLE IF EXISTS scheduler_rollout_manifests;
+DROP TABLE IF EXISTS scheduler_rollout_preflights;
+DROP TABLE IF EXISTS scheduler_shadow_comparisons;
+DROP TABLE IF EXISTS scheduler_semantic_shadow_decisions;
+DROP TABLE IF EXISTS scheduler_protocol_config;
+DROP TABLE IF EXISTS scheduler_protocol_migrations;
+DROP TABLE IF EXISTS scheduler_rollout_retirement;
+DROP TABLE IF EXISTS scheduler_yield_continuations;
+DROP TABLE IF EXISTS scheduler_missing_settlements;
+DROP TABLE IF EXISTS scheduler_agent_dispatch;
+DROP TABLE IF EXISTS scheduler_wait_generations;
+DROP TABLE IF EXISTS scheduler_waits;
+DROP TABLE IF EXISTS scheduler_activation_authorities;
+DROP TABLE IF EXISTS scheduler_agent_focus;
+DROP TABLE IF EXISTS scheduler_agent_slots;
+DROP TABLE IF EXISTS scheduler_work_demands;
+"#,
+    )?;
+
+    for table in RETIRED_SCHEDULER_TABLES {
+        if table_exists_internal(&transaction, table)? {
+            bail!("retired scheduler table {table} remains after schema migration");
+        }
+    }
+    for table in RETAINED_SCHEDULER_AUDIT_TABLES {
+        if !table_exists_internal(&transaction, table)? {
+            bail!("retained scheduler audit table {table} is missing after schema migration");
+        }
+    }
+
+    let foreign_key_violation: Option<(String, Option<i64>, String, i64)> = transaction
+        .query_row("PRAGMA foreign_key_check", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .optional()?;
+    if let Some((table, row_id, parent, foreign_key_id)) = foreign_key_violation {
+        bail!(
+            "retired scheduler schema migration introduced a foreign key violation: \
+             table={table}, row_id={row_id:?}, parent={parent}, foreign_key_id={foreign_key_id}"
+        );
+    }
+
+    record_migration(&transaction, migration)?;
+    transaction.commit()?;
+    Ok(())
 }
 
 fn migrate_scheduler_lifecycle_owners(
@@ -615,6 +746,473 @@ fn migrate_work_item_focus(connection: &Connection) -> Result<()> {
         }
     }
     connection.execute("UPDATE work_items SET current_focus = 0", [])?;
+    Ok(())
+}
+
+fn migrate_scheduler_internal_followup_admission(
+    connection: &mut Connection,
+    migration: &Migration,
+) -> Result<()> {
+    connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let result = (|| -> Result<()> {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            r#"
+DROP INDEX IF EXISTS idx_scheduler_activations_ordinary_admission_fence;
+DROP INDEX IF EXISTS idx_scheduler_activations_recovery_admission_fence;
+
+CREATE TABLE scheduler_activation_sources_v42 (
+  agent_id TEXT NOT NULL,
+  activation_id TEXT NOT NULL,
+  source_kind TEXT NOT NULL CHECK (
+    source_kind IN ('task_rejoin', 'operator_input', 'internal_followup')
+  ),
+  source_identity TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (agent_id, activation_id),
+  UNIQUE (agent_id, source_kind, source_identity)
+);
+
+INSERT INTO scheduler_activation_sources_v42
+SELECT * FROM scheduler_activation_sources;
+
+DROP TABLE scheduler_activation_sources;
+ALTER TABLE scheduler_activation_sources_v42
+  RENAME TO scheduler_activation_sources;
+
+CREATE TABLE scheduler_activations_v42 (
+  agent_id TEXT NOT NULL,
+  activation_id TEXT NOT NULL,
+  authority_id TEXT NOT NULL,
+  owner_kind TEXT NOT NULL CHECK (owner_kind IN ('work_item', 'agent_lifecycle')),
+  owner_id TEXT NOT NULL,
+  work_item_id TEXT,
+  admitted_generation INTEGER NOT NULL CHECK (admitted_generation >= 0),
+  admission_kind TEXT NOT NULL CHECK (
+    admission_kind IN (
+      'scheduling', 'wait_resume', 'lifecycle_external_nudge',
+      'internal_followup', 'settlement_recovery'
+    )
+  ),
+  recovery_for_activation_id TEXT,
+  wait_id TEXT,
+  wait_generation INTEGER CHECK (wait_generation IS NULL OR wait_generation >= 0),
+  lifecycle_state TEXT NOT NULL CHECK (
+    lifecycle_state IN (
+      'admitted', 'running', 'settled', 'interrupted',
+      'cancelled', 'settlement_missing'
+    )
+  ),
+  idempotency_key TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (agent_id, activation_id),
+  UNIQUE (agent_id, authority_id),
+  UNIQUE (agent_id, idempotency_key),
+  UNIQUE (agent_id, activation_id, owner_kind, owner_id, admitted_generation),
+  UNIQUE (agent_id, activation_id, work_item_id, admitted_generation),
+  CHECK (
+    (owner_kind = 'work_item' AND work_item_id = owner_id)
+    OR (owner_kind = 'agent_lifecycle' AND work_item_id IS NULL AND owner_id = agent_id)
+  ),
+  CHECK (
+    (admission_kind IN ('scheduling', 'internal_followup')
+      AND recovery_for_activation_id IS NULL
+      AND wait_id IS NULL
+      AND wait_generation IS NULL)
+    OR (admission_kind = 'wait_resume'
+      AND recovery_for_activation_id IS NULL
+      AND wait_id IS NOT NULL
+      AND wait_generation IS NOT NULL)
+    OR (admission_kind = 'lifecycle_external_nudge'
+      AND recovery_for_activation_id IS NULL
+      AND wait_id IS NULL
+      AND wait_generation IS NULL
+      AND owner_kind = 'agent_lifecycle')
+    OR (admission_kind = 'settlement_recovery'
+      AND recovery_for_activation_id IS NOT NULL
+      AND wait_id IS NULL
+      AND wait_generation IS NULL
+      AND owner_kind = 'work_item')
+  )
+);
+
+INSERT INTO scheduler_activations_v42
+SELECT * FROM scheduler_activations;
+
+DROP TABLE scheduler_activations;
+ALTER TABLE scheduler_activations_v42 RENAME TO scheduler_activations;
+
+CREATE INDEX idx_scheduler_activations_state
+  ON scheduler_activations(agent_id, lifecycle_state);
+
+CREATE UNIQUE INDEX idx_scheduler_activations_ordinary_admission_fence
+  ON scheduler_activations(
+    agent_id, owner_kind, owner_id, admitted_generation
+  )
+  WHERE admission_kind IN (
+    'scheduling', 'wait_resume', 'lifecycle_external_nudge', 'internal_followup'
+  );
+
+CREATE UNIQUE INDEX idx_scheduler_activations_recovery_admission_fence
+  ON scheduler_activations(
+    agent_id, owner_kind, owner_id, admitted_generation,
+    recovery_for_activation_id
+  )
+  WHERE admission_kind = 'settlement_recovery';
+"#,
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+            (
+                migration.version,
+                migration.name,
+                Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            ),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })();
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    result
+}
+
+fn migrate_wait_trigger_identity(connection: &mut Connection, migration: &Migration) -> Result<()> {
+    let transaction = connection.transaction()?;
+    apply_wait_trigger_identity_transaction(&transaction, migration)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn apply_wait_trigger_identity_transaction(
+    transaction: &Transaction<'_>,
+    migration: &Migration,
+) -> Result<()> {
+    if table_exists_internal(&transaction, "wait_conditions")? {
+        let columns = transaction
+            .prepare("PRAGMA table_info(wait_conditions)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "trigger_message_id") {
+            transaction
+                .execute_batch("ALTER TABLE wait_conditions ADD COLUMN trigger_message_id TEXT;")?;
+        }
+        if !columns.iter().any(|column| column == "triggered_at") {
+            transaction
+                .execute_batch("ALTER TABLE wait_conditions ADD COLUMN triggered_at TEXT;")?;
+        }
+        transaction.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS wait_conditions_trigger_message
+               ON wait_conditions(agent_id, trigger_message_id)
+               WHERE trigger_message_id IS NOT NULL;",
+        )?;
+    }
+    record_migration(&transaction, migration)?;
+    Ok(())
+}
+
+fn migrate_wait_unresolved_owner_uniqueness(
+    connection: &mut Connection,
+    migration: &Migration,
+) -> Result<()> {
+    let transaction = connection.transaction()?;
+    apply_wait_unresolved_owner_uniqueness_transaction(&transaction, migration)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn apply_wait_unresolved_owner_uniqueness_transaction(
+    transaction: &Transaction<'_>,
+    migration: &Migration,
+) -> Result<()> {
+    if table_exists_internal(&transaction, "wait_conditions")? {
+        converge_unresolved_wait_owners(&transaction)?;
+        transaction.execute_batch(migration.sql)?;
+    }
+    record_migration(&transaction, migration)?;
+    Ok(())
+}
+
+fn migrate_wait_protocol_cutover(connection: &mut Connection, migration: &Migration) -> Result<()> {
+    let transaction = connection.transaction()?;
+    apply_wait_protocol_cutover_transaction(&transaction, migration)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn apply_wait_protocol_cutover_transaction(
+    transaction: &Transaction<'_>,
+    migration: &Migration,
+) -> Result<()> {
+    let has_execution_attempts =
+        table_exists_internal(&transaction, "execution_protocol_attempts")?;
+    if has_execution_attempts {
+        let attempts = transaction
+            .prepare(
+                "SELECT attempt_id, payload_json
+                 FROM execution_protocol_attempts",
+            )?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (attempt_id, payload_json) in attempts {
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&payload_json).with_context(|| {
+                    format!("decoding execution attempt {attempt_id} during cutover")
+                })?;
+            let source_message_id = payload
+                .get("source_message_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let Some(identity) = payload
+                .get_mut("source")
+                .and_then(|source| source.get_mut("identity"))
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                continue;
+            };
+            if identity.get("kind").and_then(serde_json::Value::as_str) != Some("triggered_wait")
+                || identity.contains_key("trigger_message_id")
+            {
+                continue;
+            }
+            let Some(trigger_message_id) = source_message_id else {
+                continue;
+            };
+            identity.insert(
+                "trigger_message_id".into(),
+                serde_json::Value::String(trigger_message_id),
+            );
+            identity.remove("wait_generation");
+            identity.remove("trigger_id");
+            identity.remove("trigger_generation");
+            let normalized_identity = serde_json::Value::Object(identity.clone());
+            transaction.execute(
+                "UPDATE execution_protocol_attempts
+                 SET source_identity_json = ?1,
+                     payload_json = ?2
+                 WHERE attempt_id = ?3",
+                params![
+                    serde_json::to_string(&normalized_identity)?,
+                    serde_json::to_string(&payload)?,
+                    attempt_id,
+                ],
+            )?;
+        }
+    }
+
+    let has_wait_conditions = table_exists_internal(&transaction, "wait_conditions")?;
+    if !has_wait_conditions {
+        record_migration(&transaction, migration)?;
+        return Ok(());
+    }
+    let has_work_items = table_exists_internal(&transaction, "work_items")?;
+    let has_execution_work_items =
+        table_exists_internal(&transaction, "execution_protocol_work_items")?;
+
+    let waits = transaction
+        .prepare(
+            "SELECT payload_json
+             FROM wait_conditions
+             WHERE status IN ('active', 'triggered')
+             ORDER BY created_at ASC, wait_condition_id ASC",
+        )?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let now = Utc::now();
+    for payload_json in waits {
+        let mut wait: WaitConditionRecord = serde_json::from_str(&payload_json)
+            .context("decoding unresolved wait during protocol cutover")?;
+        let original_updated_at = wait.updated_at;
+        wait.status = crate::types::WaitConditionStatus::Cancelled;
+        wait.updated_at = now;
+        wait.resolved_at = None;
+        wait.cancelled_at = Some(now);
+        let mut continuation = wait
+            .continuation
+            .take()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(object) = continuation.as_object_mut() {
+            object.insert(
+                "cancel_reason".into(),
+                serde_json::Value::String("protocol_cutover".into()),
+            );
+        } else {
+            continuation = serde_json::json!({
+                "legacy_continuation": continuation,
+                "cancel_reason": "protocol_cutover",
+            });
+        }
+        wait.continuation = Some(continuation);
+        transaction.execute(
+            "UPDATE wait_conditions
+             SET status = 'cancelled',
+                 updated_at = ?1,
+                 resolved_at = NULL,
+                 cancelled_at = ?1,
+                 continuation_json = ?2,
+                 payload_json = ?3
+             WHERE wait_condition_id = ?4",
+            params![
+                timestamp(now),
+                wait.continuation
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                serde_json::to_string(&wait)?,
+                wait.id,
+            ],
+        )?;
+
+        let Some(work_item_id) = wait.work_item_id.as_deref() else {
+            continue;
+        };
+        if !has_work_items {
+            continue;
+        }
+        let work_item_payload = transaction
+            .query_row(
+                "SELECT payload_json FROM work_items WHERE work_item_id = ?1",
+                [work_item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(work_item_payload) = work_item_payload else {
+            continue;
+        };
+        let mut work_item: WorkItemRecord = serde_json::from_str(&work_item_payload)
+            .with_context(|| format!("decoding WorkItem {work_item_id} during wait cutover"))?;
+        let owns_blocker = wait.source.as_deref() == Some("WaitFor")
+            && work_item.state == crate::domain::work_item::WorkItemState::Open
+            && work_item.blocked_by.as_deref() == Some(wait.waiting_for.as_str())
+            && work_item.updated_at == original_updated_at;
+        if owns_blocker {
+            work_item.revision = work_item
+                .revision
+                .checked_add(1)
+                .context("WorkItem revision overflow during wait cutover")?;
+            work_item.blocked_by = None;
+            work_item.recheck_at = None;
+            work_item.recheck_consumed_at = None;
+            work_item.updated_at = now;
+            transaction.execute(
+                "UPDATE work_items
+                 SET revision = ?1,
+                     updated_at = ?2,
+                     blocked_by = NULL,
+                     recheck_at = NULL,
+                     recheck_consumed_at = NULL,
+                     payload_json = ?3
+                 WHERE work_item_id = ?4",
+                params![
+                    i64::try_from(work_item.revision)
+                        .context("WorkItem revision exceeds SQLite range")?,
+                    timestamp(now),
+                    serde_json::to_string(&work_item)?,
+                    work_item_id,
+                ],
+            )?;
+        }
+    }
+
+    if has_execution_work_items {
+        let waiting = transaction
+            .prepare(
+                "SELECT agent_id, work_item_id, payload_json
+                 FROM execution_protocol_work_items
+                 WHERE lifecycle_state = 'waiting'",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (agent_id, work_item_id, execution_payload) in waiting {
+            let mut execution: WorkItemExecutionRecord = serde_json::from_str(&execution_payload)
+                .with_context(|| {
+                format!("decoding WorkItem execution {work_item_id} during wait cutover")
+            })?;
+            let WorkItemExecutionState::Waiting {
+                generation,
+                wait: reference,
+            } = &execution.state
+            else {
+                continue;
+            };
+            let unresolved = transaction
+                .query_row(
+                    "SELECT 1
+                     FROM wait_conditions
+                     WHERE wait_condition_id = ?1
+                       AND status IN ('active', 'triggered')",
+                    [&reference.wait_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if unresolved {
+                continue;
+            }
+            if has_work_items {
+                if let Some(source_revision) = transaction
+                    .query_row(
+                        "SELECT revision FROM work_items WHERE work_item_id = ?1",
+                        [&work_item_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                {
+                    execution.source_revision = u64::try_from(source_revision)
+                        .context("WorkItem source revision is negative during wait cutover")?
+                        .max(1);
+                }
+            }
+            let generation = generation
+                .checked_add(1)
+                .context("WorkItem scheduling generation overflow during wait cutover")?;
+            execution.state = WorkItemExecutionState::Runnable {
+                generation,
+                recovery_ref: Some("protocol_cutover".into()),
+            };
+            transaction.execute(
+                "UPDATE execution_protocol_work_items
+                 SET source_revision = ?1,
+                     generation = ?2,
+                     lifecycle_state = 'runnable',
+                     payload_json = ?3
+                 WHERE agent_id = ?4 AND work_item_id = ?5",
+                params![
+                    i64::try_from(execution.source_revision)
+                        .context("WorkItem source revision exceeds SQLite range")?,
+                    i64::try_from(execution.generation())
+                        .context("WorkItem generation exceeds SQLite range")?,
+                    serde_json::to_string(&execution)?,
+                    agent_id,
+                    work_item_id,
+                ],
+            )?;
+        }
+    }
+
+    record_migration(&transaction, migration)?;
+    Ok(())
+}
+
+fn record_migration(transaction: &Transaction<'_>, migration: &Migration) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+        (
+            migration.version,
+            migration.name,
+            Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        ),
+    )?;
     Ok(())
 }
 
@@ -2373,6 +2971,293 @@ INSERT OR IGNORE INTO scheduler_rollout_retirement (
 );
 "#,
     },
+    Migration {
+        version: 41,
+        name: "execution_protocol_authority",
+        sql: r#"
+CREATE TABLE IF NOT EXISTS execution_protocol_partitions (
+  agent_id TEXT PRIMARY KEY,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS execution_protocol_work_items (
+  agent_id TEXT NOT NULL,
+  work_item_id TEXT NOT NULL,
+  source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+  generation INTEGER NOT NULL CHECK (generation >= 0),
+  lifecycle_state TEXT NOT NULL CHECK (
+    lifecycle_state IN (
+      'runnable', 'in_flight', 'waiting', 'paused', 'needs_repair', 'terminal'
+    )
+  ),
+  payload_json TEXT NOT NULL,
+  PRIMARY KEY (agent_id, work_item_id)
+);
+
+CREATE TABLE IF NOT EXISTS execution_protocol_attempts (
+  agent_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  lifecycle_state TEXT NOT NULL CHECK (
+    lifecycle_state IN ('open', 'settled', 'interrupted', 'protocol_violation')
+  ),
+  source_identity_json TEXT NOT NULL,
+  source_generation INTEGER NOT NULL CHECK (source_generation > 0),
+  recovery_of_attempt_id TEXT,
+  terminal_outcome_id TEXT,
+  payload_json TEXT NOT NULL,
+  PRIMARY KEY (agent_id, attempt_id),
+  UNIQUE (agent_id, terminal_outcome_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS execution_protocol_one_open_attempt
+  ON execution_protocol_attempts(agent_id)
+  WHERE lifecycle_state = 'open';
+
+CREATE TABLE IF NOT EXISTS execution_protocol_outcomes (
+  agent_id TEXT NOT NULL,
+  outcome_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  PRIMARY KEY (agent_id, outcome_id),
+  UNIQUE (agent_id, attempt_id),
+  FOREIGN KEY (agent_id, attempt_id)
+    REFERENCES execution_protocol_attempts(agent_id, attempt_id)
+);
+
+CREATE TABLE IF NOT EXISTS execution_protocol_command_results (
+  agent_id TEXT NOT NULL,
+  command_kind TEXT NOT NULL,
+  command_identity TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  references_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (agent_id, command_kind, command_identity)
+);
+"#,
+    },
+    Migration {
+        version: 42,
+        name: "scheduler_internal_followup_admission",
+        sql: "",
+    },
+    Migration {
+        version: 43,
+        name: "wait_trigger_identity",
+        sql: r#"
+ALTER TABLE wait_conditions ADD COLUMN trigger_message_id TEXT;
+ALTER TABLE wait_conditions ADD COLUMN triggered_at TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS wait_conditions_trigger_message
+  ON wait_conditions(agent_id, trigger_message_id)
+  WHERE trigger_message_id IS NOT NULL;
+"#,
+    },
+    Migration {
+        version: 44,
+        name: "wait_unresolved_owner_uniqueness",
+        sql: r#"
+CREATE UNIQUE INDEX IF NOT EXISTS wait_conditions_unresolved_agent_owner
+  ON wait_conditions(agent_id)
+  WHERE work_item_id IS NULL AND status IN ('active', 'triggered');
+
+CREATE UNIQUE INDEX IF NOT EXISTS wait_conditions_unresolved_work_item_owner
+  ON wait_conditions(agent_id, work_item_id)
+  WHERE work_item_id IS NOT NULL AND status IN ('active', 'triggered');
+"#,
+    },
+    Migration {
+        version: 45,
+        name: "wait_protocol_cutover",
+        sql: "",
+    },
+    Migration {
+        version: 46,
+        name: "queue_head_no_progress",
+        sql: r#"
+CREATE TABLE IF NOT EXISTS queue_head_no_progress (
+  message_id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  attempts INTEGER NOT NULL CHECK (attempts > 0),
+  max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+  status TEXT NOT NULL CHECK (status IN ('bounded_defer', 'quarantined')),
+  first_reason TEXT NOT NULL,
+  last_reason TEXT NOT NULL,
+  first_deferred_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_queue_head_no_progress_agent_status
+  ON queue_head_no_progress(agent_id, status, updated_at);
+"#,
+    },
+    Migration {
+        version: 47,
+        name: "drop_retired_scheduler_schema",
+        sql: "",
+    },
+    Migration {
+        version: 48,
+        name: "observer_sync_identity_foundations",
+        sql: r#"
+CREATE TABLE IF NOT EXISTS agent_identity_reservations (
+  agent_id TEXT PRIMARY KEY,
+  reservation_state TEXT NOT NULL CHECK (reservation_state IN ('active', 'retired')),
+  reserved_at TEXT NOT NULL,
+  retired_at TEXT,
+  source TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS observer_sync_capability_verifications (
+  capability TEXT PRIMARY KEY,
+  verified INTEGER NOT NULL,
+  verified_at TEXT NOT NULL,
+  detail TEXT NOT NULL
+);
+"#,
+    },
+    Migration {
+        version: 49,
+        name: "brief_created_event_linkage",
+        // The `briefs` column and index live in
+        // `ensure_brief_created_event_linkage_schema` so name-accepted
+        // upgrade paths without historical evidence tables still apply.
+        sql: r#"
+CREATE TABLE IF NOT EXISTS brief_created_linkage_uncertain (
+  evidence_id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  candidate_count INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  discovered_at TEXT NOT NULL
+);
+"#,
+    },
+    Migration {
+        version: 50,
+        name: "observer_sync_event_verification_proof",
+        // Columns and triggers live in
+        // `ensure_observer_sync_event_verification_proof_schema` so
+        // name-accepted and downgrade/re-upgrade paths remain idempotent.
+        sql: "",
+    },
+    Migration {
+        version: 51,
+        name: "audit_event_retention_watermarks",
+        sql: r#"
+CREATE TABLE IF NOT EXISTS audit_event_retention_watermarks (
+  scope_key TEXT PRIMARY KEY,
+  oldest_retained_seq INTEGER NOT NULL CHECK (oldest_retained_seq > 0)
+);
+"#,
+    },
+    Migration {
+        version: 52,
+        name: "turn_owner_identity",
+        // Columns and index live in `ensure_turn_owner_identity_schema` so
+        // baseline and downgrade/re-upgrade paths remain idempotent.
+        sql: "",
+    },
+    Migration {
+        version: 53,
+        name: "authentication_foundations",
+        sql: r#"
+CREATE TABLE IF NOT EXISTS auth_users (
+  user_id TEXT PRIMARY KEY,
+  issuer TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  display_name TEXT,
+  email TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  disabled_at TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_issuer_subject
+  ON auth_users (issuer, subject);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+  session_digest TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES auth_users(user_id),
+  auth_method TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user
+  ON auth_sessions (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry
+  ON auth_sessions (expires_at);
+
+CREATE TABLE IF NOT EXISTS auth_bootstrap_credentials (
+  credential_digest TEXT PRIMARY KEY,
+  user_id TEXT REFERENCES auth_users(user_id),
+  scope TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT,
+  revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_bootstrap_expiry
+  ON auth_bootstrap_credentials (expires_at);
+
+CREATE TABLE IF NOT EXISTS auth_login_transactions (
+  transaction_digest TEXT PRIMARY KEY,
+  state_digest TEXT NOT NULL UNIQUE,
+  nonce_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_login_expiry
+  ON auth_login_transactions (expires_at);
+"#,
+    },
+    Migration {
+        version: 54,
+        name: "authentication_login_verifier",
+        // The column helper is idempotent for downgrade/re-upgrade paths that
+        // retain additive authentication schema while losing its migration
+        // record.
+        sql: "",
+    },
+    Migration {
+        version: 55,
+        name: "authentication_unlimited_sessions",
+        sql: r#"
+ALTER TABLE auth_sessions RENAME TO auth_sessions_previous;
+
+CREATE TABLE auth_sessions (
+  session_digest TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES auth_users(user_id),
+  auth_method TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT,
+  last_seen_at TEXT NOT NULL,
+  revoked_at TEXT
+);
+
+INSERT INTO auth_sessions (
+  session_digest, user_id, auth_method, created_at, expires_at,
+  last_seen_at, revoked_at
+)
+SELECT
+  session_digest, user_id, auth_method, created_at, expires_at,
+  last_seen_at, revoked_at
+FROM auth_sessions_previous;
+
+DROP TABLE auth_sessions_previous;
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user
+  ON auth_sessions (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry
+  ON auth_sessions (expires_at);
+"#,
+    },
 ];
 
 pub(crate) fn ensure_migration_table(connection: &Connection) -> Result<()> {
@@ -2383,9 +3268,181 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   name TEXT NOT NULL,
   applied_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS schema_migration_baselines (
+  baseline_id TEXT PRIMARY KEY,
+  source_version INTEGER NOT NULL,
+  target_version INTEGER NOT NULL,
+  covered_versions_json TEXT NOT NULL,
+  schema_fingerprint TEXT NOT NULL,
+  applied_at TEXT NOT NULL
+);
 "#,
     )?;
     Ok(())
+}
+
+pub(crate) fn apply_release_baseline(connection: &mut Connection) -> Result<()> {
+    let current_version = current_schema_version(connection)?;
+    if current_version != PUBLISHED_MIGRATION_FLOOR {
+        bail!(
+            "release baseline {} requires schema version {}, found {}",
+            RELEASE_BASELINE_ID,
+            PUBLISHED_MIGRATION_FLOOR,
+            current_version
+        );
+    }
+
+    let final_schema = release_baseline_final_schema()?;
+    let transaction = connection.transaction()?;
+    for migration in MIGRATIONS.iter().filter(|migration| {
+        migration.version > PUBLISHED_MIGRATION_FLOOR && migration.version <= 30
+    }) {
+        apply_migration_transaction(&transaction, migration)?;
+    }
+    for sql in final_schema {
+        transaction.execute_batch(&sql)?;
+    }
+    ensure_execution_protocol_authority_columns(&transaction)?;
+    transaction.execute_batch(
+        r#"
+INSERT INTO scheduler_protocol_config (
+  config_id, protocol_mode, config_revision, latest_preflight_revision, updated_at
+) VALUES (1, 'authoritative', 1, 0, CURRENT_TIMESTAMP);
+
+INSERT INTO scheduler_rollout_retirement (
+  retirement_id, retired_schema_revision, reason, retired_at
+) VALUES (
+  1, 40,
+  'production scheduler authority no longer reads rollout metadata',
+  CURRENT_TIMESTAMP
+);
+"#,
+    )?;
+    let wait_trigger_identity = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 43)
+        .context("missing wait trigger identity migration")?;
+    apply_wait_trigger_identity_transaction(&transaction, wait_trigger_identity)?;
+    backfill_wait_condition_payload_columns(&transaction)?;
+    backfill_work_item_recheck_columns(&transaction)?;
+    let wait_owner_uniqueness = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 44)
+        .context("missing wait owner uniqueness migration")?;
+    apply_wait_unresolved_owner_uniqueness_transaction(&transaction, wait_owner_uniqueness)?;
+    let wait_protocol_cutover = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 45)
+        .context("missing wait protocol cutover migration")?;
+    apply_wait_protocol_cutover_transaction(&transaction, wait_protocol_cutover)?;
+
+    let applied_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    for migration in MIGRATIONS.iter().filter(|migration| {
+        migration.version > 30 && migration.version <= RELEASE_BASELINE_SCHEMA_TARGET
+    }) {
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (?1, ?2, ?3)",
+            (migration.version, migration.name, &applied_at),
+        )?;
+    }
+    let fingerprint = schema_fingerprint(&transaction)?;
+    let covered_versions =
+        (PUBLISHED_MIGRATION_FLOOR + 1..=RELEASE_BASELINE_TARGET).collect::<Vec<_>>();
+    transaction.execute(
+        "INSERT INTO schema_migration_baselines (
+           baseline_id, source_version, target_version, covered_versions_json,
+           schema_fingerprint, applied_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        (
+            RELEASE_BASELINE_ID,
+            PUBLISHED_MIGRATION_FLOOR,
+            RELEASE_BASELINE_TARGET,
+            serde_json::to_string(&covered_versions)?,
+            fingerprint,
+            applied_at,
+        ),
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn release_baseline_final_schema() -> Result<Vec<String>> {
+    let mut scratch = Connection::open_in_memory()?;
+    ensure_migration_table(&scratch)?;
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= 30)
+    {
+        apply_migration(&mut scratch, migration)?;
+    }
+    let before = schema_object_keys(&scratch)?;
+    for migration in MIGRATIONS.iter().filter(|migration| {
+        migration.version > 30 && migration.version <= RELEASE_BASELINE_SCHEMA_TARGET
+    }) {
+        apply_migration(&mut scratch, migration)?;
+    }
+
+    let mut statement = scratch.prepare(
+        "SELECT type, name, sql
+         FROM sqlite_master
+         WHERE sql IS NOT NULL
+           AND name NOT LIKE 'sqlite_%'
+         ORDER BY
+           CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 WHEN 'trigger' THEN 2 ELSE 3 END,
+           name",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(object_type, name, sql)| {
+            (!before.contains(&(object_type, name))).then_some(sql)
+        })
+        .collect())
+}
+
+fn schema_object_keys(connection: &Connection) -> Result<BTreeSet<(String, String)>> {
+    let mut statement = connection.prepare(
+        "SELECT type, name
+         FROM sqlite_master
+         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'",
+    )?;
+    let keys = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(keys)
+}
+
+pub(crate) fn schema_fingerprint(connection: &Connection) -> Result<String> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, sql
+         FROM sqlite_master
+         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+         ORDER BY type, name",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(format!(
+                "{}\n{}\n{}",
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(content_hash(&rows.join("\n")))
 }
 
 pub(crate) fn apply_migration(connection: &mut Connection, migration: &Migration) -> Result<()> {
@@ -2410,24 +3467,69 @@ pub(crate) fn apply_migration(connection: &mut Connection, migration: &Migration
     if migration.name == "scheduler_lifecycle_owners" {
         return migrate_scheduler_lifecycle_owners(connection, migration);
     }
+    if migration.name == "scheduler_internal_followup_admission" {
+        return migrate_scheduler_internal_followup_admission(connection, migration);
+    }
+    if migration.name == "wait_trigger_identity" {
+        return migrate_wait_trigger_identity(connection, migration);
+    }
+    if migration.name == "wait_unresolved_owner_uniqueness" {
+        return migrate_wait_unresolved_owner_uniqueness(connection, migration);
+    }
+    if migration.name == "wait_protocol_cutover" {
+        return migrate_wait_protocol_cutover(connection, migration);
+    }
+    if migration.name == "drop_retired_scheduler_schema" {
+        return migrate_retired_scheduler_schema(connection, migration);
+    }
 
     let transaction = connection.transaction()?;
+    apply_migration_transaction(&transaction, migration)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn apply_migration_transaction(transaction: &Transaction<'_>, migration: &Migration) -> Result<()> {
     if migration.name == "strict_runtime_sequences" {
-        repair_runtime_sequence_duplicates(&transaction)?;
+        repair_runtime_sequence_duplicates(transaction)?;
     }
     if migration.name == "canonical_work_item_focus" {
-        preflight_work_item_focus(&transaction)?;
-        migrate_work_item_focus(&transaction)?;
+        preflight_work_item_focus(transaction)?;
+        migrate_work_item_focus(transaction)?;
+    }
+    if migration.name == "execution_protocol_authority" {
+        ensure_execution_protocol_authority_columns(transaction)?;
+    }
+    if migration.name == "brief_created_event_linkage" {
+        ensure_brief_created_event_linkage_schema(transaction)?;
+    }
+    if migration.name == "observer_sync_event_verification_proof" {
+        ensure_observer_sync_event_verification_proof_schema(transaction)?;
+    }
+    if migration.name == "turn_owner_identity" {
+        ensure_turn_owner_identity_schema(transaction)?;
+    }
+    if migration.name == "authentication_login_verifier" {
+        ensure_authentication_login_verifier_schema(transaction)?;
     }
     transaction.execute_batch(migration.sql)?;
+    if migration.name == "execution_protocol_authority" {
+        backfill_execution_protocol_authority(transaction)?;
+    }
     if migration.name == "drop_work_item_readiness" {
-        drop_work_item_readiness(&transaction)?;
+        drop_work_item_readiness(transaction)?;
     }
     if migration.name == "strict_runtime_sequences" {
-        migrate_runtime_sequences(&transaction)?;
+        migrate_runtime_sequences(transaction)?;
     }
     if migration.name == "runtime_retention_created_at_indexes" {
-        migrate_runtime_retention_created_at_indexes(&transaction)?;
+        migrate_runtime_retention_created_at_indexes(transaction)?;
+    }
+    if migration.name == "observer_sync_identity_foundations" {
+        backfill_observer_sync_identity_foundations(transaction)?;
+    }
+    if migration.name == "brief_created_event_linkage" {
+        backfill_brief_created_event_linkage(transaction)?;
     }
     transaction.execute(
         "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
@@ -2437,8 +3539,1031 @@ pub(crate) fn apply_migration(connection: &mut Connection, migration: &Migration
             Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         ),
     )?;
-    transaction.commit()?;
     Ok(())
+}
+
+/// Backfills the durable Agent identity reservation registry and seeds the
+/// observer-sync capability verification table.
+///
+/// The registry (`agent_identities`) is authoritative for current
+/// availability: an Active row keeps the id reserved and available, any other
+/// status is a tombstone. Historical sources (`agent_states`, deletion jobs,
+/// audit scopes, the legacy `agents` table) only add reservations the
+/// registry lacks, always as retired tombstones, so a historical id can never
+/// be silently reused after migration.
+///
+/// Reservations are deliberately not epoch-scoped: the existing deletion
+/// contract already promises ids stay reserved forever, so an epoch rotation
+/// never releases them.
+fn table_exists_tx(transaction: &Transaction<'_>, table: &str) -> Result<bool> {
+    let count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |row| row.get(0),
+    )?;
+    Ok(count == 1)
+}
+
+/// Adds the immutable `created_event_seq` linkage column and its uniqueness
+/// index. Name-accepted upgrade paths can reach this migration without the
+/// historical evidence tables, so the column work is gated on `briefs`
+/// existing and is idempotent under downgrade/re-upgrade cycles that keep
+/// the column while losing the migration record.
+fn ensure_brief_created_event_linkage_schema(transaction: &Transaction<'_>) -> Result<()> {
+    if !table_exists_tx(transaction, "briefs")? {
+        return Ok(());
+    }
+    let columns = transaction
+        .prepare("PRAGMA table_info(briefs)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "created_event_seq") {
+        transaction.execute_batch("ALTER TABLE briefs ADD COLUMN created_event_seq INTEGER;")?;
+    }
+    transaction.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS briefs_agent_created_event_seq
+           ON briefs(agent_id, created_event_seq)
+           WHERE created_event_seq IS NOT NULL;",
+    )?;
+    Ok(())
+}
+
+fn ensure_turn_owner_identity_schema(transaction: &Transaction<'_>) -> Result<()> {
+    if !table_exists_tx(transaction, "turn_records")? {
+        return Ok(());
+    }
+    let columns = transaction
+        .prepare("PRAGMA table_info(turn_records)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (column, definition) in [
+        ("owner_kind", "owner_kind TEXT"),
+        ("owner_id", "owner_id TEXT"),
+    ] {
+        if !columns.iter().any(|existing| existing == column) {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE turn_records ADD COLUMN {definition};"
+            ))?;
+        }
+    }
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_turn_records_owner
+           ON turn_records(agent_id, owner_kind, owner_id, turn_index, created_at);",
+    )?;
+    Ok(())
+}
+
+fn ensure_authentication_login_verifier_schema(transaction: &Transaction<'_>) -> Result<()> {
+    if !table_exists_tx(transaction, "auth_login_transactions")? {
+        return Ok(());
+    }
+    let columns = transaction
+        .prepare("PRAGMA table_info(auth_login_transactions)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "code_verifier") {
+        transaction.execute_batch(
+            "ALTER TABLE auth_login_transactions
+             ADD COLUMN code_verifier TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    Ok(())
+}
+
+/// Adds the event-verification proof columns and mutation triggers. Test and
+/// recovery paths can deliberately remove migration records without reverting
+/// additive schema, while released-name compatibility paths may omit the
+/// historical tables entirely, so every object is discovered before use.
+fn ensure_observer_sync_event_verification_proof_schema(
+    transaction: &Transaction<'_>,
+) -> Result<()> {
+    if !table_exists_tx(transaction, "observer_sync_capability_verifications")? {
+        return Ok(());
+    }
+    let columns = transaction
+        .prepare("PRAGMA table_info(observer_sync_capability_verifications)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (column, definition) in [
+        (
+            "verification_version",
+            "verification_version INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("event_log_epoch", "event_log_epoch TEXT"),
+        (
+            "event_generation",
+            "event_generation INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "verified_event_generation",
+            // -1 means no inventory proof covers the current mutation generation.
+            "verified_event_generation INTEGER NOT NULL DEFAULT -1",
+        ),
+    ] {
+        if !columns.iter().any(|existing| existing == column) {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE observer_sync_capability_verifications ADD COLUMN {definition};"
+            ))?;
+        }
+    }
+    transaction.execute_batch(
+        r#"
+INSERT OR IGNORE INTO observer_sync_capability_verifications (
+  capability, verified, verified_at, detail
+) VALUES (
+  'event_projection_effect_complete',
+  0,
+  strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+  '{"stage":"verification-proof-migration"}'
+);
+"#,
+    )?;
+    if table_exists_tx(transaction, "audit_events")? {
+        transaction.execute_batch(
+            r#"
+CREATE TRIGGER IF NOT EXISTS audit_events_projection_verification_insert
+AFTER INSERT ON audit_events
+BEGIN
+  UPDATE observer_sync_capability_verifications
+  SET event_generation = event_generation + 1
+  WHERE capability = 'event_projection_effect_complete';
+END;
+
+CREATE TRIGGER IF NOT EXISTS audit_events_projection_verification_update
+AFTER UPDATE OF kind, data_json ON audit_events
+BEGIN
+  UPDATE observer_sync_capability_verifications
+  SET event_generation = event_generation + 1
+  WHERE capability = 'event_projection_effect_complete';
+END;
+"#,
+        )?;
+    }
+    Ok(())
+}
+
+/// Backfills the immutable `created_event_seq` linkage from historical
+/// `brief_created` audit events. A Brief with exactly one candidate event
+/// carrying a sequence is linked; zero candidates, multiple candidates, or a
+/// candidate without a sequence keep `NULL` linkage and are recorded in
+/// `brief_created_linkage_uncertain`, so ambiguous history stays visibly
+/// absent instead of silently linked. Brief content and timestamps are
+/// never rewritten: only the additive linkage field changes.
+fn backfill_brief_created_event_linkage(transaction: &Transaction<'_>) -> Result<()> {
+    // Without the historical evidence tables there is nothing to link and no
+    // way to classify candidates, so ambiguous-history bookkeeping stays
+    // empty instead of misreporting every Brief as uncertain.
+    if !table_exists_tx(transaction, "briefs")? || !table_exists_tx(transaction, "audit_events")? {
+        return Ok(());
+    }
+    tracing::info!("materializing brief_created candidates for linkage backfill");
+    transaction.execute_batch(
+        "DROP TABLE IF EXISTS temp._brief_created_candidate_agg;
+         DROP TABLE IF EXISTS temp._brief_created_candidates;
+         CREATE TEMP TABLE _brief_created_candidates AS
+         SELECT audit_event_id,
+                event_seq,
+                agent_id AS agent_id_col,
+                COALESCE(json_extract(data_json, '$.data.agent_id'), '') AS agent_id_json,
+                COALESCE(json_extract(data_json, '$.data.brief_id'), '') AS brief_id
+         FROM audit_events
+         WHERE kind = 'brief_created';
+         CREATE INDEX _idx_brief_created_candidates_lookup
+           ON _brief_created_candidates(brief_id, agent_id_col, agent_id_json);
+         CREATE TEMP TABLE _brief_created_candidate_agg AS
+         SELECT briefs.evidence_id,
+                briefs.agent_id,
+                briefs.payload_json,
+                COUNT(candidates.audit_event_id) AS candidate_count,
+                CASE WHEN COUNT(candidates.audit_event_id) = 1
+                     THEN MIN(candidates.event_seq)
+                     ELSE NULL
+                END AS single_event_seq
+         FROM briefs
+         LEFT JOIN _brief_created_candidates AS candidates
+           ON candidates.brief_id = briefs.evidence_id
+          AND (candidates.agent_id_col = briefs.agent_id
+               OR candidates.agent_id_json = briefs.agent_id)
+         WHERE briefs.created_event_seq IS NULL
+         GROUP BY briefs.evidence_id, briefs.agent_id, briefs.payload_json;",
+    )?;
+    let rows: Vec<(String, String, String, i64, Option<i64>)> = {
+        let mut statement = transaction.prepare(
+            "SELECT evidence_id, agent_id, payload_json, candidate_count, single_event_seq
+             FROM _brief_created_candidate_agg",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut linked = 0usize;
+    let mut uncertain = 0usize;
+    for (evidence_id, agent_id, payload_json, candidate_count, single_event_seq) in rows {
+        let reason = if candidate_count == 1 {
+            match single_event_seq {
+                Some(event_seq) => {
+                    let mut brief: crate::types::BriefRecord = serde_json::from_str(&payload_json)
+                        .context("decoding brief payload for created_event_seq backfill")?;
+                    // Schema 49's new column is authoritative: when it is NULL, replace any
+                    // payload-only value with the uniquely matched audit event sequence.
+                    brief.created_event_seq =
+                        Some(u64::try_from(event_seq).with_context(|| {
+                            format!("brief_created event_seq {event_seq} must be non-negative")
+                        })?);
+                    transaction.execute(
+                        "UPDATE briefs SET created_event_seq = ?1, payload_json = ?2
+                         WHERE evidence_id = ?3 AND created_event_seq IS NULL",
+                        params![event_seq, serde_json::to_string(&brief)?, evidence_id],
+                    )?;
+                    linked += 1;
+                    continue;
+                }
+                None => "candidate_event_missing_seq",
+            }
+        } else if candidate_count == 0 {
+            "no_candidate_event"
+        } else {
+            "ambiguous_candidate_events"
+        };
+        transaction.execute(
+            "INSERT INTO brief_created_linkage_uncertain
+               (evidence_id, agent_id, candidate_count, reason, discovered_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(evidence_id) DO UPDATE SET
+               candidate_count = excluded.candidate_count,
+               reason = excluded.reason,
+               discovered_at = excluded.discovered_at",
+            params![evidence_id, agent_id, candidate_count, reason, now],
+        )?;
+        uncertain += 1;
+    }
+    transaction.execute_batch(
+        "DROP TABLE temp._brief_created_candidate_agg;
+         DROP TABLE temp._brief_created_candidates;",
+    )?;
+    if linked > 0 || uncertain > 0 {
+        tracing::info!(
+            linked,
+            uncertain,
+            "backfilled brief created_event_seq linkage"
+        );
+    }
+    Ok(())
+}
+
+fn backfill_observer_sync_identity_foundations(transaction: &Transaction<'_>) -> Result<()> {
+    // Name-accepted upgrade paths can reach this migration without every
+    // historical source table present; each source is gated so backfill
+    // never fails an otherwise acceptable database.
+    if table_exists_tx(transaction, "agent_identities")? {
+        // The registry mapping must stay idempotent under downgrade and
+        // re-upgrade cycles, so re-runs only add missing rows and converge
+        // tombstones instead of rewriting reservation history.
+        transaction.execute(
+            r#"
+INSERT OR IGNORE INTO agent_identity_reservations (agent_id, reservation_state, reserved_at, retired_at, source)
+SELECT agent_id,
+       CASE WHEN status = 'deleted' THEN 'retired' ELSE 'active' END,
+       created_at,
+       CASE WHEN status = 'deleted' THEN COALESCE(archived_at, updated_at) ELSE NULL END,
+       'agent_registry'
+FROM agent_identities
+"#,
+            [],
+        )?;
+        transaction.execute(
+            r#"
+UPDATE agent_identity_reservations
+SET reservation_state = 'retired',
+    retired_at = COALESCE(
+        retired_at,
+        (SELECT COALESCE(i.archived_at, i.updated_at)
+         FROM agent_identities i
+         WHERE i.agent_id = agent_identity_reservations.agent_id)
+    )
+WHERE reservation_state != 'retired'
+  AND agent_id IN (SELECT agent_id FROM agent_identities WHERE status = 'deleted')
+"#,
+            [],
+        )?;
+    }
+    if table_exists_tx(transaction, "agent_states")? {
+        transaction.execute(
+            r#"
+INSERT OR IGNORE INTO agent_identity_reservations (agent_id, reservation_state, reserved_at, retired_at, source)
+SELECT agent_id, 'retired', updated_at, NULL, 'backfill:agent-state'
+FROM agent_states
+"#,
+            [],
+        )?;
+    }
+    if table_exists_tx(transaction, "agent_deletion_jobs")? {
+        transaction.execute(
+            r#"
+INSERT OR IGNORE INTO agent_identity_reservations (agent_id, reservation_state, reserved_at, retired_at, source)
+SELECT agent_id, 'retired', created_at, completed_at, 'backfill:deletion-evidence'
+FROM agent_deletion_jobs
+"#,
+            [],
+        )?;
+    }
+    if table_exists_tx(transaction, "audit_events")? {
+        transaction.execute(
+            r#"
+INSERT OR IGNORE INTO agent_identity_reservations (agent_id, reservation_state, reserved_at, retired_at, source)
+SELECT agent_id, 'retired', MIN(created_at), NULL, 'backfill:audit'
+FROM audit_events
+WHERE agent_id IS NOT NULL
+GROUP BY agent_id
+"#,
+            [],
+        )?;
+    }
+    if table_exists_tx(transaction, "agents")? {
+        transaction.execute(
+            r#"
+INSERT OR IGNORE INTO agent_identity_reservations (agent_id, reservation_state, reserved_at, retired_at, source)
+SELECT agent_id, 'retired', created_at, NULL, 'backfill:legacy-agents'
+FROM agents
+"#,
+            [],
+        )?;
+    }
+
+    let mut anomalies = serde_json::Map::new();
+
+    // An agent_states payload that names a different agent than its row key
+    // means the historical identity of at least one of the two rows is
+    // untrustworthy.
+    let mut identity_mismatches = Vec::new();
+    if table_exists_tx(transaction, "agent_states")? {
+        let mut statement = transaction
+            .prepare("SELECT agent_id, payload_json FROM agent_states ORDER BY agent_id ASC")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (row_agent_id, payload_json) = row?;
+            let payload_agent_id = serde_json::from_str::<serde_json::Value>(&payload_json)
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("agent_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                });
+            if payload_agent_id.as_deref() != Some(row_agent_id.as_str())
+                && identity_mismatches.len() < 20
+            {
+                identity_mismatches.push(row_agent_id);
+            }
+        }
+    }
+    if !identity_mismatches.is_empty() {
+        anomalies.insert(
+            "agent_state_identity_mismatch".to_string(),
+            serde_json::json!(identity_mismatches),
+        );
+    }
+
+    // A completed deletion job whose registry row is still available means
+    // the id was reused after retirement before this invariant existed.
+    let completed_deletions_with_available_registry: Vec<String> =
+        if table_exists_tx(transaction, "agent_deletion_jobs")?
+            && table_exists_tx(transaction, "agent_identities")?
+        {
+            let mut statement = transaction.prepare(
+                r#"
+SELECT d.agent_id
+FROM agent_deletion_jobs d
+JOIN agent_identities i ON i.agent_id = d.agent_id
+WHERE d.status = 'completed' AND i.status != 'deleted'
+ORDER BY d.agent_id ASC
+LIMIT 20
+"#,
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        } else {
+            Vec::new()
+        };
+    if !completed_deletions_with_available_registry.is_empty() {
+        anomalies.insert(
+            "completed_deletion_with_available_registry".to_string(),
+            serde_json::json!(completed_deletions_with_available_registry),
+        );
+    }
+
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let detail = serde_json::json!({
+        "stage": "migration-backfill",
+        "anomalies": anomalies,
+    })
+    .to_string();
+    for capability in ["runtime_identity_stable", "agent_identity_reserved"] {
+        transaction.execute(
+            "INSERT OR REPLACE INTO observer_sync_capability_verifications (capability, verified, verified_at, detail)
+             VALUES (?1, 0, ?2, ?3)",
+            params![capability, now, detail],
+        )?;
+    }
+    Ok(())
+}
+
+fn converge_unresolved_wait_owners(transaction: &Transaction<'_>) -> Result<()> {
+    let rows = transaction
+        .prepare(
+            "SELECT wait_condition_id, agent_id, work_item_id, payload_json
+             FROM wait_conditions
+             WHERE status IN ('active', 'triggered')
+             ORDER BY agent_id ASC,
+                      work_item_id IS NOT NULL ASC,
+                      work_item_id ASC,
+                      updated_at DESC,
+                      created_at DESC,
+                      wait_condition_id DESC",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let now = Utc::now();
+    let mut owners = std::collections::BTreeSet::new();
+    for (wait_id, agent_id, work_item_id, payload_json) in rows {
+        if owners.insert((agent_id, work_item_id)) {
+            continue;
+        }
+        let mut record: WaitConditionRecord = serde_json::from_str(&payload_json)
+            .with_context(|| format!("decoding duplicate unresolved wait {wait_id}"))?;
+        record.status = crate::types::WaitConditionStatus::Cancelled;
+        record.updated_at = now;
+        record.cancelled_at = Some(now);
+        record.resolved_at = None;
+        transaction.execute(
+            "UPDATE wait_conditions
+             SET status = 'cancelled',
+                 updated_at = ?1,
+                 resolved_at = NULL,
+                 cancelled_at = ?1,
+                 payload_json = ?2
+             WHERE wait_condition_id = ?3",
+            params![timestamp(now), serde_json::to_string(&record)?, wait_id,],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_execution_protocol_authority_columns(connection: &Connection) -> Result<()> {
+    if !table_exists_internal(connection, "agent_states")? {
+        return Ok(());
+    }
+    let columns = connection
+        .prepare("PRAGMA table_info(agent_states)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "control_revision") {
+        connection.execute_batch(
+            "ALTER TABLE agent_states
+               ADD COLUMN control_revision INTEGER NOT NULL DEFAULT 1
+               CHECK (control_revision > 0);",
+        )?;
+    }
+    Ok(())
+}
+
+fn backfill_execution_protocol_authority(transaction: &Transaction<'_>) -> Result<()> {
+    if !table_exists_internal(transaction, "queue_entries")? {
+        return Ok(());
+    }
+    let claims = {
+        let mut statement = transaction.prepare(
+            "SELECT agent_id, message_id
+             FROM queue_entries
+             WHERE status = 'dequeued'
+             ORDER BY agent_id, message_id",
+        )?;
+        let agents = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        agents
+    };
+    let mut imported_agents = std::collections::BTreeSet::new();
+
+    for (agent_id, message_id) in claims {
+        let active_admissions = {
+            let mut statement = transaction.prepare(
+                "SELECT activation_id, owner_kind, owner_id, work_item_id,
+                        admitted_generation, payload_json, created_at
+                 FROM scheduler_activations
+                 WHERE agent_id = ?1
+                   AND lifecycle_state IN ('admitted', 'running')
+                 ORDER BY activation_id",
+            )?;
+            let activations = statement
+                .query_map([&agent_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            activations
+        };
+        let mut matching = active_admissions
+            .into_iter()
+            .map(
+                |(
+                    activation_id,
+                    owner_kind,
+                    owner_id,
+                    work_item_id,
+                    admitted_generation,
+                    payload,
+                    created_at,
+                )| {
+                    let admission = serde_json::from_str::<AdmitActivationCommand>(&payload)?;
+                    Ok::<_, serde_json::Error>(
+                        (admission.activation.provenance.source_id == message_id).then_some((
+                            activation_id,
+                            owner_kind,
+                            owner_id,
+                            work_item_id,
+                            admitted_generation,
+                            admission,
+                            created_at,
+                        )),
+                    )
+                },
+            )
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("decoding active canonical activation admission")?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            continue;
+        }
+        if matching.len() != 1 {
+            bail!(
+                "execution protocol migration found multiple active canonical activations for \
+                 dequeued message {agent_id}:{message_id}"
+            );
+        }
+        if !imported_agents.insert(agent_id.clone()) {
+            bail!(
+                "execution protocol migration found multiple active dequeued claims for agent \
+                 {agent_id}"
+            );
+        }
+        let (
+            activation_id,
+            owner_kind,
+            owner_id,
+            work_item_id,
+            admitted_generation,
+            admission,
+            admitted_at,
+        ) = matching.pop().expect("one matching admission");
+        let message = load_migration_message(transaction, &agent_id, &message_id)?;
+        let state = execution_protocol_state_from_canonical_claim(
+            transaction,
+            &agent_id,
+            &activation_id,
+            &owner_kind,
+            &owner_id,
+            work_item_id.as_deref(),
+            admitted_generation,
+            &admission,
+            &message,
+            admitted_at,
+        )?;
+        execution_protocol::assert_invariants(&state).map_err(|error| {
+            anyhow::anyhow!("invalid migrated execution protocol state: {error}")
+        })?;
+        crate::runtime_db::transitions::persist_state_tx(transaction, &state)?;
+    }
+    Ok(())
+}
+
+fn load_migration_message(
+    transaction: &Transaction<'_>,
+    agent_id: &str,
+    message_id: &str,
+) -> Result<MessageEnvelope> {
+    let rows = {
+        let mut statement = transaction.prepare(
+            "SELECT message_seq, payload_json
+             FROM messages
+             WHERE agent_id = ?1 AND message_id = ?2
+             ORDER BY evidence_id",
+        )?;
+        let rows = statement
+            .query_map(params![agent_id, message_id], |row| {
+                Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    if rows.len() != 1 {
+        bail!(
+            "execution protocol migration requires exactly one message evidence row for \
+             {agent_id}:{message_id}, found {}",
+            rows.len()
+        );
+    }
+    let (stored_sequence, payload) = rows.into_iter().next().expect("one message row");
+    let stored_sequence = stored_sequence
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "execution protocol migration requires a positive message sequence for \
+                 {agent_id}:{message_id}"
+            )
+        })?;
+    let message: MessageEnvelope =
+        serde_json::from_str(&payload).context("decoding migration message evidence")?;
+    if message.id != message_id
+        || message.agent_id != agent_id
+        || message.message_seq != Some(stored_sequence)
+    {
+        bail!(
+            "execution protocol migration message evidence identity or sequence mismatch for \
+             {agent_id}:{message_id}"
+        );
+    }
+    Ok(message)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execution_protocol_state_from_canonical_claim(
+    transaction: &Transaction<'_>,
+    agent_id: &str,
+    activation_id: &str,
+    owner_kind: &str,
+    owner_id: &str,
+    work_item_id: Option<&str>,
+    admitted_generation: i64,
+    admission: &AdmitActivationCommand,
+    message: &MessageEnvelope,
+    admitted_at: String,
+) -> Result<ExecutionProtocolState> {
+    if admission.activation.id != activation_id
+        || admission.activation.agent_id != agent_id
+        || admission.activation.provenance.source_id != message.id
+    {
+        bail!("execution protocol migration canonical activation identity mismatch");
+    }
+    let admitted_generation = u64::try_from(admitted_generation)
+        .context("execution protocol migration admitted generation is negative")?;
+    if admitted_generation == 0 || admission.expected_scheduling_generation != admitted_generation {
+        bail!("execution protocol migration canonical admitted generation is invalid");
+    }
+    let authority_fences =
+        crate::runtime_db::transitions::authority_fences_tx(transaction, agent_id)?;
+    let source_revision = message
+        .message_seq
+        .filter(|revision| *revision > 0)
+        .ok_or_else(|| anyhow::anyhow!("execution protocol migration requires message sequence"))?;
+    let (source_identity, rejoin, recovery_of_attempt_id) =
+        migration_execution_source(transaction, admission, message)?;
+    let mut state = ExecutionProtocolState::empty(agent_id);
+    let (binding, work_item_source_revision, work_item_generation) = match owner_kind {
+        "work_item" if work_item_id == Some(owner_id) => {
+            let work_item_id = work_item_id.expect("validated WorkItem owner");
+            validate_migration_work_item_binding(admission, work_item_id)?;
+            let demand_payload = transaction
+                .query_row(
+                    "SELECT payload_json
+                     FROM scheduler_work_demands
+                     WHERE agent_id = ?1 AND work_item_id = ?2",
+                    params![agent_id, work_item_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "execution protocol migration WorkItem demand is missing for \
+                         {agent_id}:{work_item_id}"
+                    )
+                })?;
+            let demand: WorkDemand = serde_json::from_str(&demand_payload)
+                .context("decoding migration WorkItem demand")?;
+            if demand.metadata_revision == 0 || demand.scheduling_generation != admitted_generation
+            {
+                bail!(
+                    "execution protocol migration WorkItem demand fence mismatch for \
+                     {agent_id}:{work_item_id}"
+                );
+            }
+            state.work_items.insert(
+                work_item_id.to_string(),
+                WorkItemExecutionRecord {
+                    source_revision: demand.metadata_revision,
+                    state: WorkItemExecutionState::InFlight {
+                        generation: admitted_generation,
+                        attempt_id: activation_id.to_string(),
+                    },
+                },
+            );
+            (
+                ExecutionBinding::WorkItem {
+                    work_item_id: work_item_id.to_string(),
+                },
+                Some(demand.metadata_revision),
+                Some(admitted_generation),
+            )
+        }
+        "agent_lifecycle" if owner_id == agent_id && work_item_id.is_none() => {
+            validate_migration_lifecycle_binding(admission, agent_id)?;
+            (
+                ExecutionBinding::AgentLifecycle {
+                    agent_id: agent_id.to_string(),
+                },
+                None,
+                None,
+            )
+        }
+        _ => bail!(
+            "execution protocol migration invalid canonical owner \
+             {owner_kind}:{owner_id} for agent {agent_id}"
+        ),
+    };
+    let attempt = ExecutionAttempt {
+        attempt_id: activation_id.to_string(),
+        agent_id: agent_id.to_string(),
+        source_message_id: Some(message.id.clone()),
+        source: ExecutionSource {
+            identity: source_identity,
+            generation: source_revision,
+        },
+        binding,
+        provenance: ExecutionProvenance {
+            origin: migration_execution_origin(admission.activation.provenance.origin),
+            trust: migration_execution_trust(admission.activation.provenance.trust),
+            priority: migration_execution_priority(admission.activation.priority),
+            correlation_id: message.correlation_id.clone(),
+            causation_id: message.causation_id.clone(),
+        },
+        admitted_fences: AdmittedFences {
+            source_revision,
+            work_item_source_revision,
+            work_item_generation,
+            rejoin,
+            agent_control_revision: authority_fences.agent_control_revision,
+            host_registry_revision: authority_fences.host_registry_revision,
+        },
+        state: ExecutionAttemptState::Open,
+        run_id: None,
+        turn_id: message.turn_id.clone(),
+        recovery_of_attempt_id,
+        terminal_outcome_id: None,
+        admitted_at,
+        terminal_at: None,
+    };
+    state.attempts.insert(activation_id.to_string(), attempt);
+    Ok(state)
+}
+
+fn migration_execution_source(
+    transaction: &Transaction<'_>,
+    admission: &AdmitActivationCommand,
+    message: &MessageEnvelope,
+) -> Result<(ExecutionSourceIdentity, Option<RejoinFence>, Option<String>)> {
+    let result = match &admission.activation.cause {
+        ActivationCause::OperatorInput { message_id, .. }
+        | ActivationCause::OperatorInterjection { message_id }
+        | ActivationCause::MessageIngress { message_id }
+        | ActivationCause::LifecycleExternalNudge { message_id }
+            if message_id == &message.id =>
+        {
+            (
+                ExecutionSourceIdentity::QueueMessage {
+                    message_id: message.id.clone(),
+                },
+                None,
+                None,
+            )
+        }
+        ActivationCause::InternalFollowup { message_id } if message_id == &message.id => (
+            ExecutionSourceIdentity::InternalFollowup {
+                message_id: message.id.clone(),
+            },
+            None,
+            None,
+        ),
+        ActivationCause::TaskRejoin {
+            task_id,
+            message_id,
+            ..
+        } if message_id == &message.id => {
+            let payload = transaction
+                .query_row(
+                    "SELECT payload_json FROM tasks WHERE task_id = ?1 AND owner_agent_id = ?2",
+                    params![task_id, message.agent_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "execution protocol migration task rejoin source is missing: {task_id}"
+                    )
+                })?;
+            let task: TaskRecord =
+                serde_json::from_str(&payload).context("decoding migration task rejoin source")?;
+            let fence = migration_task_rejoin_fence(&task)?;
+            (
+                ExecutionSourceIdentity::TaskResult {
+                    task_id: task_id.clone(),
+                    result_message_id: message.id.clone(),
+                },
+                Some(fence),
+                None,
+            )
+        }
+        ActivationCause::WaitResume {
+            wait_id,
+            wait_generation: _,
+            trigger_id,
+            trigger_generation: _,
+        } => (
+            ExecutionSourceIdentity::TriggeredWait {
+                wait_id: wait_id.clone(),
+                trigger_message_id: trigger_id.clone(),
+            },
+            None,
+            None,
+        ),
+        ActivationCause::WorkItemRunnable { work_item_id, .. }
+        | ActivationCause::WorkItemRecheck { work_item_id, .. } => (
+            ExecutionSourceIdentity::WorkItemContinuation {
+                work_item_id: work_item_id.clone(),
+            },
+            None,
+            None,
+        ),
+        ActivationCause::SettlementRecovery { activation_id } => (
+            ExecutionSourceIdentity::WorkItemContinuation {
+                work_item_id: migration_binding_work_item_id(&admission.activation.binding)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "execution protocol migration settlement recovery lacks WorkItem"
+                        )
+                    })?
+                    .to_string(),
+            },
+            None,
+            Some(activation_id.clone()),
+        ),
+        ActivationCause::RuntimeRecovery { .. } => {
+            bail!("execution protocol migration cannot losslessly import runtime recovery")
+        }
+        _ => bail!("execution protocol migration activation cause does not match message evidence"),
+    };
+    Ok(result)
+}
+
+fn migration_binding_work_item_id(binding: &ActivationBinding) -> Option<&str> {
+    match binding {
+        ActivationBinding::WorkItem { work_item_id }
+        | ActivationBinding::WaitOwner {
+            owner: SchedulerOwner::WorkItem { work_item_id },
+            ..
+        } => Some(work_item_id),
+        ActivationBinding::Unbound
+        | ActivationBinding::WaitOwner { .. }
+        | ActivationBinding::Interaction { .. }
+        | ActivationBinding::Lifecycle { .. } => None,
+    }
+}
+
+fn migration_task_rejoin_fence(task: &TaskRecord) -> Result<RejoinFence> {
+    let detail = task
+        .detail
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("migration task rejoin contract is missing detail"))?;
+    let obligation_id = detail
+        .get("rejoin_obligation_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| *value == task.id)
+        .ok_or_else(|| anyhow::anyhow!("migration task rejoin obligation is invalid"))?;
+    let generation = detail
+        .get("rejoin_generation")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| anyhow::anyhow!("migration task rejoin generation is invalid"))?;
+    let parent_turn_id = detail
+        .get("parent_turn_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("migration task rejoin parent turn is invalid"))?;
+    Ok(RejoinFence {
+        obligation_id: obligation_id.to_string(),
+        generation,
+        parent_turn_id: parent_turn_id.to_string(),
+    })
+}
+
+fn validate_migration_work_item_binding(
+    admission: &AdmitActivationCommand,
+    work_item_id: &str,
+) -> Result<()> {
+    let valid = matches!(
+        &admission.activation.binding,
+        ActivationBinding::WorkItem {
+            work_item_id: bound
+        } if bound == work_item_id
+    ) || matches!(
+        &admission.activation.binding,
+        ActivationBinding::WaitOwner {
+            owner: SchedulerOwner::WorkItem {
+                work_item_id: bound
+            },
+            ..
+        } if bound == work_item_id
+    );
+    if !valid {
+        bail!("execution protocol migration WorkItem binding mismatch");
+    }
+    Ok(())
+}
+
+fn validate_migration_lifecycle_binding(
+    admission: &AdmitActivationCommand,
+    agent_id: &str,
+) -> Result<()> {
+    let valid = matches!(
+        &admission.activation.binding,
+        ActivationBinding::Lifecycle {
+            agent_id: bound
+        } if bound == agent_id
+    ) || matches!(
+        &admission.activation.binding,
+        ActivationBinding::WaitOwner {
+            owner: SchedulerOwner::AgentLifecycle {
+                agent_id: bound
+            },
+            ..
+        } if bound == agent_id
+    );
+    if !valid {
+        bail!("execution protocol migration lifecycle binding mismatch");
+    }
+    Ok(())
+}
+
+fn migration_execution_origin(origin: ActivationOrigin) -> ExecutionOrigin {
+    match origin {
+        ActivationOrigin::Operator => ExecutionOrigin::Operator,
+        ActivationOrigin::Channel => ExecutionOrigin::Channel,
+        ActivationOrigin::Webhook => ExecutionOrigin::Webhook,
+        ActivationOrigin::Callback => ExecutionOrigin::Callback,
+        ActivationOrigin::Timer => ExecutionOrigin::Timer,
+        ActivationOrigin::System => ExecutionOrigin::System,
+        ActivationOrigin::Task => ExecutionOrigin::Task,
+        ActivationOrigin::RuntimeRecovery => ExecutionOrigin::RuntimeRecovery,
+    }
+}
+
+fn migration_execution_trust(trust: ActivationTrust) -> ExecutionTrust {
+    match trust {
+        ActivationTrust::OperatorInstruction => ExecutionTrust::OperatorInstruction,
+        ActivationTrust::RuntimeInstruction => ExecutionTrust::RuntimeInstruction,
+        ActivationTrust::IntegrationSignal => ExecutionTrust::IntegrationSignal,
+        ActivationTrust::ExternalEvidence => ExecutionTrust::ExternalEvidence,
+    }
+}
+
+fn migration_execution_priority(priority: ActivationPriority) -> ExecutionPriority {
+    match priority {
+        ActivationPriority::Background => ExecutionPriority::Background,
+        ActivationPriority::Normal => ExecutionPriority::Normal,
+        ActivationPriority::Next => ExecutionPriority::Next,
+        ActivationPriority::Interject => ExecutionPriority::Interject,
+    }
 }
 
 fn migrate_runtime_retention_created_at_indexes(connection: &Connection) -> Result<()> {

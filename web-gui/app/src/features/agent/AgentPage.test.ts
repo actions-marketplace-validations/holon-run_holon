@@ -1,18 +1,28 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import i18next from "i18next";
 
+import "../../i18n";
 import {
   attachmentKindForFile,
   captureScrollAnchor,
+  historyLoadDecision,
+  isScrollKey,
+  looksLikeProgrammaticBottomScroll,
   readStoredComposerDraft,
   resizeComposerTextarea,
   restoredScrollTop,
   storedComposerDraftKey,
+  SyncRecoveryStatus,
   timelineForDisplayLevel,
   timelineLayoutRevision,
   writeStoredComposerDraft,
+  resolveModelSwitchReasoningEffort,
 } from "./AgentPage";
 import { availableDisplayLevels } from "../../runtime/display-level";
 import type { TimelineTurn } from "./timeline-utils";
+import type { RuntimeModelOption } from "../../runtime/types";
 
 class MemoryStorage implements Storage {
   private readonly items = new Map<string, string>();
@@ -48,6 +58,23 @@ function installWindow(localStorage: Storage) {
   });
 }
 
+describe("sync recovery status", () => {
+  it("renders the failure, retry attempt, and manual recovery action", async () => {
+    await i18next.changeLanguage("en");
+    const markup = renderToStaticMarkup(
+      createElement(SyncRecoveryStatus, {
+        error: "baseline unavailable",
+        retryAttempt: 3,
+        onRetry: () => undefined,
+      }),
+    );
+
+    expect(markup).toContain("Conversation sync recovery failed (attempt 3)");
+    expect(markup).toContain("baseline unavailable");
+    expect(markup).toContain("Retry sync now");
+  });
+});
+
 describe("composer draft storage", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -72,6 +99,41 @@ describe("composer draft storage", () => {
 
     expect(readStoredComposerDraft("agent-a")).toBe("");
     expect(storage.getItem(storedComposerDraftKey("agent-a"))).toBeNull();
+  });
+});
+
+describe("model switch reasoning effort", () => {
+  function modelOption(supportsReasoningEffort: boolean, reasoningEffortOptions: string[]): RuntimeModelOption {
+    return {
+      model: "glm-5.3",
+      routeRef: "bigmodel/glm-5.3",
+      provider: "bigmodel",
+      providerFamily: "bigmodel",
+      endpoint: "default",
+      routeProvider: "bigmodel",
+      displayName: "GLM-5.3",
+      available: true,
+      supportsImageInput: true,
+      supportsImageGeneration: false,
+      supportsReasoningEffort,
+      reasoningEffortOptions,
+    };
+  }
+
+  it("falls back to auto when the target model lacks the current effort level", () => {
+    expect(resolveModelSwitchReasoningEffort(modelOption(true, ["low", "high", "max"]), "medium")).toBe("auto");
+  });
+
+  it("keeps the current effort level when the target model supports it", () => {
+    expect(resolveModelSwitchReasoningEffort(modelOption(true, ["low", "medium", "high"]), "medium")).toBe("medium");
+  });
+
+  it("keeps auto untouched for reasoning models", () => {
+    expect(resolveModelSwitchReasoningEffort(modelOption(true, ["low", "high"]), "auto")).toBe("auto");
+  });
+
+  it("resets to auto for models without reasoning support", () => {
+    expect(resolveModelSwitchReasoningEffort(modelOption(false, []), "medium")).toBe("auto");
   });
 });
 
@@ -150,6 +212,47 @@ describe("timeline virtual layout reconciliation", () => {
   });
 });
 
+describe("scroll stick intent", () => {
+  it("treats a scroll event as programmatic only while auto-scroll is active, no user intent exists, and the position is near the bottom", () => {
+    expect(
+      looksLikeProgrammaticBottomScroll({ autoScrollActive: true, userScrollIntent: false, nearBottom: true }),
+    ).toBe(true);
+  });
+
+  it("does not force stick when the user is scrolling even inside the auto-scroll window", () => {
+    expect(
+      looksLikeProgrammaticBottomScroll({ autoScrollActive: true, userScrollIntent: true, nearBottom: false }),
+    ).toBe(false);
+    expect(
+      looksLikeProgrammaticBottomScroll({ autoScrollActive: true, userScrollIntent: true, nearBottom: true }),
+    ).toBe(false);
+  });
+
+  it("does not force stick when the position left the bottom, even without user intent", () => {
+    expect(
+      looksLikeProgrammaticBottomScroll({ autoScrollActive: true, userScrollIntent: false, nearBottom: false }),
+    ).toBe(false);
+  });
+
+  it("never forces stick outside the auto-scroll window", () => {
+    expect(
+      looksLikeProgrammaticBottomScroll({ autoScrollActive: false, userScrollIntent: false, nearBottom: true }),
+    ).toBe(false);
+  });
+
+  it("recognizes keys that can scroll the message list", () => {
+    for (const key of ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " ", "Spacebar"]) {
+      expect(isScrollKey(key)).toBe(true);
+    }
+  });
+
+  it("ignores keys that cannot scroll the message list", () => {
+    for (const key of ["Enter", "Tab", "a", "Escape", ""]) {
+      expect(isScrollKey(key)).toBe(false);
+    }
+  });
+});
+
 describe("timeline display levels", () => {
   it("only exposes Debug while developer diagnostics are enabled", () => {
     expect(availableDisplayLevels(false)).toEqual(["info", "verbose"]);
@@ -167,6 +270,21 @@ describe("timeline display levels", () => {
 
     expect(timelineForDisplayLevel([semanticItem, debugItem], "debug", 20).map((item) => item.id))
       .toEqual(["assistant-message", "runtime:debug"]);
+  });
+});
+
+describe("history loading", () => {
+  it("expands already loaded timeline items before requesting network history", () => {
+    expect(historyLoadDecision(true, true)).toBe("expand-local");
+    expect(historyLoadDecision(true, false)).toBe("expand-local");
+  });
+
+  it("requests network history only after the local timeline reaches its boundary", () => {
+    expect(historyLoadDecision(false, true)).toBe("load-network");
+  });
+
+  it("does nothing when neither local nor server history remains", () => {
+    expect(historyLoadDecision(false, false)).toBe("none");
   });
 });
 

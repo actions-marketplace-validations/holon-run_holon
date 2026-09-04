@@ -1,5 +1,8 @@
 use super::super::*;
 use super::continuation::{canonicalize_openai_provider_item, normalize_openai_function_arguments};
+use crate::types::Citation;
+use std::collections::HashSet;
+use url::Url;
 
 pub(super) async fn read_openai_streaming_response(
     response: Response,
@@ -348,28 +351,46 @@ pub(in super::super) fn parse_openai_response_with_transport_state(
         .iter()
         .map(canonicalize_openai_provider_item)
         .collect::<Vec<_>>();
+    let usage = response.get("usage").and_then(Value::as_object);
+    let input_tokens = usage
+        .and_then(|usage| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .and_then(|usage| usage.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let mut blocks = Vec::new();
+    let mut saw_nonempty_wire_item = false;
 
     for item in output {
         match item.get("type").and_then(Value::as_str) {
             Some("message") => {
                 if let Some(content) = item.get("content").and_then(Value::as_array) {
                     for content_item in content {
+                        saw_nonempty_wire_item = true;
                         match content_item.get("type").and_then(Value::as_str) {
                             Some("output_text") | Some("text") | Some("input_text") => {
                                 if let Some(text) = content_item.get("text").and_then(Value::as_str)
                                 {
                                     blocks.push(ModelBlock::Text {
-                                        text: text.to_string(),
+                                        text: strip_openai_citation_sentinels(text),
                                     });
+                                    let citations = openai_url_citations(content_item);
+                                    if !citations.is_empty() {
+                                        blocks.push(ModelBlock::Citations { citations });
+                                    }
                                 }
                             }
                             _ => {}
                         }
                     }
+                } else {
+                    saw_nonempty_wire_item = true;
                 }
             }
             Some("function_call") => {
+                saw_nonempty_wire_item = true;
                 let id = item
                     .get("call_id")
                     .or_else(|| item.get("id"))
@@ -394,7 +415,24 @@ pub(in super::super) fn parse_openai_response_with_transport_state(
                     kind: ModelToolCallKind::Function,
                 });
             }
+            Some("reasoning") => {
+                saw_nonempty_wire_item = true;
+                if let Some(content) = item.get("content").and_then(Value::as_array) {
+                    for content_item in content {
+                        if content_item.get("type").and_then(Value::as_str)
+                            == Some("reasoning_text")
+                        {
+                            if let Some(text) = content_item.get("text").and_then(Value::as_str) {
+                                blocks.push(ModelBlock::ReasoningText {
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             Some("custom_tool_call") => {
+                saw_nonempty_wire_item = true;
                 let id = item
                     .get("call_id")
                     .or_else(|| item.get("id"))
@@ -424,18 +462,24 @@ pub(in super::super) fn parse_openai_response_with_transport_state(
                     kind: ModelToolCallKind::Custom,
                 });
             }
-            _ => {}
+            _ => saw_nonempty_wire_item = true,
         }
     }
 
     if blocks.is_empty() {
+        if !saw_nonempty_wire_item {
+            return Err(empty_response_error(
+                "empty OpenAI-style response",
+                "response contained no output/content items",
+                crate::types::TokenUsage::new(input_tokens, output_tokens),
+            ));
+        }
         return Err(invalid_response_error(
             "OpenAI-style response contained no supported content blocks",
             "empty supported block set",
         ));
     }
 
-    let usage = response.get("usage").and_then(Value::as_object);
     let cache_usage = usage.map(|usage| ProviderCacheUsage {
         read_input_tokens: usage
             .get("input_tokens_details")
@@ -472,14 +516,8 @@ pub(in super::super) fn parse_openai_response_with_transport_state(
                         .and_then(Value::as_str)
                         .map(str::to_string)
                 }),
-            input_tokens: usage
-                .and_then(|usage| usage.get("input_tokens"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            output_tokens: usage
-                .and_then(|usage| usage.get("output_tokens"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+            input_tokens,
+            output_tokens,
             cache_usage,
             provider_message_id: response_id.clone(),
             provider_request_id: None,
@@ -488,6 +526,73 @@ pub(in super::super) fn parse_openai_response_with_transport_state(
         response_id,
         output_items,
     })
+}
+
+fn openai_url_citations(content_item: &Value) -> Vec<Citation> {
+    let mut seen = HashSet::new();
+    content_item
+        .get("annotations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|annotation| {
+            if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+                return None;
+            }
+            let citation = annotation
+                .get("url_citation")
+                .filter(|value| value.is_object())
+                .unwrap_or(annotation);
+            let raw_url = citation.get("url").and_then(Value::as_str)?.trim();
+            let parsed = Url::parse(raw_url).ok()?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return None;
+            }
+            let url = parsed.to_string();
+            if !seen.insert(url.clone()) {
+                return None;
+            }
+            let title = citation
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(ToString::to_string);
+            Some(Citation { url, title })
+        })
+        .collect()
+}
+
+fn strip_openai_citation_sentinels(text: &str) -> String {
+    const START: &str = "\u{e200}cite\u{e202}";
+    const END: char = '\u{e201}';
+
+    let mut visible = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(start) = remaining.find(START) {
+        visible.push_str(&remaining[..start]);
+        let marker_body = &remaining[start + START.len()..];
+        if let Some(end) = marker_body.find(END) {
+            remaining = &marker_body[end + END.len_utf8()..];
+            continue;
+        }
+        let token_end = marker_body
+            .char_indices()
+            .find_map(|(index, character)| {
+                (character.is_whitespace() || !is_openai_citation_token_character(character))
+                    .then_some(index)
+            })
+            .unwrap_or(marker_body.len());
+        remaining = &marker_body[token_end..];
+    }
+    visible.push_str(remaining);
+    visible.retain(|character| !matches!(character, '\u{e200}' | '\u{e201}' | '\u{e202}'));
+    visible
+}
+
+fn is_openai_citation_token_character(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(character, '_' | '-' | ':' | ',' | '.' | '\u{e202}')
 }
 
 #[allow(dead_code)]

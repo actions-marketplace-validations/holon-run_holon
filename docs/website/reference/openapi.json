@@ -97,6 +97,62 @@
         "title": "AddSkillRequest",
         "type": "object"
       },
+      "AgentCanonicalProjection": {
+        "additionalProperties": false,
+        "description": "First concrete AgentCanonicalProjection: compact current state plus stable revision anchors only. Deliberately excludes verbose timelines and full transcript/message history (see docs/implementation-decisions/104-agent-canonical-projection-v1-boundary.md).",
+        "properties": {
+          "agent": {
+            "$ref": "#/components/schemas/AgentListEntry"
+          },
+          "conversation": {
+            "$ref": "#/components/schemas/ConversationRevisionAnchors"
+          },
+          "current_work_item": {
+            "description": "Current WorkItem anchor; null when the Agent has no current WorkItem.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AgentWorkItemAnchor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "hydration_references": {
+            "description": "Records referenced by the projection but still resolvable through the batch record APIs.",
+            "items": {
+              "$ref": "#/components/schemas/AgentHydrationKey"
+            },
+            "type": "array"
+          },
+          "hydration_tombstones": {
+            "description": "Records deleted at or before the snapshot boundary; they terminate pending hydration without fetching a record that no longer exists.",
+            "items": {
+              "$ref": "#/components/schemas/AgentHydrationKey"
+            },
+            "type": "array"
+          },
+          "latest_brief": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AgentLatestBrief"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "agent",
+          "current_work_item",
+          "conversation",
+          "latest_brief",
+          "hydration_tombstones",
+          "hydration_references"
+        ],
+        "type": "object"
+      },
       "AgentDeletionResponse": {
         "properties": {
           "created": {
@@ -439,6 +495,208 @@
           "identity"
         ],
         "title": "AgentDeletionStatusResponse",
+        "type": "object"
+      },
+      "AgentEventWindow": {
+        "additionalProperties": false,
+        "description": "Committed event window for one Agent inside one snapshot read view. Values come from a committed database view, never from an in-memory watcher or a sequence allocator.",
+        "properties": {
+          "event_head_seq": {
+            "description": "Greatest committed event_seq visible in the response read view.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "oldest_retained_seq": {
+            "description": "Durable retention floor. Zero means no retained prefix has ever been deleted; a positive value is the earliest sequence that may still be replayable.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "event_head_seq",
+          "oldest_retained_seq"
+        ],
+        "type": "object"
+      },
+      "AgentHydrationKey": {
+        "additionalProperties": false,
+        "description": "Identifies one canonical record for hydration termination (tombstone) or batch resolution (reference).",
+        "properties": {
+          "record_id": {
+            "type": "string"
+          },
+          "record_kind": {
+            "enum": [
+              "message",
+              "brief",
+              "transcript_entry"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "record_kind",
+          "record_id"
+        ],
+        "type": "object"
+      },
+      "AgentLatestBrief": {
+        "additionalProperties": false,
+        "description": "Latest Brief anchor derived from canonical Brief storage, not a second UI-summary table.",
+        "properties": {
+          "brief_id": {
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_event_seq": {
+            "description": "Immutable brief_created event linkage; null when the Brief cannot be linked to a unique retained event. Null-linked Briefs do not participate in exact unread calculation.",
+            "oneOf": [
+              {
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "preview": {
+            "description": "Bounded to 512 UTF-8 bytes. Full Brief content remains available from the canonical Brief APIs.",
+            "maxLength": 512,
+            "type": "string"
+          }
+        },
+        "required": [
+          "brief_id",
+          "created_event_seq",
+          "created_at",
+          "preview"
+        ],
+        "type": "object"
+      },
+      "AgentListEntry": {
+        "additionalProperties": true,
+        "description": "Public Agent entry, same shape as GET /api/agents/list response entries. Baseline object schema until the agents/list DTO stabilizes under a named schema.",
+        "type": "object"
+      },
+      "AgentProjectionSnapshot": {
+        "additionalProperties": false,
+        "description": "Per-Agent canonical projection snapshot at one consistency boundary (RFC: observer sync). Served by GET /api/agents/{agent_id}/projection-snapshot only while the agents.projection-snapshot.v1 capability is advertised.",
+        "properties": {
+          "agent_id": {
+            "type": "string"
+          },
+          "contract_version": {
+            "const": 1,
+            "type": "integer"
+          },
+          "event_head_seq": {
+            "description": "May exceed snapshot_through_seq; names a committed event available through the event page. Clients replay (snapshot_through_seq, event_head_seq] and later events.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "event_log_epoch": {
+            "type": "string"
+          },
+          "oldest_retained_seq": {
+            "description": "Durable retention floor; zero means no retained prefix has ever been deleted.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "projection": {
+            "$ref": "#/components/schemas/AgentCanonicalProjection"
+          },
+          "runtime_id": {
+            "type": "string"
+          },
+          "snapshot_through_seq": {
+            "description": "Every event with event_seq <= snapshot_through_seq that affects current canonical state is already reflected in the projection or its revision anchors.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "visibility_scope_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "contract_version",
+          "runtime_id",
+          "event_log_epoch",
+          "visibility_scope_id",
+          "agent_id",
+          "snapshot_through_seq",
+          "event_head_seq",
+          "oldest_retained_seq",
+          "projection"
+        ],
+        "type": "object"
+      },
+      "AgentRosterEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "$ref": "#/components/schemas/AgentListEntry"
+          },
+          "event_window": {
+            "$ref": "#/components/schemas/AgentEventWindow"
+          },
+          "latest_brief": {
+            "description": "Latest canonical Brief; null when the Agent has no Brief yet.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AgentLatestBrief"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "agent",
+          "event_window",
+          "latest_brief"
+        ],
+        "type": "object"
+      },
+      "AgentRosterSnapshot": {
+        "additionalProperties": false,
+        "description": "Authoritative roster snapshot (RFC: observer sync). All-or-nothing membership with per-Agent event windows and latest Brief anchors. Served by GET /api/agents/snapshot only while the agents.roster-snapshot.v1 capability is advertised; route registration alone is never sufficient.",
+        "properties": {
+          "agents": {
+            "description": "Active public Agents visible to the caller in one committed read view. Private child Agents are never included. A failure to assemble one Agent fails the whole response.",
+            "items": {
+              "$ref": "#/components/schemas/AgentRosterEntry"
+            },
+            "type": "array"
+          },
+          "contract_version": {
+            "const": 1,
+            "type": "integer"
+          },
+          "event_log_epoch": {
+            "description": "Current event log epoch; a changed value means historical event continuity is intentionally reset.",
+            "type": "string"
+          },
+          "runtime_id": {
+            "description": "Stable public identity of the runtime installation. Distinguishes a replaced server at the same URL from an ordinary restart. Not a secret.",
+            "type": "string"
+          },
+          "visibility_scope_id": {
+            "description": "Server-generated scope id derived from stable runtime identity, resolved authority, normalized visibility entitlement, and policy generation. Never contains credentials or tokens.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "contract_version",
+          "runtime_id",
+          "event_log_epoch",
+          "visibility_scope_id",
+          "agents"
+        ],
         "type": "object"
       },
       "AgentStateSnapshotDto": {
@@ -1010,6 +1268,57 @@
                           "null"
                         ]
                       },
+                      "no_brief_reason": {
+                        "anyOf": [
+                          {
+                            "oneOf": [
+                              {
+                                "properties": {
+                                  "kind": {
+                                    "const": "reducer_only",
+                                    "type": "string"
+                                  },
+                                  "reason": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "kind",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              },
+                              {
+                                "properties": {
+                                  "kind": {
+                                    "const": "aborted",
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "kind"
+                                ],
+                                "type": "object"
+                              },
+                              {
+                                "properties": {
+                                  "kind": {
+                                    "const": "tool_only_wait",
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "kind"
+                                ],
+                                "type": "object"
+                              }
+                            ]
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
                       "reason": {
                         "type": [
                           "string",
@@ -1481,6 +1790,57 @@
                       "null"
                     ]
                   },
+                  "no_brief_reason": {
+                    "anyOf": [
+                      {
+                        "oneOf": [
+                          {
+                            "properties": {
+                              "kind": {
+                                "const": "reducer_only",
+                                "type": "string"
+                              },
+                              "reason": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "kind",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "properties": {
+                              "kind": {
+                                "const": "aborted",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "kind"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "properties": {
+                              "kind": {
+                                "const": "tool_only_wait",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "kind"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
                   "reason": {
                     "type": [
                       "string",
@@ -1688,6 +2048,7 @@
                     "waiting_for_operator",
                     "yielded",
                     "blocked",
+                    "completing",
                     "completed_recent"
                   ],
                   "type": "string"
@@ -1725,6 +2086,7 @@
                     "queued",
                     "yielded",
                     "blocked",
+                    "completing",
                     "completed"
                   ],
                   "type": "string"
@@ -1755,12 +2117,14 @@
                     "yielded",
                     "waiting_for_operator",
                     "blocked",
+                    "completing",
                     "completed"
                   ],
                   "type": "string"
                 },
                 "reason_code": {
                   "enum": [
+                    "completing",
                     "completed",
                     "continuation_yielded",
                     "active_task_wait",
@@ -1808,6 +2172,7 @@
                     "waiting_timer",
                     "waiting_system",
                     "blocked",
+                    "completing",
                     "completed"
                   ],
                   "type": "string"
@@ -1815,6 +2180,7 @@
                 "state": {
                   "enum": [
                     "open",
+                    "completing",
                     "completed"
                   ],
                   "type": "string"
@@ -1981,6 +2347,37 @@
         "title": "AgentStateSnapshotDto",
         "type": "object"
       },
+      "AgentWorkItemAnchor": {
+        "additionalProperties": false,
+        "properties": {
+          "plan_status": {
+            "type": "string"
+          },
+          "revision": {
+            "description": "Canonical WorkItem revision at the snapshot boundary.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "work_item_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "state",
+          "plan_status",
+          "revision",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "AttachWorkspaceRequest": {
         "additionalProperties": true,
         "description": "Baseline request DTO schema. Per-field schemas will be tightened as HTTP envelope and DTO contracts stabilize.",
@@ -2121,6 +2518,29 @@
               "null"
             ]
           },
+          "citations": {
+            "items": {
+              "properties": {
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "url"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "content_source": {
             "default": {
               "kind": "inline"
@@ -2168,6 +2588,15 @@
           "created_at": {
             "format": "date-time",
             "type": "string"
+          },
+          "created_event_seq": {
+            "description": "Immutable linkage to the unique `brief_created` audit event committed\n in the same runtime DB transition as this record. `None` for records\n whose creating event cannot be identified (pre-linkage history or\n ambiguous backfill candidates).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "finalizes_assistant_round_id": {
             "type": [
@@ -2296,8 +2725,66 @@
               "string",
               "null"
             ]
+          },
+          "invocation_context": {
+            "description": "Declaration-based provenance supplied to a CLI launched by an agent.\n\n These values describe the caller and its source activation, but are not\n authentication material. A local process can forge them.",
+            "properties": {
+              "caller_agent_id": {
+                "type": "string"
+              },
+              "inherited_authority_class": {
+                "enum": [
+                  "operator_instruction",
+                  "runtime_instruction",
+                  "integration_signal",
+                  "external_evidence",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_activation_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_task_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_turn_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_work_item_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "caller_agent_id"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "report_text": {
+            "type": "string"
           }
         },
+        "required": [
+          "report_text"
+        ],
         "title": "CompleteWorkItemRequest",
         "type": "object"
       },
@@ -2314,6 +2801,37 @@
       "ControlWakeRequest": {
         "additionalProperties": true,
         "description": "Baseline request DTO schema. Per-field schemas will be tightened as HTTP envelope and DTO contracts stabilize.",
+        "type": "object"
+      },
+      "ConversationRevisionAnchors": {
+        "additionalProperties": false,
+        "description": "Latest-record anchors for conversation families whose canonical records carry no per-record revision counter. Always present; null fields mean the family has no record at the boundary.",
+        "properties": {
+          "latest_message_id": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "latest_transcript_entry_id": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "latest_message_id",
+          "latest_transcript_entry_id"
+        ],
         "type": "object"
       },
       "CreateAgentRequest": {
@@ -2391,6 +2909,49 @@
       "CreateWorkItemRequest": {
         "additionalProperties": true,
         "description": "Baseline request DTO schema. Per-field schemas will be tightened as HTTP envelope and DTO contracts stabilize.",
+        "type": "object"
+      },
+      "CursorNotFoundError": {
+        "additionalProperties": true,
+        "description": "Rich cursor_not_found body for event pages and SSE. event_log_epoch, oldest_retained_seq, and event_head_seq must come from one committed read view so clients can distinguish a retained-prefix gap from an epoch change and select the correct reset path.",
+        "properties": {
+          "after_seq": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "code": {
+            "const": "cursor_not_found",
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          },
+          "event_head_seq": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "event_log_epoch": {
+            "type": "string"
+          },
+          "ok": {
+            "const": false,
+            "type": "boolean"
+          },
+          "oldest_retained_seq": {
+            "description": "Durable retention floor; zero means no retained prefix has ever been deleted.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ok",
+          "error",
+          "code",
+          "after_seq",
+          "event_log_epoch",
+          "oldest_retained_seq",
+          "event_head_seq"
+        ],
         "type": "object"
       },
       "DebugPromptRequest": {
@@ -2505,6 +3066,29 @@
                   "format": "uint32",
                   "minimum": 0,
                   "type": "integer"
+                },
+                "projection_effect": {
+                  "anyOf": [
+                    {
+                      "description": "Additive `StreamEventEnvelope` classification published by event pages\n and SSE once `events.projection-effect.v1` is enabled. The runtime event\n registry is the source of truth; legacy or otherwise unclassified events\n default conservatively to `DisplayInvalidation`.",
+                      "oneOf": [
+                        {
+                          "const": "none",
+                          "description": "Does not affect the Web projection; never blocks readiness.",
+                          "type": "string"
+                        },
+                        {
+                          "const": "display_invalidation",
+                          "description": "Invalidates display state derived from the referenced record; blocks\n projection readiness until resolved.",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Additive classification derived from the runtime event registry.\n Present only while `events.projection-effect.v1` is advertised."
                 },
                 "provenance": {
                   "properties": {
@@ -3357,6 +3941,58 @@
             "default": false,
             "type": "boolean"
           },
+          "invocation_context": {
+            "description": "Declaration-based provenance supplied to a CLI launched by an agent.\n\n These values describe the caller and its source activation, but are not\n authentication material. A local process can forge them.",
+            "properties": {
+              "caller_agent_id": {
+                "type": "string"
+              },
+              "inherited_authority_class": {
+                "enum": [
+                  "operator_instruction",
+                  "runtime_instruction",
+                  "integration_signal",
+                  "external_evidence",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_activation_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_task_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_turn_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_work_item_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "caller_agent_id"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "reason": {
             "type": [
               "string",
@@ -3558,6 +4194,7 @@
               "state": {
                 "enum": [
                   "open",
+                  "completing",
                   "completed"
                 ],
                 "type": "string"
@@ -3868,6 +4505,7 @@
               "state": {
                 "enum": [
                   "open",
+                  "completing",
                   "completed"
                 ],
                 "type": "string"
@@ -4009,6 +4647,7 @@
                   "yielded",
                   "waiting_for_operator",
                   "blocked",
+                  "completing",
                   "completed"
                 ],
                 "type": "string"
@@ -4022,6 +4661,7 @@
                   "yielded",
                   "waiting_for_operator",
                   "blocked",
+                  "completing",
                   "completed",
                   null
                 ],
@@ -4085,6 +4725,14 @@
         ],
         "title": "PickWorkItemResponse",
         "type": "object"
+      },
+      "ProjectionEffect": {
+        "description": "Additive top-level StreamEventEnvelope classification shared by event pages and SSE. The runtime event registry is the source of truth; legacy or otherwise unclassified events default conservatively to display_invalidation. Emitted only while events.projection-effect.v1 is advertised; introducing the field increments the envelope contract version.",
+        "enum": [
+          "none",
+          "display_invalidation"
+        ],
+        "type": "string"
       },
       "ReconcileSkillRequest": {
         "properties": {
@@ -4374,13 +5022,6 @@
                 "minimum": 0,
                 "type": "integer"
               },
-              "scheduler": {
-                "enum": [
-                  "legacy",
-                  "canonical"
-                ],
-                "type": "string"
-              },
               "unknown_model_fallback_configured": {
                 "type": "boolean"
               },
@@ -4476,7 +5117,6 @@
               "default_tool_output_tokens",
               "max_tool_output_tokens",
               "disable_provider_fallback",
-              "scheduler",
               "runtime_db_retention",
               "providers",
               "web_search",
@@ -4815,13 +5455,6 @@
                 "minimum": 0,
                 "type": "integer"
               },
-              "scheduler": {
-                "enum": [
-                  "legacy",
-                  "canonical"
-                ],
-                "type": "string"
-              },
               "unknown_model_fallback_configured": {
                 "type": "boolean"
               },
@@ -4917,7 +5550,6 @@
               "default_tool_output_tokens",
               "max_tool_output_tokens",
               "disable_provider_fallback",
-              "scheduler",
               "runtime_db_retention",
               "providers",
               "web_search",
@@ -4992,6 +5624,7 @@
                 "status": {
                   "enum": [
                     "active",
+                    "triggered",
                     "resolved",
                     "cancelled",
                     "expired"
@@ -4999,6 +5632,19 @@
                   "type": "string"
                 },
                 "subject_ref": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "trigger_message_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "triggered_at": {
+                  "format": "date-time",
                   "type": [
                     "string",
                     "null"
@@ -5153,7 +5799,8 @@
                         "processed",
                         "interjected",
                         "aborted",
-                        "dropped"
+                        "dropped",
+                        "quarantined"
                       ],
                       "type": "string"
                     },
@@ -5204,6 +5851,7 @@
                   "expected_status": {
                     "enum": [
                       "active",
+                      "triggered",
                       "resolved",
                       "cancelled",
                       "expired"
@@ -5241,7 +5889,8 @@
                           "processed",
                           "interjected",
                           "aborted",
-                          "dropped"
+                          "dropped",
+                          "quarantined"
                         ],
                         "type": "string"
                       },
@@ -5582,6 +6231,7 @@
               "waiting_for_operator",
               "yielded",
               "blocked",
+              "completing",
               "completed_recent"
             ],
             "type": "string"
@@ -5619,6 +6269,7 @@
               "queued",
               "yielded",
               "blocked",
+              "completing",
               "completed"
             ],
             "type": "string"
@@ -5649,12 +6300,14 @@
               "yielded",
               "waiting_for_operator",
               "blocked",
+              "completing",
               "completed"
             ],
             "type": "string"
           },
           "reason_code": {
             "enum": [
+              "completing",
               "completed",
               "continuation_yielded",
               "active_task_wait",
@@ -5702,6 +6355,7 @@
               "waiting_timer",
               "waiting_system",
               "blocked",
+              "completing",
               "completed"
             ],
             "type": "string"
@@ -5709,6 +6363,7 @@
           "state": {
             "enum": [
               "open",
+              "completing",
               "completed"
             ],
             "type": "string"
@@ -5777,6 +6432,29 @@
             "format": "uint32",
             "minimum": 0,
             "type": "integer"
+          },
+          "projection_effect": {
+            "anyOf": [
+              {
+                "description": "Additive `StreamEventEnvelope` classification published by event pages\n and SSE once `events.projection-effect.v1` is enabled. The runtime event\n registry is the source of truth; legacy or otherwise unclassified events\n default conservatively to `DisplayInvalidation`.",
+                "oneOf": [
+                  {
+                    "const": "none",
+                    "description": "Does not affect the Web projection; never blocks readiness.",
+                    "type": "string"
+                  },
+                  {
+                    "const": "display_invalidation",
+                    "description": "Invalidates display state derived from the referenced record; blocks\n projection readiness until resolved.",
+                    "type": "string"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Additive classification derived from the runtime event registry.\n Present only while `events.projection-effect.v1` is advertised."
           },
           "provenance": {
             "properties": {
@@ -8148,8 +8826,10 @@
           "output": true,
           "status": {
             "enum": [
+              "deferred",
               "success",
-              "error"
+              "error",
+              "interrupted"
             ],
             "type": "string"
           },
@@ -8226,6 +8906,58 @@
             ]
           },
           "blocked_by": true,
+          "invocation_context": {
+            "description": "Declaration-based provenance supplied to a CLI launched by an agent.\n\n These values describe the caller and its source activation, but are not\n authentication material. A local process can forge them.",
+            "properties": {
+              "caller_agent_id": {
+                "type": "string"
+              },
+              "inherited_authority_class": {
+                "enum": [
+                  "operator_instruction",
+                  "runtime_instruction",
+                  "integration_signal",
+                  "external_evidence",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_activation_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_task_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_turn_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_work_item_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "caller_agent_id"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "objective": {
             "type": [
               "string",
@@ -8471,6 +9203,7 @@
           "state": {
             "enum": [
               "open",
+              "completing",
               "completed"
             ],
             "type": "string"
@@ -8607,7 +9340,7 @@
   "info": {
     "description": "Generated baseline for Holon's current HTTP control-plane surface. It is intentionally conservative: many response bodies remain JSON placeholders until the success/error envelope contracts stabilize.",
     "title": "Holon HTTP control-plane API",
-    "version": "0.30.0"
+    "version": "0.36.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -8705,6 +9438,54 @@
           "agents"
         ],
         "x-holon-openapi-source": "aide::axum::ApiRouter::api_route_docs"
+      }
+    },
+    "/api/agents/snapshot": {
+      "get": {
+        "description": "Authoritative roster snapshot (RFC: observer sync): all-or-nothing membership with per-Agent event windows and latest Brief anchors from one committed read view. Served only while the agents.roster-snapshot.v1 capability is advertised; route registration alone is never sufficient.",
+        "operationId": "agentsSnapshot",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentRosterSnapshot"
+                }
+              }
+            },
+            "description": "Successful JSON response using a stable DTO schema."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Client error JSON response."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Server error JSON response."
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Agent roster snapshot",
+        "tags": [
+          "agents"
+        ]
       }
     },
     "/api/agents/{agent_id}/briefs": {
@@ -8972,7 +9753,7 @@
     },
     "/api/agents/{agent_id}/events": {
       "get": {
-        "description": "Return a bounded page of versioned runtime event envelopes. Query parameters: before_seq, after_seq, limit, order, max_level. Identity is (event_log_epoch, agent_id, event_seq); unknown kinds retain their opaque payload.",
+        "description": "Return a bounded page of versioned runtime event envelopes. Query parameters: before_seq, after_seq, limit, order, max_level. Identity is (event_log_epoch, agent_id, event_seq); unknown kinds retain their opaque payload. While events.projection-effect.v1 is advertised every envelope carries the additive projection_effect classification derived from the runtime event registry (envelope contract version 3); a max_level-filtered page changes presentation only and is never proof of raw continuity.",
         "operationId": "agentEvents",
         "parameters": [
           {
@@ -9030,7 +9811,7 @@
     },
     "/api/agents/{agent_id}/events/stream": {
       "get": {
-        "description": "Return Server-Sent Events carrying raw StreamEventEnvelope JSON data. Query parameters: after_seq, limit. SSE id is event_seq; SSE event is the audit event kind; missing replay cursors return cursor_not_found before the stream opens. If the receiver lags, the server closes the stream so clients can backfill after the last contiguous SSE id before reconnecting. Breaking change: the projection query parameter and StreamEventEnvelope.projection field have been removed.",
+        "description": "Return Server-Sent Events carrying raw StreamEventEnvelope JSON data. Query parameters: after_seq, limit. SSE id is event_seq; SSE event is the audit event kind; missing replay cursors return cursor_not_found before the stream opens, carrying event_log_epoch, oldest_retained_seq, and event_head_seq from one committed read view so clients can distinguish a retained-prefix gap from an epoch change. Envelopes carry the additive projection_effect field while events.projection-effect.v1 is advertised. If the receiver lags, the server closes the stream so clients can backfill after the last contiguous SSE id before reconnecting. Breaking change: the projection query parameter and StreamEventEnvelope.projection field have been removed.",
         "operationId": "agentEventsStream",
         "parameters": [
           {
@@ -9208,6 +9989,64 @@
         "summary": "Batch get messages",
         "tags": [
           "messages"
+        ]
+      }
+    },
+    "/api/agents/{agent_id}/projection-snapshot": {
+      "get": {
+        "description": "Per-Agent canonical projection snapshot (RFC: observer sync): compact current state plus revision anchors at one committed consistency boundary. snapshot_through_seq equals the committed per-Agent event head of the same view; clients replay only event_seq greater than it. Served only while the agents.projection-snapshot.v1 capability is advertised; route registration alone is never sufficient.",
+        "operationId": "agentProjectionSnapshot",
+        "parameters": [
+          {
+            "description": "Agent id.",
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentProjectionSnapshot"
+                }
+              }
+            },
+            "description": "Successful JSON response using a stable DTO schema."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Client error JSON response."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Server error JSON response."
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Agent projection snapshot",
+        "tags": [
+          "agents"
         ]
       }
     },
@@ -10329,6 +11168,49 @@
           }
         ],
         "summary": "Start Codex device login",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/auth/method": {
+      "get": {
+        "description": "Return the configured authentication mode used by the Web login page.",
+        "operationId": "authMethod",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonValue"
+                }
+              }
+            },
+            "description": "Successful JSON response. Baseline schema is intentionally loose until per-route response DTO contracts are stabilized."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Client error JSON response."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Server error JSON response."
+          }
+        },
+        "summary": "Authentication method",
         "tags": [
           "auth"
         ]
@@ -13669,6 +14551,54 @@
           }
         ],
         "summary": "List available models",
+        "tags": [
+          "discovery"
+        ]
+      }
+    },
+    "/api/models/refresh": {
+      "post": {
+        "description": "Discover models for providers with missing or expired caches, then return the model catalog and runtime availability.",
+        "operationId": "refreshModels",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonValue"
+                }
+              }
+            },
+            "description": "Successful JSON response. Baseline schema is intentionally loose until per-route response DTO contracts are stabilized."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Client error JSON response."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Server error JSON response."
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Refresh available models",
         "tags": [
           "discovery"
         ]

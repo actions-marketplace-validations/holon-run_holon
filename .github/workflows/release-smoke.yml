@@ -1,16 +1,18 @@
 name: Release Smoke
 
 on:
+  workflow_call:
+    inputs:
+      version:
+        description: Release tag to smoke test.
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       version:
         description: Release tag to smoke test.
         required: false
         default: v0.13.0
-  pull_request:
-    branches: [main]
-    paths:
-      - ".github/workflows/release-smoke.yml"
 
 permissions:
   contents: read
@@ -18,10 +20,12 @@ permissions:
 jobs:
   linux-asset:
     name: Linux asset
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     env:
       RELEASE_VERSION: ${{ inputs.version || 'v0.13.0' }}
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download release asset
         run: |
           set -euo pipefail
@@ -46,4 +50,4 @@ jobs:
           expected="${RELEASE_VERSION#v}"
           actual="$(./smoke/holon --version)"
           echo "$actual"
-          test "$actual" = "holon ${expected}"
+          scripts/verify-release-version.sh "$expected" "$actual"

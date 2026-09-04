@@ -1,0 +1,65 @@
+name: models.dev refresh
+
+on:
+  schedule:
+    # Every Monday at 06:00 UTC
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  refresh:
+    name: Refresh models.dev snapshot and artifact
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build holon
+        run: cargo build --locked
+
+      - name: Fetch snapshot and generate artifact
+        run: cargo run --locked -- models-dev refresh --output-dir models.dev
+
+      - name: Check for changes
+        id: diff
+        run: |
+          if [ -z "$(git status --porcelain -- models.dev/)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compose PR body from refresh summary
+        if: steps.diff.outputs.changed == 'true'
+        id: pr_body
+        run: |
+          {
+            echo 'body<<SUMMARY_EOF'
+            cat models.dev/refresh-summary.md
+            echo ''
+            echo '---'
+            echo 'Automated models.dev snapshot/artifact/supplement refresh. Supplement'
+            echo 'entries join the built-in catalog when this PR merges; provider'
+            echo 'enablement, routes, and credentials are unchanged.'
+            echo 'SUMMARY_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create or update PR
+        if: steps.diff.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: models-dev-refresh
+          title: "chore: refresh models.dev snapshot, artifact, and supplement"
+          body: ${{ steps.pr_body.outputs.body }}
+          commit-message: "chore: refresh models.dev snapshot, artifact, and supplement"
+          labels: models-dev

@@ -1,4 +1,4 @@
-.PHONY: help web web-ci transport-types transport-types-check snapshots-check snapshots-refresh build all test test-resource-lint test-concurrent test-concurrent-repeat test-live test-live-openai test-live-anthropic test-live-codex test-live-xai test-live-images test-live-runtime docker-build docker-smoke docker-e2e docker-e2e-validate docker-live-acceptance fmt fmt-check lint check ci run clean
+.PHONY: help web web-ci macos-menu-test macos-menu-package transport-types transport-types-check snapshots-check snapshots-refresh build all test test-resource-lint test-concurrent test-concurrent-repeat test-live test-live-openai test-live-anthropic test-live-codex test-live-xai test-live-images test-live-runtime docker-build docker-smoke docker-e2e docker-e2e-scheduler-required docker-e2e-scheduler-live-canary docker-e2e-validate docker-live-acceptance fmt fmt-check lint check ci run clean
 
 WEB_DIR := web-gui/app
 OPENAPI_TOOLS_DIR := web-gui/openapi-tools
@@ -34,6 +34,17 @@ web-ci: ## Test and build the web GUI with one clean dependency install
 	@if [ -s "$$HOME/.nvm/nvm.sh" ]; then . "$$HOME/.nvm/nvm.sh" && nvm use; fi; \
 	cd $(OPENAPI_TOOLS_DIR) && npm ci && npm run check && \
 	cd ../../$(WEB_DIR) && npm ci && npm test && npm run build
+
+macos-menu-test: ## Build and test the native macOS menu app
+	swift test --package-path apps/macos/HolonMenu
+
+macos-menu-package: ## Package a universal (x86_64 + arm64) Holon.app and DMG
+	rustup target add aarch64-apple-darwin x86_64-apple-darwin
+	cargo build --release --locked --target aarch64-apple-darwin --target x86_64-apple-darwin
+	mkdir -p target/universal-macos/release
+	lipo -create target/aarch64-apple-darwin/release/holon target/x86_64-apple-darwin/release/holon \
+		-output target/universal-macos/release/holon
+	scripts/package-macos-menu-app.sh target/universal-macos/release/holon dist
 
 transport-types: ## Refresh OpenAPI and generated TypeScript transport types
 	cargo test --test openapi_snapshot refresh_openapi_snapshot -- --ignored
@@ -152,6 +163,12 @@ docker-smoke: docker-build ## Start the image and verify the real service readin
 
 docker-e2e: docker-build ## Run the release core Docker E2E suite with a real LLM
 	python3 scripts/docker-e2e.py --image "$(DOCKER_IMAGE)" --skip-build --suite core
+
+docker-e2e-scheduler-required: docker-build ## Run the deterministic scheduler release gate
+	python3 scripts/docker-e2e.py --image "$(DOCKER_IMAGE)" --skip-build --profile scheduler-required --scheduler-matrix --timeout 120
+
+docker-e2e-scheduler-live-canary: docker-build ## Run the real-model scheduler canary
+	python3 scripts/docker-e2e.py --image "$(DOCKER_IMAGE)" --skip-build --profile scheduler-live-canary --scheduler-matrix --timeout 120
 
 docker-e2e-validate: ## Validate the Docker E2E manifest and runner unit tests
 	python3 scripts/docker-e2e.py --validate-manifest

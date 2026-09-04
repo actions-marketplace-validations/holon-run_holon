@@ -7,7 +7,8 @@ use crate::tool::{
     ToolError, ToolSpec,
 };
 use crate::types::{
-    TodoItemState, TurnTerminalCheckpointRecord, WorkItemPlanStatus, WorkItemRecord,
+    AuthorityClass, MessageBody, MessageKind, MessageOrigin, Priority, TodoItemState,
+    TurnTerminalCheckpointRecord, WorkItemPlanStatus, WorkItemRecord,
 };
 use chrono::Utc;
 
@@ -144,6 +145,7 @@ async fn persist_turn_record_uses_turn_id_not_numeric_sequence_collisions() {
             kind: TurnTerminalKind::Completed,
             reason: None,
             last_assistant_message: None,
+            no_brief_reason: None,
             checkpoint: None,
             completed_at: Utc::now(),
             duration_ms: 1,
@@ -165,6 +167,171 @@ async fn persist_turn_record_uses_turn_id_not_numeric_sequence_collisions() {
     assert_eq!(record.tool_execution_ids, vec![owned_tool.id]);
     assert_eq!(record.produced_brief_ids, vec![owned_brief.id]);
     assert_eq!(record.completed_work_item_ids, vec!["work-owned"]);
+}
+
+#[test]
+fn turn_record_identity_is_immutable_after_first_persist() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        std::sync::Arc::new(crate::provider::StubProvider::new("unused")),
+        "default".into(),
+        crate::runtime::tests::support::context_config(),
+    )
+    .unwrap();
+    let mut initial = crate::types::TurnRecord::new("default", "turn-immutable", 7);
+    initial.run_id = Some("run-original".into());
+    initial.current_work_item_id = Some("work-original".into());
+    initial.replay = Some(crate::types::TurnReplayProvenance {
+        source_message_id: "message-original".into(),
+        source_turn_id: "turn-original".into(),
+        reason: "interrupted_queue_claim_reentry".into(),
+        prior_terminal: None,
+    });
+    runtime.storage().append_turn(&initial).unwrap();
+
+    let mut terminal_update = initial.clone();
+    let terminal = crate::types::TurnTerminalSummary {
+        kind: TurnTerminalKind::Completed,
+        reason: None,
+        no_brief_reason: None,
+        completed_at: Utc::now(),
+        duration_ms: 5,
+    };
+    terminal_update.terminal = Some(terminal.clone());
+    terminal_update
+        .replay
+        .as_mut()
+        .expect("replay provenance")
+        .prior_terminal = Some(terminal);
+    runtime.storage().append_turn(&terminal_update).unwrap();
+
+    let mut conflicting = terminal_update.clone();
+    conflicting
+        .replay
+        .as_mut()
+        .expect("replay provenance")
+        .reason = "conflicting-replay-reason".into();
+    let error = runtime.storage().append_turn(&conflicting).unwrap_err();
+    let conflict = error
+        .downcast_ref::<crate::runtime_db::RuntimeStateTransitionConflict>()
+        .expect("turn identity conflict should be typed");
+    assert_eq!(conflict.domain(), "turn identity");
+    assert_eq!(conflict.record_id(), "turn-immutable");
+
+    assert_eq!(
+        runtime.storage().read_turn_by_id("turn-immutable").unwrap(),
+        Some(terminal_update)
+    );
+}
+
+#[tokio::test]
+async fn replay_persists_a_new_turn_with_source_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        std::sync::Arc::new(crate::provider::StubProvider::new("unused")),
+        "default".into(),
+        crate::runtime::tests::support::context_config(),
+    )
+    .unwrap();
+    let mut source_message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "resume after interrupted claim".into(),
+        },
+    );
+    source_message.id = "message-replay-source".into();
+    source_message.turn_id = Some("turn-replay-source".into());
+    runtime.storage().append_message(&source_message).unwrap();
+
+    let mut source_turn = crate::types::TurnRecord::new("default", "turn-replay-source", 4);
+    source_turn.current_work_item_id = Some("work-source".into());
+    source_turn.trigger = Some(crate::types::TurnTriggerSummary::from_message(
+        &source_message,
+    ));
+    source_turn.terminal = Some(crate::types::TurnTerminalSummary {
+        kind: TurnTerminalKind::Aborted,
+        reason: Some("runtime_restart".into()),
+        no_brief_reason: None,
+        completed_at: Utc::now(),
+        duration_ms: 10,
+    });
+    runtime.storage().append_turn(&source_turn).unwrap();
+
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.current_turn_id = Some("turn-replay-attempt".into());
+        guard.state.current_turn_work_item_id = Some("work-source".into());
+        guard.state.current_execution_binding = Some(crate::types::WorkItemExecutionBinding {
+            activation_id: Some("activation-replay".into()),
+            admission_provenance: None,
+            source_message_id: source_message.id.clone(),
+            turn_id: "turn-replay-attempt".into(),
+            owner: None,
+            work_item_id: Some("work-source".into()),
+            claimed_work_revision: Some(1),
+        });
+    }
+
+    runtime
+        .persist_turn_record(&TurnTerminalRecord {
+            turn_id: "turn-replay-attempt".into(),
+            turn_index: 5,
+            kind: TurnTerminalKind::Completed,
+            reason: None,
+            last_assistant_message: None,
+            no_brief_reason: None,
+            checkpoint: None,
+            completed_at: Utc::now(),
+            duration_ms: 20,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        runtime
+            .storage()
+            .read_turn_by_id("turn-replay-source")
+            .unwrap(),
+        Some(source_turn.clone()),
+        "replay must not overwrite the historical source turn"
+    );
+    let replay = runtime
+        .storage()
+        .read_turn_by_id("turn-replay-attempt")
+        .unwrap()
+        .expect("replay attempt turn");
+    assert_eq!(replay.turn_id, "turn-replay-attempt");
+    assert_eq!(replay.current_work_item_id.as_deref(), Some("work-source"));
+    assert_eq!(
+        replay
+            .trigger
+            .as_ref()
+            .and_then(|trigger| trigger.message_id.as_deref()),
+        Some(source_message.id.as_str())
+    );
+    assert_eq!(
+        replay.replay,
+        Some(crate::types::TurnReplayProvenance {
+            source_message_id: source_message.id,
+            source_turn_id: source_turn.turn_id,
+            reason: "interrupted_queue_claim_reentry".into(),
+            prior_terminal: source_turn.terminal,
+        })
+    );
 }
 
 #[test]
@@ -520,7 +687,9 @@ fn build_turn_local_projection_includes_runtime_reminder() {
         &TurnLocalCheckpointState::default(),
         Some("req-1".into()),
         4_000,
+        4_000,
         120,
+        2_500,
         Some(reminder),
     );
 
@@ -596,7 +765,9 @@ fn large_work_item_stale_reminder_does_not_force_baseline_over_budget() {
         &TurnLocalCheckpointState::default(),
         Some("req-large".into()),
         4_000,
+        4_000,
         120,
+        2_500,
         Some(&reminder),
     );
 
@@ -764,6 +935,7 @@ fn normalize_provider_attempt_timing_backfills_missing_attempt_timing() {
             outcome: crate::provider::ProviderAttemptOutcome::Succeeded,
             advanced_to_fallback: false,
             backoff_ms: None,
+            backoff_source: None,
             token_usage: None,
             transport_diagnostics: None,
         }
@@ -897,6 +1069,238 @@ fn build_turn_local_projection_minimum_projection_can_hit_exact_budget() {
         minimum_projection_estimated_tokens
     );
     assert!(compaction.strict_fallback_applied);
+}
+
+#[test]
+fn build_turn_local_projection_compacts_at_trigger_before_hard_budget() {
+    let rounds = vec![
+        fixture_round(1, &"alpha ".repeat(240)),
+        fixture_round(2, &"beta ".repeat(180)),
+        fixture_round(3, &"gamma ".repeat(120)),
+    ];
+    let prompt_frame = fixture_prompt_frame();
+    let mut exact_conversation = vec![ConversationMessage::UserBlocks(
+        prompt_frame.context_blocks.clone(),
+    )];
+    for round in &rounds {
+        exact_conversation.extend(exact_round_messages(round));
+    }
+    let exact_tokens = estimate_projection_tokens(&prompt_frame, &exact_conversation);
+    let hard_budget = exact_tokens + CONTINUATION_BUDGET_SAFETY_MARGIN_TOKENS + 200;
+    let trigger_budget = exact_tokens
+        .saturating_sub(80)
+        .saturating_add(CONTINUATION_BUDGET_SAFETY_MARGIN_TOKENS);
+
+    let projection = build_turn_local_projection_with_runtime_reminder(
+        &prompt_frame,
+        &rounds,
+        &[],
+        &TurnLocalCheckpointState::default(),
+        Some("req-trigger".into()),
+        hard_budget,
+        trigger_budget,
+        100,
+        2_500,
+        None,
+    );
+
+    let TurnLocalProjectionOutcome::Projection(projection) = projection else {
+        panic!("expected projection outcome");
+    };
+    let compaction = projection.compaction.expect("trigger should compact");
+    assert_eq!(
+        compaction.trigger_reason,
+        "estimated_tokens_exceeded_trigger"
+    );
+    assert!(compaction.pre_compaction_estimated_tokens < hard_budget);
+    assert!(
+        compaction.projected_estimated_tokens
+            <= trigger_budget.saturating_sub(CONTINUATION_BUDGET_SAFETY_MARGIN_TOKENS)
+    );
+    assert!(!compaction.trigger_budget_fallback_applied);
+}
+
+#[test]
+fn build_turn_local_projection_reports_zero_trigger_budget_fallback() {
+    let rounds = vec![
+        fixture_round_with_tool(
+            1,
+            "inspect command",
+            "ExecCommand",
+            serde_json::json!({"cmd": "printf ok"}),
+        ),
+        fixture_round_with_tool(
+            2,
+            "inspect command",
+            "ExecCommand",
+            serde_json::json!({"cmd": "printf ok"}),
+        ),
+    ];
+    let prompt_frame = fixture_prompt_frame();
+    let projection = build_turn_local_projection_with_runtime_reminder(
+        &prompt_frame,
+        &rounds,
+        &[],
+        &TurnLocalCheckpointState::default(),
+        Some("req-trigger-fallback".into()),
+        4_000,
+        CONTINUATION_BUDGET_SAFETY_MARGIN_TOKENS,
+        100,
+        usize::MAX,
+        None,
+    );
+
+    let TurnLocalProjectionOutcome::Projection(projection) = projection else {
+        panic!("expected projection outcome");
+    };
+    let compaction = projection.compaction.expect("repeated rounds should fold");
+    assert!(compaction.trigger_budget_fallback_applied);
+    assert_eq!(
+        compaction.effective_budget_estimated_tokens,
+        4_000 - CONTINUATION_BUDGET_SAFETY_MARGIN_TOKENS
+    );
+}
+
+#[test]
+fn compacted_tool_result_projection_uses_canonical_recoverable_receipt() {
+    let mut round = fixture_round_with_tool(
+        1,
+        "inspect command",
+        "ExecCommand",
+        serde_json::json!({"cmd": "printf ok"}),
+    );
+    let envelope = ToolResultEnvelope {
+        tool_name: "ExecCommand".into(),
+        status: ToolResultStatus::Success,
+        summary_text: Some("completed exit_status=0 truncated=true".into()),
+        result: Some(serde_json::json!({
+            "stdout_preview": "sensitive-large-payload ".repeat(500),
+            "output_ref": "tool_execution:tool_123:output",
+            "stdout_ref": "tool_execution:tool_123:stdout",
+            "truncated": true,
+            "artifacts": [{"path": "/tmp/full-output.log"}],
+            "task_handle": {"task_id": "task_123", "status": "completed"},
+            "details": {"path": "/tmp/not-an-artifact"}
+        })),
+        error: None,
+    };
+    round.tool_results = vec![ToolResultBlock {
+        tool_use_id: "call_1".into(),
+        content: serde_json::to_string(&envelope).unwrap(),
+        is_error: false,
+        error: None,
+    }];
+    round.tool_result_envelopes = vec![envelope];
+    round.estimated_tokens =
+        build_round_estimated_tokens(&round.assistant_blocks, &round.tool_results, &[]);
+    let prompt_frame = fixture_prompt_frame();
+    let tool_budget = 160;
+    let (projected_messages, stats) =
+        compacted_round_messages(&round, tool_budget).expect("compact receipt should fit");
+    let compacted_conversation = [
+        vec![ConversationMessage::UserBlocks(
+            prompt_frame.context_blocks.clone(),
+        )],
+        projected_messages,
+    ]
+    .concat();
+    let compacted_tokens = estimate_projection_tokens(&prompt_frame, &compacted_conversation);
+    let exact_tokens = estimate_projection_tokens(
+        &prompt_frame,
+        &[
+            vec![ConversationMessage::UserBlocks(
+                prompt_frame.context_blocks.clone(),
+            )],
+            exact_round_messages(&round),
+        ]
+        .concat(),
+    );
+
+    let projection = build_turn_local_projection_with_runtime_reminder(
+        &prompt_frame,
+        &[round],
+        &[],
+        &TurnLocalCheckpointState::default(),
+        Some("req-tool".into()),
+        exact_tokens + CONTINUATION_BUDGET_SAFETY_MARGIN_TOKENS + 100,
+        compacted_tokens + CONTINUATION_BUDGET_SAFETY_MARGIN_TOKENS,
+        100,
+        tool_budget,
+        None,
+    );
+
+    let TurnLocalProjectionOutcome::Projection(projection) = projection else {
+        panic!("expected projection outcome");
+    };
+    let compaction = projection.compaction.expect("tool result should compact");
+    assert_eq!(stats.compacted_tool_results, 1);
+    assert_eq!(compaction.compacted_tool_results, 1);
+    assert_eq!(compaction.preserved_artifact_refs, 3);
+    let rendered = format!("{:?}", projection.conversation);
+    assert!(rendered.contains("completed exit_status=0 truncated=true"));
+    assert!(rendered.contains("tool_execution:tool_123:output"));
+    assert!(rendered.contains("task_123"));
+    assert!(rendered.contains("/tmp/full-output.log"));
+    assert!(!rendered.contains("sensitive-large-payload"));
+}
+
+#[test]
+fn compacted_tool_result_projection_fails_closed_when_minimum_receipt_cannot_fit() {
+    let mut round = fixture_round_with_tool(
+        1,
+        "inspect command",
+        "ExecCommand",
+        serde_json::json!({"cmd": "printf ok"}),
+    );
+    let envelope = ToolResultEnvelope {
+        tool_name: "ExecCommand".into(),
+        status: ToolResultStatus::Success,
+        summary_text: Some("completed".into()),
+        result: Some(serde_json::json!({"output_ref": "tool_execution:tool_123:output"})),
+        error: None,
+    };
+    round.tool_results = vec![ToolResultBlock {
+        tool_use_id: "call_1".into(),
+        content: format!(
+            "{}{}",
+            serde_json::to_string(&envelope).unwrap(),
+            "x".repeat(2_000)
+        ),
+        is_error: false,
+        error: None,
+    }];
+    round.tool_result_envelopes = vec![envelope];
+    round.estimated_tokens =
+        build_round_estimated_tokens(&round.assistant_blocks, &round.tool_results, &[]);
+    let prompt_frame = fixture_prompt_frame();
+    let exact_tokens = estimate_projection_tokens(
+        &prompt_frame,
+        &[
+            vec![ConversationMessage::UserBlocks(
+                prompt_frame.context_blocks.clone(),
+            )],
+            exact_round_messages(&round),
+        ]
+        .concat(),
+    );
+
+    let projection = build_turn_local_projection_with_runtime_reminder(
+        &prompt_frame,
+        &[round],
+        &[],
+        &TurnLocalCheckpointState::default(),
+        Some("req-tool-fail".into()),
+        exact_tokens + CONTINUATION_BUDGET_SAFETY_MARGIN_TOKENS + 100,
+        CONTINUATION_BUDGET_SAFETY_MARGIN_TOKENS + 10,
+        100,
+        1,
+        None,
+    );
+
+    let TurnLocalProjectionOutcome::BaselineOverBudget(diagnostics) = projection else {
+        panic!("minimum compact receipt must fail closed");
+    };
+    assert_eq!(diagnostics.reason, "minimum_compact_tool_receipt_unfit");
 }
 
 #[test]
@@ -1869,6 +2273,7 @@ fn checkpoint_state_can_resume_from_structured_terminal_checkpoint() {
         kind: TurnTerminalKind::Completed,
         reason: None,
         last_assistant_message: Some("ordinary final text without checkpoint keywords".into()),
+        no_brief_reason: None,
         checkpoint: Some(TurnTerminalCheckpointRecord {
             request_id: "checkpoint-7".into(),
             requested_at_round: 3,
@@ -1917,6 +2322,7 @@ fn checkpoint_state_ignores_terminal_text_without_structured_checkpoint() {
                 "Progress checkpoint:\n\n- current user goal: fix issue\n- next goal-aligned action: apply patch"
                     .into(),
             ),
+            no_brief_reason: None,
             checkpoint: None,
             completed_at: chrono::Utc::now(),
             duration_ms: 10,
@@ -2345,6 +2751,42 @@ fn completion_report_texts_skips_thinking_blocks() {
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].0, "call_cw2");
     assert_eq!(reports[0].1, "Report text.");
+}
+
+#[test]
+fn completion_report_texts_captures_and_deduplicates_citations() {
+    let blocks = vec![
+        ModelBlock::Text {
+            text: "Report text.".to_string(),
+        },
+        ModelBlock::Citations {
+            citations: vec![
+                crate::types::Citation {
+                    url: "https://example.com/one".to_string(),
+                    title: Some("One".to_string()),
+                },
+                crate::types::Citation {
+                    url: "https://example.com/one".to_string(),
+                    title: Some("Duplicate".to_string()),
+                },
+            ],
+        },
+        ModelBlock::ToolUse {
+            id: "call_citations".to_string(),
+            name: "CompleteWorkItem".to_string(),
+            input: serde_json::json!({"work_item_id": "work_456"}),
+            kind: crate::provider::ModelToolCallKind::Function,
+        },
+    ];
+
+    let reports = completion_report_texts_by_tool_id(&blocks);
+    assert_eq!(
+        reports[0].2,
+        vec![crate::types::Citation {
+            url: "https://example.com/one".to_string(),
+            title: Some("One".to_string()),
+        }]
+    );
 }
 
 #[test]

@@ -10,12 +10,14 @@ on:
         description: Intended release tag, for example v0.14.0.
         required: true
       previous_image:
-        description: Previous release image used by upgrade cases.
+        description: Full previous release image reference. Mutually exclusive with previous_ref; invalid references fail.
+        required: false
+      previous_ref:
+        description: Git tag used to build the previous image when previous_image is omitted.
         required: false
       model:
         description: Real model route.
         required: false
-        default: deepseek/deepseek-v4-flash
 
 permissions:
   contents: read
@@ -82,8 +84,10 @@ jobs:
       packages: read
     env:
       CANDIDATE_IMAGE: ${{ needs.candidate.outputs.image }}@${{ needs.candidate.outputs.digest }}
-      HOLON_E2E_MODEL: ${{ inputs.model }}
-      HOLON_E2E_DOCKER_ENV_FILE: /tmp/holon-e2e.env
+      HOLON_E2E_MODEL: ${{ inputs.model || vars.HOLON_E2E_SCHEDULER_MODEL || 'dashscope-token-plan/qwen-3.7' }}
+      HOLON_E2E_CREDENTIAL_ENV: ${{ vars.HOLON_E2E_SCHEDULER_CREDENTIAL_ENV || 'DASHSCOPE_TOKEN_PLAN_API_KEY' }}
+      HOLON_E2E_CREDENTIAL: ${{ secrets.HOLON_E2E_SCHEDULER_CREDENTIAL || secrets.DASHSCOPE_TOKEN_PLAN_API_KEY || secrets.DEEPSEEK_API_KEY }}
+      HOLON_E2E_CONFIG_JSON: ${{ vars.HOLON_E2E_SCHEDULER_CONFIG_JSON }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -96,15 +100,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Prepare protected provider environment
+      - name: Prepare protected provider configuration
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          HOLON_E2E_PROVIDER_ENV_FILE: /tmp/holon-e2e.env
+          HOLON_E2E_PROVIDER_CONFIG_FILE: /tmp/holon-e2e-config.json
         run: |
           set -euo pipefail
-          test -n "${DEEPSEEK_API_KEY}"
+          test -n "${HOLON_E2E_CREDENTIAL}"
+          [[ "${HOLON_E2E_CREDENTIAL_ENV}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]
           umask 077
-          printf 'DEEPSEEK_API_KEY=%s\n' "${DEEPSEEK_API_KEY}" > "${HOLON_E2E_DOCKER_ENV_FILE}"
-          chmod 0600 "${HOLON_E2E_DOCKER_ENV_FILE}"
+          printf '%s=%s\n' \
+            "${HOLON_E2E_CREDENTIAL_ENV}" \
+            "${HOLON_E2E_CREDENTIAL}" > "${HOLON_E2E_PROVIDER_ENV_FILE}"
+          chmod 0600 "${HOLON_E2E_PROVIDER_ENV_FILE}"
+          if [ -n "${HOLON_E2E_CONFIG_JSON}" ]; then
+            printf '%s' "${HOLON_E2E_CONFIG_JSON}" > "${HOLON_E2E_PROVIDER_CONFIG_FILE}"
+            python3 -m json.tool "${HOLON_E2E_PROVIDER_CONFIG_FILE}" >/dev/null
+            chmod 0600 "${HOLON_E2E_PROVIDER_CONFIG_FILE}"
+          fi
 
       - name: Pull and smoke candidate digest
         run: |
@@ -112,32 +125,135 @@ jobs:
           docker pull "${CANDIDATE_IMAGE}"
           scripts/docker-smoke.sh "${CANDIDATE_IMAGE}"
 
-      - name: Run release core E2E
+      - name: Prepare previous release image
+        id: previous
         env:
-          HOLON_E2E_PREVIOUS_IMAGE: ${{ inputs.previous_image }}
+          PREVIOUS_IMAGE_INPUT: ${{ inputs.previous_image }}
+          PREVIOUS_REF: ${{ inputs.previous_ref }}
         run: |
           set -euo pipefail
+          if [ -n "${PREVIOUS_IMAGE_INPUT}" ] && [ -n "${PREVIOUS_REF}" ]; then
+            echo "previous_image and previous_ref are mutually exclusive" >&2
+            exit 1
+          fi
+          if [ -n "${PREVIOUS_IMAGE_INPUT}" ]; then
+            echo "Resolving previous release from explicit image: ${PREVIOUS_IMAGE_INPUT}"
+            if ! docker manifest inspect "${PREVIOUS_IMAGE_INPUT}" >/dev/null; then
+              echo "previous_image is not a resolvable container image: ${PREVIOUS_IMAGE_INPUT}" >&2
+              exit 1
+            fi
+            {
+              echo "image=${PREVIOUS_IMAGE_INPUT}"
+              echo "source=previous_image"
+              echo "ref="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "${PREVIOUS_REF}" ]; then
+            echo "one of previous_image or previous_ref is required" >&2
+            exit 1
+          fi
+          if [[ ! "${PREVIOUS_REF}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "previous_ref must be a release tag such as v0.31.1: ${PREVIOUS_REF}" >&2
+            exit 1
+          fi
+          echo "Building previous release image from release assets for ${PREVIOUS_REF}"
+          version="${PREVIOUS_REF#v}"
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "${workdir}"' EXIT
+          base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${PREVIOUS_REF}"
+          curl -fsSL -o "${workdir}/checksums.txt" "${base_url}/checksums.txt"
+          curl -fsSL -o "${workdir}/holon-linux-amd64.tar.gz" "${base_url}/holon-linux-amd64.tar.gz"
+          (
+            cd "${workdir}"
+            expected="$(awk 'match($0, /holon-linux-amd64\.tar\.gz$/) { print $1 }' checksums.txt)"
+            if [ -z "${expected}" ]; then
+              echo "checksums.txt has no entry for holon-linux-amd64.tar.gz" >&2
+              exit 1
+            fi
+            printf '%s  holon-linux-amd64.tar.gz\n' "${expected}" | sha256sum --check --strict -
+            tar -xzf holon-linux-amd64.tar.gz
+            test -x holon || chmod +x holon
+          )
+          cat > "${workdir}/Dockerfile" <<'DOCKERFILE'
+          FROM debian:trixie-slim
+          RUN apt-get update \
+              && apt-get install -y --no-install-recommends \
+                 bash ca-certificates curl git gzip openssh-client tar \
+              && rm -rf /var/lib/apt/lists/* \
+              && useradd --create-home --home-dir /var/lib/holon --uid 10001 holon \
+              && mkdir -p /workspace \
+              && chown holon:holon /workspace
+          COPY holon /usr/local/bin/holon
+          RUN chmod +x /usr/local/bin/holon
+          ENV HOME=/var/lib/holon \
+              HOLON_HOME=/var/lib/holon \
+              HOLON_WORKSPACE_DIR=/workspace
+          WORKDIR /workspace
+          USER holon
+          EXPOSE 7878
+          ENTRYPOINT ["holon"]
+          CMD ["serve", "--listen", "0.0.0.0:7878"]
+          DOCKERFILE
+          tag="holon-e2e-previous:${version}"
+          docker build --tag "${tag}" "${workdir}"
+          {
+            echo "image=${tag}"
+            echo "source=previous_ref"
+            echo "ref=${PREVIOUS_REF}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run release core E2E
+        env:
+          HOLON_E2E_PREVIOUS_IMAGE: ${{ steps.previous.outputs.image }}
+          HOLON_E2E_PROVIDER_ENV_FILE: /tmp/holon-e2e.env
+        run: |
+          set -euo pipefail
+          config_file=/tmp/holon-e2e-config.json
           args=(
             --image-digest "${CANDIDATE_IMAGE}"
             --skip-build
-            --scheduler-matrix
-            --env-file "${HOLON_E2E_DOCKER_ENV_FILE}"
+            --suite core
+            --env-file "${HOLON_E2E_PROVIDER_ENV_FILE}"
+            --evidence-dir target/docker-e2e/release-core
           )
-          while IFS= read -r case_id; do
-            args+=(--case "${case_id}")
-          done < <(
-            python3 -c '
-            import json
-            from pathlib import Path
-            manifest = json.loads(Path("tests/e2e/docker/manifest.json").read_text())
-            print("\n".join(
-                case["id"] for case in manifest["cases"]
-                if case["tier"] == "core" or "scheduler" in case.get("tags", [])
-            ))
-            '
-          )
+          if [ -s "${config_file}" ]; then
+            args+=(--config-file "${config_file}")
+          fi
           if [ -n "${HOLON_E2E_PREVIOUS_IMAGE}" ]; then
             args+=(--previous-image "${HOLON_E2E_PREVIOUS_IMAGE}")
+          fi
+          python3 scripts/docker-e2e.py "${args[@]}"
+
+      - name: Run deterministic scheduler release gate
+        run: |
+          set -euo pipefail
+          python3 scripts/docker-e2e.py \
+            --image-digest "${CANDIDATE_IMAGE}" \
+            --skip-build \
+            --profile scheduler-required \
+            --scheduler-matrix \
+            --timeout 120 \
+            --evidence-dir target/docker-e2e/scheduler-required
+
+      - name: Run scheduler live canary
+        continue-on-error: true
+        env:
+          HOLON_E2E_PROVIDER_ENV_FILE: /tmp/holon-e2e.env
+        run: |
+          set -euo pipefail
+          config_file=/tmp/holon-e2e-config.json
+          args=(
+            --image-digest "${CANDIDATE_IMAGE}"
+            --skip-build
+            --profile scheduler-live-canary
+            --scheduler-matrix
+            --env-file "${HOLON_E2E_PROVIDER_ENV_FILE}"
+            --timeout 120
+            --evidence-dir target/docker-e2e/scheduler-live-canary
+          )
+          if [ -s "${config_file}" ]; then
+            args+=(--config-file "${config_file}")
           fi
           python3 scripts/docker-e2e.py "${args[@]}"
 
@@ -146,25 +262,40 @@ jobs:
         run: |
           python3 - <<'PY'
           import json
+          import os
           from pathlib import Path
 
-          summaries = sorted(Path("target/docker-e2e").glob("*/summary.json"))
-          if not summaries:
-              raise SystemExit("No Docker E2E summary was produced")
-          summary = json.loads(summaries[-1].read_text())
-          scheduler_report = json.loads(
-              (summaries[-1].parent / "scheduler-acceptance-report.json").read_text()
+          summary = json.loads(
+              Path("target/docker-e2e/release-core/summary.json").read_text()
           )
+          scheduler_report = json.loads(
+              Path(
+                  "target/docker-e2e/scheduler-required/"
+                  "scheduler-acceptance-report.json"
+              ).read_text()
+          )
+          canary_path = Path(
+              "target/docker-e2e/scheduler-live-canary/"
+              "scheduler-live-canary-report.json"
+          )
+          canary = json.loads(canary_path.read_text()) if canary_path.is_file() else None
           lines = [
               "# Release Docker E2E",
               "",
               f"- Status: **{summary['status']}**",
               f"- Candidate: `{summary['image']['ref']}`",
               f"- Git SHA: `{summary['git_sha']}`",
-              f"- Scheduler matrix: **{scheduler_report['status']}**",
+              f"- Previous release image: `{os.environ['PREVIOUS_IMAGE']}`",
+              f"- Previous release source: `{os.environ['PREVIOUS_SOURCE']}`",
+              f"- Previous release ref: `{os.environ['PREVIOUS_REF'] or 'n/a'}`",
+              f"- Deterministic scheduler gate: **{scheduler_report['status']}**",
+              f"- Scheduler live canary: **{canary['status'] if canary else 'missing'}**",
               f"- Runtime schema revision: `{scheduler_report['runtime_schema_revision']}`",
               f"- Fixture corpus: `{scheduler_report['fixture_corpus_revision']}`",
-              f"- Model: `{summary['model_route']}`",
+              f"- Core model: `{summary['model_route']}`",
+              f"- Canary provider retries: `{canary['provider_retries'] if canary else 'unknown'}`",
+              f"- Canary tool counts: `{json.dumps(canary['cases'][0]['tool_counts'], sort_keys=True) if canary else 'unknown'}`",
+              f"- Canary behavioral variance: `{json.dumps(canary['behavioral_variances'], sort_keys=True) if canary else 'unknown'}`",
               f"- Duration: `{summary['duration_seconds']}s`",
               "",
               "| Case | Result | Duration |",
@@ -174,35 +305,120 @@ jobs:
               lines.append(
                   f"| `{case['id']}` | {case['status']} | {case['duration_seconds']}s |"
               )
-          Path(__import__("os").environ["GITHUB_STEP_SUMMARY"]).write_text(
+          Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text(
               "\n".join(lines) + "\n"
           )
           PY
+        env:
+          PREVIOUS_IMAGE: ${{ steps.previous.outputs.image }}
+          PREVIOUS_SOURCE: ${{ steps.previous.outputs.source }}
+          PREVIOUS_REF: ${{ steps.previous.outputs.ref }}
 
       - name: Write release E2E attestation
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          import hashlib
           import json
           import os
           from pathlib import Path
 
-          summaries = sorted(Path("target/docker-e2e").glob("*/summary.json"))
-          if not summaries:
-              raise SystemExit("No Docker E2E summary was produced")
-          summary = json.loads(summaries[-1].read_text())
+          summary_path = Path("target/docker-e2e/release-core/summary.json")
+          summary = json.loads(summary_path.read_text())
           if summary["status"] != "pass":
               raise SystemExit(f"Release E2E did not pass: {summary['status']}")
-          scheduler_report_path = summaries[-1].parent / "scheduler-acceptance-report.json"
+          scheduler_root = Path("target/docker-e2e/scheduler-required")
+          scheduler_report_path = scheduler_root / "scheduler-acceptance-report.json"
           scheduler_report = json.loads(scheduler_report_path.read_text())
+          coverage_report_path = scheduler_root / "scheduler-coverage-report.json"
+          coverage_report = json.loads(coverage_report_path.read_text())
+          canary_report_path = Path(
+              "target/docker-e2e/scheduler-live-canary/"
+              "scheduler-live-canary-report.json"
+          )
+          canary_report = (
+              json.loads(canary_report_path.read_text())
+              if canary_report_path.is_file()
+              else None
+          )
           if scheduler_report["status"] != "pass":
               raise SystemExit(
                   f"Scheduler acceptance did not pass: {scheduler_report['status']}"
+              )
+          if coverage_report["status"] != "pass":
+              raise SystemExit(
+                  f"Scheduler coverage did not pass: {coverage_report['status']}"
               )
           if scheduler_report["git_sha"] != os.environ["CANDIDATE_SHA"]:
               raise SystemExit("Scheduler acceptance Git SHA does not match candidate")
           if scheduler_report["image_digest"] != summary["image_digest"]:
               raise SystemExit("Scheduler acceptance image digest does not match summary")
+          if coverage_report["git_sha"] != os.environ["CANDIDATE_SHA"]:
+              raise SystemExit("Scheduler coverage Git SHA does not match candidate")
+          if coverage_report["image_digest"] != summary["image_digest"]:
+              raise SystemExit("Scheduler coverage image digest does not match summary")
+          if coverage_report["profile"] != "scheduler-required":
+              raise SystemExit("Scheduler coverage profile is not scheduler-required")
+          interrupted_case = next(
+              (
+                  result
+                  for result in summary["case_results"]
+                  if result["base_id"] == "runtime-upgrade-interrupted-schema47"
+              ),
+              None,
+          )
+          if interrupted_case is None or interrupted_case["status"] != "pass":
+              raise SystemExit(
+                  "Interrupted schema 47 previous-image upgrade case did not pass"
+              )
+          recovery_path = Path(
+              "target/docker-e2e/release-core/"
+              "runtime-upgrade-interrupted-schema47/"
+              "upgrade-schema47-recovery-attestation.json"
+          )
+          recovery = json.loads(recovery_path.read_text())
+          recovery_dir = recovery_path.parent
+          old_snapshot_path = recovery_dir / "upgrade-schema47-old-runtime-db.json"
+          migrated_snapshot_path = (
+              recovery_dir / "upgrade-schema47-migrated-runtime-db.json"
+          )
+          old_snapshot_sha256 = hashlib.sha256(
+              old_snapshot_path.read_bytes()
+          ).hexdigest()
+          migrated_snapshot_sha256 = hashlib.sha256(
+              migrated_snapshot_path.read_bytes()
+          ).hexdigest()
+          old_snapshot = json.loads(old_snapshot_path.read_text())
+          migrated_snapshot = json.loads(migrated_snapshot_path.read_text())
+          report_before = recovery.get("report_before", {})
+          apply = recovery.get("apply", {})
+          report_after = recovery.get("report_after", {})
+          if (
+              recovery["previous_schema_revision"]
+              != old_snapshot.get("schema_revision")
+              or recovery["candidate_schema_revision"]
+              != migrated_snapshot.get("schema_revision")
+              or recovery["candidate_schema_revision"] < 47
+              or recovery["candidate_schema_revision"]
+              <= recovery["previous_schema_revision"]
+              or len(recovery["affected_agents"]) < 2
+              or recovery.get("old_snapshot_sha256") != old_snapshot_sha256
+              or recovery.get("migrated_snapshot_sha256")
+              != migrated_snapshot_sha256
+              or not report_before.get("before", {}).get("blockers")
+              or report_before.get("report_errors")
+              or not apply.get("apply", {}).get("changed")
+              or apply.get("after", {}).get("blockers")
+              or apply.get("report_errors")
+              or report_after.get("before", {}).get("blockers")
+              or report_after.get("after", {}).get("blockers")
+              or report_after.get("report_errors")
+              or report_after.get("reports")
+          ):
+              raise SystemExit(
+                  f"Interrupted schema 47 recovery evidence is invalid: {recovery}"
+              )
+          recovery_sha256 = hashlib.sha256(recovery_path.read_bytes()).hexdigest()
           attestation = {
               "schema_version": 1,
               "release_tag": os.environ["RELEASE_TAG"],
@@ -214,9 +430,30 @@ jobs:
               "model_route": summary["model_route"],
               "image": summary["image"],
               "image_digest": summary["image_digest"],
+              "previous_release": {
+                  "image": os.environ["PREVIOUS_IMAGE"],
+                  "source": os.environ["PREVIOUS_SOURCE"],
+                  "ref": os.environ["PREVIOUS_REF"] or None,
+              },
               "scheduler_acceptance": scheduler_report,
-              "summary_path": str(summaries[-1]),
+              "scheduler_coverage": coverage_report,
+              "scheduler_live_canary": canary_report,
+              "interrupted_schema47_upgrade": {
+                  "case": interrupted_case,
+                  "evidence_path": str(recovery_path),
+                  "evidence_sha256": recovery_sha256,
+                  "previous_schema_revision": recovery["previous_schema_revision"],
+                  "candidate_schema_revision": recovery["candidate_schema_revision"],
+                  "affected_agents": recovery["affected_agents"],
+                  "old_snapshot_sha256": recovery["old_snapshot_sha256"],
+                  "migrated_snapshot_sha256": recovery["migrated_snapshot_sha256"],
+              },
+              "summary_path": str(summary_path),
               "scheduler_acceptance_path": str(scheduler_report_path),
+              "scheduler_coverage_path": str(coverage_report_path),
+              "scheduler_live_canary_path": (
+                  str(canary_report_path) if canary_report is not None else None
+              ),
           }
           Path("target/release-e2e-attestation").mkdir(parents=True, exist_ok=True)
           Path("target/release-e2e-attestation/release-e2e-attestation.json").write_text(
@@ -226,6 +463,9 @@ jobs:
         env:
           CANDIDATE_REF: ${{ inputs.candidate_ref }}
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+          PREVIOUS_IMAGE: ${{ steps.previous.outputs.image }}
+          PREVIOUS_SOURCE: ${{ steps.previous.outputs.source }}
+          PREVIOUS_REF: ${{ steps.previous.outputs.ref }}
           RELEASE_TAG: ${{ inputs.release_tag }}
 
       - name: Prepare safe evidence upload
@@ -239,32 +479,42 @@ jobs:
           import json
           from pathlib import Path
 
-          summaries = sorted(Path("target/docker-e2e").glob("*/summary.json"))
-          if not summaries:
+          evidence_roots = [
+              path
+              for path in (
+                  Path("target/docker-e2e/release-core"),
+                  Path("target/docker-e2e/scheduler-required"),
+                  Path("target/docker-e2e/scheduler-live-canary"),
+              )
+              if (path / "summary.json").is_file()
+          ]
+          if not evidence_roots:
               Path("target/docker-e2e-upload/upload-blocked.txt").write_text(
                   "Raw evidence upload blocked because no secret-scan.json was produced.\n"
               )
               raise SystemExit(0)
-          evidence = summaries[-1].parent
-          if not (evidence / "secret-scan.json").is_file():
-              Path("target/docker-e2e-upload/upload-blocked.txt").write_text(
-                  f"Raw evidence upload blocked because {evidence}/secret-scan.json is missing.\n"
-              )
-              raise SystemExit(0)
-          scan = json.loads((evidence / "secret-scan.json").read_text())
-          if scan.get("status") != "pass":
+          for evidence in evidence_roots:
               destination = Path("target/docker-e2e-upload") / evidence.name
-              destination.mkdir(parents=True, exist_ok=True)
-              for name in ("secret-scan.json", "summary.json", "junit.xml"):
-                  source = evidence / name
-                  if source.is_file():
-                      shutil.copy2(source, destination / name)
-              (destination / "raw-evidence-blocked.txt").write_text(
-                  "Raw evidence upload blocked because the secret scan failed. "
-                  "Only metadata was uploaded.\n"
-              )
-              raise SystemExit(0)
-          shutil.copytree(evidence, Path("target/docker-e2e-upload") / evidence.name)
+              scan_path = evidence / "secret-scan.json"
+              if not scan_path.is_file():
+                  destination.mkdir(parents=True, exist_ok=True)
+                  (destination / "raw-evidence-blocked.txt").write_text(
+                      f"Raw evidence upload blocked because {scan_path} is missing.\n"
+                  )
+                  continue
+              scan = json.loads(scan_path.read_text())
+              if scan.get("status") != "pass":
+                  destination.mkdir(parents=True, exist_ok=True)
+                  for name in ("secret-scan.json", "summary.json", "junit.xml"):
+                      source = evidence / name
+                      if source.is_file():
+                          shutil.copy2(source, destination / name)
+                  (destination / "raw-evidence-blocked.txt").write_text(
+                      "Raw evidence upload blocked because the secret scan failed. "
+                      "Only metadata was uploaded.\n"
+                  )
+                  continue
+              shutil.copytree(evidence, destination)
           PY
 
       - name: Upload E2E evidence
@@ -284,6 +534,9 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      - name: Remove provider environment
+      - name: Remove provider configuration
         if: always()
-        run: rm -f "${HOLON_E2E_DOCKER_ENV_FILE}"
+        env:
+          HOLON_E2E_PROVIDER_ENV_FILE: /tmp/holon-e2e.env
+          HOLON_E2E_PROVIDER_CONFIG_FILE: /tmp/holon-e2e-config.json
+        run: rm -f "${HOLON_E2E_PROVIDER_ENV_FILE}" "${HOLON_E2E_PROVIDER_CONFIG_FILE}"

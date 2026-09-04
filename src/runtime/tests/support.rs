@@ -41,6 +41,7 @@ mod lifecycle;
 pub(crate) use lifecycle::{
     advance_lifecycle_time, assert_injected_transition_fault, controlled_clock,
     DurableLifecycleSnapshot, LifecycleHarness, POST_COMMIT_FAULTS, PRE_COMMIT_FAULTS,
+    TERMINAL_PRE_COMMIT_FAULTS,
 };
 
 pub(crate) fn context_config() -> ContextConfig {
@@ -114,6 +115,9 @@ pub(crate) fn terminal_transition(
         kind: TurnTerminalKind::Completed,
         reason: None,
         last_assistant_message: Some("terminal transition committed".into()),
+        no_brief_reason: Some(crate::types::TurnNoBriefReason::ReducerOnly {
+            reason: "test_terminal_transition".into(),
+        }),
         checkpoint: None,
         completed_at: Utc::now(),
         duration_ms: 1,
@@ -126,6 +130,8 @@ pub(crate) fn terminal_transition(
     super::super::turn::TurnTerminalTransition {
         terminal,
         turn_record,
+        prepared_work_item_completion: None,
+        terminal_tool_executions: Vec::new(),
     }
 }
 
@@ -217,6 +223,12 @@ pub(crate) fn test_effective_prompt() -> EffectivePrompt {
         context_sections: vec![],
         rendered_system_prompt: "system".into(),
         rendered_context_attachment: "context".into(),
+        projection_owner: crate::projection_eval::ProjectionOwner::AgentLifecycle {
+            agent_id: "default".into(),
+        },
+        projection_binding: None,
+        projection_turn_id: None,
+        projection_evidence: Default::default(),
         context_plan_evidence: Default::default(),
         recent_turns_reprojection: None,
     }
@@ -245,11 +257,83 @@ pub(crate) async fn bind_turn_to_work_item(runtime: &RuntimeHandle, work_item_id
         kind: TurnTerminalKind::Completed,
         reason: None,
         last_assistant_message: Some("done".into()),
+        no_brief_reason: None,
         checkpoint: None,
         completed_at: Utc::now(),
         duration_ms: 10,
     });
     guard.persist_state(&runtime.inner.storage).unwrap();
+}
+
+pub(crate) fn bind_autonomous_work_queue_tick(
+    message: &mut MessageEnvelope,
+    work_item: &WorkItemRecord,
+    reason: &str,
+) {
+    message.work_item_id = Some(work_item.id.clone());
+    message.metadata = Some(serde_json::json!({
+        "work_queue": {
+            "reason": reason,
+            "work_item_id": work_item.id,
+            "work_item_revision": work_item.revision
+        }
+    }));
+}
+
+pub(crate) fn seed_runnable_work_execution(storage: &AppStorage, work_item: &WorkItemRecord) {
+    seed_work_execution(
+        storage,
+        work_item,
+        crate::domain::execution_protocol::WorkItemExecutionState::Runnable {
+            generation: work_item.revision.max(1),
+            recovery_ref: None,
+        },
+    );
+}
+
+pub(crate) fn seed_waiting_work_execution(
+    storage: &AppStorage,
+    work_item: &WorkItemRecord,
+    wait_id: &str,
+) {
+    seed_work_execution(
+        storage,
+        work_item,
+        crate::domain::execution_protocol::WorkItemExecutionState::Waiting {
+            generation: work_item.revision.max(1),
+            wait: crate::domain::execution_protocol::WaitReference {
+                wait_id: wait_id.into(),
+            },
+        },
+    );
+}
+
+fn seed_work_execution(
+    storage: &AppStorage,
+    work_item: &WorkItemRecord,
+    state: crate::domain::execution_protocol::WorkItemExecutionState,
+) {
+    let runtime_db = storage
+        .runtime_db()
+        .unwrap()
+        .expect("test storage should expose RuntimeDb");
+    let mut execution = runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized(&work_item.agent_id)
+        .unwrap()
+        .unwrap_or_else(|| {
+            crate::domain::execution_protocol::ExecutionProtocolState::empty(&work_item.agent_id)
+        });
+    execution.work_items.insert(
+        work_item.id.clone(),
+        crate::domain::execution_protocol::WorkItemExecutionRecord {
+            source_revision: work_item.revision,
+            state,
+        },
+    );
+    runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &execution))
+        .unwrap();
 }
 
 pub(crate) async fn seed_bound_work_item(
@@ -481,9 +565,17 @@ impl AgentProvider for TruncatingProvider {
         *calls += 1;
         if *calls == 1 {
             return Ok(ProviderTurnResponse {
-                blocks: vec![ModelBlock::Text {
-                    text: "Partial report heading:".into(),
-                }],
+                blocks: vec![
+                    ModelBlock::Text {
+                        text: "Partial report heading:".into(),
+                    },
+                    ModelBlock::Citations {
+                        citations: vec![crate::types::Citation {
+                            url: "https://example.com/first".into(),
+                            title: Some("First".into()),
+                        }],
+                    },
+                ],
                 stop_reason: Some("max_tokens".into()),
                 input_tokens: 100,
                 output_tokens: 50,
@@ -505,9 +597,23 @@ impl AgentProvider for TruncatingProvider {
         }));
 
         Ok(ProviderTurnResponse {
-            blocks: vec![ModelBlock::Text {
-                text: "\n\n- final grounded recommendation".into(),
-            }],
+            blocks: vec![
+                ModelBlock::Text {
+                    text: "\n\n- final grounded recommendation".into(),
+                },
+                ModelBlock::Citations {
+                    citations: vec![
+                        crate::types::Citation {
+                            url: "https://example.com/first".into(),
+                            title: Some("Duplicate".into()),
+                        },
+                        crate::types::Citation {
+                            url: "https://example.com/second".into(),
+                            title: Some("Second".into()),
+                        },
+                    ],
+                },
+            ],
             stop_reason: None,
             input_tokens: 50,
             output_tokens: 25,
@@ -558,6 +664,7 @@ impl AgentProvider for TimelineProvider {
                         outcome: ProviderAttemptOutcome::Retrying,
                         advanced_to_fallback: false,
                         backoff_ms: Some(200),
+                        backoff_source: None,
                         token_usage: None,
                         transport_diagnostics: None,
                     },
@@ -574,6 +681,7 @@ impl AgentProvider for TimelineProvider {
                         outcome: ProviderAttemptOutcome::Succeeded,
                         advanced_to_fallback: false,
                         backoff_ms: None,
+                        backoff_source: None,
                         token_usage: Some(TokenUsage::new(12, 6)),
                         transport_diagnostics: None,
                     },
@@ -987,6 +1095,7 @@ impl AgentProvider for FailingTimelineProvider {
                     outcome: ProviderAttemptOutcome::FailFastAborted,
                     advanced_to_fallback: false,
                     backoff_ms: None,
+                    backoff_source: None,
                     token_usage: None,
                     transport_diagnostics: Some(ProviderTransportDiagnostics {
                         stage: "request_send".into(),
@@ -1086,6 +1195,7 @@ impl AgentProvider for ContextLengthExceededProvider {
                     outcome: ProviderAttemptOutcome::FailFastAborted,
                     advanced_to_fallback: false,
                     backoff_ms: None,
+                    backoff_source: None,
                     token_usage: Some(TokenUsage::new(125_166, 0)),
                     transport_diagnostics: None
                 }],
@@ -1128,6 +1238,7 @@ impl AgentProvider for DeferredFallbackProvider {
                     outcome: ProviderAttemptOutcome::RetriesExhausted,
                     advanced_to_fallback: true,
                     backoff_ms: None,
+                    backoff_source: None,
                     token_usage: None,
                     transport_diagnostics: None,
                 }],
@@ -1178,6 +1289,7 @@ impl AgentProvider for TextThenFailingFallbackProvider {
                     outcome: ProviderAttemptOutcome::RetriesExhausted,
                     advanced_to_fallback: true,
                     backoff_ms: None,
+                    backoff_source: None,
                     token_usage: None,
                     transport_diagnostics: None,
                 }],

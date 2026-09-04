@@ -36,7 +36,6 @@ and description.
 | `model.default` | model_route_ref | Default executable route, e.g. `"anthropic@default/claude-sonnet-4-6"` |
 | `model.fallbacks` | model_route_ref_list | Ordered executable fallback routes |
 | `runtime.disable_provider_fallback` | boolean | Disable provider/model fallback; require deterministic single-provider execution |
-| `runtime.scheduler` | `legacy` or `canonical` | Startup-only process-wide scheduler engine; defaults to `canonical` |
 
 ```bash
 # Set the default model
@@ -104,29 +103,27 @@ Do not combine `api.cors.allow_credentials=true` with
 
 ### Scheduler
 
-The process selects exactly one scheduler engine at startup:
+The canonical scheduler is always enabled. `runtime.scheduler` is no longer a
+configurable key. For one minor release, an existing persisted
+`runtime.scheduler=canonical` value or `HOLON_SCHEDULER=canonical` environment
+value is accepted with a deprecation warning. `legacy` and all other values
+fail startup. Remove the obsolete selector from deployment configuration.
 
-```text
-HOLON_SCHEDULER > runtime.scheduler > canonical
-```
+Migration 40 marked the rollout tables as retired compatibility data. The
+follow-up cleanup migration removes them after recovery reaches a fixed point.
+They do not decide authority during startup, ordinary scheduler transactions,
+or typed repair.
 
-Accepted values are `legacy` and `canonical`. The selected engine is immutable
-until process restart, global to every agent in the process, and never enables
-shadow execution or per-scenario authority. `runtime.scheduler` is startup-only:
-stop the daemon before changing it with `holon config set`, or use the
-`HOLON_SCHEDULER` environment override for the next process start.
+The follow-up cleanup migration fails closed while any canonical execution is
+open, any execution work item is in flight, or any queue entry is dequeued. The
+error lists the affected agent IDs. Stop Holon and run
+`holon debug scheduler-recovery --agent <agent>` to report, apply the typed
+recovery, and report again. This command can open the immediately preceding
+schema without triggering cleanup; other current-binary commands cannot.
 
-Migration 40 marks the rollout tables as retired compatibility data without
-dropping them. `holon debug scheduler-recovery` reports their retained row
-counts and stale authoritative rows. They are diagnostic only: startup,
-ordinary scheduler transactions, and typed repair do not read them to decide
-authority.
-
-`legacy` is a temporary compatibility fallback. It does not write canonical
-activation or settlement facts, and startup fails closed if non-terminal
-canonical activations remain. Stop admission and settle or interrupt in-flight
-canonical work before changing engines. The selector will be removed with the
-legacy engine after the compatibility release.
+Holon v0.31.1 is the rollback release for deployments that still require the
+legacy scheduler. Use it only with a pre-migration database backup; a database
+migrated by the follow-up schema cleanup is not downgrade-compatible.
 
 ## Credential Management
 
@@ -201,6 +198,25 @@ holon config providers list
 ```
 
 Each provider entry shows its transport protocol (`anthropic_messages`, `openai_chat_completions`, etc.), base URL, and credential requirement.
+
+### Ollama (local)
+
+Holon includes a built-in [`ollama`](./models.md) provider for running models
+locally with [Ollama](https://ollama.com). It requires no API key and targets
+a local Ollama server at `http://127.0.0.1:11434` over the Anthropic Messages
+transport.
+
+1. Install and start Ollama, then pull a model, for example
+   `ollama pull qwen3.8:latest`.
+2. Select Ollama during `holon onboard`, or set it directly:
+
+```bash
+holon config set model.default "ollama/qwen3.8:latest"
+```
+
+The Web GUI discovers locally running Ollama models without any credential
+configuration, and `ViewImage` automatically discovers Ollama vision models
+for image analysis.
 
 ### Adding a Custom Provider
 

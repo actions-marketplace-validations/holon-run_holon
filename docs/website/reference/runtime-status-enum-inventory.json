@@ -16,6 +16,7 @@
       "name": "WorkItemState",
       "serialized_values": [
         "open",
+        "completing",
         "completed"
       ],
       "source": "src/domain/work_item.rs"
@@ -36,6 +37,7 @@
         "yielded",
         "waiting_for_operator",
         "blocked",
+        "completing",
         "completed"
       ],
       "source": "src/domain/work_item.rs"
@@ -57,6 +59,7 @@
       "name": "WaitConditionStatus",
       "serialized_values": [
         "active",
+        "triggered",
         "resolved",
         "cancelled",
         "expired"
@@ -81,6 +84,7 @@
         "interjected",
         "aborted",
         "dropped",
+        "quarantined",
         "interrupted"
       ],
       "source": "src/types.rs"
@@ -88,6 +92,7 @@
     {
       "name": "ToolResultStatus",
       "serialized_values": [
+        "deferred",
         "success",
         "error"
       ],

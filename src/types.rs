@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::config::ModelRouteRef;
-use crate::domain::scheduler_protocol::{ScenarioMode, SchedulerScenarioClass};
+use crate::domain::scheduler::{ScenarioMode, SchedulerScenarioClass};
 pub use crate::domain::{agent_home_workspace_id, work_item::*, AGENT_HOME_WORKSPACE_ID};
 use crate::ids;
 use crate::model_catalog::ResolvedRuntimeModelPolicy;
@@ -1007,10 +1007,20 @@ pub enum ContinuationTriggerKind {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum TaskResultOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ContinuationClass {
     ResumeExpectedWait,
     ResumeOverride,
     LocalContinuation,
+    TaskResultReentry,
     LivenessOnly,
 }
 
@@ -1370,6 +1380,107 @@ pub enum AuthorityClass {
     ExternalEvidence,
 }
 
+pub const HOLON_CALLER_AGENT_ID_ENV: &str = "HOLON_CALLER_AGENT_ID";
+pub const HOLON_CALLER_SOURCE_TASK_ID_ENV: &str = "HOLON_CALLER_SOURCE_TASK_ID";
+pub const HOLON_CALLER_SOURCE_TURN_ID_ENV: &str = "HOLON_CALLER_SOURCE_TURN_ID";
+pub const HOLON_CALLER_SOURCE_WORK_ITEM_ID_ENV: &str = "HOLON_CALLER_SOURCE_WORK_ITEM_ID";
+pub const HOLON_CALLER_SOURCE_ACTIVATION_ID_ENV: &str = "HOLON_CALLER_SOURCE_ACTIVATION_ID";
+pub const HOLON_CALLER_AUTHORITY_CLASS_ENV: &str = "HOLON_CALLER_AUTHORITY_CLASS";
+
+/// Declaration-based provenance supplied to a CLI launched by an agent.
+///
+/// These values describe the caller and its source activation, but are not
+/// authentication material. A local process can forge them.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AgentInvocationContext {
+    pub caller_agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_activation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_authority_class: Option<AuthorityClass>,
+}
+
+impl AgentInvocationContext {
+    pub fn from_env() -> Result<Option<Self>, String> {
+        let read = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        let caller_agent_id = read(HOLON_CALLER_AGENT_ID_ENV);
+        let any_context_field = [
+            HOLON_CALLER_SOURCE_TASK_ID_ENV,
+            HOLON_CALLER_SOURCE_TURN_ID_ENV,
+            HOLON_CALLER_SOURCE_WORK_ITEM_ID_ENV,
+            HOLON_CALLER_SOURCE_ACTIVATION_ID_ENV,
+            HOLON_CALLER_AUTHORITY_CLASS_ENV,
+        ]
+        .into_iter()
+        .any(|name| std::env::var_os(name).is_some());
+
+        Self::from_fields(
+            caller_agent_id,
+            read(HOLON_CALLER_SOURCE_TASK_ID_ENV),
+            read(HOLON_CALLER_SOURCE_TURN_ID_ENV),
+            read(HOLON_CALLER_SOURCE_WORK_ITEM_ID_ENV),
+            read(HOLON_CALLER_SOURCE_ACTIVATION_ID_ENV),
+            read(HOLON_CALLER_AUTHORITY_CLASS_ENV),
+            any_context_field,
+        )
+    }
+
+    fn from_fields(
+        caller_agent_id: Option<String>,
+        source_task_id: Option<String>,
+        source_turn_id: Option<String>,
+        source_work_item_id: Option<String>,
+        source_activation_id: Option<String>,
+        inherited_authority_class: Option<String>,
+        any_context_field: bool,
+    ) -> Result<Option<Self>, String> {
+        let Some(caller_agent_id) = caller_agent_id else {
+            if any_context_field {
+                return Err(format!(
+                    "{HOLON_CALLER_AGENT_ID_ENV} is required when caller context is present"
+                ));
+            }
+            return Ok(None);
+        };
+
+        let inherited_authority_class = inherited_authority_class
+            .map(|value| parse_agent_invocation_authority(&value))
+            .transpose()?;
+
+        Ok(Some(Self {
+            caller_agent_id,
+            source_task_id,
+            source_turn_id,
+            source_work_item_id,
+            source_activation_id,
+            inherited_authority_class,
+        }))
+    }
+}
+
+fn parse_agent_invocation_authority(value: &str) -> Result<AuthorityClass, String> {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "operator_instruction" | "trusted_operator" => Ok(AuthorityClass::OperatorInstruction),
+        "runtime_instruction" | "trusted_system" => Ok(AuthorityClass::RuntimeInstruction),
+        "integration_signal" | "trusted_integration" => Ok(AuthorityClass::IntegrationSignal),
+        "external_evidence" | "untrusted_external" => Ok(AuthorityClass::ExternalEvidence),
+        _ => Err(format!(
+            "invalid {HOLON_CALLER_AUTHORITY_CLASS_ENV}: {value}"
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MessageEnvelope {
     pub id: String,
@@ -1497,6 +1608,60 @@ impl MessageEnvelope {
             }
             _ => {}
         }
+
+        if !self.source_refs.contains_key("interaction_id") {
+            if let Some(interaction_id) = self.trusted_interaction_id() {
+                self.source_refs
+                    .insert("interaction_id".into(), interaction_id);
+            }
+        }
+    }
+
+    pub fn trusted_interaction_id(&self) -> Option<String> {
+        if self.kind != MessageKind::OperatorPrompt
+            || self.authority_class != AuthorityClass::OperatorInstruction
+            || !matches!(self.origin, MessageOrigin::Operator { .. })
+        {
+            return None;
+        }
+
+        let scope = match (self.delivery_surface, self.admission_context) {
+            (Some(MessageDeliverySurface::CliPrompt), Some(AdmissionContext::LocalProcess)) => {
+                "cli_prompt"
+            }
+            (Some(MessageDeliverySurface::RunOnce), Some(AdmissionContext::LocalProcess)) => {
+                "run_once"
+            }
+            (
+                Some(MessageDeliverySurface::HttpControlPrompt),
+                Some(AdmissionContext::ControlAuthenticated),
+            ) => "http_control_prompt",
+            (
+                Some(MessageDeliverySurface::RemoteOperatorTransport),
+                Some(AdmissionContext::OperatorTransportAuthenticated),
+            ) => "remote_operator_transport",
+            _ => return None,
+        };
+
+        self.source_refs
+            .get("interaction_id")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|interaction_id| !interaction_id.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                let actor_id = match &self.origin {
+                    MessageOrigin::Operator { actor_id } => {
+                        actor_id.as_deref().unwrap_or("operator")
+                    }
+                    _ => unreachable!("operator origin checked above"),
+                };
+                Some(crate::ids::interaction_id(&[
+                    &self.agent_id,
+                    scope,
+                    actor_id,
+                ]))
+            })
     }
 
     fn metadata_binding_fields_are_trusted(&self) -> bool {
@@ -1665,6 +1830,8 @@ pub struct TurnTerminalRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_assistant_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_brief_reason: Option<TurnNoBriefReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<TurnTerminalCheckpointRecord>,
     pub completed_at: DateTime<Utc>,
     pub duration_ms: u64,
@@ -1703,6 +1870,8 @@ pub struct TurnTerminalSummary {
     pub kind: TurnTerminalKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_brief_reason: Option<TurnNoBriefReason>,
     pub completed_at: DateTime<Utc>,
     pub duration_ms: u64,
 }
@@ -1712,8 +1881,53 @@ impl TurnTerminalSummary {
         Self {
             kind: record.kind,
             reason: record.reason.clone(),
+            no_brief_reason: record.no_brief_reason.clone(),
             completed_at: record.completed_at,
             duration_ms: record.duration_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnNoBriefReason {
+    ReducerOnly { reason: String },
+    Aborted,
+    ToolOnlyWait,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnReplayProvenance {
+    pub source_message_id: String,
+    pub source_turn_id: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_terminal: Option<TurnTerminalSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnOwner {
+    WorkItem { work_item_id: String },
+    Conversation { interaction_id: String },
+    AgentLifecycle { agent_id: String },
+    Command,
+}
+
+impl TurnOwner {
+    pub fn work_item_id(&self) -> Option<&str> {
+        match self {
+            Self::WorkItem { work_item_id } => Some(work_item_id),
+            Self::Conversation { .. } | Self::AgentLifecycle { .. } | Self::Command => None,
+        }
+    }
+
+    pub fn index_parts(&self) -> (&'static str, Option<&str>) {
+        match self {
+            Self::WorkItem { work_item_id } => ("work_item", Some(work_item_id)),
+            Self::Conversation { interaction_id } => ("conversation", Some(interaction_id)),
+            Self::AgentLifecycle { agent_id } => ("agent_lifecycle", Some(agent_id)),
+            Self::Command => ("command", None),
         }
     }
 }
@@ -1727,6 +1941,8 @@ pub struct TurnRecord {
     pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<TurnOwner>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<TurnTriggerSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1743,6 +1959,8 @@ pub struct TurnRecord {
     pub waiting_condition_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<TurnTerminalSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<TurnReplayProvenance>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -1754,6 +1972,7 @@ impl TurnRecord {
             agent_id: agent_id.into(),
             run_id: None,
             current_work_item_id: None,
+            owner: None,
             trigger: None,
             input_message_ids: Vec::new(),
             tool_execution_ids: Vec::new(),
@@ -1762,8 +1981,22 @@ impl TurnRecord {
             completed_work_item_ids: Vec::new(),
             waiting_condition_ids: Vec::new(),
             terminal: None,
+            replay: None,
             created_at: Utc::now(),
         }
+    }
+
+    pub fn effective_owner(&self) -> TurnOwner {
+        self.owner.clone().unwrap_or_else(|| {
+            self.current_work_item_id.as_ref().map_or_else(
+                || TurnOwner::AgentLifecycle {
+                    agent_id: self.agent_id.clone(),
+                },
+                |work_item_id| TurnOwner::WorkItem {
+                    work_item_id: work_item_id.clone(),
+                },
+            )
+        })
     }
 }
 
@@ -1981,6 +2214,8 @@ pub struct WorkItemExecutionBinding {
     pub admission_provenance: Option<ExecutionAdmissionProvenance>,
     pub source_message_id: String,
     pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<TurnOwner>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_item_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2249,6 +2484,7 @@ fn default_external_trigger_scope() -> ExternalTriggerScope {
 #[serde(rename_all = "snake_case")]
 pub enum WaitConditionStatus {
     Active,
+    Triggered,
     Resolved,
     Cancelled,
     Expired,
@@ -2316,9 +2552,28 @@ pub struct WaitConditionRecord {
     pub cancelled_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triggered_at: Option<DateTime<Utc>>,
 }
 
 impl WaitConditionRecord {
+    pub fn trigger_message_id(&self) -> Option<&str> {
+        self.trigger_message_id.as_deref()
+    }
+
+    pub fn triggered_at(&self) -> Option<DateTime<Utc>> {
+        self.triggered_at
+    }
+
+    pub fn mark_triggered(&mut self, message_id: &str, triggered_at: DateTime<Utc>) {
+        self.trigger_message_id = Some(message_id.to_string());
+        self.triggered_at = Some(triggered_at);
+        self.status = WaitConditionStatus::Triggered;
+        self.updated_at = triggered_at;
+    }
+
     pub fn external_recoverability(&self) -> Option<ExternalWaitRecoverability> {
         if self.kind != WaitConditionKind::External || self.status != WaitConditionStatus::Active {
             return None;
@@ -2775,6 +3030,39 @@ pub struct TaskRecord {
 }
 
 impl TaskRecord {
+    pub fn rejoin_fence(
+        &self,
+    ) -> std::result::Result<crate::domain::execution_protocol::RejoinFence, String> {
+        let detail = self
+            .detail
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| "task rejoin contract is missing task detail".to_string())?;
+        let obligation_id = detail
+            .get("rejoin_obligation_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "task rejoin contract is missing obligation identity".to_string())?;
+        if obligation_id != self.id {
+            return Err("task rejoin obligation identity does not match task identity".into());
+        }
+        let generation = detail
+            .get("rejoin_generation")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|generation| *generation > 0)
+            .ok_or_else(|| "task rejoin contract is missing generation".to_string())?;
+        let parent_turn_id = detail
+            .get("parent_turn_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "task rejoin contract is missing parent turn identity".to_string())?;
+        Ok(crate::domain::execution_protocol::RejoinFence {
+            obligation_id: obligation_id.to_string(),
+            generation,
+            parent_turn_id: parent_turn_id.to_string(),
+        })
+    }
+
     pub fn wait_policy(&self) -> TaskWaitPolicy {
         // Active tasks are never scheduler-blocking; terminal results drive re-entry.
         TaskWaitPolicy::Background
@@ -3688,6 +3976,8 @@ pub struct RemoveWorktreeResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_retained_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_text: Option<String>,
 }
 
@@ -3960,6 +4250,7 @@ pub enum QueueEntryStatus {
     Interrupted,
     Aborted,
     Dropped,
+    Quarantined,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3972,6 +4263,7 @@ pub enum OperatorMessageStatus {
     Processed,
     Failed,
     Dropped,
+    Quarantined,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -4000,8 +4292,10 @@ pub struct QueueEntryRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolExecutionStatus {
+    Deferred,
     Success,
     Error,
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -4491,7 +4785,12 @@ pub struct LegacyToolResultBlock {
 #[serde(untagged)]
 pub enum ToolResultData {
     /// New ref-backed format with explicit wrapper
-    RefsWithWrapper { refs: Vec<ToolResultRef> },
+    RefsWithWrapper {
+        /// The owning turn for new transcript entries; absent in legacy data.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        refs: Vec<ToolResultRef>,
+    },
     /// Legacy format with explicit wrapper
     LegacyWithWrapper { results: Vec<LegacyToolResultBlock> },
 }
@@ -4588,6 +4887,13 @@ impl BriefKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct Citation {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct BriefRecord {
     pub id: String,
     #[serde(alias = "session_id")]
@@ -4607,6 +4913,14 @@ pub struct BriefRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finalizes_assistant_round_id: Option<String>,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citations: Option<Vec<Citation>>,
+    /// Immutable linkage to the unique `brief_created` audit event committed
+    /// in the same runtime DB transition as this record. `None` for records
+    /// whose creating event cannot be identified (pre-linkage history or
+    /// ambiguous backfill candidates).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_event_seq: Option<u64>,
     pub attachments: Option<Vec<BriefAttachment>>,
     pub related_message_id: Option<String>,
     pub related_task_id: Option<String>,
@@ -4633,11 +4947,42 @@ impl BriefRecord {
             content_source: BriefContentSource::Inline,
             finalizes_assistant_round_id: None,
             text: text.into(),
+            citations: None,
             attachments: None,
+            created_event_seq: None,
             related_message_id,
             related_task_id,
         }
     }
+}
+
+/// Deterministic idempotency identity for a brief's `brief_created` audit
+/// event. Retry of a Brief publication must reuse the same event id (and
+/// brief-sourced `created_at`) so the transactional append sees one event,
+/// not one per attempt.
+pub fn stable_brief_created_event_id(agent_id: &str, brief_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update("brief_created".as_bytes());
+    hasher.update([0]);
+    hasher.update(agent_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(brief_id.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    format!("event_{}", &digest[..15])
+}
+
+/// Builds the deterministic `brief_created` audit event for a Brief record.
+/// The event id and `created_at` are derived from the Brief so retries are
+/// content-identical and deduplicate at the storage layer.
+pub fn brief_created_event_for(brief: &BriefRecord) -> anyhow::Result<AuditEvent> {
+    let mut event = AuditEvent::typed(
+        crate::runtime_event::RuntimeEventKind::BriefCreated,
+        &BriefCreatedAuditEvent::from_brief(brief),
+    )?;
+    event.id = stable_brief_created_event_id(&brief.agent_id, &brief.id);
+    event.created_at = brief.created_at;
+    Ok(event)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -4772,6 +5117,10 @@ pub struct ResolvedModelAvailability {
     pub available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_disposition: Option<String>,
     pub policy: ResolvedRuntimeModelPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_capabilities: Option<crate::config::ResolvedModelCapabilities>,
@@ -5082,6 +5431,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_invocation_context_requires_caller_when_any_field_is_present() {
+        let error = AgentInvocationContext::from_fields(
+            None,
+            None,
+            Some("turn-1".into()),
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains(HOLON_CALLER_AGENT_ID_ENV));
+    }
+
+    #[test]
+    fn agent_invocation_context_parses_declared_fields_and_authority_aliases() {
+        let context = AgentInvocationContext::from_fields(
+            Some("agent-a".into()),
+            Some("task-1".into()),
+            Some("turn-1".into()),
+            Some("work-1".into()),
+            Some("activation-1".into()),
+            Some("trusted-integration".into()),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(context.caller_agent_id, "agent-a");
+        assert_eq!(context.source_task_id.as_deref(), Some("task-1"));
+        assert_eq!(context.source_turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(context.source_work_item_id.as_deref(), Some("work-1"));
+        assert_eq!(
+            context.source_activation_id.as_deref(),
+            Some("activation-1")
+        );
+        assert_eq!(
+            context.inherited_authority_class,
+            Some(AuthorityClass::IntegrationSignal)
+        );
+    }
+
+    #[test]
+    fn context_free_agent_invocation_context_is_operator_mode() {
+        assert_eq!(
+            AgentInvocationContext::from_fields(None, None, None, None, None, None, false).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn legacy_scheduler_contract_names_deserialize_as_current_terms() {
         let continuation: ContinuationResolution = serde_json::from_value(serde_json::json!({
             "trigger_kind": "task_result",
@@ -5152,6 +5552,7 @@ mod tests {
             kind: TurnTerminalKind::Completed,
             reason: None,
             last_assistant_message: Some("assistant output that must stay out of the event".into()),
+            no_brief_reason: None,
             checkpoint: None,
             completed_at: Utc::now(),
             duration_ms: 123,
@@ -5681,6 +6082,7 @@ mod tests {
         let brief: BriefRecord = serde_json::from_value(brief).unwrap();
         assert_eq!(brief.workspace_id, AGENT_HOME_WORKSPACE_ID);
         assert_eq!(brief.turn_index, None);
+        assert_eq!(brief.citations, None);
 
         let mut work_item =
             serde_json::to_value(WorkItemRecord::new("default", "ship", WorkItemState::Open))
@@ -5855,6 +6257,10 @@ mod tests {
             Some("task-1".into()),
         );
         brief.work_item_id = Some("wi-1".into());
+        brief.citations = Some(vec![Citation {
+            url: "https://example.com/source".into(),
+            title: Some("Source".into()),
+        }]);
         brief.attachments = Some(vec![BriefAttachment {
             kind: "json".into(),
             name: "large".into(),
@@ -5868,6 +6274,7 @@ mod tests {
 
         assert_eq!(payload["brief_id"], brief.id);
         assert_eq!(payload["work_item_id"], "wi-1");
+        assert!(payload.get("citations").is_none());
         assert!(payload.get("text").is_none());
         assert!(payload.get("text_preview").is_none());
         assert!(payload.get("attachments").is_none());

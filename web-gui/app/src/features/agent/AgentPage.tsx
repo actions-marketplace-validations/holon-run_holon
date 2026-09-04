@@ -6,8 +6,9 @@ import {
 } from "lucide-react";
 import {
   useEffect, useLayoutEffect, useMemo, useRef, useState,
-  type DragEvent, type FormEvent, type KeyboardEvent, type MutableRefObject, type RefObject,
+  type CSSProperties, type DragEvent, type FormEvent, type KeyboardEvent, type MutableRefObject, type RefObject,
 } from "react";
+import { createPortal } from "react-dom";
 import { useVirtualizer, type VirtualItem, type Virtualizer } from "@tanstack/react-virtual";
 
 import { Button } from "../../components/ui/Button";
@@ -45,13 +46,20 @@ interface AgentPageProps {
   modelCatalogLoading: boolean;
   modelCatalogError?: string;
   historyError?: string;
+  syncError?: string;
+  syncRetryAttempt?: number;
+  /** Ledger-backed lower-bound unread state (W5 truncation indicator). */
+  historyTruncated?: boolean;
   targetEventSeq?: number;
   resumeRevision?: number;
   onRefreshModels: () => Promise<void>;
   onSetModel: (model: string, reasoningEffort?: string) => Promise<void>;
   onClearModel: () => Promise<void>;
   onLoadOlderEvents: () => Promise<void>;
+  onRetrySync: () => void;
+  onAcknowledgeTruncation?: () => void;
   onSendPrompt: (text: string, attachments?: OperatorPromptAttachment[]) => Promise<void>;
+  onConversationRead: () => void;
   onOpenInspector: () => void;
   onInspectActivity: (activity: AgentTimelineActivity) => void;
   selectedActivityId?: string;
@@ -63,9 +71,20 @@ const DEFAULT_DEBUG_TIMELINE_ITEM_LIMIT = 220;
 const HISTORY_PAGE_VISIBLE_INCREMENT = 80;
 const TOP_SCROLL_THRESHOLD = 16;
 const BOTTOM_SCROLL_THRESHOLD = 96;
+// How long scroll intent stays active after the last user scroll input
+// (wheel, touch, or scroll keys). Long enough to cover momentum scrolling.
+const USER_SCROLL_INTENT_CLEAR_MS = 500;
 const COMPOSER_DRAFT_STORAGE_PREFIX = "holon.webGui.composerDraft.v1";
 const COMPOSER_TEXTAREA_MAX_HEIGHT = 320;
 const MESSAGE_LIST_BOTTOM_SAFE_SPACE = 96;
+
+export type HistoryLoadDecision = "expand-local" | "load-network" | "none";
+
+export function historyLoadDecision(hasHiddenTimelineItems: boolean, hasOlderEvents: boolean): HistoryLoadDecision {
+  if (hasHiddenTimelineItems) return "expand-local";
+  if (hasOlderEvents) return "load-network";
+  return "none";
+}
 
 export function storedComposerDraftKey(agentId: string): string {
   return `${COMPOSER_DRAFT_STORAGE_PREFIX}:${encodeURIComponent(agentId)}`;
@@ -300,13 +319,19 @@ export function AgentPage({
   modelCatalogLoading,
   modelCatalogError,
   historyError,
+  syncError,
+  syncRetryAttempt,
+  historyTruncated = false,
   targetEventSeq,
   resumeRevision = 0,
   onRefreshModels,
   onSetModel,
   onClearModel,
   onLoadOlderEvents,
+  onRetrySync,
+  onAcknowledgeTruncation,
   onSendPrompt,
+  onConversationRead,
   onOpenInspector,
   onInspectActivity,
   selectedActivityId,
@@ -320,16 +345,53 @@ export function AgentPage({
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
   const [selectedReasoningEffort, setSelectedReasoningEffort] = useState("auto");
   const [reasoningPopoverOpen, setReasoningPopoverOpen] = useState(false);
+  const [modelMenuStyle, setModelMenuStyle] = useState<CSSProperties | null>(null);
   const [visibleTimelineItemLimit, setVisibleTimelineItemLimit] = useState(() => defaultTimelineItemLimit("info"));
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const virtualWrapperRef = useRef<HTMLDivElement | null>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const modelPickerRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragCounterRef = useRef(0);
   const preserveScrollRef = useRef<ScrollAnchor | null>(null);
   const stickToBottomRef = useRef(true);
   const autoStickToBottomRef = useRef(false);
+  const userScrollIntentRef = useRef(false);
+  const userScrollIntentTimerRef = useRef<number | null>(null);
   const scheduledBottomScrollRef = useRef<number | null>(null);
+
+  // The model menu renders through a portal with fixed positioning so narrow
+  // main columns no longer clip it behind the sidebar. Track the picker anchor
+  // each frame while open so resizes, panel toggles, and scroll stay aligned.
+  useLayoutEffect(() => {
+    if (!modelPickerOpen) {
+      setModelMenuStyle(null);
+      return;
+    }
+    let frame = 0;
+    let lastKey = "";
+    const position = () => {
+      frame = requestAnimationFrame(position);
+      const anchor = modelPickerRef.current;
+      if (!anchor) return;
+      const rect = anchor.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) return;
+      const margin = 12;
+      const next = {
+        right: Math.max(window.innerWidth - rect.right, 0),
+        bottom: window.innerHeight - rect.top + 8,
+        width: Math.max(280, Math.min(720, rect.right - margin, window.innerWidth - margin * 2)),
+        maxHeight: Math.max(180, Math.min(480, rect.top - 16)),
+      };
+      const key = `${next.right}|${next.bottom}|${next.width}|${next.maxHeight}`;
+      if (key === lastKey) return;
+      lastKey = key;
+      setModelMenuStyle(next);
+    };
+    position();
+    return () => cancelAnimationFrame(frame);
+  }, [modelPickerOpen]);
+
   const activeAgent = detail?.agent ?? agent;
   const sourceTimeline = detail?.timeline ?? [];
   const timeline = useMemo(
@@ -358,6 +420,8 @@ export function AgentPage({
     getItemKey: (index) => timelineTurns[index]?.id ?? `empty:${index}`,
   });
   const hasHiddenTimelineItems = timeline.length >= visibleTimelineItemLimit && sourceTimeline.length > visibleTimelineItemLimit;
+  const historyLoadAction = historyLoadDecision(hasHiddenTimelineItems, hasOlderEvents);
+  const loadingNetworkHistory = historyLoadAction === "load-network" && loadingOlderEvents;
   const groupedModelOptions = useMemo(() => groupModelOptionsByProvider(modelCatalog.options), [modelCatalog.options]);
   const activeModelOption = useMemo(() => modelCatalog.options.find((option) => option.routeRef === activeAgent.model), [activeAgent.model, modelCatalog.options]);
   const activeModelSupportsReasoning = activeModelOption?.supportsReasoningEffort ?? Boolean(activeAgent.modelReasoningEffort);
@@ -377,13 +441,37 @@ export function AgentPage({
     setReasoningPopoverOpen(false);
     setSelectedProvider(null);
     setSelectedReasoningEffort(activeAgent.modelReasoningEffort ?? "auto");
-  }, [activeAgent.id, displayLevel]);
+  }, [activeAgent.id, displayLevel, activeAgent.modelReasoningEffort]);
 
   useEffect(() => {
     return () => {
       if (scheduledBottomScrollRef.current !== null) {
         window.cancelAnimationFrame(scheduledBottomScrollRef.current);
       }
+      clearUserScrollIntent(userScrollIntentRef, userScrollIntentTimerRef);
+    };
+  }, []);
+
+  // Distinguish user-initiated scrolling from programmatic bottom scrolls by
+  // input source. The auto-stick time window alone cannot tell them apart
+  // while streaming keeps re-opening it, which used to drag users viewing
+  // history back to the bottom on every new message.
+  useEffect(() => {
+    const list = messageListRef.current;
+    if (!list) return;
+    const markIntent = () => scheduleUserScrollIntentClear(userScrollIntentRef, userScrollIntentTimerRef);
+    const handleKeyDown = (event: { key: string }) => {
+      if (isScrollKey(event.key)) markIntent();
+    };
+    list.addEventListener("wheel", markIntent, { passive: true });
+    list.addEventListener("touchstart", markIntent, { passive: true });
+    list.addEventListener("touchmove", markIntent, { passive: true });
+    list.addEventListener("keydown", handleKeyDown);
+    return () => {
+      list.removeEventListener("wheel", markIntent);
+      list.removeEventListener("touchstart", markIntent);
+      list.removeEventListener("touchmove", markIntent);
+      list.removeEventListener("keydown", handleKeyDown);
     };
   }, []);
 
@@ -429,6 +517,9 @@ export function AgentPage({
   useLayoutEffect(() => {
     preserveScrollRef.current = null;
     stickToBottomRef.current = true;
+    // A fresh conversation view must not inherit scroll intent from the
+    // previously viewed agent.
+    clearUserScrollIntent(userScrollIntentRef, userScrollIntentTimerRef);
     rowVirtualizer.measure();
     scrollToConversationBottom();
   }, [activeAgent.id]);
@@ -439,8 +530,25 @@ export function AgentPage({
 
     if (stickToBottomRef.current) {
       scrollToConversationBottom();
+      onConversationRead();
     }
-  }, [timelineVersion]);
+  }, [timelineVersion, syncStatus, onConversationRead]);
+
+  useEffect(() => {
+    const markReadIfVisible = () => {
+      const list = messageListRef.current;
+      if (
+        document.visibilityState === "visible" &&
+        list &&
+        isScrolledNearBottom(list)
+      ) {
+        onConversationRead();
+      }
+    };
+    markReadIfVisible();
+    document.addEventListener("visibilitychange", markReadIfVisible);
+    return () => document.removeEventListener("visibilitychange", markReadIfVisible);
+  }, [activeAgent.id, timelineVersion, syncStatus, onConversationRead]);
 
   useReconciledVirtualMeasurements({
     virtualizer: rowVirtualizer,
@@ -577,14 +685,29 @@ export function AgentPage({
   function handleMessageListScroll() {
     const list = messageListRef.current;
     if (!list) return;
-    if (autoStickToBottomRef.current) {
+    if (userScrollIntentRef.current) {
+      // Continued scrolling while intent is active (e.g. momentum after a
+      // trackpad flick) keeps the intent window open so programmatic bottom
+      // scrolls cannot hijack it mid-gesture.
+      scheduleUserScrollIntentClear(userScrollIntentRef, userScrollIntentTimerRef);
+    }
+    const nearBottom = isScrolledNearBottom(list);
+    if (
+      looksLikeProgrammaticBottomScroll({
+        autoScrollActive: autoStickToBottomRef.current,
+        userScrollIntent: userScrollIntentRef.current,
+        nearBottom,
+      })
+    ) {
       stickToBottomRef.current = true;
       return;
     }
-    stickToBottomRef.current = isScrolledNearBottom(list);
+    stickToBottomRef.current = nearBottom;
+    if (stickToBottomRef.current) onConversationRead();
   }
 
   async function handleLoadOlderEvents() {
+    if (historyLoadAction === "none") return;
     const list = messageListRef.current;
     if (list) {
       const contentOffset = virtualWrapperRef.current?.offsetTop ?? 0;
@@ -595,6 +718,10 @@ export function AgentPage({
           ? captureScrollAnchor([anchorItem], virtualScrollTop)
           : null;
       stickToBottomRef.current = false;
+    }
+    if (historyLoadAction === "expand-local") {
+      setVisibleTimelineItemLimit((limit) => limit + HISTORY_PAGE_VISIBLE_INCREMENT);
+      return;
     }
     try {
       await onLoadOlderEvents();
@@ -616,11 +743,10 @@ export function AgentPage({
   async function handleSelectModel(option: RuntimeModelOption, reasoningEffort = selectedReasoningEffort) {
     if (!option.available || changingModel) return;
 
-    // When switching to a non-reasoning model, reset thinking display to auto.
-    if (!option.supportsReasoningEffort) {
-      setSelectedReasoningEffort("auto");
-      reasoningEffort = "auto";
-    }
+    // Switching models must win over a stale thinking level: fall back to auto
+    // when the target model does not support the currently selected effort.
+    reasoningEffort = resolveModelSwitchReasoningEffort(option, reasoningEffort);
+    setSelectedReasoningEffort(reasoningEffort);
 
     setChangingModel(option.routeRef);
     try {
@@ -665,10 +791,10 @@ export function AgentPage({
       <div className="agent-workbench">
         <section className="conversation-pane">
           <div className="message-list" ref={messageListRef} onScroll={handleMessageListScroll}>
-            {hasOlderEvents || hasHiddenTimelineItems ? (
+            {historyLoadAction !== "none" ? (
               <div className="history-loader">
-                <Button type="button" size="sm" variant="secondary" disabled={loadingOlderEvents} onClick={handleLoadOlderEvents}>
-                  {loadingOlderEvents ? t("agent.loadingEarlier") : t("agent.loadEarlier")}
+                <Button type="button" size="sm" variant="secondary" disabled={loadingNetworkHistory} onClick={handleLoadOlderEvents}>
+                  {loadingNetworkHistory ? t("agent.loadingEarlier") : t("agent.loadEarlier")}
                 </Button>
               </div>
             ) : null}
@@ -676,6 +802,21 @@ export function AgentPage({
               <div className="history-status" role="alert">
                 {historyError}
               </div>
+            ) : null}
+            {historyTruncated && onAcknowledgeTruncation ? (
+              <div className="history-status truncation-notice" role="status">
+                <span>{t("app.truncationNotice")}</span>
+                <Button type="button" size="sm" variant="secondary" onClick={onAcknowledgeTruncation}>
+                  {t("app.truncationAcknowledge")}
+                </Button>
+              </div>
+            ) : null}
+            {syncError ? (
+              <SyncRecoveryStatus
+                error={syncError}
+                retryAttempt={syncRetryAttempt}
+                onRetry={onRetrySync}
+              />
             ) : null}
             {timelineTurns.length > 0 ? (
               <div
@@ -714,7 +855,9 @@ export function AgentPage({
               </div>
             ) : null}
             {timeline.length === 0 ? (
-              detailLoading || (contentStatus === "unknown" && syncStatus !== "error") ? (
+              detailLoading ||
+              (contentStatus === "unknown" && syncStatus !== "error") ||
+              (contentStatus === "available" && (syncStatus === "refreshing" || syncStatus === "recovering")) ? (
                 <div className="conversation-loading" role="status" aria-label={t("common.loading")}>
                   <LoaderCircle size={24} className="spin" />
                   <span>{t("common.syncing")}</span>
@@ -732,9 +875,9 @@ export function AgentPage({
               />
               ) : null
             ) : null}
-            {timeline.length > 0 && (syncStatus === "refreshing" || syncStatus === "stale" || syncStatus === "recovering") ? (
-              <div className="history-status" role="status">
-                {syncStatus === "refreshing" ? t("common.refreshing") : syncStatus === "recovering" ? t("common.recovering") : t("common.syncing")}
+            {timeline.length > 0 && (syncStatus === "refreshing" || syncStatus === "recovering") ? (
+              <div className={`history-status${syncStatus === "recovering" ? " history-status--recovering" : ""}`} role="status">
+                {syncStatus === "refreshing" ? t("common.refreshing") : t("common.recovering")}
               </div>
             ) : null}
           </div>
@@ -816,7 +959,7 @@ export function AgentPage({
                 >
                   <Paperclip size={16} />
                 </Button>
-                <div className="model-picker">
+                <div className="model-picker" ref={modelPickerRef}>
                   <Button
                     className="model-button"
                     type="button"
@@ -864,8 +1007,9 @@ export function AgentPage({
                       ) : null}
                     </div>
                   ) : null}
-                  {modelPickerOpen ? (
-                    <div className="model-menu" role="dialog" aria-label={t("agent.switchModelAria")}>
+                  {modelPickerOpen && modelMenuStyle ? (
+                    createPortal(
+                      <div className="model-menu" role="dialog" aria-label={t("agent.switchModelAria")} style={modelMenuStyle}>
                       <div className="model-menu-header">
                         <div>
                           <strong>{t("agent.switchModel")}</strong>
@@ -875,7 +1019,12 @@ export function AgentPage({
                           {modelCatalogLoading ? t("common.loading") : t("common.refresh")}
                         </Button>
                       </div>
-                      {modelCatalogError ? (
+                      {modelCatalog.stale ? (
+                        <div className="model-picker-status" role="alert">
+                          {t("agent.cachedModelCatalog")}
+                          {modelCatalogError ? ` ${modelCatalogError}` : ""}
+                        </div>
+                      ) : modelCatalogError ? (
                         <div className="model-picker-status" role="alert">
                           {modelCatalogError}
                         </div>
@@ -926,7 +1075,7 @@ export function AgentPage({
                                 key={option.routeRef}
                                 type="button"
                                 disabled={!option.available || changingModel !== null}
-                                title={option.unavailableReason ?? option.model}
+                                title={option.unavailableReason ?? option.availabilityWarning ?? option.model}
                                 onClick={() => void handleSelectModel(option)}
                               >
                                 <span>
@@ -935,6 +1084,7 @@ export function AgentPage({
                                 </span>
                                 <span className="model-option-meta">
                                   {option.supportsReasoningEffort ? <small>{t("agent.reasoningMeta")}</small> : null}
+                                  {option.availabilityWarning ? <small>{t("agent.availabilityWarningMeta")}</small> : null}
                                   {!option.available ? <small>{t("agent.unavailableMeta")}</small> : null}
                                   {changingModel === option.routeRef ? <em>{t("common.saving")}</em> : null}
                                 </span>
@@ -951,7 +1101,9 @@ export function AgentPage({
                           description={t("agent.modelRefreshDesc")}
                         />
                       ) : null}
-                    </div>
+                      </div>,
+                      document.body,
+                    )
                   ) : null}
                 </div>
                 <Button className="send-button" type="submit" size="icon" variant="accent" aria-label={t("common.send")} disabled={!canSendPrompt}>
@@ -969,6 +1121,12 @@ export function AgentPage({
 function shortModelLabel(model: string): string {
   const parts = model.split("/");
   return parts[parts.length - 1] || model;
+}
+
+export function resolveModelSwitchReasoningEffort(option: RuntimeModelOption, requestedEffort: string): string {
+  if (!option.supportsReasoningEffort) return "auto";
+  if (requestedEffort !== "auto" && !option.reasoningEffortOptions.includes(requestedEffort)) return "auto";
+  return requestedEffort;
 }
 
 function modelButtonTitle(model: string, reasoningEffort: string | undefined, isModelOverride: boolean): string {
@@ -1005,6 +1163,56 @@ function isScrolledNearBottom(list: HTMLElement): boolean {
   return list.scrollHeight - list.scrollTop - list.clientHeight < BOTTOM_SCROLL_THRESHOLD;
 }
 
+export function isScrollKey(key: string): boolean {
+  return (
+    key === "ArrowUp" ||
+    key === "ArrowDown" ||
+    key === "PageUp" ||
+    key === "PageDown" ||
+    key === "Home" ||
+    key === "End" ||
+    key === " " ||
+    key === "Spacebar"
+  );
+}
+
+// A scroll event is only treated as our own programmatic bottom scroll when
+// no user scroll input is active and the scroll position actually matches the
+// programmatic target. Anything else reflects real user intent and must be
+// evaluated against the current position.
+export function looksLikeProgrammaticBottomScroll(state: {
+  autoScrollActive: boolean;
+  userScrollIntent: boolean;
+  nearBottom: boolean;
+}): boolean {
+  return state.autoScrollActive && !state.userScrollIntent && state.nearBottom;
+}
+
+function scheduleUserScrollIntentClear(
+  intentRef: MutableRefObject<boolean>,
+  timerRef: MutableRefObject<number | null>,
+): void {
+  intentRef.current = true;
+  if (timerRef.current !== null) {
+    window.clearTimeout(timerRef.current);
+  }
+  timerRef.current = window.setTimeout(() => {
+    timerRef.current = null;
+    intentRef.current = false;
+  }, USER_SCROLL_INTENT_CLEAR_MS);
+}
+
+function clearUserScrollIntent(
+  intentRef: MutableRefObject<boolean>,
+  timerRef: MutableRefObject<number | null>,
+): void {
+  if (timerRef.current !== null) {
+    window.clearTimeout(timerRef.current);
+    timerRef.current = null;
+  }
+  intentRef.current = false;
+}
+
 function defaultTimelineItemLimit(displayLevel: DisplayLevel): number {
   if (displayLevel === "debug") return DEFAULT_DEBUG_TIMELINE_ITEM_LIMIT;
   if (displayLevel === "verbose") return DEFAULT_VERBOSE_TIMELINE_ITEM_LIMIT;
@@ -1026,5 +1234,27 @@ function isAgentWorking(agent: AgentSummary, sendingPrompt: boolean, t: TFunctio
 function cssEscape(value: string): string {
   if (typeof CSS !== "undefined" && CSS.escape) return CSS.escape(value);
   return value.replace(/["\\]/g, "\\$&");
+}
+
+export function SyncRecoveryStatus({
+  error,
+  retryAttempt,
+  onRetry,
+}: {
+  error: string;
+  retryAttempt?: number;
+  onRetry: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="history-status history-status--recovering sync-recovery-status" role="alert">
+      <span>
+        {t("agent.syncRecoveryFailed", { attempt: retryAttempt ?? 1 })}: {error}
+      </span>
+      <Button type="button" size="sm" variant="secondary" onClick={onRetry}>
+        {t("agent.retrySync")}
+      </Button>
+    </div>
+  );
 }
 

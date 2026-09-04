@@ -291,7 +291,7 @@ async fn task_input_on_nonexistent_task_returns_error() {
 // ── complete_work_item idempotency ──────────────────────────────────
 
 #[tokio::test]
-async fn complete_work_item_is_idempotent_for_already_completed() {
+async fn complete_work_item_is_idempotent_for_existing_completion_intent() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let runtime = RuntimeHandle::new(
@@ -313,13 +313,13 @@ async fn complete_work_item_is_idempotent_for_already_completed() {
         .complete_work_item(item.id.clone(), Vec::new())
         .await
         .unwrap();
-    assert_eq!(first.state, WorkItemState::Completed);
+    assert_eq!(first.state, WorkItemState::Completing);
     // Complete it again — should succeed idempotently
     let second = runtime
         .complete_work_item(item.id.clone(), Vec::new())
         .await
         .unwrap();
-    assert_eq!(second.state, WorkItemState::Completed);
+    assert_eq!(second.state, WorkItemState::Completing);
     assert_eq!(first.id, second.id);
 }
 
@@ -347,14 +347,24 @@ async fn pick_completed_work_item_returns_error() {
         .complete_work_item(item.id.clone(), Vec::new())
         .await
         .unwrap();
+    runtime
+        .promote_work_item_completion_report(
+            item.id.clone(),
+            "completed".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
     let result = runtime.pick_work_item(item.id.clone()).await;
     assert!(result.is_err());
     assert!(
         result
             .unwrap_err()
             .to_string()
-            .contains("cannot pick completed"),
-        "error should mention cannot pick completed work item"
+            .contains("cannot pick non-open"),
+        "error should mention cannot pick non-open work item"
     );
 }
 
@@ -465,6 +475,7 @@ async fn execution_bound_pick_yields_without_rebinding_current_turn() {
             admission_provenance: None,
             source_message_id: "message-yield".into(),
             turn_id: "turn-yield".into(),
+            owner: None,
             work_item_id: Some(first.id.clone()),
             claimed_work_revision: Some(first.revision),
         });

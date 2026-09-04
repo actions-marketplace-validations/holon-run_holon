@@ -71,6 +71,22 @@
   },
   {
     "method": "get",
+    "path": "/api/agents/snapshot",
+    "handler": "agent_roster_snapshot",
+    "operation_id": "agentsSnapshot",
+    "tag": "agents",
+    "parameters": [],
+    "request_schema": null,
+    "request_strict": null,
+    "response_content_types": [
+      "application/json"
+    ],
+    "security": [
+      "BearerAuth"
+    ]
+  },
+  {
+    "method": "get",
     "path": "/api/agents/{agent_id}/briefs",
     "handler": "briefs",
     "operation_id": "agentBriefs",
@@ -177,6 +193,28 @@
       },
       {
         "name": "message_id",
+        "location": "path",
+        "required": true
+      }
+    ],
+    "request_schema": null,
+    "request_strict": null,
+    "response_content_types": [
+      "application/json"
+    ],
+    "security": [
+      "BearerAuth"
+    ]
+  },
+  {
+    "method": "get",
+    "path": "/api/agents/{agent_id}/projection-snapshot",
+    "handler": "agent_projection_snapshot",
+    "operation_id": "agentProjectionSnapshot",
+    "tag": "agents",
+    "parameters": [
+      {
+        "name": "agent_id",
         "location": "path",
         "required": true
       }
@@ -581,6 +619,20 @@
     "security": [
       "BearerAuth"
     ]
+  },
+  {
+    "method": "get",
+    "path": "/api/auth/method",
+    "handler": "auth_method",
+    "operation_id": "authMethod",
+    "tag": "auth",
+    "parameters": [],
+    "request_schema": null,
+    "request_strict": null,
+    "response_content_types": [
+      "application/json"
+    ],
+    "security": []
   },
   {
     "method": "get",
@@ -1861,6 +1913,22 @@
     "tag": "search",
     "parameters": [],
     "request_schema": "MemoryGetRequest",
+    "request_strict": null,
+    "response_content_types": [
+      "application/json"
+    ],
+    "security": [
+      "BearerAuth"
+    ]
+  },
+  {
+    "method": "post",
+    "path": "/api/models/refresh",
+    "handler": "refresh_models_handler",
+    "operation_id": "refreshModels",
+    "tag": "discovery",
+    "parameters": [],
+    "request_schema": null,
     "request_strict": null,
     "response_content_types": [
       "application/json"

@@ -9,13 +9,14 @@ use crate::runtime_error::{
 use crate::tool::helpers::truncate_output_to_char_budget;
 use crate::tool::ToolError;
 use crate::types::{
-    AgentProfilePreset, BriefKind, BriefRecord, ChildAgentWorkspaceMode, CommandTaskStatusSnapshot,
-    CompletionReportRequirement, CompletionReportState, FailureArtifact, FailureArtifactCategory,
-    SpawnAgentModelRequest, SpawnAgentModelResolution, SpawnAgentModelResolutionStatus,
-    SpawnAgentResult, TaskHandle, TaskInputResult, TaskKind, TaskListEntry, TaskOutputResult,
-    TaskOutputRetrievalStatus, TaskOutputSnapshot, TaskStatusSnapshot, TodoItem, ToolArtifactRef,
-    WaitConditionStatus, WorkItemCompletionIntent, WorkItemContinuationFrame,
-    WorkItemContinuationReturnPolicy, WorkItemDelegationRecord, WorkItemDelegationState,
+    brief_created_event_for, AgentProfilePreset, BriefKind, BriefRecord, ChildAgentWorkspaceMode,
+    CommandTaskStatusSnapshot, CompletionReportRequirement, CompletionReportState, FailureArtifact,
+    FailureArtifactCategory, SpawnAgentModelRequest, SpawnAgentModelResolution,
+    SpawnAgentModelResolutionStatus, SpawnAgentResult, TaskHandle, TaskInputResult, TaskKind,
+    TaskListEntry, TaskOutputResult, TaskOutputRetrievalStatus, TaskOutputSnapshot,
+    TaskStatusSnapshot, TodoItem, ToolArtifactRef, WaitConditionRecord, WaitConditionStatus,
+    WorkItemCompletionIntent, WorkItemContinuationFrame, WorkItemContinuationReturnPolicy,
+    WorkItemContinuationState, WorkItemDelegationRecord, WorkItemDelegationState,
     WorkItemPlanStatus, WorkItemReadiness, WorkItemRecord, WorkItemState, CHILD_AGENT_TASK_KIND,
 };
 use schemars::JsonSchema;
@@ -26,6 +27,12 @@ const TASK_OUTPUT_POLL_INTERVAL_MS: u64 = 100;
 const TASK_OUTPUT_MESSAGE_SCAN_LIMIT: usize = 200;
 const TASK_OUTPUT_PREVIEW_CHAR_BUDGET: usize = 8_000;
 const SPAWN_AGENT_TASK_LABEL_CHAR_BUDGET: usize = 120;
+
+#[derive(Debug, Clone)]
+enum WorkItemReadinessMutation {
+    Pause(String),
+    Resume,
+}
 
 #[derive(Debug, Clone)]
 struct TaskMessageSnapshot {
@@ -85,6 +92,34 @@ fn child_agent_task_detail(workspace_mode: ChildAgentWorkspaceMode) -> serde_jso
         "wait_policy": crate::types::TaskWaitPolicy::Background,
         "workspace_mode": workspace_mode,
     })
+}
+
+const REJOIN_OBLIGATION_ID_DETAIL: &str = "rejoin_obligation_id";
+const REJOIN_GENERATION_DETAIL: &str = "rejoin_generation";
+const PARENT_TURN_ID_DETAIL: &str = "parent_turn_id";
+
+fn copy_task_rejoin_contract(task: &TaskRecord, detail: &mut serde_json::Value) {
+    let Some(target) = detail.as_object_mut() else {
+        return;
+    };
+    let Some(source) = task.detail.as_ref().and_then(serde_json::Value::as_object) else {
+        return;
+    };
+    for key in [
+        REJOIN_OBLIGATION_ID_DETAIL,
+        REJOIN_GENERATION_DETAIL,
+        PARENT_TURN_ID_DETAIL,
+    ] {
+        if let Some(value) = source.get(key) {
+            target.entry(key).or_insert_with(|| value.clone());
+        }
+    }
+}
+
+pub(super) fn task_rejoin_fence(
+    task: &TaskRecord,
+) -> Result<crate::domain::execution_protocol::RejoinFence> {
+    task.rejoin_fence().map_err(anyhow::Error::msg)
 }
 
 fn spawn_agent_task_label(initial_message: &str) -> String {
@@ -161,13 +196,15 @@ fn task_with_result_message(
     mut detail: Option<serde_json::Value>,
     result_message: &MessageEnvelope,
 ) -> TaskRecord {
-    if let (Some(detail), Some(parent_turn_id)) = (detail.as_mut(), result_message.turn_id.as_ref())
     {
-        if let Some(detail) = detail.as_object_mut() {
-            detail.insert(
-                "parent_turn_id".to_string(),
-                serde_json::json!(parent_turn_id),
-            );
+        let detail = detail.get_or_insert_with(|| serde_json::json!({}));
+        copy_task_rejoin_contract(task, detail);
+        if let (Some(detail), Some(parent_turn_id)) =
+            (detail.as_object_mut(), result_message.turn_id.as_ref())
+        {
+            detail
+                .entry(PARENT_TURN_ID_DETAIL)
+                .or_insert_with(|| serde_json::json!(parent_turn_id));
         }
     }
     let mut terminal_task = task_with_status(task, status, detail);
@@ -179,7 +216,101 @@ pub(super) fn restart_task_result_message_id(task_id: &str) -> String {
     format!("message:task-restart:{task_id}")
 }
 
+fn interrupted_task_result_message(
+    task: &TaskRecord,
+    interrupted_reason: &'static str,
+) -> MessageEnvelope {
+    let status_before = task
+        .detail
+        .as_ref()
+        .and_then(|detail| {
+            detail
+                .get("status_before_restart")
+                .or_else(|| detail.get("status_before_stop"))
+        })
+        .and_then(|value| value.as_str())
+        .unwrap_or("running");
+    let mut message = MessageEnvelope {
+        id: if interrupted_reason == "runtime_restarted" {
+            restart_task_result_message_id(&task.id)
+        } else {
+            crate::ids::message_id()
+        },
+        turn_id: Some(crate::ids::turn_id()),
+        work_item_id: task.effective_work_item_id().map(ToString::to_string),
+        metadata: Some(serde_json::json!({
+            "task_id": task.id,
+            "task_kind": task.kind,
+            "task_status": "interrupted",
+            "task_summary": task.summary,
+            "task_detail": task.detail,
+            "task_recovery": task.recovery,
+            "work_item_id": task.effective_work_item_id(),
+            "status_before_restart": status_before,
+            "interrupted_reason": interrupted_reason,
+        })),
+        ..MessageEnvelope::new(
+            task.agent_id.clone(),
+            MessageKind::TaskResult,
+            MessageOrigin::Task {
+                task_id: task.id.clone(),
+            },
+            AuthorityClass::RuntimeInstruction,
+            Priority::Next,
+            MessageBody::Text {
+                text: format!(
+                    "task {} was interrupted because the {}",
+                    task.id,
+                    if interrupted_reason == "runtime_restarted" {
+                        "runtime restarted"
+                    } else {
+                        "agent stopped"
+                    }
+                ),
+            },
+        )
+        .with_admission(
+            MessageDeliverySurface::TaskRejoin,
+            AdmissionContext::RuntimeOwned,
+        )
+    };
+    message.task_id = Some(task.id.clone());
+    message
+}
+
 impl RuntimeHandle {
+    pub(super) async fn task_creation_detail(
+        &self,
+        task_id: &str,
+        mut detail: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let parent_turn_id = self.agent_state().await?.current_turn_id;
+        let detail = detail
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("task detail must be a JSON object"))?;
+        detail.insert(
+            REJOIN_OBLIGATION_ID_DETAIL.into(),
+            serde_json::json!(task_id),
+        );
+        detail.insert(REJOIN_GENERATION_DETAIL.into(), serde_json::json!(1));
+        if let Some(parent_turn_id) = parent_turn_id {
+            detail.insert(
+                PARENT_TURN_ID_DETAIL.into(),
+                serde_json::json!(parent_turn_id),
+            );
+        }
+        Ok(serde_json::Value::Object(detail.clone()))
+    }
+
+    pub(super) fn task_detail_preserving_rejoin_contract(
+        &self,
+        task: &TaskRecord,
+        mut detail: serde_json::Value,
+    ) -> serde_json::Value {
+        copy_task_rejoin_contract(task, &mut detail);
+        detail
+    }
+
     pub(super) async fn task_work_item_binding(&self) -> Option<String> {
         let guard = self.inner.agent.lock().await;
         guard
@@ -251,8 +382,12 @@ impl RuntimeHandle {
             authority_class: authority_class.clone(),
             workspace_mode,
         };
+        let task_id = crate::ids::task_id();
+        let detail = self
+            .task_creation_detail(&task_id, child_agent_task_detail(workspace_mode))
+            .await?;
         let task = TaskRecord {
-            id: crate::ids::task_id(),
+            id: task_id,
             agent_id: agent_id.clone(),
             kind: TaskKind::ChildAgentTask,
             status: TaskStatus::Queued,
@@ -261,7 +396,7 @@ impl RuntimeHandle {
             parent_message_id: None,
             work_item_id,
             summary: Some(summary.clone()),
-            detail: Some(child_agent_task_detail(workspace_mode)),
+            detail: Some(detail),
             recovery: Some(recovery),
         };
         self.apply_task_transition(task_state_reducer::TaskTransition::new(
@@ -355,7 +490,7 @@ impl RuntimeHandle {
             let terminal_task =
                 task_with_result_message(&task_record, status, Some(task_detail), &result_message);
             if let Err(error) = runtime
-                .persist_task_status_direct(&terminal_task, "task_status_updated")
+                .commit_terminal_task_result(&terminal_task, "task_status_updated", &result_message)
                 .await
             {
                 tracing::warn!(
@@ -364,7 +499,7 @@ impl RuntimeHandle {
                     "failed to persist terminal task status before task result"
                 );
             }
-            let _ = runtime.enqueue(result_message).await;
+
             runtime
                 .inner
                 .task_handles
@@ -485,7 +620,10 @@ impl RuntimeHandle {
 
                 let queued_task = TaskRecord {
                     updated_at: Utc::now(),
-                    detail: Some(spawned.task_detail.clone()),
+                    detail: Some(self.task_detail_preserving_rejoin_contract(
+                        &task,
+                        spawned.task_detail.clone(),
+                    )),
                     ..task.clone()
                 };
                 self.apply_task_transition(task_state_reducer::TaskTransition::new(
@@ -726,8 +864,12 @@ impl RuntimeHandle {
             authority_class: authority_class.clone(),
             workspace_mode,
         };
+        let task_id = crate::ids::task_id();
+        let detail = self
+            .task_creation_detail(&task_id, child_agent_task_detail(workspace_mode))
+            .await?;
         let task = TaskRecord {
-            id: crate::ids::task_id(),
+            id: task_id,
             agent_id: agent_id.clone(),
             kind: TaskKind::ChildAgentTask,
             status: TaskStatus::Queued,
@@ -736,7 +878,7 @@ impl RuntimeHandle {
             parent_message_id: None,
             work_item_id,
             summary: Some(summary.clone()),
-            detail: Some(child_agent_task_detail(workspace_mode)),
+            detail: Some(detail),
             recovery: Some(recovery),
         };
         self.apply_task_transition(task_state_reducer::TaskTransition::new(
@@ -857,7 +999,7 @@ impl RuntimeHandle {
             let terminal_task =
                 task_with_result_message(&task_record, status, Some(task_detail), &result_message);
             if let Err(error) = runtime
-                .persist_task_status_direct(&terminal_task, "task_status_updated")
+                .commit_terminal_task_result(&terminal_task, "task_status_updated", &result_message)
                 .await
             {
                 tracing::warn!(
@@ -866,7 +1008,7 @@ impl RuntimeHandle {
                     "failed to persist terminal task status before task result"
                 );
             }
-            let _ = runtime.enqueue(result_message).await;
+
             runtime
                 .inner
                 .task_handles
@@ -997,7 +1139,11 @@ impl RuntimeHandle {
                         &result_message,
                     );
                     if let Err(error) = runtime
-                        .persist_task_status_direct(&failed_task, "task_status_updated")
+                        .commit_terminal_task_result(
+                            &failed_task,
+                            "task_status_updated",
+                            &result_message,
+                        )
                         .await
                     {
                         tracing::warn!(
@@ -1006,7 +1152,7 @@ impl RuntimeHandle {
                             "failed to persist terminal task status before task result"
                         );
                     }
-                    let _ = runtime.enqueue(result_message).await;
+
                     runtime
                         .inner
                         .task_handles
@@ -1087,8 +1233,12 @@ impl RuntimeHandle {
             authority_class: authority_class.clone(),
             workspace_mode,
         };
+        let task_id = crate::ids::task_id();
+        let detail = self
+            .task_creation_detail(&task_id, child_agent_task_detail(workspace_mode))
+            .await?;
         let task = TaskRecord {
-            id: crate::ids::task_id(),
+            id: task_id,
             agent_id,
             kind: TaskKind::ChildAgentTask,
             status: TaskStatus::Queued,
@@ -1097,7 +1247,7 @@ impl RuntimeHandle {
             parent_message_id: None,
             work_item_id,
             summary: Some(summary),
-            detail: Some(child_agent_task_detail(workspace_mode)),
+            detail: Some(detail),
             recovery: Some(recovery),
         };
         self.apply_task_transition(task_state_reducer::TaskTransition::new(
@@ -1306,7 +1456,7 @@ impl RuntimeHandle {
         let terminal_task =
             task_with_result_message(&task_record, status, Some(task_detail), &result_message);
         if let Err(error) = self
-            .persist_task_status_direct(&terminal_task, "task_status_updated")
+            .commit_terminal_task_result(&terminal_task, "task_status_updated", &result_message)
             .await
         {
             tracing::warn!(
@@ -1315,7 +1465,7 @@ impl RuntimeHandle {
                 "failed to persist terminal task status before task result"
             );
         }
-        let _ = self.enqueue(result_message).await;
+
         Ok(())
     }
 
@@ -1469,43 +1619,29 @@ impl RuntimeHandle {
                 status: TaskStatus::Interrupted,
                 created_at: task.created_at,
                 updated_at: Utc::now(),
-                parent_message_id: Some(restart_task_result_message_id(&task.id)),
+                parent_message_id: None,
                 work_item_id: task.work_item_id.clone(),
                 summary: task.summary.clone(),
                 detail: Some(detail),
                 recovery: task.recovery.clone(),
             };
-            self.persist_task_status_direct(&interrupted_task, "task_interrupted_on_restart")
-                .await?;
+            let result_message =
+                interrupted_task_result_message(&interrupted_task, "runtime_restarted");
+            let interrupted_task = task_with_result_message(
+                &interrupted_task,
+                TaskStatus::Interrupted,
+                interrupted_task.detail.clone(),
+                &result_message,
+            );
+            self.commit_terminal_task_result(
+                &interrupted_task,
+                "task_interrupted_on_restart",
+                &result_message,
+            )
+            .await?;
             interrupted.push(interrupted_task);
         }
         Ok(interrupted)
-    }
-
-    pub(super) async fn missing_interrupted_task_results(&self) -> Result<Vec<TaskRecord>> {
-        let agent_id = self.agent_id().await?;
-        let mut missing = Vec::new();
-        for task in self
-            .inner
-            .runtime_db
-            .tasks()
-            .latest_for_agent(&agent_id, usize::MAX)?
-        {
-            if task.status != TaskStatus::Interrupted {
-                continue;
-            }
-            let Some(message_id) = task
-                .parent_message_id
-                .as_deref()
-                .filter(|message_id| message_id.starts_with("message:task-restart:"))
-            else {
-                continue;
-            };
-            if self.inner.storage.read_message_by_id(message_id)?.is_none() {
-                missing.push(task);
-            }
-        }
-        Ok(missing)
     }
 
     pub(super) async fn interrupt_active_tasks_for_lifecycle_stop(
@@ -1566,8 +1702,20 @@ impl RuntimeHandle {
                 detail: Some(detail),
                 recovery: task.recovery.clone(),
             };
-            self.persist_task_status_direct(&interrupted_task, "task_interrupted_on_agent_stop")
-                .await?;
+            let result_message =
+                interrupted_task_result_message(&interrupted_task, "agent_stopped");
+            let interrupted_task = task_with_result_message(
+                &interrupted_task,
+                TaskStatus::Interrupted,
+                interrupted_task.detail.clone(),
+                &result_message,
+            );
+            self.commit_terminal_task_result(
+                &interrupted_task,
+                "task_interrupted_on_agent_stop",
+                &result_message,
+            )
+            .await?;
             interrupted.push(interrupted_task);
         }
         Ok(interrupted)
@@ -2278,7 +2426,8 @@ impl RuntimeHandle {
             .active_workspace_entry
             .map(|entry| entry.workspace_id)
             .unwrap_or_else(|| crate::types::AGENT_HOME_WORKSPACE_ID.to_string());
-        let commit = self.inner.runtime_db.transitions().commit_work_item(
+        let execution_protocol = self.plan_work_item_execution_create(&record)?;
+        let commit = self.commit_work_item_transition_with_execution(
             &crate::runtime_db::transitions::WorkItemTransitionCommand {
                 agent_id,
                 mutation: crate::runtime_db::transitions::WorkItemMutation::Insert {
@@ -2291,9 +2440,369 @@ impl RuntimeHandle {
                 notify_scheduler: true,
                 fault: self.take_transition_fault(),
             },
+            &execution_protocol,
         )?;
         self.apply_transition_commit(commit).await;
         Ok(record)
+    }
+
+    fn plan_work_item_execution_create(
+        &self,
+        record: &WorkItemRecord,
+    ) -> Result<crate::runtime_db::transitions::ExecutionProtocolTransition> {
+        use crate::domain::execution_protocol::{
+            ExecutionProtocolCommand, ExecutionProtocolState, RegisterWorkItemExecution,
+            WorkItemExecutionRecord, WorkItemExecutionState,
+        };
+
+        let existing = self
+            .inner
+            .runtime_db
+            .transitions()
+            .load_execution_protocol_state_if_initialized(&record.agent_id)?;
+        Ok(
+            crate::runtime_db::transitions::ExecutionProtocolTransition {
+                bootstrap: existing
+                    .is_none()
+                    .then(|| ExecutionProtocolState::empty(&record.agent_id)),
+                commands: vec![ExecutionProtocolCommand::RegisterWorkItem(Box::new(
+                    RegisterWorkItemExecution {
+                        work_item_id: record.id.clone(),
+                        record: WorkItemExecutionRecord {
+                            source_revision: record.revision,
+                            state: WorkItemExecutionState::Runnable {
+                                generation: record.revision,
+                                recovery_ref: None,
+                            },
+                        },
+                    },
+                ))],
+            },
+        )
+    }
+
+    fn plan_work_item_execution_update(
+        &self,
+        record: &WorkItemRecord,
+        readiness_mutation: Option<WorkItemReadinessMutation>,
+    ) -> Result<crate::runtime_db::transitions::ExecutionProtocolTransition> {
+        use crate::domain::execution_protocol::{
+            AdvanceWorkItemSourceRevision, ExecutionProtocolCommand, ExecutionProtocolState,
+            RegisterWorkItemExecution, SetWorkItemReadiness, WorkItemExecutionRecord,
+            WorkItemExecutionState,
+        };
+
+        let existing = self
+            .inner
+            .runtime_db
+            .transitions()
+            .load_execution_protocol_state_if_initialized(&record.agent_id)?;
+        let authoritative = existing
+            .as_ref()
+            .and_then(|state| state.work_items.get(&record.id));
+        let Some(authoritative) = authoritative else {
+            let state = match readiness_mutation {
+                Some(WorkItemReadinessMutation::Pause(reason)) => WorkItemExecutionState::Paused {
+                    generation: record.revision,
+                    reason,
+                },
+                _ => WorkItemExecutionState::Runnable {
+                    generation: record.revision,
+                    recovery_ref: None,
+                },
+            };
+            return Ok(
+                crate::runtime_db::transitions::ExecutionProtocolTransition {
+                    bootstrap: existing
+                        .is_none()
+                        .then(|| ExecutionProtocolState::empty(&record.agent_id)),
+                    commands: vec![ExecutionProtocolCommand::RegisterWorkItem(Box::new(
+                        RegisterWorkItemExecution {
+                            work_item_id: record.id.clone(),
+                            record: WorkItemExecutionRecord {
+                                source_revision: record.revision,
+                                state,
+                            },
+                        },
+                    ))],
+                },
+            );
+        };
+        if readiness_mutation.is_some()
+            && matches!(
+                authoritative.state,
+                WorkItemExecutionState::InFlight { .. }
+                    | WorkItemExecutionState::Waiting { .. }
+                    | WorkItemExecutionState::NeedsRepair { .. }
+            )
+        {
+            return Err(anyhow!(
+                "cannot change WorkItem readiness while canonical execution state is active or requires repair"
+            ));
+        }
+        let next_state = match (&authoritative.state, readiness_mutation) {
+            (WorkItemExecutionState::InFlight { .. }, _)
+            | (WorkItemExecutionState::NeedsRepair { .. }, _)
+            | (WorkItemExecutionState::Waiting { .. }, None)
+            | (WorkItemExecutionState::Waiting { .. }, Some(WorkItemReadinessMutation::Pause(_)))
+            | (WorkItemExecutionState::Waiting { .. }, Some(WorkItemReadinessMutation::Resume))
+            | (_, None) => None,
+            (
+                WorkItemExecutionState::Runnable { generation, .. },
+                Some(WorkItemReadinessMutation::Pause(reason)),
+            )
+            | (
+                WorkItemExecutionState::Paused { generation, .. },
+                Some(WorkItemReadinessMutation::Pause(reason)),
+            ) => Some(WorkItemExecutionState::Paused {
+                generation: if matches!(
+                    authoritative.state,
+                    WorkItemExecutionState::Runnable { .. }
+                ) {
+                    generation
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("WorkItem scheduling generation overflow"))?
+                } else {
+                    *generation
+                },
+                reason,
+            }),
+            (
+                WorkItemExecutionState::Runnable { generation, .. },
+                Some(WorkItemReadinessMutation::Resume),
+            )
+            | (
+                WorkItemExecutionState::Paused { generation, .. },
+                Some(WorkItemReadinessMutation::Resume),
+            ) => Some(WorkItemExecutionState::Runnable {
+                generation: if matches!(authoritative.state, WorkItemExecutionState::Paused { .. })
+                {
+                    generation
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("WorkItem scheduling generation overflow"))?
+                } else {
+                    *generation
+                },
+                recovery_ref: None,
+            }),
+            (WorkItemExecutionState::Terminal { .. }, _) => {
+                return Err(anyhow!("cannot update terminal WorkItem execution state"));
+            }
+        };
+        let command = if let Some(state) = next_state {
+            ExecutionProtocolCommand::SetWorkItemReadiness(Box::new(SetWorkItemReadiness {
+                command_id: format!("work_item:update:{}:{}", record.id, record.revision),
+                work_item_id: record.id.clone(),
+                expected: authoritative.clone(),
+                record: WorkItemExecutionRecord {
+                    source_revision: record.revision,
+                    state,
+                },
+            }))
+        } else {
+            ExecutionProtocolCommand::AdvanceWorkItemSourceRevision(AdvanceWorkItemSourceRevision {
+                command_id: format!("work_item:update:{}:{}", record.id, record.revision),
+                work_item_id: record.id.clone(),
+                expected_source_revision: authoritative.source_revision,
+                source_revision: record.revision,
+            })
+        };
+        Ok(
+            crate::runtime_db::transitions::ExecutionProtocolTransition {
+                bootstrap: None,
+                commands: vec![command],
+            },
+        )
+    }
+
+    fn plan_work_item_execution_clear_blocker(
+        &self,
+        record: &WorkItemRecord,
+        wait_conditions: &[crate::types::WaitConditionRecord],
+    ) -> Result<crate::runtime_db::transitions::ExecutionProtocolTransition> {
+        use crate::domain::execution_protocol::{
+            AdvanceWorkItemSourceRevision, ExecutionProtocolCommand, ExecutionProtocolState,
+            RegisterWorkItemExecution, SetWorkItemReadiness, WorkItemExecutionRecord,
+            WorkItemExecutionState,
+        };
+
+        let existing = self
+            .inner
+            .runtime_db
+            .transitions()
+            .load_execution_protocol_state_if_initialized(&record.agent_id)?;
+        let Some(authoritative) = existing
+            .as_ref()
+            .and_then(|state| state.work_items.get(&record.id))
+        else {
+            return Ok(
+                crate::runtime_db::transitions::ExecutionProtocolTransition {
+                    bootstrap: existing
+                        .is_none()
+                        .then(|| ExecutionProtocolState::empty(&record.agent_id)),
+                    commands: vec![ExecutionProtocolCommand::RegisterWorkItem(Box::new(
+                        RegisterWorkItemExecution {
+                            work_item_id: record.id.clone(),
+                            record: WorkItemExecutionRecord {
+                                source_revision: record.revision,
+                                state: WorkItemExecutionState::Runnable {
+                                    generation: record.revision,
+                                    recovery_ref: None,
+                                },
+                            },
+                        },
+                    ))],
+                },
+            );
+        };
+        let revision_changed = authoritative.source_revision != record.revision;
+        let command = match &authoritative.state {
+            WorkItemExecutionState::Waiting { generation, .. }
+            | WorkItemExecutionState::Paused { generation, .. } => Some(
+                ExecutionProtocolCommand::SetWorkItemReadiness(Box::new(SetWorkItemReadiness {
+                    command_id: format!(
+                        "work_item:clear_blocker:{}:{}",
+                        record.id, record.revision
+                    ),
+                    work_item_id: record.id.clone(),
+                    expected: authoritative.clone(),
+                    record: WorkItemExecutionRecord {
+                        source_revision: record.revision,
+                        state: WorkItemExecutionState::Runnable {
+                            generation: generation.checked_add(1).ok_or_else(|| {
+                                anyhow!("WorkItem scheduling generation overflow")
+                            })?,
+                            recovery_ref: None,
+                        },
+                    },
+                })),
+            ),
+            WorkItemExecutionState::Runnable { generation, .. } if revision_changed => Some(
+                ExecutionProtocolCommand::SetWorkItemReadiness(Box::new(SetWorkItemReadiness {
+                    command_id: format!(
+                        "work_item:clear_blocker:{}:{}",
+                        record.id, record.revision
+                    ),
+                    work_item_id: record.id.clone(),
+                    expected: authoritative.clone(),
+                    record: WorkItemExecutionRecord {
+                        source_revision: record.revision,
+                        state: WorkItemExecutionState::Runnable {
+                            generation: *generation,
+                            recovery_ref: None,
+                        },
+                    },
+                })),
+            ),
+            WorkItemExecutionState::InFlight { .. }
+            | WorkItemExecutionState::NeedsRepair { .. }
+                if revision_changed =>
+            {
+                Some(ExecutionProtocolCommand::AdvanceWorkItemSourceRevision(
+                    AdvanceWorkItemSourceRevision {
+                        command_id: format!(
+                            "work_item:clear_blocker:{}:{}",
+                            record.id, record.revision
+                        ),
+                        work_item_id: record.id.clone(),
+                        expected_source_revision: authoritative.source_revision,
+                        source_revision: record.revision,
+                    },
+                ))
+            }
+            WorkItemExecutionState::Terminal { .. } => {
+                return Err(anyhow!("cannot clear terminal WorkItem execution state"));
+            }
+            _ => None,
+        };
+        if command.is_none() && !wait_conditions.is_empty() {
+            return Err(anyhow!(
+                "cancelled WorkItem waits require a canonical readiness transition"
+            ));
+        }
+        Ok(
+            crate::runtime_db::transitions::ExecutionProtocolTransition {
+                bootstrap: None,
+                commands: command.into_iter().collect(),
+            },
+        )
+    }
+
+    fn plan_work_item_execution_continuation_suspend(
+        &self,
+        parent: &WorkItemRecord,
+        continuation: &WorkItemContinuationFrame,
+    ) -> Result<Option<crate::domain::execution_protocol::ExecutionProtocolCommand>> {
+        use crate::domain::execution_protocol::{
+            ExecutionProtocolCommand, SuspendWorkItemContinuation,
+        };
+
+        let state = self
+            .inner
+            .runtime_db
+            .transitions()
+            .load_execution_protocol_state_if_initialized(&parent.agent_id)?
+            .ok_or_else(|| anyhow!("continuation suspension requires canonical execution state"))?;
+        let authoritative = state
+            .work_items
+            .get(&parent.id)
+            .ok_or_else(|| anyhow!("continuation suspension parent execution state is missing"))?;
+        anyhow::ensure!(
+            authoritative.source_revision == parent.revision,
+            "continuation suspension parent WorkItem fence is stale"
+        );
+        Ok(Some(ExecutionProtocolCommand::SuspendWorkItemContinuation(
+            Box::new(SuspendWorkItemContinuation {
+                command_id: format!("continuation:suspend:{}", continuation.id),
+                work_item_id: parent.id.clone(),
+                active_work_item_id: continuation.active_work_item_id.clone(),
+                continuation_id: continuation.id.clone(),
+                expected: authoritative.clone(),
+            }),
+        )))
+    }
+
+    fn plan_work_item_execution_continuation_resume(
+        &self,
+        agent_id: &str,
+        continuation: &WorkItemContinuationFrame,
+        command_reason: &str,
+        projected_parent: Option<&WorkItemRecord>,
+        projected_wait_conditions: &[WaitConditionRecord],
+    ) -> Result<Option<crate::domain::execution_protocol::ExecutionProtocolCommand>> {
+        use crate::domain::execution_protocol::{
+            ExecutionProtocolCommand, ResumeWorkItemContinuation,
+        };
+
+        let state = self
+            .inner
+            .runtime_db
+            .transitions()
+            .load_execution_protocol_state_if_initialized(agent_id)?
+            .ok_or_else(|| anyhow!("continuation resume requires canonical execution state"))?;
+        let authoritative = state
+            .work_items
+            .get(&continuation.suspended_work_item_id)
+            .ok_or_else(|| anyhow!("continuation resume parent execution state is missing"))?;
+        let (source, outcome) = work_item_continuation_resume_source(
+            &self.inner.storage,
+            &self.inner.runtime_db,
+            agent_id,
+            &continuation.suspended_work_item_id,
+            projected_parent,
+            projected_wait_conditions,
+        )?;
+        Ok(Some(ExecutionProtocolCommand::ResumeWorkItemContinuation(
+            Box::new(ResumeWorkItemContinuation {
+                command_id: format!("continuation:{command_reason}:{}", continuation.id),
+                work_item_id: continuation.suspended_work_item_id.clone(),
+                active_work_item_id: continuation.active_work_item_id.clone(),
+                continuation_id: continuation.id.clone(),
+                expected: authoritative.clone(),
+                source,
+                outcome,
+            }),
+        )))
     }
 
     pub async fn pick_work_item(
@@ -2327,10 +2836,10 @@ impl RuntimeHandle {
             None => None,
         };
         let mut record = self.validate_owned_work_item(&agent_id, &work_item_id)?;
-        if record.state == WorkItemState::Completed {
+        if record.state != WorkItemState::Open {
             return Err(RuntimeError::validation(
-                "work_item_completed",
-                format!("cannot pick completed work item {work_item_id}"),
+                "work_item_not_open",
+                format!("cannot pick non-open work item {work_item_id}"),
             )
             .with_safe_context("work_item_id", work_item_id)
             .into());
@@ -2390,38 +2899,79 @@ impl RuntimeHandle {
         let mut continuation_created = None;
         let mut continuation_resolved = None;
         let mut continuation_records = Vec::new();
-        let target_yielded_frame = self
+        let active_continuations = self
             .inner
             .storage
-            .latest_active_work_item_continuation_for_suspended(&agent_id, &record.id)?;
-        let target_was_yielded = target_yielded_frame.is_some();
-        if let Some(frame) = target_yielded_frame {
-            let resolved = frame.resume("explicit_pick");
-            continuation_resolved = Some(continuation_summary(&resolved, "explicit_pick"));
-            audit_events.push(AuditEvent::legacy(
-                "work_item_continuation_resumed",
-                serde_json::json!({
-                    "agent_id": agent_id,
-                    "continuation": continuation_summary(&resolved, "explicit_pick"),
-                }),
-            ));
-            continuation_records.push(resolved);
-        }
-        if let Some(id) = current_id.as_deref() {
-            if let Some(frame) = self
-                .inner
-                .storage
-                .latest_active_work_item_continuation_for_suspended(&agent_id, id)?
-            {
-                let cancelled = frame.cancel("current_focus_reselected");
+            .latest_active_work_item_continuations_for_agent(&agent_id)?;
+        let by_suspended = active_continuations
+            .iter()
+            .map(|frame| (frame.suspended_work_item_id.as_str(), frame))
+            .collect::<BTreeMap<_, _>>();
+        let target_was_yielded = by_suspended.contains_key(record.id.as_str());
+        let mut resolved_frame_ids = std::collections::BTreeSet::new();
+        if target_was_yielded {
+            let mut parent_id = record.id.as_str();
+            let mut first = true;
+            loop {
+                let frame = by_suspended
+                    .get(parent_id)
+                    .copied()
+                    .ok_or_else(|| anyhow!("continuation unwind path is incomplete"))?;
+                anyhow::ensure!(
+                    resolved_frame_ids.insert(frame.id.clone()),
+                    "continuation unwind path contains a cycle"
+                );
+                let (resolved, reason, event_kind) = if first {
+                    (
+                        frame.clone().resume("explicit_pick"),
+                        "explicit_pick",
+                        "work_item_continuation_resumed",
+                    )
+                } else {
+                    (
+                        frame.clone().cancel("current_focus_reselected"),
+                        "current_focus_reselected",
+                        "work_item_continuation_cancelled",
+                    )
+                };
+                let summary = continuation_summary(&resolved, reason);
+                if first {
+                    continuation_resolved = Some(summary.clone());
+                }
+                audit_events.push(AuditEvent::legacy(
+                    event_kind,
+                    serde_json::json!({
+                        "agent_id": agent_id,
+                        "continuation": summary,
+                    }),
+                ));
+                continuation_records.push(resolved);
+                if current_id.as_deref() == Some(frame.active_work_item_id.as_str()) {
+                    break;
+                }
+                parent_id = frame.active_work_item_id.as_str();
+                first = false;
+            }
+        } else if let Some(id) = current_id.as_deref() {
+            let mut parent_id = id;
+            while let Some(frame) = by_suspended.get(parent_id).copied() {
+                anyhow::ensure!(
+                    resolved_frame_ids.insert(frame.id.clone()),
+                    "continuation cancellation path contains a cycle"
+                );
+                let cancelled = frame.clone().cancel("current_focus_reselected");
                 audit_events.push(AuditEvent::legacy(
                     "work_item_continuation_cancelled",
                     serde_json::json!({
                         "agent_id": agent_id,
-                        "continuation": continuation_summary(&cancelled, "current_focus_reselected"),
+                        "continuation": continuation_summary(
+                            &cancelled,
+                            "current_focus_reselected"
+                        ),
                     }),
                 ));
                 continuation_records.push(cancelled);
+                parent_id = frame.active_work_item_id.as_str();
             }
         }
         let yield_current = switching
@@ -2541,7 +3091,49 @@ impl RuntimeHandle {
                 }]
             })
             .unwrap_or_default();
-        let commit = self.inner.runtime_db.transitions().commit_work_item_focus(
+        let mut execution_protocol = if blocker_cleared {
+            self.plan_work_item_execution_clear_blocker(&record, &wait_conditions)?
+        } else {
+            Default::default()
+        };
+        for continuation in &continuation_records {
+            if continuation.state == WorkItemContinuationState::Active {
+                continue;
+            }
+            let command_reason = match continuation.state {
+                WorkItemContinuationState::Resumed => "resume",
+                WorkItemContinuationState::Cancelled => "cancel",
+                WorkItemContinuationState::Active => unreachable!(),
+            };
+            if let Some(command) = self.plan_work_item_execution_continuation_resume(
+                &agent_id,
+                continuation,
+                command_reason,
+                (record.id == continuation.suspended_work_item_id).then_some(&record),
+                &wait_conditions,
+            )? {
+                execution_protocol.commands.push(command);
+            }
+        }
+        if yield_current && !terminal_transition {
+            let previous = previous
+                .as_ref()
+                .expect("yielding current focus requires the previous WorkItem");
+            let continuation = continuation_records
+                .iter()
+                .find(|frame| {
+                    frame.state == WorkItemContinuationState::Active
+                        && frame.suspended_work_item_id == previous.id
+                        && frame.active_work_item_id == record.id
+                })
+                .expect("yielding current focus creates an active continuation");
+            if let Some(command) =
+                self.plan_work_item_execution_continuation_suspend(previous, continuation)?
+            {
+                execution_protocol.commands.push(command);
+            }
+        }
+        let commit = self.commit_work_item_focus_transition_with_execution(
             &crate::runtime_db::transitions::WorkItemFocusTransitionCommand {
                 agent_id: agent_id.clone(),
                 work_items,
@@ -2551,11 +3143,13 @@ impl RuntimeHandle {
                     expected: Some(Box::new(state)),
                     record: Box::new(next_state),
                 },
+                brief_evidence: Vec::new(),
                 audit_events,
                 index_changes,
                 notify_scheduler: true,
                 fault: self.take_transition_fault(),
             },
+            &execution_protocol,
         )?;
         self.apply_transition_commit(commit).await;
         Ok(PickedWorkItem {
@@ -2600,10 +3194,10 @@ impl RuntimeHandle {
     ) -> Result<WorkItemRecord> {
         let agent_id = self.agent_id().await?;
         let existing = self.validate_owned_work_item(&agent_id, &work_item_id)?;
-        if existing.state == WorkItemState::Completed {
+        if existing.state != WorkItemState::Open {
             return Err(RuntimeError::validation(
-                "work_item_completed",
-                format!("cannot update completed work item {work_item_id}"),
+                "work_item_not_open",
+                format!("cannot update non-open work item {work_item_id}"),
             )
             .with_safe_context("work_item_id", work_item_id)
             .into());
@@ -2630,6 +3224,10 @@ impl RuntimeHandle {
             record.updated_at = Utc::now();
             wrote_item = true;
         }
+        let readiness_mutation = blocked_by.as_ref().map(|blocked_by| match blocked_by {
+            Some(reason) => WorkItemReadinessMutation::Pause(reason.clone()),
+            None => WorkItemReadinessMutation::Resume,
+        });
         if let Some(blocked_by) = blocked_by {
             let now = self.now();
             record.blocked_by = blocked_by;
@@ -2704,7 +3302,9 @@ impl RuntimeHandle {
                     });
                 }
             }
-            let commit = self.inner.runtime_db.transitions().commit_work_item(
+            let execution_protocol =
+                self.plan_work_item_execution_update(&record, readiness_mutation)?;
+            let commit = self.commit_work_item_transition_with_execution(
                 &crate::runtime_db::transitions::WorkItemTransitionCommand {
                     agent_id,
                     mutation: crate::runtime_db::transitions::WorkItemMutation::Update {
@@ -2718,6 +3318,7 @@ impl RuntimeHandle {
                     notify_scheduler: true,
                     fault: self.take_transition_fault(),
                 },
+                &execution_protocol,
             )?;
             self.apply_transition_commit(commit).await;
         }
@@ -2772,7 +3373,7 @@ impl RuntimeHandle {
                 "recheck_consumed_at": record.recheck_consumed_at,
             }),
         ));
-        let commit = self.inner.runtime_db.transitions().commit_work_item(
+        let commit = self.commit_work_item_transition(
             &crate::runtime_db::transitions::WorkItemTransitionCommand {
                 agent_id,
                 mutation: crate::runtime_db::transitions::WorkItemMutation::Update {
@@ -2809,14 +3410,14 @@ impl RuntimeHandle {
     ) -> Result<CompletedWorkItem> {
         let agent_id = self.agent_id().await?;
         let existing = self.validate_owned_work_item(&agent_id, &work_item_id)?;
-        if existing.state == WorkItemState::Completed {
+        if existing.state != WorkItemState::Open {
             return Ok(CompletedWorkItem {
                 work_item: existing,
                 continuation_resumed: None,
             });
         }
-        let mut state = self.agent_state().await?;
-        let expected_state = state.clone();
+        let state = self.agent_state().await?;
+        let mut next_state = state.clone();
         let now = Utc::now();
         let execution_binding = state.current_execution_binding.clone();
         let matching_execution_binding = execution_binding
@@ -2844,7 +3445,7 @@ impl RuntimeHandle {
         };
         let mut record = WorkItemRecord {
             revision: existing.revision + 1,
-            state: WorkItemState::Completed,
+            state: WorkItemState::Completing,
             blocked_by: None,
             recheck_at: None,
             recheck_consumed_at: None,
@@ -2858,6 +3459,12 @@ impl RuntimeHandle {
             self.agent_home().as_path(),
             &mut record,
         )?;
+        let mut audit_events = Vec::new();
+        if plan_artifact_changed {
+            if let Some(event) = self.work_item_plan_artifact_refreshed_event(&record) {
+                audit_events.push(event);
+            }
+        }
         let active_waits = self
             .inner
             .storage
@@ -2875,36 +3482,849 @@ impl RuntimeHandle {
             cancelled_wait_condition_ids.push(condition.id);
             wait_conditions.push(cancelled);
         }
-        let mut audit_events = Vec::new();
-        if plan_artifact_changed {
-            if let Some(event) = self.work_item_plan_artifact_refreshed_event(&record) {
-                audit_events.push(event);
-            }
-        }
-        let release_current = state.current_work_item_id.as_deref() == Some(record.id.as_str());
-        let release_turn = state.current_turn_work_item_id.as_deref() == Some(record.id.as_str());
-        let mut continuation_records = Vec::new();
-        let mut continuation_resumed = None;
+        let release_current =
+            next_state.current_work_item_id.as_deref() == Some(record.id.as_str());
+        let release_turn =
+            next_state.current_turn_work_item_id.as_deref() == Some(record.id.as_str());
         if release_current {
-            state.current_work_item_id = None;
+            next_state.current_work_item_id = None;
         }
         if release_turn {
-            state.current_turn_work_item_id = None;
+            next_state.current_turn_work_item_id = None;
         }
         if release_current || release_turn {
             audit_events.push(AuditEvent::legacy(
                 "work_item_focus_released",
                 serde_json::json!({
                     "agent_id": agent_id,
-                    "work_item_id": record.id.as_str(),
+                    "work_item_id": record.id,
+                    "reason": "completion_intent_recorded",
+                    "readiness": record.readiness(),
+                    "revision": record.revision,
+                }),
+            ));
+        }
+        if !cancelled_wait_condition_ids.is_empty() {
+            audit_events.push(AuditEvent::legacy(
+                "wait_conditions_cancelled",
+                serde_json::json!({
+                    "agent_id": agent_id,
+                    "work_item_id": record.id,
+                    "reason": "completion_intent_recorded",
+                    "wait_condition_ids": cancelled_wait_condition_ids,
+                }),
+            ));
+        }
+        audit_events.push(self.work_item_written_event(
+            "completing",
+            &record,
+            serde_json::json!({
+                "warning_count": warnings.len(),
+                "completion_intent": record.completion_intent,
+            }),
+        ));
+        let commit = self.commit_work_item_focus_transition(
+            &crate::runtime_db::transitions::WorkItemFocusTransitionCommand {
+                agent_id,
+                work_items: vec![crate::runtime_db::transitions::WorkItemMutation::Update {
+                    record: record.clone(),
+                    expected_revision: existing.revision,
+                }],
+                wait_conditions,
+                continuations: Vec::new(),
+                agent_state: crate::runtime_db::transitions::AgentStateMutation {
+                    expected: Some(Box::new(state)),
+                    record: Box::new(next_state),
+                },
+                brief_evidence: Vec::new(),
+                audit_events,
+                index_changes: self.inner.storage.index_changes_for_work_item(&record)?,
+                notify_scheduler: true,
+                fault: self.take_transition_fault(),
+            },
+        )?;
+        self.apply_transition_commit(commit).await;
+        Ok(CompletedWorkItem {
+            work_item: record,
+            continuation_resumed: None,
+        })
+    }
+
+    pub async fn promote_work_item_completion_report(
+        &self,
+        work_item_id: String,
+        report_text: String,
+        source_turn_index: Option<u64>,
+        source_round: Option<usize>,
+        warnings: Vec<serde_json::Value>,
+    ) -> Result<WorkItemRecord> {
+        Ok(self
+            .promote_work_item_completion_report_with_metadata(
+                work_item_id,
+                report_text,
+                Vec::new(),
+                source_turn_index,
+                source_round,
+                warnings,
+            )
+            .await?
+            .into_record())
+    }
+
+    pub(crate) async fn complete_work_item_with_report(
+        &self,
+        work_item_id: String,
+        authority: WorkItemCompletionAuthority,
+        report_text: String,
+        citations: Vec<crate::types::Citation>,
+        source_turn_index: Option<u64>,
+        source_round: Option<usize>,
+        source_turn_id: Option<String>,
+        source_message_id: Option<String>,
+        source_assistant_round_id: Option<String>,
+        source_tool_call_id: Option<String>,
+        warnings: Vec<serde_json::Value>,
+    ) -> Result<WorkItemCompletionReportPromotionOutcome> {
+        let agent_id = self.agent_id().await?;
+        let existing = self.validate_owned_work_item(&agent_id, &work_item_id)?;
+        if existing.state == WorkItemState::Completed {
+            return Ok(WorkItemCompletionReportPromotionOutcome::Unchanged(
+                existing,
+            ));
+        }
+        if existing.state != WorkItemState::Open {
+            return Err(RuntimeError::new(
+                RuntimeErrorDomain::Conflict,
+                "work_item_completion_in_progress",
+                format!(
+                    "work item {work_item_id} already has a legacy completion intent in progress"
+                ),
+            )
+            .with_safe_context("work_item_id", work_item_id)
+            .with_recovery_hint(
+                "complete the existing legacy completion intent through the control completion API",
+            )
+            .into());
+        }
+        let report_text = report_text.trim();
+        if report_text.is_empty() {
+            return Err(RuntimeError::validation(
+                "missing_completion_report",
+                "CompleteWorkItem requires nearby preceding same-round operator-facing report text",
+            )
+            .with_safe_context("work_item_id", work_item_id)
+            .with_recovery_hint(
+                "write the concise operator-facing completion report immediately before CompleteWorkItem in the same assistant response",
+            )
+            .into());
+        }
+
+        let mut brief =
+            BriefRecord::new(agent_id.clone(), BriefKind::Result, report_text, None, None);
+        if !citations.is_empty() {
+            brief.citations = Some(citations);
+        }
+        brief.work_item_id = Some(existing.id.clone());
+        brief.workspace_id = existing.workspace_id.clone();
+        brief.turn_index = source_turn_index;
+        brief.turn_id = source_turn_id;
+        brief.related_message_id = source_message_id;
+        brief.finalizes_assistant_round_id = source_assistant_round_id.clone();
+
+        let Some(completed) = self
+            .finalize_open_work_item_completion_with_brief(
+                &work_item_id,
+                &authority,
+                &brief,
+                AuditEvent::legacy(
+                    "work_item_completion_report_promoted",
+                    serde_json::json!({
+                        "agent_id": agent_id,
+                        "work_item_id": work_item_id,
+                        "source_turn_index": source_turn_index,
+                        "source_round": source_round,
+                        "source_assistant_round_id": source_assistant_round_id,
+                        "source_tool_call_id": source_tool_call_id,
+                        "source": "same_assistant_round_preceding_text",
+                        "text_preview": crate::tool::helpers::truncate_text(report_text, 600),
+                        "warnings": warnings.clone(),
+                        "warning_count": warnings.len(),
+                        "brief_id": brief.id.clone(),
+                    }),
+                ),
+            )
+            .await?
+        else {
+            let latest = self.validate_owned_work_item(&self.agent_id().await?, &work_item_id)?;
+            return Ok(WorkItemCompletionReportPromotionOutcome::Unchanged(latest));
+        };
+        Ok(WorkItemCompletionReportPromotionOutcome::Promoted(
+            WorkItemCompletionReportPromotion {
+                record: completed.work_item,
+                brief_id: brief.id,
+                continuation_resumed: completed.continuation_resumed,
+            },
+        ))
+    }
+
+    pub(crate) async fn prepare_work_item_completion_with_report(
+        &self,
+        work_item_id: String,
+        authority: WorkItemCompletionAuthority,
+        report_text: String,
+        citations: Vec<crate::types::Citation>,
+        source_turn_index: Option<u64>,
+        source_round: Option<usize>,
+        source_turn_id: Option<String>,
+        source_message_id: Option<String>,
+        source_assistant_round_id: Option<String>,
+        source_tool_call_id: Option<String>,
+        report_source: &'static str,
+        warnings: Vec<serde_json::Value>,
+    ) -> Result<Option<PreparedWorkItemCompletion>> {
+        let agent_id = self.agent_id().await?;
+        let existing = self.validate_owned_work_item(&agent_id, &work_item_id)?;
+        if existing.state == WorkItemState::Completed {
+            return Ok(None);
+        }
+        if existing.state != WorkItemState::Open {
+            return Err(RuntimeError::new(
+                RuntimeErrorDomain::Conflict,
+                "work_item_completion_in_progress",
+                format!(
+                    "work item {work_item_id} already has a legacy completion intent in progress"
+                ),
+            )
+            .with_safe_context("work_item_id", work_item_id)
+            .with_recovery_hint(
+                "complete the existing legacy completion intent through the control completion API",
+            )
+            .into());
+        }
+        let report_text = report_text.trim();
+        if report_text.is_empty() {
+            return Err(RuntimeError::validation(
+                "missing_completion_report",
+                "CompleteWorkItem requires nearby preceding same-round operator-facing report text",
+            )
+            .with_safe_context("work_item_id", work_item_id)
+            .with_recovery_hint(
+                "write the concise operator-facing completion report immediately before CompleteWorkItem in the same assistant response",
+            )
+            .into());
+        }
+
+        let mut brief =
+            BriefRecord::new(agent_id.clone(), BriefKind::Result, report_text, None, None);
+        if !citations.is_empty() {
+            brief.citations = Some(citations);
+        }
+        brief.work_item_id = Some(existing.id.clone());
+        brief.workspace_id = existing.workspace_id.clone();
+        brief.turn_index = source_turn_index;
+        brief.turn_id = source_turn_id;
+        brief.related_message_id = source_message_id;
+        brief.finalizes_assistant_round_id = source_assistant_round_id.clone();
+
+        self.plan_work_item_completion_with_brief_mode(
+            &work_item_id,
+            Some(&authority),
+            &brief,
+            AuditEvent::legacy(
+                "work_item_completion_report_promoted",
+                serde_json::json!({
+                    "agent_id": agent_id,
+                    "work_item_id": work_item_id,
+                    "source_turn_index": source_turn_index,
+                    "source_round": source_round,
+                    "source_assistant_round_id": source_assistant_round_id,
+                    "source_tool_call_id": source_tool_call_id,
+                    "source": report_source,
+                    "text_preview": crate::tool::helpers::truncate_text(report_text, 600),
+                    "warnings": warnings.clone(),
+                    "warning_count": warnings.len(),
+                    "brief_id": brief.id.clone(),
+                }),
+            ),
+            true,
+            true,
+        )
+        .await
+    }
+
+    pub(crate) async fn validate_work_item_completion_request(
+        &self,
+        work_item_id: &str,
+        authority: &WorkItemCompletionAuthority,
+    ) -> Result<u64> {
+        let agent_id = self.agent_id().await?;
+        let existing = self.validate_owned_work_item(&agent_id, work_item_id)?;
+        if existing.state != WorkItemState::Open {
+            return Err(RuntimeError::new(
+                RuntimeErrorDomain::Conflict,
+                "work_item_completion_in_progress",
+                format!("work item {work_item_id} is not open"),
+            )
+            .with_safe_context("work_item_id", work_item_id)
+            .into());
+        }
+        let WorkItemCompletionAuthority::AgentExecution(binding) = authority else {
+            return Ok(existing.revision);
+        };
+        let mut brief = BriefRecord::new(
+            agent_id,
+            BriefKind::Result,
+            "completion report request validation",
+            None,
+            None,
+        );
+        brief.work_item_id = Some(existing.id.clone());
+        brief.workspace_id = existing.workspace_id.clone();
+        brief.turn_id = Some(binding.turn_id.clone());
+        brief.related_message_id = Some(binding.source_message_id.clone());
+        self.plan_work_item_completion_with_brief_mode(
+            work_item_id,
+            Some(authority),
+            &brief,
+            AuditEvent::legacy(
+                "work_item_completion_request_validated",
+                serde_json::json!({
+                    "agent_id": brief.agent_id,
+                    "work_item_id": work_item_id,
+                }),
+            ),
+            true,
+            false,
+        )
+        .await?;
+        Ok(existing.revision)
+    }
+
+    pub(super) async fn promote_work_item_completion_report_with_metadata(
+        &self,
+        work_item_id: String,
+        report_text: String,
+        citations: Vec<crate::types::Citation>,
+        source_turn_index: Option<u64>,
+        source_round: Option<usize>,
+        warnings: Vec<serde_json::Value>,
+    ) -> Result<WorkItemCompletionReportPromotionOutcome> {
+        let agent_id = self.agent_id().await?;
+        let existing = self.validate_owned_work_item(&agent_id, &work_item_id)?;
+        if existing.state == WorkItemState::Open {
+            return Err(anyhow!(
+                "cannot promote completion report for open work item {}",
+                work_item_id
+            ));
+        }
+        let report_text = report_text.trim();
+        if report_text.is_empty() {
+            return Ok(WorkItemCompletionReportPromotionOutcome::Unchanged(
+                existing,
+            ));
+        }
+        if existing.result_brief_id.is_some()
+            || existing
+                .completion_intent
+                .as_ref()
+                .is_some_and(|intent| intent.report_state == CompletionReportState::Bound)
+        {
+            return Ok(WorkItemCompletionReportPromotionOutcome::Unchanged(
+                existing,
+            ));
+        }
+        let mut brief =
+            BriefRecord::new(agent_id.clone(), BriefKind::Result, report_text, None, None);
+        if !citations.is_empty() {
+            brief.citations = Some(citations);
+        }
+        brief.work_item_id = Some(existing.id.clone());
+        brief.workspace_id = existing.workspace_id.clone();
+        brief.turn_index = source_turn_index;
+        brief.turn_id = existing
+            .completion_intent
+            .as_ref()
+            .and_then(|intent| intent.source_turn_id.clone());
+        brief.related_message_id = existing
+            .completion_intent
+            .as_ref()
+            .and_then(|intent| intent.source_message_id.clone());
+        let Some(completed) = self
+            .finalize_work_item_completion_with_brief(
+                &work_item_id,
+                &brief,
+                AuditEvent::legacy(
+                    "work_item_completion_report_promoted",
+                    serde_json::json!({
+                        "agent_id": agent_id,
+                        "work_item_id": work_item_id,
+                        "source_turn_index": source_turn_index,
+                        "source_round": source_round,
+                        "text_preview": crate::tool::helpers::truncate_text(report_text, 600),
+                        "warnings": warnings.clone(),
+                        "warning_count": warnings.len(),
+                        "brief_id": brief.id.clone(),
+                    }),
+                ),
+            )
+            .await?
+        else {
+            let latest = self.validate_owned_work_item(&self.agent_id().await?, &work_item_id)?;
+            return Ok(WorkItemCompletionReportPromotionOutcome::Unchanged(latest));
+        };
+        Ok(WorkItemCompletionReportPromotionOutcome::Promoted(
+            WorkItemCompletionReportPromotion {
+                record: completed.work_item,
+                brief_id: brief.id,
+                continuation_resumed: completed.continuation_resumed,
+            },
+        ))
+    }
+
+    pub(super) async fn finalize_work_item_completion_with_brief(
+        &self,
+        work_item_id: &str,
+        brief: &BriefRecord,
+        binding_event: AuditEvent,
+    ) -> Result<Option<CompletedWorkItem>> {
+        self.finalize_work_item_completion_with_brief_mode(
+            work_item_id,
+            None,
+            brief,
+            binding_event,
+            false,
+        )
+        .await
+    }
+
+    async fn finalize_open_work_item_completion_with_brief(
+        &self,
+        work_item_id: &str,
+        authority: &WorkItemCompletionAuthority,
+        brief: &BriefRecord,
+        binding_event: AuditEvent,
+    ) -> Result<Option<CompletedWorkItem>> {
+        self.finalize_work_item_completion_with_brief_mode(
+            work_item_id,
+            Some(authority),
+            brief,
+            binding_event,
+            true,
+        )
+        .await
+    }
+
+    async fn finalize_work_item_completion_with_brief_mode(
+        &self,
+        work_item_id: &str,
+        authority: Option<&WorkItemCompletionAuthority>,
+        brief: &BriefRecord,
+        binding_event: AuditEvent,
+        require_open: bool,
+    ) -> Result<Option<CompletedWorkItem>> {
+        const MAX_ATTEMPTS: usize = 8;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            let Some(prepared) = self
+                .plan_work_item_completion_with_brief_mode(
+                    work_item_id,
+                    authority,
+                    brief,
+                    binding_event.clone(),
+                    require_open,
+                    false,
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            let record = prepared.record.clone();
+            let continuation_resumed = prepared.continuation_resumed.clone();
+            #[cfg(test)]
+            self.apply_completion_binding_replacement_before_commit()
+                .await?;
+            let commit = self.commit_work_item_focus_transition(
+                &crate::runtime_db::transitions::WorkItemFocusTransitionCommand {
+                    agent_id: record.agent_id.clone(),
+                    work_items: vec![crate::runtime_db::transitions::WorkItemMutation::Update {
+                        record: record.clone(),
+                        expected_revision: record.revision - 1,
+                    }],
+                    wait_conditions: prepared.wait_conditions,
+                    continuations: prepared.continuations,
+                    agent_state: crate::runtime_db::transitions::AgentStateMutation {
+                        expected: Some(Box::new(prepared.expected_agent_state)),
+                        record: Box::new(prepared.committed_agent_state),
+                    },
+                    brief_evidence: vec![prepared.brief],
+                    audit_events: prepared.audit_events,
+                    index_changes: prepared.index_changes,
+                    notify_scheduler: true,
+                    fault: self.take_transition_fault(),
+                },
+            );
+            match commit {
+                Ok(commit) => {
+                    self.apply_transition_commit(commit).await;
+                    return Ok(Some(CompletedWorkItem {
+                        work_item: record,
+                        continuation_resumed,
+                    }));
+                }
+                Err(error)
+                    if attempt + 1 < MAX_ATTEMPTS
+                        && error
+                            .downcast_ref::<crate::runtime_db::RuntimeStateTransitionConflict>()
+                            .is_some_and(
+                                crate::runtime_db::RuntimeStateTransitionConflict::retryable,
+                            ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("completion finalization attempts return or continue")
+    }
+
+    async fn plan_work_item_completion_with_brief_mode(
+        &self,
+        work_item_id: &str,
+        authority: Option<&WorkItemCompletionAuthority>,
+        brief: &BriefRecord,
+        binding_event: AuditEvent,
+        require_open: bool,
+        require_completion_commit_attempt: bool,
+    ) -> Result<Option<PreparedWorkItemCompletion>> {
+        let agent_id = self.agent_id().await?;
+        let existing = self.validate_owned_work_item(&agent_id, work_item_id)?;
+        if existing.state == WorkItemState::Completed {
+            return Ok(None);
+        }
+        let expected_state = if require_open {
+            WorkItemState::Open
+        } else {
+            WorkItemState::Completing
+        };
+        if existing.state != expected_state {
+            return Err(anyhow!(
+                "cannot finalize completion report for work item {} in state {:?}; expected {:?}",
+                work_item_id,
+                existing.state,
+                expected_state,
+            ));
+        }
+        let now = Utc::now();
+        let mut state = self.agent_state().await?;
+        let expected_execution_protocol_state = if require_completion_commit_attempt
+            && matches!(
+                authority,
+                Some(WorkItemCompletionAuthority::AgentExecution(_))
+            ) {
+            self.inner
+                .runtime_db
+                .transitions()
+                .load_execution_protocol_state_if_initialized(&agent_id)?
+        } else {
+            None
+        };
+        let legacy_work_item_execution = expected_execution_protocol_state
+            .as_ref()
+            .filter(|state| !state.work_items.contains_key(&existing.id))
+            .map(|_| {
+                use crate::domain::execution_protocol::{
+                    WaitReference, WorkItemExecutionRecord, WorkItemExecutionState,
+                };
+
+                let active_wait_ids = self
+                    .inner
+                    .storage
+                    .raw_active_wait_conditions_for_agent(&agent_id)?
+                    .into_iter()
+                    .filter(|condition| {
+                        condition.work_item_id.as_deref() == Some(existing.id.as_str())
+                    })
+                    .map(|condition| condition.id)
+                    .collect::<Vec<_>>();
+                let generation = existing.revision.max(1);
+                let state = match active_wait_ids.as_slice() {
+                    [wait_id] => WorkItemExecutionState::Waiting {
+                        generation,
+                        wait: WaitReference {
+                            wait_id: wait_id.clone(),
+                        },
+                    },
+                    [] if existing.blocked_by.is_some() => WorkItemExecutionState::Paused {
+                        generation,
+                        reason: existing
+                            .blocked_by
+                            .clone()
+                            .expect("manual blocker checked above"),
+                    },
+                    [] => WorkItemExecutionState::Runnable {
+                        generation,
+                        recovery_ref: None,
+                    },
+                    _ => WorkItemExecutionState::NeedsRepair {
+                        generation,
+                        repair_id: format!("work_item_waits_ambiguous:{}", existing.id),
+                    },
+                };
+                Ok::<_, anyhow::Error>(WorkItemExecutionRecord {
+                    source_revision: existing.revision,
+                    state,
+                })
+            })
+            .transpose()?;
+        let expected_agent_state = state.clone();
+        let agent_execution_authority = matches!(
+            authority,
+            Some(WorkItemCompletionAuthority::AgentExecution(_))
+        );
+        let matching_execution_binding = match authority {
+            Some(WorkItemCompletionAuthority::AgentExecution(expected_binding)) => {
+                if let Some(bound_work_item_id) = expected_binding.work_item_id.as_deref() {
+                    if bound_work_item_id != existing.id {
+                        return Err(RuntimeError::policy(
+                                "work_item_execution_binding_mismatch",
+                                format!(
+                                    "current execution is bound to work item {bound_work_item_id}, not {work_item_id}"
+                                ),
+                            )
+                            .with_safe_context("work_item_id", work_item_id)
+                            .with_recovery_hint(
+                                "complete the WorkItem from its own execution or from an agent-lifecycle execution without another WorkItem binding",
+                            )
+                            .into());
+                    }
+                }
+                let Some(current_binding) = state.current_execution_binding.as_ref() else {
+                    return Err(RuntimeError::policy(
+                        "work_item_execution_binding_missing",
+                        "the execution binding that authorized this completion is no longer active",
+                    )
+                    .with_safe_context("work_item_id", work_item_id)
+                    .into());
+                };
+                if current_binding != expected_binding {
+                    return Err(RuntimeError::policy(
+                            "work_item_execution_binding_stale",
+                            "the execution binding that authorized this completion changed before commit",
+                        )
+                        .with_safe_context("work_item_id", work_item_id)
+                        .with_recovery_hint(
+                            "retry completion from the WorkItem's current execution",
+                        )
+                        .into());
+                }
+                if Some(expected_binding.turn_id.as_str()) != brief.turn_id.as_deref()
+                    || Some(expected_binding.source_message_id.as_str())
+                        != brief.related_message_id.as_deref()
+                {
+                    return Err(RuntimeError::policy(
+                        "work_item_completion_report_binding_mismatch",
+                        "the completion report does not belong to the authorizing execution",
+                    )
+                    .with_safe_context("work_item_id", work_item_id)
+                    .into());
+                }
+                (expected_binding.work_item_id.as_deref() == Some(existing.id.as_str()))
+                    .then_some(expected_binding)
+            }
+            Some(WorkItemCompletionAuthority::Control) | None => None,
+        };
+        let mut source_activation_id =
+            matching_execution_binding.and_then(|binding| binding.activation_id.clone());
+        if source_activation_id.is_none()
+            && agent_execution_authority
+            && require_completion_commit_attempt
+        {
+            if let Some(protocol_state) = expected_execution_protocol_state.as_ref() {
+                let mut matching_attempts = protocol_state.attempts.values().filter(|attempt| {
+                    attempt.state
+                        == crate::domain::execution_protocol::ExecutionAttemptState::Open
+                        && attempt.source_message_id.as_deref()
+                            == brief.related_message_id.as_deref()
+                        && match &attempt.binding {
+                            crate::domain::execution_protocol::ExecutionBinding::WorkItem {
+                                work_item_id,
+                            } => {
+                                work_item_id == &existing.id
+                                    && attempt.admitted_fences.work_item_source_revision
+                                        == matching_execution_binding
+                                            .and_then(|binding| binding.claimed_work_revision)
+                                            .or(Some(existing.revision))
+                                    && protocol_state
+                                        .work_items
+                                        .get(&existing.id)
+                                        .is_some_and(|work_item| {
+                                            matches!(
+                                                &work_item.state,
+                                                crate::domain::execution_protocol::WorkItemExecutionState::InFlight {
+                                                    attempt_id,
+                                                    generation,
+                                                } if attempt_id == &attempt.attempt_id
+                                                    && Some(*generation)
+                                                        == attempt
+                                                            .admitted_fences
+                                                            .work_item_generation
+                                            )
+                                        })
+                            }
+                            crate::domain::execution_protocol::ExecutionBinding::AgentLifecycle {
+                                agent_id: binding_agent_id,
+                            } => {
+                                binding_agent_id == &agent_id
+                                    && protocol_state.work_items.get(&existing.id).map_or_else(
+                                        || legacy_work_item_execution.is_some(),
+                                        |work_item| {
+                                            work_item.source_revision == existing.revision
+                                                && !matches!(
+                                                    work_item.state,
+                                                    crate::domain::execution_protocol::WorkItemExecutionState::InFlight { .. }
+                                                        | crate::domain::execution_protocol::WorkItemExecutionState::Terminal { .. }
+                                                )
+                                        },
+                                    )
+                            }
+                            crate::domain::execution_protocol::ExecutionBinding::Conversation {
+                                ..
+                            } => {
+                                attempt.agent_id == agent_id
+                                    && protocol_state.work_items.get(&existing.id).map_or_else(
+                                        || legacy_work_item_execution.is_some(),
+                                        |work_item| {
+                                            work_item.source_revision == existing.revision
+                                                && !matches!(
+                                                    work_item.state,
+                                                    crate::domain::execution_protocol::WorkItemExecutionState::InFlight { .. }
+                                                        | crate::domain::execution_protocol::WorkItemExecutionState::Terminal { .. }
+                                                )
+                                        },
+                                    )
+                            }
+                            crate::domain::execution_protocol::ExecutionBinding::Command => false,
+                        }
+                });
+                let matching_attempt = matching_attempts
+                    .next()
+                    .ok_or_else(|| anyhow!("completion commit execution attempt is missing"))?;
+                if matching_attempts.next().is_some() {
+                    return Err(anyhow!("completion commit execution attempt is ambiguous"));
+                }
+                source_activation_id = Some(matching_attempt.attempt_id.clone());
+            }
+        }
+        let mut completion_intent = if require_open {
+            WorkItemCompletionIntent {
+                work_item_id: existing.id.clone(),
+                source_activation_id,
+                source_message_id: brief.related_message_id.clone(),
+                source_turn_id: brief.turn_id.clone(),
+                expected_work_revision: matching_execution_binding
+                    .and_then(|binding| binding.claimed_work_revision)
+                    .unwrap_or(existing.revision),
+                report_requirement: CompletionReportRequirement::Required,
+                report_state: CompletionReportState::Pending,
+                result_brief_id: None,
+                created_at: now,
+                updated_at: now,
+            }
+        } else {
+            let intent = existing
+                .completion_intent
+                .clone()
+                .ok_or_else(|| anyhow!("completion brief binding requires a completion intent"))?;
+            if intent.work_item_id != existing.id
+                || intent.source_turn_id != brief.turn_id
+                || intent.source_message_id != brief.related_message_id
+            {
+                return Err(anyhow!(
+                    "completion brief identity does not match work item {} intent",
+                    work_item_id
+                ));
+            }
+            intent
+        };
+        completion_intent.report_state = CompletionReportState::Bound;
+        completion_intent.result_brief_id = Some(brief.id.clone());
+        completion_intent.updated_at = now;
+        let mut record = WorkItemRecord {
+            revision: existing.revision + 1,
+            state: WorkItemState::Completed,
+            blocked_by: None,
+            recheck_at: None,
+            recheck_consumed_at: None,
+            result_brief_id: Some(brief.id.clone()),
+            completion_intent: Some(completion_intent),
+            updated_at: now,
+            ..existing
+        };
+        let plan_artifact_changed = crate::work_item_plan::refresh_plan_artifact_metadata(
+            self.agent_home().as_path(),
+            &mut record,
+        )?;
+
+        let active_waits = self
+            .inner
+            .storage
+            .raw_active_wait_conditions_for_agent(&agent_id)?
+            .into_iter()
+            .filter(|condition| condition.work_item_id.as_deref() == Some(record.id.as_str()))
+            .collect::<Vec<_>>();
+        let mut wait_conditions = Vec::with_capacity(active_waits.len());
+        let mut cancelled_wait_condition_ids = Vec::with_capacity(active_waits.len());
+        for condition in active_waits {
+            let mut cancelled = condition.clone();
+            cancelled.status = WaitConditionStatus::Cancelled;
+            cancelled.updated_at = now;
+            cancelled.cancelled_at = Some(now);
+            cancelled_wait_condition_ids.push(condition.id);
+            wait_conditions.push(cancelled);
+        }
+
+        state.last_brief_at = Some(brief.created_at);
+        let release_current = state.current_work_item_id.as_deref() == Some(record.id.as_str());
+        let release_turn = state.current_turn_work_item_id.as_deref() == Some(record.id.as_str());
+        if release_current {
+            state.current_work_item_id = None;
+        }
+        if release_turn {
+            state.current_turn_work_item_id = None;
+        }
+        state.current_execution_binding = None;
+        state.current_run_id = None;
+        if !matches!(state.status, AgentStatus::Asleep | AgentStatus::Stopped) {
+            state.status = AgentStatus::AwakeIdle;
+        }
+
+        let mut audit_events = vec![
+            // Deterministic identity so a replayed completion transition
+            // reuses the committed brief_created event and links the Brief
+            // to its event sequence in the same transaction.
+            brief_created_event_for(brief)?,
+            binding_event.clone(),
+        ];
+        if plan_artifact_changed {
+            if let Some(event) = self.work_item_plan_artifact_refreshed_event(&record) {
+                audit_events.push(event);
+            }
+        }
+        if release_current || release_turn {
+            audit_events.push(AuditEvent::legacy(
+                "work_item_focus_released",
+                serde_json::json!({
+                    "agent_id": agent_id,
+                    "work_item_id": record.id,
                     "reason": "work_item_completed",
                     "readiness": record.readiness(),
                     "revision": record.revision,
                 }),
             ));
         }
-        // Pick atomically cancels conflicting active frames, so this lookup has
-        // at most one resumable continuation for the completed WorkItem.
+
+        let mut continuation_records = Vec::new();
+        let mut continuation_resumed = None;
         if let Some(frame) = self
             .inner
             .storage
@@ -2971,7 +4391,7 @@ impl RuntimeHandle {
                     "agent_id": agent_id,
                     "work_item_id": record.id,
                     "reason": "work_item_completed",
-                    "wait_condition_ids": &cancelled_wait_condition_ids,
+                    "wait_condition_ids": cancelled_wait_condition_ids,
                 }),
             ));
         }
@@ -2979,175 +4399,28 @@ impl RuntimeHandle {
             "completed",
             &record,
             serde_json::json!({
-                "warning_count": warnings.len(),
                 "continuation_resumed": continuation_resumed,
                 "completion_intent": record.completion_intent,
+                "brief_id": brief.id,
             }),
         ));
-        let commit = self.inner.runtime_db.transitions().commit_work_item_focus(
-            &crate::runtime_db::transitions::WorkItemFocusTransitionCommand {
-                agent_id: agent_id.clone(),
-                work_items: vec![crate::runtime_db::transitions::WorkItemMutation::Update {
-                    record: record.clone(),
-                    expected_revision: existing.revision,
-                }],
-                wait_conditions,
-                continuations: continuation_records,
-                agent_state: crate::runtime_db::transitions::AgentStateMutation {
-                    expected: Some(Box::new(expected_state)),
-                    record: Box::new(state),
-                },
-                audit_events,
-                index_changes: self.inner.storage.index_changes_for_work_item(&record)?,
-                notify_scheduler: true,
-                fault: self.take_transition_fault(),
-            },
-        )?;
-        self.apply_transition_commit(commit).await;
-        Ok(CompletedWorkItem {
-            work_item: record,
+
+        let index_changes = self.inner.storage.index_changes_for_work_item(&record)?;
+        Ok(Some(PreparedWorkItemCompletion {
+            record,
+            brief: brief.clone(),
+            expected_execution_protocol_state,
+            legacy_work_item_execution,
+            expected_agent_state,
+            committed_agent_state: state,
+            wait_conditions,
+            continuations: continuation_records,
             continuation_resumed,
-        })
-    }
-
-    pub async fn promote_work_item_completion_report(
-        &self,
-        work_item_id: String,
-        report_text: String,
-        source_turn_index: Option<u64>,
-        source_round: Option<usize>,
-        warnings: Vec<serde_json::Value>,
-    ) -> Result<WorkItemRecord> {
-        Ok(self
-            .promote_work_item_completion_report_with_metadata(
-                work_item_id,
-                report_text,
-                source_turn_index,
-                source_round,
-                warnings,
-            )
-            .await?
-            .into_record())
-    }
-
-    pub(super) async fn promote_work_item_completion_report_with_metadata(
-        &self,
-        work_item_id: String,
-        report_text: String,
-        source_turn_index: Option<u64>,
-        source_round: Option<usize>,
-        warnings: Vec<serde_json::Value>,
-    ) -> Result<WorkItemCompletionReportPromotionOutcome> {
-        let agent_id = self.agent_id().await?;
-        let existing = self.validate_owned_work_item(&agent_id, &work_item_id)?;
-        if existing.state != WorkItemState::Completed {
-            return Err(anyhow!(
-                "cannot promote completion report for open work item {}",
-                work_item_id
-            ));
-        }
-        let report_text = report_text.trim();
-        if report_text.is_empty() {
-            return Ok(WorkItemCompletionReportPromotionOutcome::Unchanged(
-                existing,
-            ));
-        }
-        if existing.result_brief_id.is_some()
-            || existing
-                .completion_intent
-                .as_ref()
-                .is_some_and(|intent| intent.report_state == CompletionReportState::Bound)
-        {
-            return Ok(WorkItemCompletionReportPromotionOutcome::Unchanged(
-                existing,
-            ));
-        }
-        let mut brief =
-            BriefRecord::new(agent_id.clone(), BriefKind::Result, report_text, None, None);
-        brief.work_item_id = Some(existing.id.clone());
-        brief.workspace_id = existing.workspace_id.clone();
-        brief.turn_index = source_turn_index;
-        brief.turn_id = existing
-            .completion_intent
-            .as_ref()
-            .and_then(|intent| intent.source_turn_id.clone());
-        brief.related_message_id = existing
-            .completion_intent
-            .as_ref()
-            .and_then(|intent| intent.source_message_id.clone());
-        let now = Utc::now();
-        let mut completion_intent =
-            existing
-                .completion_intent
-                .clone()
-                .unwrap_or(WorkItemCompletionIntent {
-                    work_item_id: existing.id.clone(),
-                    source_activation_id: None,
-                    source_message_id: brief.related_message_id.clone(),
-                    source_turn_id: brief.turn_id.clone(),
-                    expected_work_revision: existing.revision.saturating_sub(1),
-                    report_requirement: CompletionReportRequirement::Required,
-                    report_state: CompletionReportState::Pending,
-                    result_brief_id: None,
-                    created_at: now,
-                    updated_at: now,
-                });
-        completion_intent.report_state = CompletionReportState::Bound;
-        completion_intent.result_brief_id = Some(brief.id.clone());
-        completion_intent.updated_at = now;
-        let record = WorkItemRecord {
-            revision: existing.revision + 1,
-            result_brief_id: Some(brief.id.clone()),
-            completion_intent: Some(completion_intent),
-            updated_at: now,
-            ..existing
-        };
-        let commit = self.inner.runtime_db.transitions().commit_work_item(
-            &crate::runtime_db::transitions::WorkItemTransitionCommand {
-                agent_id: agent_id.clone(),
-                mutation: crate::runtime_db::transitions::WorkItemMutation::Update {
-                    record: record.clone(),
-                    expected_revision: record.revision - 1,
-                },
-                agent_state: None,
-                brief_evidence: vec![brief.clone()],
-                audit_events: vec![
-                    AuditEvent::typed(
-                        RuntimeEventKind::BriefCreated,
-                        &BriefCreatedAuditEvent::from_brief(&brief),
-                    )?,
-                    AuditEvent::legacy(
-                        "work_item_completion_report_promoted",
-                        serde_json::json!({
-                            "agent_id": agent_id,
-                            "work_item_id": record.id.clone(),
-                            "revision": record.revision,
-                            "source_turn_index": source_turn_index,
-                            "source_round": source_round,
-                            "text_preview": crate::tool::helpers::truncate_text(report_text, 600),
-                            "warnings": warnings.clone(),
-                            "warning_count": warnings.len(),
-                            "brief_id": brief.id.clone(),
-                        }),
-                    ),
-                ],
-                index_changes: self.inner.storage.index_changes_for_work_item(&record)?,
-                notify_scheduler: false,
-                fault: self.take_transition_fault(),
-            },
-        )?;
-        self.apply_transition_commit(commit).await;
-        {
-            let mut guard = self.inner.agent.lock().await;
-            guard.state.last_brief_at = Some(brief.created_at);
-            guard.persist_state(&self.inner.storage)?;
-        }
-        Ok(WorkItemCompletionReportPromotionOutcome::Promoted(
-            WorkItemCompletionReportPromotion {
-                record,
-                brief_id: brief.id,
-            },
-        ))
+            audit_events,
+            index_changes,
+            tool_execution: None,
+            transcript_entries: Vec::new(),
+        }))
     }
 
     pub async fn record_work_item_completion_warning(

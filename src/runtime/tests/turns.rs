@@ -1,9 +1,180 @@
 use super::super::*;
 use super::support::*;
 
+use crate::tool::ApplyPatchSurface;
+
 struct PickThenExecProvider {
     calls: Mutex<usize>,
     target_work_item_id: String,
+}
+
+struct StablePrefixDiagnosticsProvider;
+
+fn terminal_settlement_transition(
+    kind: TurnTerminalKind,
+    produced_brief_ids: Vec<String>,
+    no_brief_reason: Option<TurnNoBriefReason>,
+) -> turn::TurnTerminalTransition {
+    let terminal = TurnTerminalRecord {
+        turn_id: "turn-settlement".into(),
+        turn_index: 7,
+        kind,
+        reason: None,
+        last_assistant_message: None,
+        no_brief_reason,
+        checkpoint: None,
+        completed_at: Utc::now(),
+        duration_ms: 1,
+    };
+    let mut turn_record = TurnRecord::new("default", terminal.turn_id.clone(), terminal.turn_index);
+    turn_record.produced_brief_ids = produced_brief_ids;
+    turn_record.terminal = Some(crate::types::TurnTerminalSummary::from_terminal(&terminal));
+    turn::TurnTerminalTransition {
+        terminal,
+        turn_record,
+        prepared_work_item_completion: None,
+        terminal_tool_executions: Vec::new(),
+    }
+}
+
+#[test]
+fn terminal_settlement_accepts_exactly_one_brief_or_typed_no_brief_reason() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    for transition in [
+        terminal_settlement_transition(
+            TurnTerminalKind::Completed,
+            vec!["brief-result".into()],
+            None,
+        ),
+        terminal_settlement_transition(
+            TurnTerminalKind::Completed,
+            Vec::new(),
+            Some(TurnNoBriefReason::ReducerOnly {
+                reason: "task_status".into(),
+            }),
+        ),
+        terminal_settlement_transition(
+            TurnTerminalKind::Completed,
+            Vec::new(),
+            Some(TurnNoBriefReason::ToolOnlyWait),
+        ),
+        terminal_settlement_transition(
+            TurnTerminalKind::Aborted,
+            Vec::new(),
+            Some(TurnNoBriefReason::Aborted),
+        ),
+    ] {
+        runtime
+            .validate_terminal_brief_settlement(&transition)
+            .unwrap();
+    }
+}
+
+#[test]
+fn terminal_settlement_rejects_missing_or_ambiguous_settlement_with_diagnostic() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    for transition in [
+        terminal_settlement_transition(TurnTerminalKind::Completed, Vec::new(), None),
+        terminal_settlement_transition(
+            TurnTerminalKind::Completed,
+            vec!["brief-result".into()],
+            Some(TurnNoBriefReason::ToolOnlyWait),
+        ),
+        terminal_settlement_transition(
+            TurnTerminalKind::Completed,
+            Vec::new(),
+            Some(TurnNoBriefReason::ReducerOnly {
+                reason: "  ".into(),
+            }),
+        ),
+    ] {
+        let error = runtime
+            .validate_terminal_brief_settlement(&transition)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("expected exactly one of canonical Brief or valid typed NoBrief reason"));
+    }
+
+    let diagnostics = runtime
+        .all_events()
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "turn_terminal_brief_settlement_failed")
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 3);
+    assert_eq!(
+        diagnostics[0].data["failure"],
+        "terminal_missing_brief_settlement"
+    );
+    assert_eq!(
+        diagnostics[1].data["failure"],
+        "brief_and_no_brief_reason_are_mutually_exclusive"
+    );
+    assert_eq!(
+        diagnostics[2].data["failure"],
+        "terminal_missing_brief_settlement"
+    );
+}
+
+#[async_trait]
+impl AgentProvider for StablePrefixDiagnosticsProvider {
+    async fn complete_turn(&self, _request: ProviderTurnRequest) -> Result<ProviderTurnResponse> {
+        Ok(ProviderTurnResponse {
+            blocks: vec![ModelBlock::Text {
+                text: "done".into(),
+            }],
+            stop_reason: None,
+            input_tokens: 42,
+            output_tokens: 7,
+            cache_usage: None,
+            provider_message_id: None,
+            provider_request_id: None,
+            request_diagnostics: Some(
+                serde_json::from_value(serde_json::json!({
+                    "request_lowering_mode": "full_replay",
+                    "stable_prefix": {
+                        "schema_version": 1,
+                        "algorithm": "sha256",
+                        "full_request_fingerprint": "full-fingerprint",
+                        "stable_prefix_fingerprint": "stable-fingerprint",
+                        "history_prefix_items": 2,
+                        "dynamic_tail_items": 1,
+                        "components": [{
+                            "name": "tools",
+                            "fingerprint": "tools-fingerprint",
+                            "item_count": 3
+                        }]
+                    }
+                }))
+                .unwrap(),
+            ),
+        })
+    }
 }
 
 #[tokio::test]
@@ -38,6 +209,7 @@ async fn terminal_pick_ends_turn_before_later_tools_or_provider_rounds() {
             admission_provenance: None,
             source_message_id: "message-terminal-pick".into(),
             turn_id: "turn-terminal-pick".into(),
+            owner: None,
             work_item_id: Some(caller.id.clone()),
             claimed_work_revision: Some(caller.revision),
         });
@@ -151,6 +323,19 @@ async fn runtime_recovers_from_max_token_truncation() {
 
     assert!(outcome.final_text.contains("Partial report heading:"));
     assert!(outcome.final_text.contains("final grounded recommendation"));
+    assert_eq!(
+        outcome.final_citations,
+        vec![
+            crate::types::Citation {
+                url: "https://example.com/first".into(),
+                title: Some("First".into()),
+            },
+            crate::types::Citation {
+                url: "https://example.com/second".into(),
+                title: Some("Second".into()),
+            },
+        ]
+    );
 }
 
 #[tokio::test]
@@ -226,6 +411,63 @@ async fn runtime_records_text_only_round_observations() {
 }
 
 #[tokio::test]
+async fn ordinary_final_response_persists_canonical_brief_settlement() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("Final operator-visible response.")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "finish the turn".into(),
+        },
+    );
+
+    runtime
+        .process_interactive_message(
+            &message,
+            None,
+            LoopControlOptions {
+                max_tool_rounds: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let turn = runtime
+        .storage()
+        .read_recent_turns(1)
+        .unwrap()
+        .pop()
+        .expect("terminal turn");
+    assert_eq!(turn.produced_brief_ids.len(), 1);
+    assert_eq!(
+        turn.terminal
+            .as_ref()
+            .and_then(|terminal| terminal.no_brief_reason.as_ref()),
+        None
+    );
+    let brief = runtime
+        .storage()
+        .read_brief_by_id(&turn.produced_brief_ids[0])
+        .unwrap()
+        .expect("canonical result brief");
+    assert_eq!(brief.text, "Final operator-visible response.");
+}
+
+#[tokio::test]
 async fn first_provider_round_records_prompt_cache_identity_fields() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
@@ -288,6 +530,54 @@ async fn first_provider_round_records_prompt_cache_identity_fields() {
 }
 
 #[tokio::test]
+async fn provider_round_records_secret_safe_stable_prefix_diagnostics() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StablePrefixDiagnosticsProvider),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    runtime
+        .run_agent_loop(
+            "default",
+            AuthorityClass::OperatorInstruction,
+            test_effective_prompt(),
+            LoopControlOptions {
+                max_tool_rounds: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let events = runtime.storage().read_recent_events(10).unwrap();
+    let provider_event = events
+        .iter()
+        .find(|event| event.kind == "provider_round_completed")
+        .expect("missing provider_round_completed");
+    let stable_prefix = &provider_event.data["provider_request_diagnostics"]["stable_prefix"];
+    assert_eq!(
+        stable_prefix["stable_prefix_fingerprint"].as_str(),
+        Some("stable-fingerprint")
+    );
+    assert_eq!(stable_prefix["dynamic_tail_items"].as_u64(), Some(1));
+    assert_eq!(
+        stable_prefix["components"][0]["name"].as_str(),
+        Some("tools")
+    );
+    let serialized = serde_json::to_string(&provider_event.data).unwrap();
+    assert!(!serialized.contains("system_prompt"));
+    assert!(!serialized.contains("conversation"));
+    assert!(!serialized.contains("tool_arguments"));
+}
+
+#[tokio::test]
 async fn sleep_only_tool_round_completes_without_extra_provider_turn() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
@@ -342,6 +632,19 @@ async fn sleep_only_tool_round_completes_without_extra_provider_turn() {
             .map(|terminal| terminal.kind),
         Some(TurnTerminalKind::Completed)
     );
+    let turn = runtime
+        .storage()
+        .read_recent_turns(1)
+        .unwrap()
+        .pop()
+        .expect("sleep-only terminal turn");
+    assert!(turn.produced_brief_ids.is_empty());
+    assert_eq!(
+        turn.terminal
+            .as_ref()
+            .and_then(|terminal| terminal.no_brief_reason.as_ref()),
+        Some(&TurnNoBriefReason::ToolOnlyWait)
+    );
 }
 
 #[tokio::test]
@@ -389,6 +692,19 @@ async fn wait_for_only_tool_round_completes_without_extra_provider_turn() {
     assert_eq!(
         waiting[0].subject_ref.as_deref(),
         Some("github:holon-run/holon#1939")
+    );
+    let turn = runtime
+        .storage()
+        .read_recent_turns(1)
+        .unwrap()
+        .pop()
+        .expect("wait-only terminal turn");
+    assert!(turn.produced_brief_ids.is_empty());
+    assert_eq!(
+        turn.terminal
+            .as_ref()
+            .and_then(|terminal| terminal.no_brief_reason.as_ref()),
+        Some(&TurnNoBriefReason::ToolOnlyWait)
     );
 }
 
@@ -720,12 +1036,21 @@ async fn turn_local_compaction_rewrites_older_rounds_into_runtime_recap() {
     assert_eq!(outcome.terminal_kind, TurnTerminalKind::Completed);
     assert_eq!(outcome.final_text, "Finished after compacted continuation.");
     assert!(outcome.final_text_source_assistant_round_id.is_some());
+    assert!(outcome.terminal.checkpoint.is_some());
+    assert_eq!(outcome.terminal.no_brief_reason, None);
     assert_eq!(*provider.calls.lock().await, 6);
 
     let requests = provider.requests.lock().await;
     let continuation_request = requests.get(3).expect("missing round 4 request");
     let checkpoint_resume_request = requests.get(4).expect("missing round 5 request");
     let pending_delivery_retry_request = requests.get(5).expect("missing round 6 request");
+    let first_tool_schema = serde_json::to_value(&requests[0].tools).unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|request| serde_json::to_value(&request.tools).unwrap() == first_tool_schema),
+        "resolved route tool order and schema must remain stable across rounds"
+    );
     let cache = continuation_request
         .prompt_frame
         .cache
@@ -754,6 +1079,19 @@ async fn turn_local_compaction_rewrites_older_rounds_into_runtime_recap() {
     );
     let serialized_conversation = format!("{:?}", continuation_request.conversation);
     let events = runtime.storage().read_recent_events(50).unwrap();
+    let lineage_event = events
+        .iter()
+        .find(|event| event.kind == "lineage_selected")
+        .expect("missing lineage_selected");
+    assert_eq!(
+        lineage_event.data["tool_capability_projection"]["pruning"].as_str(),
+        Some("none")
+    );
+    assert!(
+        lineage_event.data["tool_capability_projection"]["schema_fingerprint"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("sha256:"))
+    );
     let round_four_event = events
         .iter()
         .find(|event| {
@@ -809,6 +1147,14 @@ async fn turn_local_compaction_rewrites_older_rounds_into_runtime_recap() {
                 .as_u64()
                 .unwrap_or_default()
                 >= 1
+        );
+        assert_eq!(
+            round_four_event.data["turn_local_compaction"]["trigger_reason"].as_str(),
+            Some("estimated_tokens_exceeded_trigger")
+        );
+        assert_eq!(
+            round_four_event.data["turn_local_compaction"]["compacted_rounds"],
+            compaction_event.data["compacted_rounds"]
         );
         let checkpoint_request_id = compaction_event.data["checkpoint_request_id"]
             .as_str()
@@ -1037,7 +1383,7 @@ async fn turn_local_continuation_recovers_by_reprojecting_recent_turns() {
         .filter(|(_, tool)| tool.name != crate::tool::names::X_SEARCH)
         .map(|(_, tool)| tool)
         .collect::<Vec<_>>();
-    let continuation_effective_budget = 12_000;
+    let continuation_effective_budget = 14_000;
     let prompt_budget_estimated_tokens = turn::estimate_tool_specs_tokens(&available_tools)
         + turn::CONTINUATION_BUDGET_SAFETY_MARGIN_TOKENS
         + continuation_effective_budget;
@@ -1301,6 +1647,19 @@ async fn context_length_exceeded_turn_fails_fast_without_runtime_error() {
         .expect("failure brief should exist");
     assert!(failure.text.contains("context_length_exceeded"));
     assert_eq!(failure.turn_index, Some(1));
+    let turn = runtime
+        .storage()
+        .read_recent_turns(1)
+        .unwrap()
+        .pop()
+        .expect("aborted terminal turn");
+    assert_eq!(turn.produced_brief_ids, vec![failure.id.clone()]);
+    assert_eq!(
+        turn.terminal
+            .as_ref()
+            .and_then(|terminal| terminal.no_brief_reason.as_ref()),
+        None
+    );
 
     let events = runtime.storage().read_recent_events(20).unwrap();
     assert!(events
@@ -1452,14 +1811,7 @@ async fn provider_failure_before_output_defers_fallback_to_next_turn() {
 
     assert_eq!(outcome.terminal_kind, TurnTerminalKind::DeferredToFallback);
     let state = runtime.agent_state().await.unwrap();
-    assert_eq!(
-        state
-            .pending_fallback_model
-            .as_ref()
-            .map(|model| model.as_string())
-            .as_deref(),
-        Some("anthropic@default/claude-sonnet-4-6")
-    );
+    assert!(state.pending_fallback_model.is_none());
     assert_eq!(
         state.last_turn_terminal.as_ref().map(|record| record.kind),
         Some(TurnTerminalKind::DeferredToFallback)
@@ -1474,6 +1826,21 @@ async fn provider_failure_before_output_defers_fallback_to_next_turn() {
         queued.authority_class,
         AuthorityClass::RuntimeInstruction
     ));
+    assert_eq!(
+        queued
+            .metadata
+            .as_ref()
+            .and_then(|metadata| { metadata["provider_recovery"]["fallback_model_ref"].as_str() }),
+        Some("anthropic@default/claude-sonnet-4-6")
+    );
+    assert_eq!(
+        crate::runtime::turn::TurnModelSelection::from_message(&queued)
+            .unwrap()
+            .fallback_model()
+            .map(|model| model.as_string())
+            .as_deref(),
+        Some("anthropic@default/claude-sonnet-4-6")
+    );
 
     let events = wait_for_audit_events(
         &runtime,
@@ -1485,9 +1852,7 @@ async fn provider_failure_before_output_defers_fallback_to_next_turn() {
                 && events
                     .iter()
                     .any(|event| event.kind == "deferred_to_fallback")
-                && events
-                    .iter()
-                    .any(|event| event.kind == "recovery_turn_started")
+                && events.iter().any(|event| event.kind == "recovery_enqueued")
         },
         "provider failure fallback events",
     )
@@ -1509,9 +1874,483 @@ async fn provider_failure_before_output_defers_fallback_to_next_turn() {
     assert!(deferred.data["operator_message"]
         .as_str()
         .is_some_and(|message| message.contains("Queued fallback turn")));
-    assert!(events
+    assert!(events.iter().any(|event| event.kind == "recovery_enqueued"));
+    assert!(!events
         .iter()
         .any(|event| event.kind == "recovery_turn_started"));
+}
+
+#[test]
+fn provider_recovery_directive_requires_runtime_owned_recovery_provenance() {
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Next,
+        MessageBody::Text {
+            text: "try to select a model".into(),
+        },
+    );
+    message.metadata = Some(serde_json::json!({
+        "provider_recovery": {
+            "fallback_model_ref": "anthropic/claude-sonnet-4-6",
+            "source_turn_id": "turn-source",
+            "source_message_id": "message-source",
+            "source_terminal_kind": "deferred_to_fallback",
+            "source_round": 1
+        }
+    }));
+
+    let selection = crate::runtime::turn::TurnModelSelection::from_message(&message).unwrap();
+    assert!(selection.fallback_model().is_none());
+}
+
+async fn assert_successful_same_owner_turn_supersedes_queued_provider_recovery(
+    mut superseding: MessageEnvelope,
+) {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let mut source_turn = TurnRecord::new("default", "turn-source", 1);
+    source_turn.current_work_item_id = Some("work-1".into());
+    runtime.storage().append_turn(&source_turn).unwrap();
+
+    let mut recovery = MessageEnvelope::new(
+        "default",
+        MessageKind::InternalFollowup,
+        MessageOrigin::System {
+            subsystem: "model_lineage_recovery".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Next,
+        MessageBody::Text {
+            text: "continue recovery".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        crate::types::AdmissionContext::RuntimeOwned,
+    );
+    recovery.work_item_id = Some("work-1".into());
+    recovery.metadata = Some(serde_json::json!({
+        "provider_recovery": {
+            "fallback_model_ref": "anthropic/claude-sonnet-4-6",
+            "source_turn_id": "turn-source",
+            "source_message_id": "message-source",
+            "source_terminal_kind": "deferred_to_fallback",
+            "source_round": 1
+        }
+    }));
+    let recovery = runtime.enqueue(recovery).await.unwrap();
+
+    superseding.turn_id = Some("turn-success".into());
+    let mut transition = terminal_transition(&superseding, Some("work-1"));
+    transition.terminal.turn_index = 2;
+    transition.turn_record.turn_index = 2;
+    transition.turn_record.produced_brief_ids = vec!["brief-success".into()];
+
+    assert_eq!(
+        runtime
+            .maybe_supersede_queued_provider_recovery(&superseding, Some(&transition))
+            .await
+            .unwrap(),
+        1
+    );
+    let queue_entry = runtime
+        .inner
+        .runtime_db
+        .queue_entries()
+        .latest_all()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.message_id == recovery.id)
+        .expect("recovery queue entry");
+    assert_eq!(queue_entry.status, QueueEntryStatus::Dropped);
+    assert!(runtime
+        .inner
+        .agent
+        .lock()
+        .await
+        .queue
+        .peek_next_matching(|message| message.id == recovery.id)
+        .is_none());
+    assert!(runtime
+        .storage()
+        .read_recent_events(20)
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == "recovery_superseded"));
+}
+
+#[tokio::test]
+async fn successful_ordinary_turn_supersedes_queued_provider_recovery() {
+    assert_successful_same_owner_turn_supersedes_queued_provider_recovery(MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "continue successfully".into(),
+        },
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn successful_recovery_turn_supersedes_older_queued_provider_recovery() {
+    let mut superseding = MessageEnvelope::new(
+        "default",
+        MessageKind::InternalFollowup,
+        MessageOrigin::System {
+            subsystem: "model_lineage_recovery".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Next,
+        MessageBody::Text {
+            text: "continue newer recovery".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        crate::types::AdmissionContext::RuntimeOwned,
+    );
+    superseding.metadata = Some(serde_json::json!({
+        "provider_recovery": {
+            "fallback_model_ref": "openai/gpt-5.4",
+            "source_turn_id": "turn-newer-source",
+            "source_message_id": "message-newer-source",
+            "source_terminal_kind": "deferred_to_fallback",
+            "source_round": 1
+        }
+    }));
+    assert_successful_same_owner_turn_supersedes_queued_provider_recovery(superseding).await;
+}
+
+#[tokio::test]
+async fn view_image_selection_uses_current_turn_fallback_model() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    *runtime.inner.turn_fallback_model.write().await = Some(
+        crate::config::ModelRouteRef::parse_compatible("anthropic/claude-sonnet-4-6").unwrap(),
+    );
+
+    let selection = runtime.current_view_image_vision_selection().await.unwrap();
+    assert_eq!(selection.primary_provider.as_deref(), Some("anthropic"));
+    assert_eq!(
+        selection.primary_model.as_deref(),
+        Some("claude-sonnet-4-6")
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_surface_uses_current_turn_fallback_model() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    // Without the turn-local fallback binding the surface follows the primary
+    // chain head (anthropic in this test setup).
+    assert_eq!(
+        runtime.current_apply_patch_surface().await,
+        ApplyPatchSurface::UnifiedDiffJson
+    );
+
+    *runtime.inner.turn_fallback_model.write().await = Some(
+        crate::config::ModelRouteRef::parse_compatible("deepseek@responses/deepseek-v4-pro")
+            .unwrap(),
+    );
+
+    let surface = runtime.current_apply_patch_surface().await;
+    assert_eq!(surface, ApplyPatchSurface::CodexDslFreeform);
+}
+
+#[tokio::test]
+async fn concurrent_view_image_selection_discovers_ollama_vision_once_from_cold_cache() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let tags_requests = Arc::new(AtomicUsize::new(0));
+    let show_requests = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let stopped = Arc::clone(&stopped);
+        let tags_requests = Arc::clone(&tags_requests);
+        let show_requests = Arc::clone(&show_requests);
+        std::thread::spawn(move || {
+            while !stopped.load(Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("Ollama test server accept failed: {error}"),
+                };
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let body = if request.starts_with("GET /api/tags HTTP/1.1") {
+                    tags_requests.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    r#"{"models":[{"name":"qwen3-vl:latest"}]}"#
+                } else if request.starts_with("POST /api/show HTTP/1.1") {
+                    show_requests.fetch_add(1, Ordering::SeqCst);
+                    assert!(request.contains(r#""model":"qwen3-vl:latest""#));
+                    r#"{"capabilities":["vision"],"model_info":{"qwen3.context_length":131072}}"#
+                } else {
+                    panic!("unexpected Ollama test request: {request}");
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        })
+    };
+
+    let home = tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.json"),
+        r#"{"model":{"default":"ollama/qwen3-vl:latest"}}"#,
+    )
+    .unwrap();
+    let mut config = {
+        let _env_lock = crate::test_env::lock_env();
+        AppConfig::load_with_home(Some(home.path().to_path_buf())).unwrap()
+    };
+    config
+        .providers
+        .get_mut(&crate::config::ProviderId::parse("ollama").unwrap())
+        .unwrap()
+        .base_url = base_url;
+    let host = RuntimeHost::new(config).unwrap();
+    let runtime = host.default_runtime().await.unwrap();
+
+    let (first, second) = tokio::join!(
+        runtime.current_view_image_vision_selection(),
+        runtime.current_view_image_vision_selection()
+    );
+    stopped.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+
+    for selection in [first.unwrap(), second.unwrap()] {
+        assert_eq!(
+            selection.selected_mode,
+            crate::types::ViewImageSelectedMode::NativeImageWithObservation
+        );
+        assert_eq!(selection.primary_provider.as_deref(), Some("ollama"));
+        assert_eq!(selection.primary_model.as_deref(), Some("qwen3-vl:latest"));
+    }
+    assert_eq!(tags_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(show_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn panicking_model_discovery_refresh_releases_waiters_and_in_flight_state() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let provider_id = crate::config::ProviderId::parse("ollama").unwrap();
+    runtime
+        .inner
+        .model_discovery_refreshes
+        .lock()
+        .await
+        .insert(provider_id.clone());
+
+    let notified = runtime.inner.model_discovery_refresh_notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let refresh_guard = crate::runtime::bootstrap::ModelDiscoveryRefreshGuard::new(
+        runtime.clone(),
+        provider_id.clone(),
+    );
+    let refresh = tokio::spawn(async move {
+        let _refresh_guard = refresh_guard;
+        panic!("simulated provider discovery panic");
+    });
+
+    assert!(refresh.await.unwrap_err().is_panic());
+    tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+        .await
+        .expect("panic cleanup should notify discovery waiters");
+    assert!(!runtime
+        .inner
+        .model_discovery_refreshes
+        .lock()
+        .await
+        .contains(&provider_id));
+}
+
+#[tokio::test]
+async fn fallback_turn_model_state_uses_fallback_model_policy() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let state = runtime.agent_state().await.unwrap();
+    let fallback =
+        crate::config::ModelRouteRef::parse("deepseek@responses/deepseek-v4-pro").unwrap();
+
+    let model_state = runtime.model_state_for_turn(&state, Some(&fallback));
+    let snapshot = runtime.inner.config_snapshot.load();
+    let expected_policy = snapshot
+        .model_catalog
+        .resolved_model_policy(&snapshot.base_context_config, Some(&fallback));
+
+    assert_eq!(model_state.active_model.as_ref(), Some(&fallback));
+    assert_eq!(model_state.resolved_policy, expected_policy);
+    assert_eq!(
+        model_state.resolved_policy.model_ref.as_string(),
+        "deepseek/deepseek-v4-pro"
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_discards_legacy_fallback_slot_but_preserves_typed_recovery() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let recovery_id = {
+        let runtime = RuntimeHandle::new(
+            "default",
+            dir.path().to_path_buf(),
+            workspace.path().to_path_buf(),
+            "http://127.0.0.1:7878".into(),
+            Arc::new(StubProvider::new("unused")),
+            "default".into(),
+            context_config(),
+        )
+        .unwrap();
+        {
+            let mut guard = runtime.inner.agent.lock().await;
+            guard.state.pending_fallback_model = Some(
+                crate::config::ModelRouteRef::parse_compatible("anthropic/claude-sonnet-4-6")
+                    .unwrap(),
+            );
+            guard.persist_state(&runtime.inner.storage).unwrap();
+        }
+        let mut recovery = MessageEnvelope::new(
+            "default",
+            MessageKind::InternalFollowup,
+            MessageOrigin::System {
+                subsystem: "model_lineage_recovery".into(),
+            },
+            AuthorityClass::RuntimeInstruction,
+            Priority::Next,
+            MessageBody::Text {
+                text: "continue recovery".into(),
+            },
+        )
+        .with_admission(
+            MessageDeliverySurface::RuntimeSystem,
+            crate::types::AdmissionContext::RuntimeOwned,
+        );
+        recovery.metadata = Some(serde_json::json!({
+            "provider_recovery": {
+                "fallback_model_ref": "anthropic/claude-sonnet-4-6",
+                "source_turn_id": "turn-source",
+                "source_message_id": "message-source",
+                "source_terminal_kind": "deferred_to_fallback",
+                "source_round": 1
+            }
+        }));
+        runtime.enqueue(recovery).await.unwrap().id
+    };
+
+    let reopened = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    assert!(reopened
+        .agent_state()
+        .await
+        .unwrap()
+        .pending_fallback_model
+        .is_none());
+    let recovery = reopened
+        .inner
+        .agent
+        .lock()
+        .await
+        .queue
+        .peek_next_matching(|message| message.id == recovery_id)
+        .cloned()
+        .expect("typed recovery should survive bootstrap");
+    assert_eq!(
+        crate::runtime::turn::TurnModelSelection::from_message(&recovery)
+            .unwrap()
+            .fallback_model()
+            .map(|model| model.as_string())
+            .as_deref(),
+        Some("anthropic@default/claude-sonnet-4-6")
+    );
+    assert!(reopened
+        .storage()
+        .read_recent_events(20)
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == "legacy_pending_fallback_discarded"));
 }
 
 #[tokio::test]
@@ -1787,6 +2626,7 @@ async fn runtime_failure_artifacts_append_turn_record_after_failure_brief() {
         .last_turn_terminal
         .expect("missing aborted turn terminal");
     assert_eq!(terminal.kind, TurnTerminalKind::Aborted);
+    assert_eq!(terminal.no_brief_reason, Some(TurnNoBriefReason::Aborted));
 
     runtime
         .persist_runtime_failure_artifacts(&message, &error)
@@ -1810,6 +2650,13 @@ async fn runtime_failure_artifacts_append_turn_record_after_failure_brief() {
     assert_eq!(
         turns[0].terminal.as_ref().map(|terminal| terminal.kind),
         Some(TurnTerminalKind::Aborted)
+    );
+    assert_eq!(
+        turns[0]
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.no_brief_reason.as_ref()),
+        None
     );
     assert_eq!(turns[0].produced_brief_ids, vec![failure_brief.id.clone()]);
 }
@@ -1857,6 +2704,7 @@ async fn runtime_failure_artifacts_create_terminal_turn_record_when_missing() {
         let mut guard = runtime.inner.agent.lock().await;
         guard.state.last_turn_terminal = None;
         runtime.storage().write_agent(&guard.state).unwrap();
+        guard.last_persisted_state = guard.state.clone();
     }
 
     runtime

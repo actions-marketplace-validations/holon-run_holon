@@ -13,7 +13,7 @@ use crate::{
 };
 
 use super::{
-    spec::{ToolCall, ToolResult, ToolSpec},
+    spec::{ToolCall, ToolExecutionContext, ToolResult, ToolSpec},
     tools,
 };
 
@@ -100,6 +100,24 @@ impl ToolRegistry {
         authority_class: &AuthorityClass,
         call: &ToolCall,
     ) -> Result<(ToolResult, ToolExecutionRecord)> {
+        self.execute_with_context(
+            runtime,
+            agent_id,
+            authority_class,
+            call,
+            &ToolExecutionContext::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_with_context(
+        &self,
+        runtime: &RuntimeHandle,
+        agent_id: &str,
+        authority_class: &AuthorityClass,
+        call: &ToolCall,
+        context: &ToolExecutionContext,
+    ) -> Result<(ToolResult, ToolExecutionRecord)> {
         let started_at = chrono::Utc::now();
         let required_family = match self.family_for_tool(&call.name)? {
             Some(required_family) => required_family,
@@ -144,7 +162,14 @@ impl ToolRegistry {
             .into());
         }
         let tool_started = std::time::Instant::now();
-        let result = tools::execute_builtin_tool(runtime, agent_id, authority_class, call).await?;
+        let result = tools::execute_builtin_tool_with_context(
+            runtime,
+            agent_id,
+            authority_class,
+            call,
+            context,
+        )
+        .await?;
         crate::diagnostics::record_tool_execution(&call.name, tool_started.elapsed(), None);
         if !result.is_error() {
             if let Err(error) =
@@ -164,11 +189,16 @@ impl ToolRegistry {
             "sleep_duration_ms": result.sleep_duration_ms,
             "error": result.tool_error().cloned(),
         });
-        let completed_at = chrono::Utc::now();
-        let duration_ms = completed_at
+        let finished_at = chrono::Utc::now();
+        let duration_ms = finished_at
             .signed_duration_since(started_at)
             .num_milliseconds()
             .max(0) as u64;
+        let completed_at = (!matches!(
+            result.envelope.status,
+            crate::tool::spec::ToolResultStatus::Deferred
+        ))
+        .then_some(finished_at);
         let record = ToolExecutionRecord {
             id: crate::ids::tool_execution_id(),
             agent_id: agent_id.to_string(),
@@ -177,13 +207,13 @@ impl ToolRegistry {
             turn_id: None,
             tool_name: call.name.clone(),
             created_at: started_at,
-            completed_at: Some(completed_at),
+            completed_at,
             duration_ms,
             authority_class: authority_class.clone(),
-            status: if result.is_error() {
-                ToolExecutionStatus::Error
-            } else {
-                ToolExecutionStatus::Success
+            status: match result.envelope.status {
+                crate::tool::spec::ToolResultStatus::Deferred => ToolExecutionStatus::Deferred,
+                crate::tool::spec::ToolResultStatus::Success => ToolExecutionStatus::Success,
+                crate::tool::spec::ToolResultStatus::Error => ToolExecutionStatus::Error,
             },
             input: call.input.clone(),
             output: output_value,

@@ -1,6 +1,5 @@
 use super::super::*;
 use super::support::*;
-use crate::domain::scheduler_protocol::WaitState;
 use crate::types::{
     CompletionReportState, WaitConditionKind, WaitConditionRecord, WaitConditionStatus, WakeSource,
     WorkItemContinuationState, WorkItemPlanStatus, WorkItemReadiness, WorkItemSchedulingState,
@@ -38,6 +37,30 @@ fn continuation_context_config() -> ContextConfig {
     }
 }
 
+async fn finalize_completion_with_report(
+    runtime: &RuntimeHandle,
+    work_item_id: &str,
+    report_text: &str,
+) -> WorkItemCompletionReportPromotion {
+    match runtime
+        .promote_work_item_completion_report_with_metadata(
+            work_item_id.to_string(),
+            report_text.to_string(),
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap()
+    {
+        WorkItemCompletionReportPromotionOutcome::Promoted(promotion) => promotion,
+        WorkItemCompletionReportPromotionOutcome::Unchanged(record) => {
+            panic!("expected completion promotion for {}", record.id)
+        }
+    }
+}
+
 struct CompleteWorkItemReportProvider {
     work_item_id: String,
     report_text: Option<String>,
@@ -68,6 +91,83 @@ impl AgentProvider for CompleteWorkItemReportProvider {
         } else {
             vec![ModelBlock::Text {
                 text: "done".into(),
+            }]
+        };
+        Ok(ProviderTurnResponse {
+            blocks,
+            stop_reason: None,
+            input_tokens: 10,
+            output_tokens: 10,
+            cache_usage: None,
+            provider_message_id: None,
+            provider_request_id: None,
+            request_diagnostics: None,
+        })
+    }
+}
+
+struct AbandonCompletionReportProvider {
+    work_item_id: String,
+    calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl AgentProvider for AbandonCompletionReportProvider {
+    async fn complete_turn(&self, _request: ProviderTurnRequest) -> Result<ProviderTurnResponse> {
+        let mut calls = self.calls.lock().await;
+        if *calls >= 3 {
+            drop(calls);
+            return std::future::pending::<Result<ProviderTurnResponse>>().await;
+        }
+        *calls += 1;
+        Ok(ProviderTurnResponse {
+            blocks: vec![ModelBlock::ToolUse {
+                id: format!("complete-work-{}", *calls),
+                name: "CompleteWorkItem".into(),
+                input: serde_json::json!({
+                    "work_item_id": self.work_item_id.clone()
+                }),
+                kind: crate::provider::ModelToolCallKind::Function,
+            }],
+            stop_reason: None,
+            input_tokens: 10,
+            output_tokens: 10,
+            cache_usage: None,
+            provider_message_id: None,
+            provider_request_id: None,
+            request_diagnostics: None,
+        })
+    }
+}
+
+struct RevisionChangeCompletionReportProvider {
+    work_item_id: String,
+    calls: Mutex<usize>,
+    followup_started: Arc<tokio::sync::Notify>,
+    release_followup: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl AgentProvider for RevisionChangeCompletionReportProvider {
+    async fn complete_turn(&self, _request: ProviderTurnRequest) -> Result<ProviderTurnResponse> {
+        let mut calls = self.calls.lock().await;
+        *calls += 1;
+        let call = *calls;
+        drop(calls);
+        let blocks = if call == 1 {
+            vec![ModelBlock::ToolUse {
+                id: "complete-work".into(),
+                name: "CompleteWorkItem".into(),
+                input: serde_json::json!({
+                    "work_item_id": self.work_item_id.clone()
+                }),
+                kind: crate::provider::ModelToolCallKind::Function,
+            }]
+        } else {
+            self.followup_started.notify_one();
+            self.release_followup.notified().await;
+            vec![ModelBlock::Text {
+                text: "This report arrived after the WorkItem changed.".into(),
             }]
         };
         Ok(ProviderTurnResponse {
@@ -147,15 +247,12 @@ impl AgentProvider for StaleTextThenCompleteProvider {
         let blocks = if *calls == 1 {
             vec![
                 ModelBlock::Text {
-                    text: "This text belongs to the ExecCommand tool call.".into(),
+                    text: "This text belongs to the AgentGet tool call.".into(),
                 },
                 ModelBlock::ToolUse {
                     id: "inspect".into(),
-                    name: "ExecCommand".into(),
-                    input: serde_json::json!({
-                        "cmd": "printf 'inspected'",
-                        "shell": "sh"
-                    }),
+                    name: "AgentGet".into(),
+                    input: serde_json::json!({}),
                     kind: crate::provider::ModelToolCallKind::Function,
                 },
                 ModelBlock::ToolUse {
@@ -169,7 +266,7 @@ impl AgentProvider for StaleTextThenCompleteProvider {
             ]
         } else {
             vec![ModelBlock::Text {
-                text: "No completion report was provided.".into(),
+                text: "Completed after inspection.".into(),
             }]
         };
         Ok(ProviderTurnResponse {
@@ -310,6 +407,169 @@ async fn update_work_item_sets_and_preserves_blocked_recheck_deadline() {
     assert!(cleared.recheck_consumed_at.is_none());
 }
 
+#[tokio::test]
+async fn work_item_mutations_atomically_track_execution_readiness() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let work = runtime
+        .create_work_item("track execution readiness".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("create initializes execution protocol");
+    let registered = execution
+        .work_items
+        .get(&work.id)
+        .expect("create registers WorkItem");
+    assert_eq!(registered.source_revision, work.revision);
+    assert!(matches!(
+        registered.state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Runnable { .. }
+    ));
+
+    let updated = runtime
+        .update_work_item_fields(
+            work.id.clone(),
+            Some("track updated execution readiness".into()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    let registered = execution.work_items.get(&work.id).unwrap();
+    assert_eq!(registered.source_revision, updated.revision);
+    assert!(matches!(
+        registered.state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Runnable { .. }
+    ));
+
+    let blocked = runtime
+        .update_work_item_fields(
+            work.id.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(Some("manual hold".into())),
+        )
+        .await
+        .unwrap();
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    let registered = execution.work_items.get(&work.id).unwrap();
+    assert_eq!(registered.source_revision, blocked.revision);
+    assert!(matches!(
+        &registered.state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Paused { reason, .. }
+            if reason == "manual hold"
+    ));
+
+    let consumed_recheck = runtime
+        .consume_work_item_recheck(&work.id)
+        .await
+        .unwrap()
+        .expect("blocked recheck is consumed");
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    let registered = execution.work_items.get(&work.id).unwrap();
+    assert_eq!(registered.source_revision, consumed_recheck.revision);
+    assert!(matches!(
+        registered.state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Paused { .. }
+    ));
+
+    let cleared = runtime
+        .pick_work_item_with_reason_and_clear_blocker(
+            work.id.clone(),
+            Some("manual hold resolved".into()),
+            true,
+        )
+        .await
+        .unwrap()
+        .current_work_item;
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    let registered = execution.work_items.get(&work.id).unwrap();
+    assert_eq!(registered.source_revision, cleared.revision);
+    assert!(matches!(
+        registered.state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Runnable { .. }
+    ));
+
+    let before_rejected_block = cleared.clone();
+    let mut waiting_execution = execution;
+    let waiting_record = waiting_execution.work_items.get_mut(&work.id).unwrap();
+    waiting_record.state = crate::domain::execution_protocol::WorkItemExecutionState::Waiting {
+        generation: waiting_record.generation() + 1,
+        wait: crate::domain::execution_protocol::WaitReference {
+            wait_id: "wait-active".into(),
+        },
+    };
+    runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &waiting_execution))
+        .unwrap();
+    let error = runtime
+        .update_work_item_fields(
+            work.id.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(Some("different manual blocker".into())),
+        )
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("cannot change WorkItem readiness"));
+    assert_eq!(
+        runtime.latest_work_item(&work.id).await.unwrap().unwrap(),
+        before_rejected_block
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn runtime_wakes_itself_for_blocked_work_item_recheck_deadline() {
     let dir = tempdir().unwrap();
@@ -425,6 +685,8 @@ async fn work_queue_projection_derives_scheduling_state_per_work_item() {
             resolved_at: None,
             cancelled_at: None,
             turn_id: None,
+            trigger_message_id: None,
+            triggered_at: None,
         })
         .unwrap();
     runtime
@@ -588,6 +850,8 @@ async fn work_item_query_tools_return_current_open_done_views() {
             cancelled_at: None,
 
             turn_id: None,
+            trigger_message_id: None,
+            triggered_at: None,
         })
         .unwrap();
 
@@ -726,7 +990,7 @@ async fn work_item_query_tools_return_current_open_done_views() {
 }
 
 #[tokio::test]
-async fn work_item_query_tools_fall_back_to_delivery_summary_report() {
+async fn completing_work_item_does_not_fall_back_to_delivery_summary_report() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let runtime = RuntimeHandle::new(
@@ -760,7 +1024,6 @@ async fn work_item_query_tools_fall_back_to_delivery_summary_report() {
         Some(11),
         None,
     );
-    let summary_id = summary.id.clone();
     runtime.storage().append_delivery_summary(&summary).unwrap();
 
     let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
@@ -778,17 +1041,8 @@ async fn work_item_query_tools_fall_back_to_delivery_summary_report() {
         .await
         .unwrap();
     let payload = result.envelope.result.unwrap();
-    let report = &payload["work_item"]["completion_report"];
-    assert_eq!(
-        report["text"].as_str(),
-        Some("Legacy delivery summary report.")
-    );
-    assert_eq!(report["source"].as_str(), Some("delivery_summary"));
-    assert_eq!(
-        report["delivery_summary_id"].as_str(),
-        Some(summary_id.as_str())
-    );
-    assert_eq!(report["source_turn_index"].as_u64(), Some(11));
+    assert_eq!(payload["work_item"]["state"].as_str(), Some("completing"));
+    assert!(payload["work_item"]["completion_report"].is_null());
 }
 
 #[tokio::test]
@@ -889,7 +1143,7 @@ async fn work_item_completion_ignores_running_tasks_and_clears_explicit_waits() 
         .complete_work_item(explicit_wait.id.clone(), Vec::new())
         .await
         .unwrap();
-    assert_eq!(completed_wait.state, WorkItemState::Completed);
+    assert_eq!(completed_wait.state, WorkItemState::Completing);
     assert!(completed_wait.blocked_by.is_none());
 }
 
@@ -963,6 +1217,8 @@ async fn work_item_query_tools_return_readiness_views() {
             cancelled_at: None,
 
             turn_id: None,
+            trigger_message_id: None,
+            triggered_at: None,
         })
         .unwrap();
 
@@ -1431,7 +1687,7 @@ async fn complete_work_item_refreshes_latest_plan_artifact_snapshot() {
         .await
         .unwrap();
 
-    assert_eq!(completed.state, WorkItemState::Completed);
+    assert_eq!(completed.state, WorkItemState::Completing);
     assert_eq!(completed.plan_status, WorkItemPlanStatus::Ready);
     assert_eq!(completed.plan_artifact.as_ref(), Some(&expected));
     let latest = runtime.latest_work_item(&work.id).await.unwrap().unwrap();
@@ -1817,6 +2073,51 @@ async fn persist_brief_binds_current_turn_work_item() {
 }
 
 #[tokio::test]
+async fn persist_brief_commits_record_and_unique_created_event() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let brief = BriefRecord::new(
+        "default",
+        BriefKind::Result,
+        "atomic publication",
+        None,
+        None,
+    );
+    runtime.persist_brief(&brief).await.unwrap();
+    // Duplicate publication (for example a retry after a crash between the
+    // old record/event steps) must not produce a second brief_created event.
+    runtime.persist_brief(&brief).await.unwrap();
+
+    let events = runtime.storage().read_recent_events(usize::MAX).unwrap();
+    let brief_created: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == "brief_created")
+        .collect();
+    assert_eq!(brief_created.len(), 1);
+    let stored = runtime
+        .brief_by_id(&brief.id)
+        .await
+        .unwrap()
+        .expect("brief readable");
+    assert_eq!(
+        stored.created_event_seq,
+        Some(brief_created[0].event_seq),
+        "brief must link to its unique created event"
+    );
+}
+
+#[tokio::test]
 async fn create_callback_returns_default_ingress_with_current_turn_work_item() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
@@ -1951,32 +2252,64 @@ async fn complete_work_item_promotes_same_round_report_and_binds_evidence() {
         continuation_context_config(),
     )
     .unwrap();
-    let message = MessageEnvelope::new(
+    let mut message = MessageEnvelope::new(
         "default",
         MessageKind::OperatorPrompt,
-        MessageOrigin::Operator { actor_id: None },
+        MessageOrigin::Operator {
+            actor_id: Some("control".into()),
+        },
         AuthorityClass::OperatorInstruction,
         Priority::Normal,
         MessageBody::Text {
             text: "finish the tracked work".into(),
         },
+    )
+    .with_admission(
+        MessageDeliverySurface::HttpControlPrompt,
+        AdmissionContext::ControlAuthenticated,
     );
+    message.work_item_id = Some(work_item.id.clone());
 
-    runtime
-        .process_interactive_message(
-            &message,
-            None,
-            LoopControlOptions {
-                max_tool_rounds: None,
-            },
-        )
-        .await
-        .unwrap();
+    let mut runtime_task = tokio::spawn(runtime.clone().run());
+    runtime.enqueue(message.clone()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if runtime
+                .storage()
+                .read_recent_events(200)
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event.kind == "work_item_written"
+                        && event.data["action"].as_str() == Some("completed")
+                        && event.data["work_item_id"].as_str() == Some(work_item.id.as_str())
+                })
+            {
+                break;
+            }
+            if runtime_task.is_finished() {
+                panic!(
+                    "runtime exited before completion commit: {:#}",
+                    (&mut runtime_task)
+                        .await
+                        .expect("runtime task join")
+                        .expect_err("runtime unexpectedly completed")
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for canonical completion commit");
     assert_eq!(
         *provider.calls.lock().await,
-        2,
-        "promoted completion report should not hard-stop the provider loop"
+        1,
+        "same-round completion must terminate the provider loop"
     );
+    let state = runtime.agent_state().await.unwrap();
+    assert_eq!(state.total_model_rounds, 1);
+    assert_eq!(state.total_input_tokens, 10);
+    assert_eq!(state.total_output_tokens, 10);
 
     let completed = runtime
         .latest_work_item(&work_item.id)
@@ -2077,10 +2410,633 @@ async fn complete_work_item_promotes_same_round_report_and_binds_evidence() {
         tool_result["result"]["completion_report_promoted"].as_bool(),
         Some(true)
     );
+    runtime_task.abort();
 }
 
 #[tokio::test]
-async fn later_final_report_binds_completed_work_item_after_continuation_resume() {
+async fn lifecycle_completion_registers_missing_legacy_work_item_execution() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let seed_runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = seed_runtime
+        .create_work_item(
+            "complete pre-execution-protocol work".into(),
+            Some(WorkItemPlanStatus::NeedsInput),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    seed_runtime
+        .pick_work_item(work_item.id.clone())
+        .await
+        .unwrap();
+    seed_runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| {
+            tx.execute(
+                "DELETE FROM execution_protocol_work_items
+                 WHERE agent_id = ?1 AND work_item_id = ?2",
+                ["default", work_item.id.as_str()],
+            )?;
+            tx.execute(
+                "DELETE FROM execution_protocol_command_results
+                 WHERE agent_id = ?1
+                   AND command_kind = 'register_work_item_execution'
+                   AND command_identity = ?2",
+                ["default", work_item.id.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let provider = Arc::new(CompleteWorkItemReportProvider {
+        work_item_id: work_item.id.clone(),
+        report_text: Some("Closed the legacy tracked work.".into()),
+        calls: Mutex::new(0),
+    });
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        provider,
+        "default".into(),
+        continuation_context_config(),
+    )
+    .unwrap();
+    let message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator {
+            actor_id: Some("control".into()),
+        },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "close the legacy work item".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::HttpControlPrompt,
+        AdmissionContext::ControlAuthenticated,
+    );
+
+    let mut runtime_task = tokio::spawn(runtime.clone().run());
+    runtime.enqueue(message).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if runtime
+                .latest_work_item(&work_item.id)
+                .await
+                .unwrap()
+                .is_some_and(|record| record.state == WorkItemState::Completed)
+            {
+                break;
+            }
+            if runtime_task.is_finished() {
+                panic!(
+                    "runtime exited before legacy completion commit: {:#}",
+                    (&mut runtime_task)
+                        .await
+                        .expect("runtime task join")
+                        .expect_err("runtime unexpectedly completed")
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for legacy completion commit");
+    runtime_task.abort();
+
+    let completed = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.state, WorkItemState::Completed);
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        execution.work_items.get(&work_item.id).map(|record| &record.state),
+        Some(crate::domain::execution_protocol::WorkItemExecutionState::Terminal {
+            completion,
+            ..
+        }) if Some(completion.as_str()) == completed.result_brief_id.as_deref()
+    ));
+}
+
+#[tokio::test]
+async fn standalone_turn_writer_rejects_prepared_completion() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let seed_runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let caller = seed_runtime
+        .create_work_item(
+            "resume caller after completion".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    seed_runtime
+        .pick_work_item(caller.id.clone())
+        .await
+        .unwrap();
+    let callee = seed_runtime
+        .create_work_item("complete callee".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    seed_runtime
+        .pick_work_item(callee.id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        seed_runtime
+            .storage()
+            .latest_work_item_continuations()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let provider = Arc::new(CompleteWorkItemReportProvider {
+        work_item_id: callee.id.clone(),
+        report_text: Some("Callee work is complete.".into()),
+        calls: Mutex::new(0),
+    });
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        provider.clone(),
+        "default".into(),
+        continuation_context_config(),
+    )
+    .unwrap();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::SystemTick,
+        MessageOrigin::System {
+            subsystem: "work_queue".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "finish the callee".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    bind_autonomous_work_queue_tick(&mut message, &callee, "continue_active");
+    let message = runtime.enqueue(message).await.unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+
+    let transition = runtime
+        .process_interactive_message_deferred_with_cleanup(
+            &message,
+            None,
+            ExecutionAdmissionProvenance::Canonical {
+                scenario_class: scheduler::WORK_ITEM_AUTONOMOUS_CONTINUATION_SCENARIO,
+                activation_id,
+            },
+            LoopControlOptions {
+                max_tool_rounds: None,
+            },
+        )
+        .await
+        .unwrap();
+    let error = runtime
+        .persist_terminal_transition(&transition)
+        .await
+        .expect_err("standalone Turn persistence must not bypass CompletionCommit");
+
+    assert_eq!(
+        *provider.calls.lock().await,
+        1,
+        "CompleteWorkItem must still terminate the provider loop"
+    );
+    assert!(error
+        .to_string()
+        .contains("canonical queue terminal settlement"));
+    assert_eq!(
+        runtime
+            .latest_work_item(&callee.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkItemState::Open
+    );
+    let state = runtime.agent_state().await.unwrap();
+    assert_eq!(
+        state.current_work_item_id.as_deref(),
+        Some(callee.id.as_str())
+    );
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_work_item_continuations()
+            .unwrap()
+            .into_iter()
+            .find(|frame| frame.active_work_item_id == callee.id)
+            .map(|frame| frame.state),
+        Some(WorkItemContinuationState::Active)
+    );
+}
+
+#[tokio::test]
+async fn atomic_completion_rolls_back_all_effects_on_transition_failure() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item("complete atomically".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    let before = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let state_before = runtime.agent_state().await.unwrap();
+    let result_brief_ids_before = runtime
+        .recent_briefs(100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|brief| {
+            brief.kind == BriefKind::Result
+                && brief.work_item_id.as_deref() == Some(work_item.id.as_str())
+        })
+        .map(|brief| brief.id)
+        .collect::<Vec<_>>();
+
+    runtime.inject_next_transition_fault(
+        crate::runtime_db::transitions::TransitionFaultPoint::AfterCanonicalWrites,
+    );
+    let error = runtime
+        .complete_work_item_with_report(
+            work_item.id.clone(),
+            WorkItemCompletionAuthority::Control,
+            "Atomic completion report".into(),
+            Vec::new(),
+            Some(1),
+            Some(1),
+            Some("turn-atomic-completion".into()),
+            Some("message-atomic-completion".into()),
+            Some("assistant-round-atomic-completion".into()),
+            Some("tool-call-atomic-completion".into()),
+            Vec::new(),
+        )
+        .await
+        .expect_err("injected transition fault should fail completion");
+    assert_injected_transition_fault(&error);
+
+    let after = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(runtime.agent_state().await.unwrap(), state_before);
+    let result_brief_ids_after = runtime
+        .recent_briefs(100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|brief| {
+            brief.kind == BriefKind::Result
+                && brief.work_item_id.as_deref() == Some(work_item.id.as_str())
+        })
+        .map(|brief| brief.id)
+        .collect::<Vec<_>>();
+    assert_eq!(result_brief_ids_after, result_brief_ids_before);
+}
+
+#[tokio::test]
+async fn lifecycle_execution_can_complete_without_borrowing_work_item_authority() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "complete from lifecycle execution".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let execution_binding = WorkItemExecutionBinding {
+        activation_id: Some("activation-lifecycle".into()),
+        admission_provenance: None,
+        source_message_id: "message-lifecycle".into(),
+        turn_id: "turn-lifecycle".into(),
+        owner: None,
+        work_item_id: None,
+        claimed_work_revision: None,
+    };
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.current_execution_binding = Some(execution_binding.clone());
+        guard.persist_state(&runtime.inner.storage).unwrap();
+    }
+
+    let completed = runtime
+        .complete_work_item_with_report(
+            work_item.id.clone(),
+            WorkItemCompletionAuthority::AgentExecution(execution_binding),
+            "Lifecycle completion report".into(),
+            Vec::new(),
+            Some(4),
+            Some(2),
+            Some("turn-lifecycle".into()),
+            Some("message-lifecycle".into()),
+            Some("assistant-round-lifecycle".into()),
+            Some("tool-call-lifecycle".into()),
+            Vec::new(),
+        )
+        .await
+        .unwrap()
+        .into_record();
+    assert_eq!(completed.state, WorkItemState::Completed);
+    let intent = completed.completion_intent.expect("completion intent");
+    assert_eq!(intent.source_activation_id, None);
+    assert_eq!(
+        intent.source_message_id.as_deref(),
+        Some("message-lifecycle")
+    );
+    assert_eq!(intent.source_turn_id.as_deref(), Some("turn-lifecycle"));
+    assert_eq!(intent.expected_work_revision, work_item.revision);
+}
+
+#[tokio::test]
+async fn control_completion_ignores_unrelated_execution_binding() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let target = runtime
+        .create_work_item("control completion target".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let active = runtime
+        .create_work_item("active agent execution".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.current_execution_binding = Some(WorkItemExecutionBinding {
+            activation_id: Some("activation-active".into()),
+            admission_provenance: None,
+            source_message_id: "message-active".into(),
+            turn_id: "turn-active".into(),
+            owner: None,
+            work_item_id: Some(active.id.clone()),
+            claimed_work_revision: Some(active.revision),
+        });
+        guard.persist_state(&runtime.inner.storage).unwrap();
+    }
+
+    let completed = runtime
+        .complete_work_item_with_report(
+            target.id.clone(),
+            WorkItemCompletionAuthority::Control,
+            "Completed through authenticated control.".into(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("control authority should not borrow the active execution binding")
+        .into_record();
+
+    assert_eq!(completed.state, WorkItemState::Completed);
+    let intent = completed.completion_intent.expect("completion intent");
+    assert_eq!(intent.source_activation_id, None);
+    assert_eq!(intent.source_message_id, None);
+    assert_eq!(intent.source_turn_id, None);
+}
+
+#[tokio::test]
+async fn work_item_execution_cannot_complete_an_unrelated_work_item() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let active = runtime
+        .create_work_item("active execution".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let unrelated = runtime
+        .create_work_item("unrelated completion target".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let execution_binding = WorkItemExecutionBinding {
+        activation_id: Some("activation-active".into()),
+        admission_provenance: None,
+        source_message_id: "message-active".into(),
+        turn_id: "turn-active".into(),
+        owner: None,
+        work_item_id: Some(active.id.clone()),
+        claimed_work_revision: Some(active.revision),
+    };
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.current_execution_binding = Some(execution_binding.clone());
+        guard.persist_state(&runtime.inner.storage).unwrap();
+    }
+
+    let error = runtime
+        .complete_work_item_with_report(
+            unrelated.id.clone(),
+            WorkItemCompletionAuthority::AgentExecution(execution_binding),
+            "Must be rejected".into(),
+            Vec::new(),
+            Some(1),
+            Some(1),
+            Some("turn-active".into()),
+            Some("message-active".into()),
+            Some("assistant-round-active".into()),
+            Some("tool-call-active".into()),
+            Vec::new(),
+        )
+        .await
+        .expect_err("unrelated WorkItem completion should fail closed");
+    assert_eq!(
+        error
+            .downcast_ref::<crate::runtime_error::RuntimeError>()
+            .map(|error| error.descriptor().code.as_str()),
+        Some("work_item_execution_binding_mismatch")
+    );
+    let unchanged = runtime
+        .latest_work_item(&unrelated.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.state, WorkItemState::Open);
+    assert!(unchanged.completion_intent.is_none());
+    assert!(unchanged.result_brief_id.is_none());
+}
+
+#[tokio::test]
+async fn completion_retry_rejects_replaced_execution_binding() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("unused")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let target = runtime
+        .create_work_item("completion retry target".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let execution_binding = WorkItemExecutionBinding {
+        activation_id: Some("activation-original".into()),
+        admission_provenance: None,
+        source_message_id: "message-original".into(),
+        turn_id: "turn-original".into(),
+        owner: None,
+        work_item_id: Some(target.id.clone()),
+        claimed_work_revision: Some(target.revision),
+    };
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.current_execution_binding = Some(execution_binding.clone());
+        guard.persist_state(&runtime.inner.storage).unwrap();
+    }
+    runtime.inject_completion_binding_replacement_before_commit(WorkItemExecutionBinding {
+        activation_id: Some("activation-replacement".into()),
+        admission_provenance: None,
+        source_message_id: "message-replacement".into(),
+        turn_id: "turn-replacement".into(),
+        owner: None,
+        work_item_id: Some(target.id.clone()),
+        claimed_work_revision: Some(target.revision),
+    });
+
+    let error = runtime
+        .complete_work_item_with_report(
+            target.id.clone(),
+            WorkItemCompletionAuthority::AgentExecution(execution_binding),
+            "Must not commit after authority changes.".into(),
+            Vec::new(),
+            Some(1),
+            Some(1),
+            Some("turn-original".into()),
+            Some("message-original".into()),
+            Some("assistant-round-original".into()),
+            Some("tool-call-original".into()),
+            Vec::new(),
+        )
+        .await
+        .expect_err("retry must revalidate the execution binding");
+    assert_eq!(
+        error
+            .downcast_ref::<crate::runtime_error::RuntimeError>()
+            .map(|error| error.descriptor().code.as_str()),
+        Some("work_item_execution_binding_stale")
+    );
+    let unchanged = runtime.latest_work_item(&target.id).await.unwrap().unwrap();
+    assert_eq!(unchanged.state, WorkItemState::Open);
+    assert!(unchanged.completion_intent.is_none());
+    assert!(unchanged.result_brief_id.is_none());
+    assert!(runtime
+        .recent_briefs(10)
+        .await
+        .unwrap()
+        .iter()
+        .all(|brief| {
+            brief.kind != BriefKind::Result
+                || brief.work_item_id.as_deref() != Some(target.id.as_str())
+        }));
+}
+
+#[tokio::test]
+async fn followup_final_report_completes_child_and_resumes_caller() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let seed_runtime = RuntimeHandle::new(
@@ -2130,65 +3086,76 @@ async fn later_final_report_binds_completed_work_item_after_continuation_resume(
         dir.path().to_path_buf(),
         workspace.path().to_path_buf(),
         "http://127.0.0.1:7878".into(),
-        provider,
+        provider.clone(),
         "default".into(),
         continuation_context_config(),
     )
     .unwrap();
-    let message = MessageEnvelope::new(
+    let mut message = MessageEnvelope::new(
         "default",
         MessageKind::OperatorPrompt,
-        MessageOrigin::Operator { actor_id: None },
+        MessageOrigin::Operator {
+            actor_id: Some("control".into()),
+        },
         AuthorityClass::OperatorInstruction,
         Priority::Normal,
         MessageBody::Text {
             text: "complete the child and return to the caller".into(),
         },
+    )
+    .with_admission(
+        MessageDeliverySurface::HttpControlPrompt,
+        AdmissionContext::ControlAuthenticated,
     );
+    message.work_item_id = Some(completed_work.id.clone());
 
-    runtime
-        .process_interactive_message(
-            &message,
-            None,
-            LoopControlOptions {
-                max_tool_rounds: None,
-            },
-        )
-        .await
-        .unwrap();
+    let mut runtime_task = tokio::spawn(runtime.clone().run());
+    runtime.enqueue(message).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let completed = runtime
+                .latest_work_item(&completed_work.id)
+                .await
+                .unwrap()
+                .is_some_and(|record| record.state == WorkItemState::Completed);
+            let caller_resumed = runtime
+                .agent_state()
+                .await
+                .unwrap()
+                .current_work_item_id
+                .as_deref()
+                == Some(caller.id.as_str());
+            if completed && caller_resumed {
+                break;
+            }
+            if runtime_task.is_finished() {
+                panic!(
+                    "runtime exited before follow-up completion resumed the caller: {:#}",
+                    (&mut runtime_task)
+                        .await
+                        .expect("runtime task join")
+                        .expect_err("runtime unexpectedly completed")
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for follow-up completion and continuation resume");
+    runtime_task.abort();
 
+    assert!(
+        *provider.calls.lock().await >= 2,
+        "completion report handshake requires a follow-up provider round"
+    );
     let completed = runtime
         .latest_work_item(&completed_work.id)
         .await
         .unwrap()
         .unwrap();
-    let result_brief_id = completed
-        .result_brief_id
-        .as_deref()
-        .expect("later final report should bind the completed work item");
-    let result_brief = runtime
-        .storage()
-        .read_brief_by_id(result_brief_id)
-        .unwrap()
-        .expect("bound later final report should exist");
-    assert_eq!(result_brief.text, "done");
-    assert_eq!(
-        result_brief.work_item_id.as_deref(),
-        Some(completed_work.id.as_str())
-    );
-    assert_eq!(
-        result_brief.related_message_id.as_deref(),
-        Some(message.id.as_str())
-    );
-    let completion_intent = completed
-        .completion_intent
-        .as_ref()
-        .expect("completion intent should remain durable");
-    assert_eq!(completion_intent.report_state, CompletionReportState::Bound);
-    assert_eq!(
-        completion_intent.result_brief_id.as_deref(),
-        Some(result_brief_id)
-    );
+    assert_eq!(completed.state, WorkItemState::Completed);
+    assert!(completed.result_brief_id.is_some());
+    assert!(completed.completion_intent.is_some());
     let state = runtime.agent_state().await.unwrap();
     assert_eq!(
         state.current_work_item_id.as_deref(),
@@ -2198,14 +3165,14 @@ async fn later_final_report_binds_completed_work_item_after_continuation_resume(
         state.current_turn_work_item_id.as_deref(),
         Some(caller.id.as_str())
     );
+    let continuations = runtime.storage().latest_work_item_continuations().unwrap();
     assert!(
-        runtime
-            .recent_briefs(10)
-            .await
-            .unwrap()
-            .iter()
-            .all(|brief| brief.work_item_id.as_deref() != Some(caller.id.as_str())),
-        "completed child final report must not be rebound to resumed caller"
+        continuations.iter().any(|frame| {
+            frame.suspended_work_item_id == caller.id
+                && frame.active_work_item_id == completed_work.id
+                && frame.state == WorkItemContinuationState::Resumed
+        }),
+        "follow-up completion must resume the active continuation"
     );
 
     let restarted = RuntimeHandle::new(
@@ -2223,13 +3190,16 @@ async fn later_final_report_binds_completed_work_item_after_continuation_resume(
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(restarted_completed.state, WorkItemState::Completed);
+    assert!(restarted_completed.result_brief_id.is_some());
     assert_eq!(
-        restarted_completed.result_brief_id,
-        completed.result_brief_id
-    );
-    assert_eq!(
-        restarted_completed.completion_intent,
-        completed.completion_intent
+        restarted
+            .agent_state()
+            .await
+            .unwrap()
+            .current_work_item_id
+            .as_deref(),
+        Some(caller.id.as_str())
     );
 }
 
@@ -2351,6 +3321,7 @@ async fn turn_end_marks_unbound_completion_report_missing_and_persists_restart()
             kind: TurnTerminalKind::Completed,
             reason: None,
             last_assistant_message: None,
+            no_brief_reason: None,
             checkpoint: None,
             completed_at: Utc::now(),
             duration_ms: 10,
@@ -2358,11 +3329,14 @@ async fn turn_end_marks_unbound_completion_report_missing_and_persists_restart()
         guard.persist_state(&runtime.inner.storage).unwrap();
     }
 
-    assert!(runtime
-        .maybe_commit_turn_end_work_item_transition()
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        runtime
+            .maybe_commit_turn_end_work_item_transition()
+            .await
+            .unwrap()
+            .is_none(),
+        "completion should already have released the turn work item focus"
+    );
     let missing = runtime
         .latest_work_item(&work_item.id)
         .await
@@ -2436,40 +3410,88 @@ async fn complete_work_item_followed_by_same_round_tool_keeps_terminal_brief() {
         continuation_context_config(),
     )
     .unwrap();
-    let message = MessageEnvelope::new(
+    let mut message = MessageEnvelope::new(
         "default",
         MessageKind::OperatorPrompt,
-        MessageOrigin::Operator { actor_id: None },
+        MessageOrigin::Operator {
+            actor_id: Some("control".into()),
+        },
         AuthorityClass::OperatorInstruction,
         Priority::Normal,
         MessageBody::Text {
             text: "complete and verify".into(),
         },
+    )
+    .with_admission(
+        MessageDeliverySurface::HttpControlPrompt,
+        AdmissionContext::ControlAuthenticated,
     );
+    message.work_item_id = Some(work_item.id.clone());
 
-    runtime
-        .process_interactive_message(
-            &message,
-            None,
-            LoopControlOptions {
-                max_tool_rounds: None,
-            },
-        )
-        .await
-        .unwrap();
+    let mut runtime_task = tokio::spawn(runtime.clone().run());
+    runtime.enqueue(message).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if runtime
+                .storage()
+                .read_recent_events(200)
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event.kind == "work_item_written"
+                        && event.data["action"].as_str() == Some("completed")
+                        && event.data["work_item_id"].as_str() == Some(work_item.id.as_str())
+                })
+            {
+                break;
+            }
+            if runtime_task.is_finished() {
+                panic!(
+                    "runtime exited before completion commit: {:#}",
+                    (&mut runtime_task)
+                        .await
+                        .expect("runtime task join")
+                        .expect_err("runtime unexpectedly completed")
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for canonical completion commit");
 
-    assert_eq!(*provider.calls.lock().await, 2);
+    assert_eq!(
+        *provider.calls.lock().await,
+        1,
+        "CompleteWorkItem must terminate the provider loop"
+    );
+    assert_eq!(
+        runtime
+            .latest_work_item(&work_item.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkItemState::Completed
+    );
     let briefs = runtime.recent_briefs(10).await.unwrap();
     assert!(briefs.iter().any(|brief| {
         brief.kind == BriefKind::Result && brief.text == "Finished the tracked work."
     }));
-    assert!(briefs.iter().any(|brief| {
-        brief.kind == BriefKind::Result && brief.text == "Verified after completion."
-    }));
+    assert!(briefs
+        .iter()
+        .all(|brief| brief.text != "Verified after completion."));
+    assert!(runtime
+        .storage()
+        .read_recent_tool_executions(10)
+        .unwrap()
+        .iter()
+        .all(|tool| tool.tool_name != "ExecCommand"));
+    runtime_task.abort();
 }
 
 #[tokio::test]
-async fn complete_work_item_does_not_promote_text_before_other_tool() {
+async fn complete_work_item_uses_followup_report_after_text_before_other_tool() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let seed_runtime = RuntimeHandle::new(
@@ -2500,32 +3522,69 @@ async fn complete_work_item_does_not_promote_text_before_other_tool() {
         dir.path().to_path_buf(),
         workspace.path().to_path_buf(),
         "http://127.0.0.1:7878".into(),
-        provider,
+        provider.clone(),
         "default".into(),
         continuation_context_config(),
     )
     .unwrap();
-    let message = MessageEnvelope::new(
+    let mut message = MessageEnvelope::new(
         "default",
         MessageKind::OperatorPrompt,
-        MessageOrigin::Operator { actor_id: None },
+        MessageOrigin::Operator {
+            actor_id: Some("control".into()),
+        },
         AuthorityClass::OperatorInstruction,
         Priority::Normal,
         MessageBody::Text {
             text: "inspect then complete".into(),
         },
+    )
+    .with_admission(
+        MessageDeliverySurface::HttpControlPrompt,
+        AdmissionContext::ControlAuthenticated,
     );
+    message.work_item_id = Some(work_item.id.clone());
 
-    runtime
-        .process_interactive_message(
-            &message,
-            None,
-            LoopControlOptions {
-                max_tool_rounds: None,
-            },
-        )
-        .await
-        .unwrap();
+    let mut runtime_task = tokio::spawn(runtime.clone().run());
+    runtime.enqueue(message).await.unwrap();
+    let completion = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if runtime
+                .latest_work_item(&work_item.id)
+                .await
+                .unwrap()
+                .is_some_and(|record| record.state == WorkItemState::Completed)
+            {
+                break;
+            }
+            if runtime_task.is_finished() {
+                panic!(
+                    "runtime exited before follow-up completion commit: {:#}",
+                    (&mut runtime_task)
+                        .await
+                        .expect("runtime task join")
+                        .expect_err("runtime unexpectedly completed")
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if completion.is_err() {
+        let calls = *provider.calls.lock().await;
+        let latest = runtime.latest_work_item(&work_item.id).await.unwrap();
+        let event_kinds = runtime
+            .storage()
+            .read_recent_events(50)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
+        panic!(
+            "timed out waiting for follow-up completion commit: calls={calls}, latest={latest:?}, events={event_kinds:?}"
+        );
+    }
+    runtime_task.abort();
 
     let completed = runtime
         .latest_work_item(&work_item.id)
@@ -2533,12 +3592,17 @@ async fn complete_work_item_does_not_promote_text_before_other_tool() {
         .unwrap()
         .unwrap();
     assert_eq!(completed.state, WorkItemState::Completed);
-    assert_eq!(completed.result_summary, None);
-    assert!(runtime
-        .storage()
-        .latest_delivery_summary(&work_item.id)
-        .unwrap()
-        .is_none());
+    let result_brief_id = completed
+        .result_brief_id
+        .as_deref()
+        .expect("follow-up report should create a result brief");
+    let briefs = runtime.recent_briefs(10).await.unwrap();
+    assert!(briefs.iter().any(|brief| {
+        brief.id == result_brief_id && brief.text == "Completed after inspection."
+    }));
+    assert!(briefs
+        .iter()
+        .all(|brief| brief.text != "This text belongs to the AgentGet tool call."));
     let transcript = runtime.storage().read_recent_transcript(10).unwrap();
     let tool_results = transcript
         .iter()
@@ -2562,8 +3626,8 @@ async fn complete_work_item_does_not_promote_text_before_other_tool() {
         .expect("provider_visible_text");
     let content_json: serde_json::Value = serde_json::from_str(content).unwrap();
     assert_eq!(
-        content_json["result"]["completion_report_promoted"].as_bool(),
-        None
+        content_json["result"]["disposition"].as_str(),
+        Some("awaiting_completion_report")
     );
 }
 
@@ -2606,24 +3670,66 @@ async fn promoted_completion_report_resumes_next_queued_work_item_via_system_tic
         "http://127.0.0.1:7878".into(),
         provider,
         "default".into(),
-        context_config(),
+        continuation_ready_context_config(&workspace, 16_000),
     )
     .unwrap();
-    let message = MessageEnvelope::new(
+    let mut message = MessageEnvelope::new(
         "default",
         MessageKind::OperatorPrompt,
-        MessageOrigin::Operator { actor_id: None },
+        MessageOrigin::Operator {
+            actor_id: Some("control".into()),
+        },
         AuthorityClass::OperatorInstruction,
         Priority::Normal,
         MessageBody::Text {
             text: "finish active work".into(),
         },
+    )
+    .with_admission(
+        MessageDeliverySurface::HttpControlPrompt,
+        AdmissionContext::ControlAuthenticated,
     );
+    message.work_item_id = Some(active.id.clone());
 
-    runtime
-        .process_message(message, closure_decision(ClosureOutcome::Completed, None))
-        .await
-        .unwrap();
+    let mut runtime_task = tokio::spawn(runtime.clone().run());
+    runtime.enqueue(message).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let active_completed = runtime
+                .latest_work_item(&active.id)
+                .await
+                .unwrap()
+                .is_some_and(|record| record.state == WorkItemState::Completed);
+            let tick_emitted = runtime
+                .storage()
+                .read_recent_messages(10)
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    matches!(
+                        (&message.kind, &message.origin),
+                        (MessageKind::SystemTick, MessageOrigin::System { subsystem })
+                            if subsystem == "work_queue"
+                    )
+                });
+            if active_completed && tick_emitted {
+                break;
+            }
+            if runtime_task.is_finished() {
+                panic!(
+                    "runtime exited before completion and queued-work tick: {:#}",
+                    (&mut runtime_task)
+                        .await
+                        .expect("runtime task join")
+                        .expect_err("runtime unexpectedly completed")
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("completion should emit the next queued WorkItem tick");
+    runtime_task.abort();
 
     let messages = runtime.storage().read_recent_messages(10).unwrap();
     let tick = messages
@@ -2647,7 +3753,7 @@ async fn promoted_completion_report_resumes_next_queued_work_item_via_system_tic
 }
 
 #[tokio::test]
-async fn complete_work_item_without_same_round_report_warns_without_summary() {
+async fn complete_work_item_without_same_round_report_uses_followup_final_text() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let seed_runtime = RuntimeHandle::new(
@@ -2681,42 +3787,101 @@ async fn complete_work_item_without_same_round_report_warns_without_summary() {
         "http://127.0.0.1:7878".into(),
         provider.clone(),
         "default".into(),
-        context_config(),
+        continuation_context_config(),
     )
     .unwrap();
-    let message = MessageEnvelope::new(
+    let mut message = MessageEnvelope::new(
         "default",
         MessageKind::OperatorPrompt,
-        MessageOrigin::Operator { actor_id: None },
+        MessageOrigin::Operator {
+            actor_id: Some("control".into()),
+        },
         AuthorityClass::OperatorInstruction,
         Priority::Normal,
         MessageBody::Text {
             text: "finish the tracked work".into(),
         },
+    )
+    .with_admission(
+        MessageDeliverySurface::HttpControlPrompt,
+        AdmissionContext::ControlAuthenticated,
     );
+    message.work_item_id = Some(work_item.id.clone());
 
-    runtime
-        .process_interactive_message(
-            &message,
-            None,
-            LoopControlOptions {
-                max_tool_rounds: None,
-            },
-        )
-        .await
-        .unwrap();
+    let mut runtime_task = tokio::spawn(runtime.clone().run());
+    runtime.enqueue(message).await.unwrap();
+    let completion = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if runtime
+                .latest_work_item(&work_item.id)
+                .await
+                .unwrap()
+                .is_some_and(|record| record.state == WorkItemState::Completed)
+            {
+                break;
+            }
+            if runtime_task.is_finished() {
+                panic!(
+                    "runtime exited before follow-up completion commit: {:#}",
+                    (&mut runtime_task)
+                        .await
+                        .expect("runtime task join")
+                        .expect_err("runtime unexpectedly completed")
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if completion.is_err() {
+        let calls = *provider.calls.lock().await;
+        let latest = runtime.latest_work_item(&work_item.id).await.unwrap();
+        let event_kinds = runtime
+            .storage()
+            .read_recent_events(50)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
+        panic!(
+            "timed out waiting for follow-up completion commit: calls={calls}, latest={latest:?}, events={event_kinds:?}"
+        );
+    }
+
+    assert_eq!(
+        *provider.calls.lock().await,
+        2,
+        "tool-only completion should request one follow-up text round"
+    );
     let completed = runtime
         .latest_work_item(&work_item.id)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(completed.state, WorkItemState::Completed);
-    assert_eq!(completed.result_summary, None);
-    assert!(runtime
-        .storage()
-        .latest_delivery_summary(&work_item.id)
-        .unwrap()
-        .is_none());
+    let result_brief_id = completed
+        .result_brief_id
+        .as_deref()
+        .expect("follow-up report should create a result brief");
+    let briefs = runtime.recent_briefs(10).await.unwrap();
+    let result_briefs = briefs
+        .iter()
+        .filter(|brief| brief.kind == BriefKind::Result && brief.text == "done")
+        .collect::<Vec<_>>();
+    assert_eq!(result_briefs.len(), 1);
+    assert_eq!(result_briefs[0].id, result_brief_id);
+
+    let tools = runtime.storage().read_recent_tool_executions(10).unwrap();
+    let completion_tools = tools
+        .iter()
+        .filter(|tool| tool.tool_name == "CompleteWorkItem")
+        .collect::<Vec<_>>();
+    assert_eq!(completion_tools.len(), 1);
+    assert_eq!(
+        completion_tools[0].status,
+        crate::types::ToolExecutionStatus::Success
+    );
+
     let transcript = runtime.storage().read_recent_transcript(10).unwrap();
     let tool_results = transcript
         .iter()
@@ -2734,19 +3899,385 @@ async fn complete_work_item_without_same_round_report_warns_without_summary() {
         .expect("provider_visible_text");
     let tool_result: serde_json::Value = serde_json::from_str(content).unwrap();
     assert_eq!(
-        tool_result["result"]["warnings"][0]["kind"].as_str(),
-        Some("missing_completion_report")
+        tool_result["result"]["disposition"].as_str(),
+        Some("awaiting_completion_report")
     );
-    let events = runtime.storage().read_recent_events(20).unwrap();
-    assert!(events.iter().any(|event| {
-        event.kind == "work_item_completion_warning"
-            && event.data["kind"].as_str() == Some("missing_completion_report")
-            && event.data["work_item_id"].as_str() == Some(work_item.id.as_str())
-    }));
+    let events = runtime.storage().read_recent_events(200).unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "completion_report_request_created"));
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "completion_report_request_completed"));
+    assert!(events
+        .iter()
+        .all(|event| event.kind != "tool_execution_failed"));
+    runtime_task.abort();
 }
 
 #[tokio::test]
-async fn multiple_complete_work_items_in_one_round_do_not_promote_or_short_circuit() {
+async fn abandoned_completion_report_protocol_interrupts_deferred_tool_atomically() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let seed_runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = seed_runtime
+        .create_work_item(
+            "abandon completion report protocol".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    seed_runtime
+        .pick_work_item(work_item.id.clone())
+        .await
+        .unwrap();
+
+    let provider = Arc::new(AbandonCompletionReportProvider {
+        work_item_id: work_item.id.clone(),
+        calls: Mutex::new(0),
+    });
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        provider.clone(),
+        "default".into(),
+        continuation_context_config(),
+    )
+    .unwrap();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator {
+            actor_id: Some("control".into()),
+        },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "finish the tracked work".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::HttpControlPrompt,
+        AdmissionContext::ControlAuthenticated,
+    );
+    message.work_item_id = Some(work_item.id.clone());
+
+    let mut runtime_task = tokio::spawn(runtime.clone().run());
+    runtime.enqueue(message).await.unwrap();
+    let abandonment = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let interrupted_tool_id = runtime
+                .storage()
+                .read_recent_tool_executions(10)
+                .unwrap()
+                .into_iter()
+                .find(|tool| {
+                    tool.tool_name == "CompleteWorkItem"
+                        && tool.status == crate::types::ToolExecutionStatus::Interrupted
+                })
+                .map(|tool| tool.id);
+            let terminal_projected = interrupted_tool_id.is_some_and(|tool_id| {
+                runtime
+                    .storage()
+                    .read_recent_turns(10)
+                    .unwrap()
+                    .iter()
+                    .any(|turn| {
+                        turn.tool_execution_ids.contains(&tool_id)
+                            && turn
+                                .terminal
+                                .as_ref()
+                                .is_some_and(|terminal| terminal.kind == TurnTerminalKind::Aborted)
+                    })
+            });
+            if terminal_projected {
+                break;
+            }
+            if runtime_task.is_finished() {
+                panic!(
+                    "runtime exited before the deferred completion tool and terminal were projected: {:#}",
+                    (&mut runtime_task)
+                        .await
+                        .expect("runtime task join")
+                        .expect_err("runtime unexpectedly completed")
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if abandonment.is_err() {
+        let calls = *provider.calls.lock().await;
+        let tools = runtime.storage().read_recent_tool_executions(10).unwrap();
+        let turns = runtime.storage().read_recent_turns(10).unwrap();
+        let state = runtime.agent_state().await.unwrap();
+        let events = runtime
+            .storage()
+            .read_recent_events(200)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
+        panic!(
+            "timed out waiting for completion report protocol abandonment: calls={calls}, tools={tools:?}, turns={turns:?}, terminal={:?}, events={events:?}, runtime_finished={}",
+            state.last_turn_terminal,
+            runtime_task.is_finished()
+        );
+    }
+
+    assert_eq!(*provider.calls.lock().await, 3);
+    let current = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.state, WorkItemState::Open);
+    assert!(current.result_brief_id.is_none());
+    assert!(current.completion_intent.is_none());
+    assert!(
+        runtime
+            .recent_briefs(10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|brief| brief.kind != BriefKind::Result),
+        "abandoned completion report protocol must not create a result brief"
+    );
+    assert!(
+        runtime
+            .recent_briefs(10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|brief| brief.kind == BriefKind::Failure),
+        "operator-visible protocol abandonment must promote a failure brief"
+    );
+
+    let tools = runtime.storage().read_recent_tool_executions(10).unwrap();
+    let completion_tools = tools
+        .iter()
+        .filter(|tool| tool.tool_name == "CompleteWorkItem")
+        .collect::<Vec<_>>();
+    assert_eq!(completion_tools.len(), 1);
+    assert_eq!(
+        completion_tools[0].status,
+        crate::types::ToolExecutionStatus::Interrupted
+    );
+    assert_eq!(
+        completion_tools[0].output["reason"],
+        "report_protocol_abandoned"
+    );
+    let completed_at = completion_tools[0]
+        .completed_at
+        .expect("interrupted execution must record completion time");
+    assert_eq!(
+        completion_tools[0].duration_ms,
+        completed_at
+            .signed_duration_since(completion_tools[0].created_at)
+            .num_milliseconds()
+            .max(0) as u64
+    );
+
+    let terminal = runtime
+        .storage()
+        .read_recent_turns(10)
+        .unwrap()
+        .into_iter()
+        .find(|turn| {
+            turn.tool_execution_ids.contains(&completion_tools[0].id) && turn.terminal.is_some()
+        })
+        .and_then(|turn| turn.terminal)
+        .expect("protocol abandonment must write a terminal Turn");
+    assert_eq!(terminal.kind, TurnTerminalKind::Aborted);
+    assert_eq!(terminal.no_brief_reason, None);
+    let events = runtime.storage().read_recent_events(200).unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "completion_report_request_abandoned"));
+    assert!(events
+        .iter()
+        .all(|event| event.kind != "tool_execution_failed"));
+    runtime_task.abort();
+}
+
+#[tokio::test]
+async fn invalidated_completion_report_binding_interrupts_deferred_tool_atomically() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let seed_runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = seed_runtime
+        .create_work_item(
+            "invalidate completion report binding".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    seed_runtime
+        .pick_work_item(work_item.id.clone())
+        .await
+        .unwrap();
+
+    let followup_started = Arc::new(tokio::sync::Notify::new());
+    let release_followup = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(RevisionChangeCompletionReportProvider {
+        work_item_id: work_item.id.clone(),
+        calls: Mutex::new(0),
+        followup_started: followup_started.clone(),
+        release_followup: release_followup.clone(),
+    });
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        provider,
+        "default".into(),
+        continuation_context_config(),
+    )
+    .unwrap();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator {
+            actor_id: Some("control".into()),
+        },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "finish the tracked work".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::HttpControlPrompt,
+        AdmissionContext::ControlAuthenticated,
+    );
+    message.work_item_id = Some(work_item.id.clone());
+
+    let runtime_task = tokio::spawn(runtime.clone().run());
+    runtime.enqueue(message).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        followup_started.notified(),
+    )
+    .await
+    .expect("follow-up completion report round should start");
+    runtime
+        .update_work_item_fields(
+            work_item.id.clone(),
+            Some("changed while awaiting completion report".into()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    release_followup.notify_one();
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let interrupted_tool_id = runtime
+                .storage()
+                .read_recent_tool_executions(10)
+                .unwrap()
+                .into_iter()
+                .find(|tool| {
+                    tool.tool_name == "CompleteWorkItem"
+                        && tool.status == crate::types::ToolExecutionStatus::Interrupted
+                })
+                .map(|tool| tool.id);
+            if interrupted_tool_id.is_some_and(|tool_id| {
+                runtime
+                    .storage()
+                    .read_recent_turns(10)
+                    .unwrap()
+                    .iter()
+                    .any(|turn| {
+                        turn.tool_execution_ids.contains(&tool_id)
+                            && turn
+                                .terminal
+                                .as_ref()
+                                .is_some_and(|terminal| terminal.kind == TurnTerminalKind::Aborted)
+                    })
+            }) {
+                break;
+            }
+            assert!(
+                !runtime_task.is_finished(),
+                "runtime exited before invalidated completion report settlement"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("invalidated completion report should settle atomically");
+
+    let current = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.state, WorkItemState::Open);
+    assert!(current.result_brief_id.is_none());
+    assert!(current.completion_intent.is_none());
+    assert!(
+        runtime
+            .recent_briefs(10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|brief| brief.kind != BriefKind::Result),
+        "invalidated completion report binding must not create a result brief"
+    );
+    let tools = runtime.storage().read_recent_tool_executions(10).unwrap();
+    let completion_tool = tools
+        .iter()
+        .find(|tool| tool.tool_name == "CompleteWorkItem")
+        .expect("completion tool execution");
+    assert_eq!(
+        completion_tool.status,
+        crate::types::ToolExecutionStatus::Interrupted
+    );
+    assert_eq!(
+        completion_tool.output["reason"],
+        "work_item_revision_changed"
+    );
+    let events = runtime.storage().read_recent_events(200).unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "completion_report_request_invalidated"));
+    assert!(events
+        .iter()
+        .all(|event| event.kind != "tool_execution_failed"));
+    runtime_task.abort();
+}
+
+#[tokio::test]
+async fn complete_work_item_is_a_hard_turn_boundary() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let seed_runtime = RuntimeHandle::new(
@@ -2767,6 +4298,7 @@ async fn multiple_complete_work_items_in_one_round_do_not_promote_or_short_circu
         .create_work_item("second completion".into(), None, None, Vec::new())
         .await
         .unwrap();
+    seed_runtime.pick_work_item(first.id.clone()).await.unwrap();
 
     let provider = Arc::new(MultiCompleteWorkItemReportProvider {
         work_item_ids: vec![first.id.clone(), second.id.clone()],
@@ -2786,92 +4318,98 @@ async fn multiple_complete_work_items_in_one_round_do_not_promote_or_short_circu
         continuation_context_config(),
     )
     .unwrap();
-    let message = MessageEnvelope::new(
+    let mut message = MessageEnvelope::new(
         "default",
         MessageKind::OperatorPrompt,
-        MessageOrigin::Operator { actor_id: None },
+        MessageOrigin::Operator {
+            actor_id: Some("control".into()),
+        },
         AuthorityClass::OperatorInstruction,
         Priority::Normal,
         MessageBody::Text {
             text: "finish both tracked items".into(),
         },
+    )
+    .with_admission(
+        MessageDeliverySurface::HttpControlPrompt,
+        AdmissionContext::ControlAuthenticated,
     );
+    message.work_item_id = Some(first.id.clone());
 
-    runtime
-        .process_interactive_message(
-            &message,
-            None,
-            LoopControlOptions {
-                max_tool_rounds: None,
-            },
-        )
-        .await
-        .unwrap();
+    let mut runtime_task = tokio::spawn(runtime.clone().run());
+    runtime.enqueue(message).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if runtime
+                .storage()
+                .read_recent_events(200)
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event.kind == "work_item_written"
+                        && event.data["action"].as_str() == Some("completed")
+                        && event.data["work_item_id"].as_str() == Some(first.id.as_str())
+                })
+            {
+                break;
+            }
+            if runtime_task.is_finished() {
+                panic!(
+                    "runtime exited before completion commit: {:#}",
+                    (&mut runtime_task)
+                        .await
+                        .expect("runtime task join")
+                        .expect_err("runtime unexpectedly completed")
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for canonical completion commit");
 
-    for (work_item_id, report_text) in [
-        (&first.id, "Finished the first work item."),
-        (&second.id, "Finished the second work item."),
-    ] {
-        let completed = runtime
-            .latest_work_item(work_item_id)
+    let completion_turn = runtime
+        .storage()
+        .read_recent_turns(10)
+        .unwrap()
+        .into_iter()
+        .find(|turn| turn.completed_work_item_ids.contains(&first.id))
+        .expect("completion commit must write the terminal Turn");
+    assert_eq!(
+        completion_turn.tool_execution_ids.len(),
+        1,
+        "CompleteWorkItem must stop later tools in the same provider round"
+    );
+    assert_eq!(
+        completion_turn.completed_work_item_ids,
+        vec![first.id.clone()],
+        "the terminal Turn must settle only the first completion"
+    );
+    assert!(
+        completion_turn.terminal.is_some(),
+        "the completion commit must own the terminal Turn write"
+    );
+    assert_eq!(
+        runtime
+            .latest_work_item(&first.id)
             .await
             .unwrap()
-            .unwrap();
-        assert_eq!(completed.state, WorkItemState::Completed);
-        assert_eq!(completed.result_summary, None);
-        let result_brief_id = completed
-            .result_brief_id
-            .as_deref()
-            .expect("completion report should store result brief id");
-        assert_eq!(
-            runtime
-                .storage()
-                .read_brief_by_id(result_brief_id)
-                .unwrap()
-                .expect("completion result brief should exist")
-                .text,
-            report_text
-        );
-        assert!(runtime
-            .storage()
-            .latest_delivery_summary(work_item_id)
             .unwrap()
-            .is_none());
-    }
-    assert_eq!(
-        *provider.calls.lock().await,
-        2,
-        "multiple completion reports should not hard-stop the provider loop"
-    );
-    let briefs = runtime.recent_briefs(10).await.unwrap();
-    assert_eq!(
-        briefs
-            .iter()
-            .filter(|brief| brief.kind == BriefKind::Result
-                && brief.work_item_id.as_deref() == Some(first.id.as_str()))
-            .count(),
-        1
+            .state,
+        WorkItemState::Completed,
+        "the first completion must commit through the queue terminal transaction"
     );
     assert_eq!(
-        briefs
-            .iter()
-            .filter(|brief| brief.kind == BriefKind::Result
-                && brief.work_item_id.as_deref() == Some(second.id.as_str()))
-            .count(),
-        1
+        runtime
+            .latest_work_item(&second.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkItemState::Open,
+        "tools after CompleteWorkItem must not execute"
     );
-    let events = runtime.storage().read_recent_events(usize::MAX).unwrap();
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| {
-                event.kind == "work_item_completion_warning"
-                    && event.data["kind"].as_str()
-                        == Some("completion_report_not_promoted_multiple_completions")
-            })
-            .count(),
-        0
-    );
+    runtime_task.abort();
 }
 
 #[tokio::test]
@@ -3106,10 +4644,28 @@ async fn complete_work_item_with_unfinished_todos_returns_structured_warning() {
         )
         .await
         .unwrap();
+    let work_item = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.current_execution_binding = Some(WorkItemExecutionBinding {
+            activation_id: Some("activation-complete-with-warning".into()),
+            admission_provenance: None,
+            source_message_id: "message-complete-with-warning".into(),
+            turn_id: "turn-complete-with-warning".into(),
+            owner: None,
+            work_item_id: Some(work_item.id.clone()),
+            claimed_work_revision: Some(work_item.revision),
+        });
+        guard.persist_state(&runtime.inner.storage).unwrap();
+    }
 
     let registry = crate::tool::ToolRegistry::new(runtime.workspace_root());
     let (result, _) = registry
-        .execute(
+        .execute_with_context(
             &runtime,
             "default",
             &AuthorityClass::OperatorInstruction,
@@ -3118,9 +4674,29 @@ async fn complete_work_item_with_unfinished_todos_returns_structured_warning() {
                 name: "CompleteWorkItem".into(),
                 input: serde_json::json!({"work_item_id": work_item.id}),
             },
+            &crate::tool::spec::ToolExecutionContext {
+                completion_report_candidate: Some(crate::tool::spec::CompletionReportCandidate {
+                    text: "Completed with unfinished todos.".into(),
+                    citations: vec![crate::types::Citation {
+                        url: "https://example.com/completion".into(),
+                        title: Some("Completion source".into()),
+                    }],
+                    source_turn_index: 1,
+                    source_round: 1,
+                    source_turn_id: Some("turn-complete-with-warning".into()),
+                    source_message_id: Some("message-complete-with-warning".into()),
+                    source_assistant_round_id: "assistant-round-complete".into(),
+                    source_tool_call_id: "complete".into(),
+                }),
+            },
         )
         .await
         .unwrap();
+    assert!(!result.terminal_transition);
+    let prepared = result
+        .prepared_work_item_completion
+        .as_ref()
+        .expect("completion tool should prepare a terminal commit");
     let payload = result.envelope.result.unwrap();
     assert_eq!(
         payload["warnings"][0]["kind"].as_str(),
@@ -3131,20 +4707,37 @@ async fn complete_work_item_with_unfinished_todos_returns_structured_warning() {
         payload["warnings"][0]["in_progress_count"].as_u64(),
         Some(1)
     );
-    let events = runtime.storage().read_recent_events(20).unwrap();
-    let completed_event = events
+    let completed_event = prepared
+        .audit_events
         .iter()
         .find(|event| {
             event.kind == "work_item_written" && event.data["action"].as_str() == Some("completed")
         })
-        .expect("completion event should be recorded");
+        .expect("prepared completion should include the completed event");
     assert_eq!(
         completed_event.data["work_item_id"].as_str(),
         Some(work_item.id.as_str())
     );
-    assert_eq!(completed_event.data["warning_count"].as_u64(), Some(1));
-    assert!(completed_event.data.get("warnings").is_none());
     assert!(completed_event.data.get("record").is_none());
+    let durable = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .expect("durable work item");
+    assert_eq!(durable.state, WorkItemState::Open);
+    assert!(runtime
+        .storage()
+        .read_brief_by_id(&prepared.brief.id)
+        .unwrap()
+        .is_none());
+    let brief = &prepared.brief;
+    assert_eq!(
+        brief.citations,
+        Some(vec![crate::types::Citation {
+            url: "https://example.com/completion".into(),
+            title: Some("Completion source".into()),
+        }])
+    );
 }
 
 #[tokio::test]
@@ -3290,6 +4883,7 @@ async fn turn_end_work_item_commit_keeps_failed_turn_open_without_blocker() {
             kind: TurnTerminalKind::Aborted,
             reason: None,
             last_assistant_message: Some("provider context_length_exceeded".into()),
+            no_brief_reason: None,
             checkpoint: None,
             completed_at: Utc::now(),
             duration_ms: 42,
@@ -3338,6 +4932,7 @@ async fn turn_end_work_item_commit_preserves_existing_blocker_on_failed_turn() {
             kind: TurnTerminalKind::Aborted,
             reason: None,
             last_assistant_message: Some("provider timeout".into()),
+            no_brief_reason: None,
             checkpoint: None,
             completed_at: Utc::now(),
             duration_ms: 42,
@@ -3681,6 +5276,8 @@ async fn agent_scoped_wake_hint_binds_unique_wildcard_external_wait() {
             resolved_at: None,
             cancelled_at: None,
             turn_id: None,
+            trigger_message_id: None,
+            triggered_at: None,
         })
         .unwrap();
     let capability = runtime
@@ -3763,6 +5360,8 @@ async fn agent_scoped_wake_hint_does_not_bind_ambiguous_wildcard_external_waits(
                 resolved_at: None,
                 cancelled_at: None,
                 turn_id: None,
+                trigger_message_id: None,
+                triggered_at: None,
             })
             .unwrap();
     }
@@ -3883,7 +5482,7 @@ async fn default_external_ingress_wakes_without_owning_work_item_wait_state() {
         .complete_work_item(work.id.clone(), Vec::new())
         .await
         .unwrap();
-    assert_eq!(completed.state, WorkItemState::Completed);
+    assert_eq!(completed.state, WorkItemState::Completing);
     assert!(completed.blocked_by.is_none());
 }
 
@@ -3935,7 +5534,7 @@ async fn external_wake_records_wait_reconciliation_and_resolves_wait() {
         MessageDeliverySurface::RuntimeSystem,
         AdmissionContext::RuntimeOwned,
     );
-    wait_message.work_item_id = Some(work.id.clone());
+    bind_autonomous_work_queue_tick(&mut wait_message, &work, "continue_active");
     wait_message.turn_id = Some("turn-wait-for-ci".into());
     let wait_message = runtime.enqueue(wait_message).await.unwrap();
     assert!(matches!(
@@ -3986,23 +5585,14 @@ async fn external_wake_records_wait_reconciliation_and_resolves_wait() {
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    let canonical_wait = settled
-        .waits
-        .get(&wait_condition_id)
-        .expect("settlement should create the canonical external wait");
-    let canonical_generation = canonical_wait.current_generation;
-    assert_eq!(
-        canonical_wait.generations[&canonical_generation]
-            .owner
-            .work_item_id(),
-        Some(work.id.as_str())
-    );
-    assert_eq!(
-        canonical_wait.generations[&canonical_generation].state,
-        WaitState::Active
-    );
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("settlement should preserve unified execution authority");
+    assert!(matches!(
+        &settled.work_items[&work.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Waiting { wait, .. }
+            if wait.wait_id == wait_condition_id
+    ));
     let local_wait = runtime
         .storage()
         .latest_wait_conditions()
@@ -4030,7 +5620,7 @@ async fn external_wake_records_wait_reconciliation_and_resolves_wait() {
             .exact_external_wait_correlation(Some(&trigger_id))
             .await
             .unwrap(),
-        Some((wait_condition_id.clone(), canonical_generation)),
+        Some(wait_condition_id.clone()),
         "callback ingress should resolve one exact active canonical wait"
     );
 
@@ -4079,10 +5669,9 @@ async fn external_wake_records_wait_reconciliation_and_resolves_wait() {
     assert_eq!(scheduled.message.id, tick.id);
 
     let mut mismatched = scheduled.message.clone();
-    mismatched.source_refs.insert(
-        "wait_generation".into(),
-        canonical_generation.saturating_add(1).to_string(),
-    );
+    mismatched
+        .source_refs
+        .insert("wait_generation".into(), u64::MAX.to_string());
     runtime
         .record_wait_reconciliation_signals(&mismatched)
         .await
@@ -4092,9 +5681,8 @@ async fn external_wake_records_wait_reconciliation_and_resolves_wait() {
             .storage()
             .active_wait_conditions_for_work_item("default", &work.id)
             .unwrap()
-            .iter()
-            .any(|condition| condition.id == wait_condition_id),
-        "mismatched canonical generation must not resolve the external wait"
+            .is_empty(),
+        "legacy generation must not veto an exact unified wait identity"
     );
 
     runtime
@@ -4109,23 +5697,17 @@ async fn external_wake_records_wait_reconciliation_and_resolves_wait() {
         .unwrap();
 
     let events = runtime.storage().read_recent_events(100).unwrap();
-    let signal = events
-        .iter()
-        .find(|event| {
-            event.kind == "wait_reconciliation_requested"
-                && event.data["wait_condition_id"] == wait_condition_id
-        })
-        .expect("external wake should request wait reconciliation");
-    assert_eq!(
-        signal.data["wake_source"].as_str(),
-        Some("external_ingress")
+    assert!(
+        events.iter().any(|event| {
+            event.kind == "wait_conditions_resolved"
+                && event.data["message_id"] == tick.id
+                && event.data["reason"] == "execution_admission"
+                && event.data["wait_condition_ids"]
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().any(|id| id == &wait_condition_id))
+        }),
+        "external wake admission should atomically resolve the exact wait"
     );
-    assert_eq!(signal.data["work_item_id"].as_str(), Some(work.id.as_str()));
-    assert_eq!(
-        signal.data["subject_ref"].as_str(),
-        Some(trigger_id.as_str())
-    );
-    assert_eq!(signal.data["waiting_for"].as_str(), Some("checks complete"));
 
     let active = runtime
         .storage()
@@ -4521,6 +6103,7 @@ async fn current_closure_reports_continuable_for_current_work_item() {
     );
     let active_id = active.id.clone();
     storage.append_work_item(&active).unwrap();
+    seed_runnable_work_execution(&storage, &active);
     let mut agent = AgentState::new("default");
     agent.current_work_item_id = Some(active_id.clone());
     storage.write_agent(&agent).unwrap();
@@ -4610,6 +6193,8 @@ async fn current_external_wait_does_not_suppress_queued_runnable_work_item() {
     let queued = WorkItemRecord::new("default", "queued follow-up work", WorkItemState::Open);
     let queued_id = queued.id.clone();
     storage.append_work_item(&queued).unwrap();
+    seed_waiting_work_execution(&storage, &current, "wait-current");
+    seed_runnable_work_execution(&storage, &queued);
     let now = Utc::now();
     storage
         .append_wait_condition(&WaitConditionRecord {
@@ -4631,6 +6216,8 @@ async fn current_external_wait_does_not_suppress_queued_runnable_work_item() {
             resolved_at: None,
             cancelled_at: None,
             turn_id: None,
+            trigger_message_id: None,
+            triggered_at: None,
         })
         .unwrap();
     let mut agent = AgentState::new("default");
@@ -4675,6 +6262,7 @@ async fn current_closure_reports_continuable_for_queued_work_item_without_active
     );
     let queued_id = queued.id.clone();
     storage.append_work_item(&queued).unwrap();
+    seed_runnable_work_execution(&storage, &queued);
 
     let runtime = RuntimeHandle::new(
         "default",
@@ -4929,6 +6517,7 @@ async fn wait_for_falls_back_to_current_focus_for_lifecycle_execution() {
             admission_provenance: None,
             source_message_id: "message-lifecycle".into(),
             turn_id: "turn-lifecycle".into(),
+            owner: None,
             work_item_id: None,
             claimed_work_revision: None,
         });
@@ -4995,6 +6584,7 @@ async fn wait_for_uses_lifecycle_owner_without_any_work_item_binding_or_focus() 
             admission_provenance: None,
             source_message_id: "message-lifecycle".into(),
             turn_id: "turn-lifecycle".into(),
+            owner: None,
             work_item_id: None,
             claimed_work_revision: None,
         });
@@ -5337,6 +6927,25 @@ async fn pick_blocked_work_item_with_clear_blocker_resumes_runnable_focus() {
         .active_wait_conditions_for_work_item("default", &work.id)
         .unwrap()
         .is_empty());
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("execution protocol remains initialized");
+    let execution_work = execution
+        .work_items
+        .get(&work.id)
+        .expect("clear blocker retains WorkItem execution state");
+    assert_eq!(
+        execution_work.source_revision,
+        picked.current_work_item.revision
+    );
+    assert!(matches!(
+        execution_work.state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Runnable { .. }
+    ));
 }
 
 #[tokio::test]
@@ -5437,13 +7046,16 @@ async fn pick_from_runnable_current_yields_and_complete_resumes_caller() {
         Some("yielded")
     );
 
-    let completed = runtime
+    let completing = runtime
         .complete_work_item_with_continuation(next.id.clone(), Vec::new())
         .await
         .unwrap();
-    let resumed = completed
+    assert_eq!(completing.work_item.state, WorkItemState::Completing);
+    assert!(completing.continuation_resumed.is_none());
+    let promotion = finalize_completion_with_report(&runtime, &next.id, "next completed").await;
+    let resumed = promotion
         .continuation_resumed
-        .expect("completion should resume direct caller");
+        .expect("completion finalization should resume direct caller");
     assert_eq!(resumed.suspended_work_item_id.as_str(), current.id.as_str());
     assert_eq!(resumed.active_work_item_id.as_str(), next.id.as_str());
     let state = runtime.agent_state().await.unwrap();
@@ -5534,6 +7146,7 @@ async fn work_item_continuation_stack_resumes_nested_callers() {
         .complete_work_item_with_continuation(review.id.clone(), Vec::new())
         .await
         .unwrap();
+    finalize_completion_with_report(&runtime, &review.id, "review completed").await;
     let state = runtime.agent_state().await.unwrap();
     assert_eq!(
         state.current_work_item_id.as_deref(),
@@ -5551,6 +7164,7 @@ async fn work_item_continuation_stack_resumes_nested_callers() {
         .complete_work_item_with_continuation(issue.id.clone(), Vec::new())
         .await
         .unwrap();
+    finalize_completion_with_report(&runtime, &issue.id, "issue completed").await;
     let state = runtime.agent_state().await.unwrap();
     assert_eq!(
         state.current_work_item_id.as_deref(),
@@ -5604,4 +7218,221 @@ async fn explicit_pick_of_yielded_work_item_resolves_frame_without_new_yield() {
     let frames = runtime.storage().latest_work_item_continuations().unwrap();
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0].state, WorkItemContinuationState::Resumed);
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        execution.work_items[&current.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Runnable { .. }
+    ));
+
+    runtime.pick_work_item(next.id.clone()).await.unwrap();
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        &execution.work_items[&current.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Paused { reason, .. }
+            if reason == &format!("yielded_to:{}", next.id)
+    ));
+}
+
+#[tokio::test]
+async fn explicit_pick_unwinds_nested_continuations_and_canonical_parents() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(StubProvider::new("done")),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+
+    let parent = runtime
+        .create_work_item("parent".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let child = runtime
+        .create_work_item("child".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let leaf = runtime
+        .create_work_item("leaf".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime.pick_work_item(parent.id.clone()).await.unwrap();
+    runtime.pick_work_item(child.id.clone()).await.unwrap();
+    runtime.pick_work_item(leaf.id.clone()).await.unwrap();
+
+    runtime.pick_work_item(parent.id.clone()).await.unwrap();
+
+    let active = runtime
+        .storage()
+        .latest_active_work_item_continuations_for_agent("default")
+        .unwrap();
+    assert!(active.is_empty());
+    let frames = runtime.storage().latest_work_item_continuations().unwrap();
+    assert_eq!(frames.len(), 2);
+    assert!(frames
+        .iter()
+        .any(|frame| frame.suspended_work_item_id == parent.id
+            && frame.state == WorkItemContinuationState::Resumed));
+    assert!(frames
+        .iter()
+        .any(|frame| frame.suspended_work_item_id == child.id
+            && frame.state == WorkItemContinuationState::Cancelled));
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        execution.work_items[&parent.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Runnable { .. }
+    ));
+    assert!(matches!(
+        execution.work_items[&child.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Runnable { .. }
+    ));
+}
+
+/// When `persist_state()` is called between completion preparation and the
+/// canonical terminal settlement commit, the baseline (`last_persisted_state`)
+/// may diverge from `expected_agent_state` (captured from `guard.state` at
+/// preparation time). The rebase must not bail — the committed values are
+/// applied unconditionally and the DB-level OCC check catches real conflicts.
+#[test]
+fn rebase_completion_accepts_diverged_baseline_after_concurrent_persist() {
+    let agent_id = "agent-rebase";
+    let work_item_id = "work-rebase";
+    let run_id = "run-rebase-1";
+    let turn_id = "turn-rebase-1";
+
+    // Expected state at completion preparation time: agent focused on the
+    // work item with an active execution binding.
+    let mut expected = AgentState::new(agent_id);
+    expected.current_run_id = Some(run_id.to_string());
+    expected.current_work_item_id = Some(work_item_id.to_string());
+    expected.current_turn_work_item_id = Some(work_item_id.to_string());
+    expected.current_execution_binding = Some(WorkItemExecutionBinding {
+        activation_id: None,
+        admission_provenance: None,
+        source_message_id: "msg-1".to_string(),
+        turn_id: turn_id.to_string(),
+        owner: None,
+        work_item_id: Some(work_item_id.to_string()),
+        claimed_work_revision: Some(1),
+    });
+    expected.status = AgentStatus::AwakeRunning;
+
+    // Committed state after completion: focus released, binding cleared.
+    let mut committed = expected.clone();
+    committed.current_run_id = None;
+    committed.current_work_item_id = None;
+    committed.current_turn_work_item_id = None;
+    committed.current_execution_binding = None;
+    committed.status = AgentStatus::AwakeIdle;
+
+    // Baseline after a concurrent persist_state(): the same focus/binding
+    // fields as expected (persist_state writes guard.state which wasn't
+    // modified in these fields), but pending_wake_hint is now set.
+    let mut baseline = expected.clone();
+    baseline.pending_wake_hint = Some(PendingWakeHint {
+        reason: "ci_callback".to_string(),
+        description: None,
+        source: None,
+        scope: None,
+        external_trigger_id: None,
+        resource: None,
+        body: None,
+        content_type: None,
+        correlation_id: None,
+        causation_id: None,
+        created_at: Utc::now(),
+    });
+
+    let record = WorkItemRecord::new(agent_id, "test", WorkItemState::Completed);
+    let brief = BriefRecord::new(
+        agent_id,
+        BriefKind::Result,
+        "done",
+        Some("msg-1".to_string()),
+        None,
+    );
+    let prepared = PreparedWorkItemCompletion {
+        record,
+        brief,
+        expected_execution_protocol_state: None,
+        legacy_work_item_execution: None,
+        expected_agent_state: expected,
+        committed_agent_state: committed.clone(),
+        wait_conditions: Vec::new(),
+        continuations: Vec::new(),
+        continuation_resumed: None,
+        audit_events: Vec::new(),
+        index_changes: Vec::new(),
+        tool_execution: None,
+        transcript_entries: Vec::new(),
+    };
+
+    let rebased = crate::runtime::rebase_prepared_completion_agent_state(&prepared, &baseline)
+        .expect("rebase must not bail on benign baseline divergence");
+
+    // The committed values must be applied on top of the baseline.
+    assert_eq!(rebased.status, AgentStatus::AwakeIdle);
+    assert!(rebased.current_run_id.is_none());
+    assert!(rebased.current_work_item_id.is_none());
+    assert!(rebased.current_turn_work_item_id.is_none());
+    assert!(rebased.current_execution_binding.is_none());
+    // The benign baseline change (pending_wake_hint) must be preserved.
+    assert!(rebased.pending_wake_hint.is_some());
+}
+
+/// A mismatched agent id must still be rejected.
+#[test]
+fn rebase_completion_rejects_mismatched_agent_id() {
+    let expected = AgentState::new("agent-a");
+    let committed = expected.clone();
+    let baseline = AgentState::new("agent-b");
+
+    let record = WorkItemRecord::new("agent-a", "test", WorkItemState::Completed);
+    let brief = BriefRecord::new(
+        "agent-a",
+        BriefKind::Result,
+        "done",
+        Some("msg-1".to_string()),
+        None,
+    );
+    let prepared = PreparedWorkItemCompletion {
+        record,
+        brief,
+        expected_execution_protocol_state: None,
+        legacy_work_item_execution: None,
+        expected_agent_state: expected,
+        committed_agent_state: committed,
+        wait_conditions: Vec::new(),
+        continuations: Vec::new(),
+        continuation_resumed: None,
+        audit_events: Vec::new(),
+        index_changes: Vec::new(),
+        tool_execution: None,
+        transcript_entries: Vec::new(),
+    };
+
+    let result = crate::runtime::rebase_prepared_completion_agent_state(&prepared, &baseline);
+    assert!(result.is_err(), "mismatched agent id must be rejected");
 }

@@ -234,8 +234,12 @@ type WorkItemDto = components["schemas"]["WorkItemRecord"];
 type WorkItemTransportDto = SlimWorkItemDto | WorkItemDto;
 
 type BriefRecordDto = RuntimeBriefRecord;
+type AgentRosterSnapshotGeneratedDto = components["schemas"]["AgentRosterSnapshot"];
 
 export type EventPageResponseDto = components["schemas"]["EventsPageResponse"];
+type MeasuredEventPageResponseDto = EventPageResponseDto & { responseBytes?: number };
+export type AgentProjectionSnapshotDto = components["schemas"]["AgentProjectionSnapshot"];
+export type AgentRosterSnapshotDto = AgentRosterSnapshotGeneratedDto;
 type GeneratedStreamEventEnvelopeDto = components["schemas"]["StreamEventEnvelope"];
 export type StreamEventEnvelopeDto = Partial<GeneratedStreamEventEnvelopeDto>;
 type EventEnvelopeDto = StreamEventEnvelopeDto;
@@ -313,6 +317,8 @@ interface ModelAvailabilityDto {
   display_name?: string;
   available?: boolean;
   unavailable_reason?: string;
+  failure_kind?: string;
+  failure_disposition?: "retryable" | "fail_fast";
   policy?: {
     supported_parameters?: string[];
     reasoning_effort_options?: string[];
@@ -476,6 +482,17 @@ interface RuntimeWebSearchProviderCapabilitiesDto {
 interface SearchResponseDto {
   query?: string;
   limit?: number;
+  index_status?: {
+    freshness?: string;
+    cursor?: number;
+    high_watermark?: number;
+    lag?: number;
+    last_indexed_at?: string | null;
+    indexing_needed?: boolean;
+    results_may_be_incomplete?: boolean;
+    consumption_was_limited?: boolean;
+    skipped_error_count?: number;
+  };
   results?: SearchResultItemDto[];
 }
 
@@ -664,7 +681,9 @@ export function createRuntimeClient(options: RuntimeClientOptions = {}) {
   const connectionMode = options.mode ?? (options.baseUrl ? "remote" : "local");
   const defaultBaseUrl = connectionMode === "local" ? DEFAULT_DEV_API_BASE : undefined;
   const baseUrl = normalizeBaseUrl(options.baseUrl ?? import.meta.env.VITE_HOLON_API_BASE ?? defaultBaseUrl);
-  const fetchImpl = options.fetchImpl ?? fetch;
+  const rawFetchImpl = options.fetchImpl ?? fetch;
+  const fetchImpl = ((input: RequestInfo | URL, init?: RequestInit) =>
+    rawFetchImpl(input, { ...init, credentials: "include" })) as typeof fetch;
   const requestHeaders = authorizationHeaders(options.token);
   const hasToken = Boolean(options.token?.trim());
 
@@ -721,11 +740,37 @@ export function createRuntimeClient(options: RuntimeClientOptions = {}) {
       const workItem = await fetchAgentWorkItem(baseUrl, fetchImpl, requestHeaders, agentId, workItemId);
       return projectWorkItem(workItem);
     },
-    async getAgentEvents(agentId: string, options: AgentEventPageOptions = {}): Promise<EventPageResponseDto> {
+    async getAgentEvents(
+      agentId: string,
+      options: AgentEventPageOptions = {},
+    ): Promise<MeasuredEventPageResponseDto> {
       if (!baseUrl) {
         return emptyEventPage();
       }
       return fetchAgentEvents(baseUrl, fetchImpl, requestHeaders, agentId, options);
+    },
+    async getAgentProjectionSnapshot(agentId: string): Promise<AgentProjectionSnapshotDto | null> {
+      if (!baseUrl) {
+        return null;
+      }
+      return getJson<AgentProjectionSnapshotDto>(
+        fetchImpl,
+        baseUrl,
+        `/agents/${encodeURIComponent(agentId)}/projection-snapshot`,
+        { headers: requestHeaders },
+      );
+    },
+    /** Authoritative roster snapshot owned by the embedded daemon contract. */
+    async getAgentRosterSnapshot(): Promise<AgentRosterSnapshotDto> {
+      if (!baseUrl) {
+        throw new Error("The authoritative roster snapshot requires a runtime connection.");
+      }
+      return getJson<AgentRosterSnapshotDto>(
+        fetchImpl,
+        baseUrl,
+        "/agents/snapshot",
+        { headers: requestHeaders },
+      );
     },
     async getAgentMessagesBatch(agentId: string, messageIds: string[]): Promise<AgentMessagesBatchGetResponseDto> {
       if (!baseUrl || !messageIds.length) {
@@ -795,6 +840,22 @@ export function createRuntimeClient(options: RuntimeClientOptions = {}) {
         return { source: "fixture", options: [] };
       }
       const response = await getJson<RuntimeModelsDto>(fetchImpl, baseUrl, "/models", { headers: requestHeaders });
+      return {
+        source: "http",
+        options: projectModelOptions(response),
+      };
+    },
+    async refreshModels(): Promise<RuntimeModelCatalog> {
+      if (!baseUrl) {
+        return { source: "fixture", options: [] };
+      }
+      const response = await postJson<RuntimeModelsDto>(
+        fetchImpl,
+        baseUrl,
+        "/models/refresh",
+        {},
+        requestHeaders,
+      );
       return {
         source: "http",
         options: projectModelOptions(response),
@@ -1267,7 +1328,7 @@ async function fetchAgentEvents(
   headers: Record<string, string>,
   agentId: string,
   options: AgentEventPageOptions,
-): Promise<EventPageResponseDto> {
+): Promise<MeasuredEventPageResponseDto> {
   const query = new URLSearchParams();
   if (options.beforeSeq != null) query.set("before_seq", String(options.beforeSeq));
   if (options.afterSeq != null) query.set("after_seq", String(options.afterSeq));
@@ -1276,12 +1337,43 @@ async function fetchAgentEvents(
   if (options.displayLevel) query.set("max_level", options.displayLevel);
   const queryString = query.toString();
   const path = `/agents/${encodeURIComponent(agentId)}/events${queryString ? `?${queryString}` : ""}`;
-  const response = await getJson<EventPageResponseDto>(fetchImpl, baseUrl, path, { headers });
+  const { value: response, responseBytes } = await getJsonWithResponseBytes<EventPageResponseDto>(
+    fetchImpl,
+    baseUrl,
+    path,
+    { headers },
+  );
   return {
     ...response,
+    responseBytes,
     events: response.events
       .map((event) => decodeStreamEventEnvelope(event))
       .filter((event): event is EventPageResponseDto["events"][number] => event != null),
+  };
+}
+
+async function getJsonWithResponseBytes<T>(
+  fetchImpl: typeof fetch,
+  baseUrl: string,
+  path: string,
+  options: { timeoutMs?: number; headers?: Record<string, string> } = {},
+): Promise<{ value: T; responseBytes: number }> {
+  const controller = new AbortController();
+  const timeout = globalThis.setTimeout(
+    () => controller.abort(),
+    options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+  );
+  const response = await fetchImpl(`${baseUrl}${path}`, {
+    headers: { Accept: "application/json", ...options.headers },
+    signal: controller.signal,
+  }).finally(() => globalThis.clearTimeout(timeout));
+  if (!response.ok) {
+    throw await httpRequestError("GET", path, response);
+  }
+  const body = await response.arrayBuffer();
+  return {
+    value: JSON.parse(new TextDecoder().decode(body)) as T,
+    responseBytes: body.byteLength,
   };
 }
 
@@ -1535,7 +1627,11 @@ async function fetchRuntimeBootstrap(
   connectionMode: "local" | "remote",
   hasToken: boolean,
 ): Promise<RuntimeBootstrap> {
-  await getJson<{ auth?: { mode?: string } }>(fetchImpl, baseUrl, "/handshake", { headers });
+  const handshake = await getJson<{
+    auth?: { mode?: string };
+    capabilities?: string[];
+  }>(fetchImpl, baseUrl, "/handshake", { headers });
+  assertObserverSyncCapabilities(handshake.capabilities ?? []);
   const agentEntries = await getJson<AgentListEntryDto[]>(fetchImpl, baseUrl, "/agents/list", { headers });
 
   const agents = agentEntries.map((entry) => projectAgent(entry));
@@ -1552,6 +1648,7 @@ async function fetchRuntimeBootstrap(
 
   return {
     attentionCount,
+    capabilities: handshake.capabilities ?? [],
     connection,
     metrics: buildMetrics(agents.length, attentionCount, activeTaskCount, currentWorkCount),
     agents,
@@ -1910,9 +2007,21 @@ function projectRuntimeConfigSurface(surface: RuntimeConfigSurfaceDto): RuntimeC
 }
 
 function projectSearchResponse(response: SearchResponseDto): SearchResponse {
+  const indexStatus = response.index_status;
   return {
     query: response.query ?? "",
     limit: response.limit ?? 0,
+    indexStatus: {
+      freshness: indexStatus?.freshness ?? "fresh",
+      cursor: indexStatus?.cursor ?? 0,
+      highWatermark: indexStatus?.high_watermark ?? 0,
+      lag: indexStatus?.lag ?? 0,
+      lastIndexedAt: indexStatus?.last_indexed_at ?? undefined,
+      indexingNeeded: indexStatus?.indexing_needed ?? false,
+      resultsMayBeIncomplete: indexStatus?.results_may_be_incomplete ?? false,
+      consumptionWasLimited: indexStatus?.consumption_was_limited ?? false,
+      skippedErrorCount: indexStatus?.skipped_error_count ?? 0,
+    },
     results: (response.results ?? []).map((result) => ({
       resultType: result.result_type ?? result.type ?? "message",
       agentId: result.agent_id ?? "unknown-agent",
@@ -2011,6 +2120,75 @@ function projectAgent(entry: AgentListEntryDto, state?: AgentStateDto, brief?: B
   };
 }
 
+/** Handshake capability name for the authoritative roster snapshot. */
+export const ROSTER_SNAPSHOT_CAPABILITY = "agents.roster-snapshot.v1";
+export const PROJECTION_SNAPSHOT_CAPABILITY = "agents.projection-snapshot.v1";
+export const PROJECTION_EFFECT_CAPABILITY = "events.projection-effect.v1";
+export const ATOMIC_BRIEF_CREATED_EVENT_CAPABILITY = "briefs.atomic-created-event.v1";
+
+export const REQUIRED_OBSERVER_SYNC_CAPABILITIES = [
+  ROSTER_SNAPSHOT_CAPABILITY,
+  PROJECTION_SNAPSHOT_CAPABILITY,
+  PROJECTION_EFFECT_CAPABILITY,
+  ATOMIC_BRIEF_CREATED_EVENT_CAPABILITY,
+] as const;
+
+export function assertObserverSyncCapabilities(capabilities: readonly string[]): void {
+  const advertised = new Set(capabilities);
+  const missing = REQUIRED_OBSERVER_SYNC_CAPABILITIES.filter(
+    (capability) => !advertised.has(capability),
+  );
+  if (missing.length) {
+    throw new Error(
+      `This Web GUI requires the embedded daemon observer-sync contract; missing capabilities: ${missing.join(", ")}`,
+    );
+  }
+}
+
+/** One authoritative roster entry narrowed to the local list-entry shape. */
+export interface RosterAgentEntry {
+  agentId: string;
+  entry: AgentListEntryDto;
+  latestBriefPreview?: string;
+  eventWindow: {
+    eventHeadSeq: number;
+    oldestRetainedSeq: number;
+  };
+}
+
+/** Narrow generated roster DTOs once, at the client boundary. */
+export function rosterAgentEntries(snapshot: AgentRosterSnapshotDto): RosterAgentEntry[] {
+  return snapshot.agents.flatMap((generated) => {
+    const entry = generated.agent as AgentListEntryDto | undefined;
+    const agentId = entry?.identity?.agent_id;
+    if (!agentId) return [];
+    return [{
+      agentId,
+      entry,
+      latestBriefPreview: generated.latest_brief?.preview || undefined,
+      eventWindow: {
+        eventHeadSeq: generated.event_window.event_head_seq,
+        oldestRetainedSeq: generated.event_window.oldest_retained_seq,
+      },
+    }];
+  });
+}
+
+/**
+ * Project authoritative roster entries to dashboard agent summaries. The
+ * roster entry carries the same list-entry shape as /agents/list plus a
+ * latest-Brief preview used for the roster line.
+ */
+export function projectRosterAgents(snapshot: AgentRosterSnapshotDto): AgentSummary[] {
+  return rosterAgentEntries(snapshot).flatMap(({ entry, latestBriefPreview }) => {
+    const projected = projectAgent(entry);
+    return [{
+      ...projected,
+      lastBrief: latestBriefPreview || projected.lastBrief,
+    }];
+  });
+}
+
 function projectWorkspaceFromInfo(ws: AgentStateDto["workspace"]["workspaces"][number]): WorkspaceSummary {
   const anchor = ws.workspace_anchor ?? ws.execution_root ?? ws.cwd ?? "—";
   const name = ws.workspace_alias ?? basename(anchor) ?? ws.workspace_id ?? "not bound";
@@ -2102,33 +2280,46 @@ function sortableTime(value: string | undefined): number {
 }
 
 export function projectModelOptions(response: RuntimeModelsDto): RuntimeModelOption[] {
-  if (response.model_availability?.length) {
-    return response.model_availability
-      .filter((entry): entry is ModelAvailabilityDto & { model: string } => Boolean(entry.model))
-      .map((entry) => {
-        const provider = entry.provider ?? entry.model.split("/")[0] ?? "unknown";
-        const providerFamily = entry.provider_family ?? provider;
-        const endpoint = entry.endpoint ?? "default";
-        return {
-          model: entry.model,
-          routeRef: modelRouteRef(entry.model, providerFamily, endpoint),
-          provider,
-          providerFamily,
-          endpoint,
-          routeProvider: entry.route_provider ?? provider,
-          displayName: entry.display_name ?? entry.model,
-          available: entry.available ?? false,
-          unavailableReason: entry.unavailable_reason,
-          supportsImageInput: entry.policy?.capabilities?.image_input ?? false,
-          supportsImageGeneration: entry.policy?.capabilities?.image_generation ?? false,
-          supportsReasoningEffort: supportsReasoningEffort(entry),
-          reasoningEffortOptions: reasoningEffortOptions(entry),
-        };
-      })
-      .sort(compareModelOptions);
+  const optionsByRoute = new Map<string, RuntimeModelOption>();
+  for (const option of projectAvailableModels(response.available_models ?? [])) {
+    optionsByRoute.set(option.routeRef, option);
   }
 
-  return (response.available_models ?? [])
+  for (const entry of response.model_availability ?? []) {
+    if (!entry.model) continue;
+    const provider = entry.provider ?? entry.model.split("/")[0] ?? "unknown";
+    const providerFamily = entry.provider_family ?? provider;
+    const endpoint = entry.endpoint ?? "default";
+    const routeRef = modelRouteRef(entry.model, providerFamily, endpoint);
+    const existing = optionsByRoute.get(routeRef);
+    const retryableFailure = entry.available === false && entry.failure_disposition === "retryable";
+    optionsByRoute.set(routeRef, {
+      model: entry.model,
+      routeRef,
+      provider,
+      providerFamily,
+      endpoint,
+      routeProvider: entry.route_provider ?? provider,
+      displayName: entry.display_name ?? existing?.displayName ?? entry.model,
+      available: retryableFailure ? true : (entry.available ?? existing?.available ?? false),
+      unavailableReason: retryableFailure ? undefined : entry.unavailable_reason,
+      availabilityWarning: retryableFailure ? (entry.unavailable_reason ?? entry.failure_kind) : undefined,
+      supportsImageInput: entry.policy?.capabilities?.image_input ?? existing?.supportsImageInput ?? false,
+      supportsImageGeneration: entry.policy?.capabilities?.image_generation ?? existing?.supportsImageGeneration ?? false,
+      supportsReasoningEffort: supportsReasoningEffort(entry) || (existing?.supportsReasoningEffort ?? false),
+      reasoningEffortOptions: reasoningEffortOptions(entry).length
+        ? reasoningEffortOptions(entry)
+        : (existing?.reasoningEffortOptions ?? []),
+    });
+  }
+
+  return [...optionsByRoute.values()].sort(compareModelOptions);
+}
+
+function projectAvailableModels(
+  entries: Array<string | RuntimeAvailableModelDto>,
+): RuntimeModelOption[] {
+  return entries
     .map((entry) => {
       const model = typeof entry === "string" ? entry : entry.model;
       if (!model) return undefined;
@@ -2150,8 +2341,7 @@ export function projectModelOptions(response: RuntimeModelsDto): RuntimeModelOpt
         reasoningEffortOptions: typeof entry === "string" ? [] : reasoningEffortOptions(entry),
       };
     })
-    .filter((entry): entry is RuntimeModelOption => Boolean(entry))
-    .sort(compareModelOptions);
+    .filter((entry): entry is RuntimeModelOption => Boolean(entry));
 }
 
 function modelRouteRef(model: string, providerFamily: string, endpoint: string): string {
@@ -2292,38 +2482,119 @@ function stringValue(value: unknown): string | undefined {
 class RuntimeHttpError extends Error {
   readonly status: number;
   readonly code?: string;
+  /**
+   * Known rich cursor extensions from `cursor_not_found` bodies (S2): the
+   * recovery layer uses them to distinguish a retained-prefix gap from an
+   * epoch change.
+   */
+  readonly cursorExtensions?: {
+    afterSeq?: number;
+    eventLogEpoch?: string;
+    oldestRetainedSeq?: number | null;
+    eventHeadSeq?: number;
+  };
 
-  constructor(method: string, path: string, status: number, reason?: string, code?: string) {
+  constructor(
+    method: string,
+    path: string,
+    status: number,
+    reason?: string,
+    code?: string,
+    cursorExtensions?: RuntimeHttpError["cursorExtensions"],
+  ) {
     super(reason ? `${method} ${path} failed with ${status}: ${reason}` : `${method} ${path} failed with ${status}`);
     this.name = "RuntimeHttpError";
     this.status = status;
     this.code = code;
+    this.cursorExtensions = cursorExtensions;
   }
 }
 
 async function httpRequestError(method: string, path: string, response: Response): Promise<RuntimeHttpError> {
   const envelope = await readErrorEnvelope(response);
-  return new RuntimeHttpError(method, path, response.status, envelope?.error, envelope?.code);
+  return new RuntimeHttpError(
+    method,
+    path,
+    response.status,
+    envelope?.error,
+    envelope?.code,
+    envelope?.extensions,
+  );
 }
 
-async function readErrorEnvelope(response: Response): Promise<{ error?: string; code?: string } | undefined> {
+async function readErrorEnvelope(
+  response: Response,
+): Promise<
+  | { error?: string; code?: string; extensions?: RuntimeHttpError["cursorExtensions"] }
+  | undefined
+> {
   const contentType = response.headers.get("content-type") ?? "";
   if (!contentType.includes("application/json")) return undefined;
   try {
     const value = await response.json();
     const record = asRecord(value);
-    return record ? { error: stringValue(record.error), code: stringValue(record.code) } : undefined;
+    if (!record) return undefined;
+    const numberValue = (input: unknown): number | undefined =>
+      typeof input === "number" && Number.isFinite(input) ? input : undefined;
+    const extensions: RuntimeHttpError["cursorExtensions"] = {
+      afterSeq: numberValue(record.after_seq),
+      eventLogEpoch: stringValue(record.event_log_epoch),
+      oldestRetainedSeq:
+        record.oldest_retained_seq == null ? null : numberValue(record.oldest_retained_seq),
+      eventHeadSeq: numberValue(record.event_head_seq),
+    };
+    const hasExtensions = Object.values(extensions).some((entry) => entry !== undefined);
+    return {
+      error: stringValue(record.error),
+      code: stringValue(record.code),
+      extensions: hasExtensions ? extensions : undefined,
+    };
   } catch {
     return undefined;
   }
 }
 
-function isAuthRequiredError(error: unknown): boolean {
+/** True when the remote rejected the request's authorization. */
+export function isAuthRequiredError(error: unknown): boolean {
   return error instanceof RuntimeHttpError && error.code === "auth_required";
 }
 
 export function isProjectionBusyError(error: unknown): boolean {
   return error instanceof RuntimeHttpError && error.status === 429 && error.code === "projection_busy";
+}
+
+/** True when the snapshot target agent is unknown or not a member. */
+export function isSnapshotAgentMissingError(error: unknown): boolean {
+  return error instanceof RuntimeHttpError && error.status === 404;
+}
+
+/** Extract a rich cursor_not_found payload, when the error carries one. */
+export function cursorNotFoundPayload(
+  error: unknown,
+):
+  | {
+      afterSeq: number;
+      eventLogEpoch: string;
+      oldestRetainedSeq: number;
+      eventHeadSeq: number;
+    }
+  | undefined {
+  if (!(error instanceof RuntimeHttpError) || error.code !== "cursor_not_found") return undefined;
+  const extensions = error.cursorExtensions;
+  if (
+    !extensions ||
+    extensions.afterSeq == null ||
+    !extensions.eventLogEpoch ||
+    extensions.eventHeadSeq == null
+  ) {
+    return undefined;
+  }
+  return {
+    afterSeq: extensions.afterSeq,
+    eventLogEpoch: extensions.eventLogEpoch,
+    oldestRetainedSeq: extensions.oldestRetainedSeq ?? 0,
+    eventHeadSeq: extensions.eventHeadSeq,
+  };
 }
 
 function buildDisconnectedBootstrap(

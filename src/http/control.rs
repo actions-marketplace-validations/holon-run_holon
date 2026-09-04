@@ -311,7 +311,14 @@ fn validate_runtime_config_candidate(
 fn is_runtime_mutable_config_key(key: &str) -> bool {
     matches!(
         key,
-        "api.cors.enabled"
+        "auth.mode"
+            | "auth.oidc.issuer_url"
+            | "auth.oidc.client_id"
+            | "auth.oidc.client_secret_env"
+            | "auth.oidc.redirect_uri"
+            | "auth.session.absolute_ttl_seconds"
+            | "auth.session.idle_ttl_seconds"
+            | "api.cors.enabled"
             | "api.cors.allowed_origins"
             | "api.cors.allowed_methods"
             | "api.cors.allowed_headers"
@@ -1299,9 +1306,17 @@ pub async fn operator_ingress(
         .map_err(error_response)?;
 
     let reply_route_id = request.reply_route_id.and_then(non_empty_opt);
+    let conversation_ref = request.conversation_ref.and_then(non_empty_opt);
+    let interaction_id = crate::ids::interaction_id(&[
+        &agent_id,
+        "remote_operator_transport",
+        &binding.binding_id,
+        conversation_ref.as_deref().unwrap_or("default"),
+    ]);
     let metadata = json!({
         "operator_transport": {
             "binding_id": binding.binding_id,
+            "conversation_ref": conversation_ref,
             "transport": binding.transport,
             "reply_route_id": reply_route_id,
             "provider": request.provider.and_then(non_empty_opt).unwrap_or(expected_provider),
@@ -1328,6 +1343,10 @@ pub async fn operator_ingress(
         causation_id: request.causation_id,
     }
     .into_message();
+    let mut message = message;
+    message
+        .source_refs
+        .insert("interaction_id".into(), interaction_id);
     let queued = runtime.enqueue(message).await.map_err(error_response)?;
     Ok(Json(EnqueueResponse {
         ok: true,
@@ -1352,12 +1371,37 @@ pub async fn control_debug_prompt(
         .host
         .public_agent_boundary_metadata(&agent_id)
         .map_err(agent_access_error)?;
-    let dump = state
+    let prompt = state
         .host
-        .preview_public_agent_prompt(&agent_id, request.text.clone(), effective_trust.clone())
+        .preview_public_agent_prompt(
+            &agent_id,
+            request.text.clone(),
+            effective_trust.clone(),
+            request.budget,
+        )
         .await
-        .map_err(agent_access_error)?
-        .render_dump();
+        .map_err(agent_access_error)?;
+    let manifest_requested = request.manifest.unwrap_or(false);
+    let manifest_json = if manifest_requested {
+        Some(
+            prompt
+                .projection_manifest()
+                .canonical_json()
+                .map_err(|err| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": err.to_string()})),
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let dump = if manifest_requested {
+        None
+    } else {
+        Some(prompt.render_dump())
+    };
     Ok(Json(json!({
         "ok": true,
         "agent_id": agent_id,
@@ -1365,6 +1409,7 @@ pub async fn control_debug_prompt(
         "effective_trust": effective_trust,
         "boundary": boundary,
         "dump": dump,
+        "manifest": manifest_json,
     })))
 }
 

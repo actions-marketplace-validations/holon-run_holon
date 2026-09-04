@@ -37,6 +37,7 @@ import type {
   DisplayLevel,
   RuntimeMessageEnvelope,
   RuntimeBriefRecord,
+  RuntimeCitation,
   RuntimeTranscriptEntry,
 } from "./types";
 import { canApplySessionEvent, type SessionEventEnvelope } from "./session-events";
@@ -83,6 +84,7 @@ interface SessionItemDraft {
   meta: string;
   minDisplayLevel: DisplayLevel;
   sourceIds: string[];
+  citations?: RuntimeCitation[];
   detail?: AgentTimelineItemDetail;
   executionMeta?: TimelineExecutionMeta;
   statusTrail?: TimelineStatusStep[];
@@ -389,7 +391,7 @@ export function projectRuntimeEvent(
   messagesById?: Record<string, RuntimeMessageEnvelope>,
   transcriptEntriesById?: Record<string, RuntimeTranscriptEntry>,
   briefRecordsById?: Record<string, RuntimeBriefRecord>,
-): (Pick<SessionItemDraft, "kind" | "label" | "body" | "minDisplayLevel" | "detail" | "executionMeta" | "statusTrail"> & { timestamp?: string }) | undefined {
+): (Pick<SessionItemDraft, "kind" | "label" | "body" | "citations" | "minDisplayLevel" | "detail" | "executionMeta" | "statusTrail"> & { timestamp?: string }) | undefined {
   if (eventType === "message_enqueued") {
     const message = messageEnvelopeProjection(payload, messagesById);
     if (message?.origin === "operator") {
@@ -410,12 +412,14 @@ export function projectRuntimeEvent(
   }
 
   if (eventType === "brief_created") {
+    const brief = briefForPayload(payload, briefRecordsById);
     return {
       kind: "assistant",
       label: stringField(payload, "kind") === "result" ? "Result" : "Brief Created",
       body:
-        briefTextForPayload(payload, briefRecordsById) ||
+        brief?.text?.trim() ||
         readableTextWithoutSummary(payload),
+      citations: normalizeCitations(brief?.citations),
       timestamp: stringField(payload, "created_at"),
       minDisplayLevel: runtimeEventDisplayLevel(eventType),
     };
@@ -525,16 +529,17 @@ function runtimeEventDisplayLevel(eventType: string): DisplayLevel {
 function projectAssistantRoundRecorded(
   payload: Record<string, unknown> | undefined,
   transcriptEntriesById?: Record<string, RuntimeTranscriptEntry>,
-): Pick<SessionItemDraft, "kind" | "label" | "body" | "minDisplayLevel" | "detail"> | undefined {
+): Pick<SessionItemDraft, "kind" | "label" | "body" | "citations" | "minDisplayLevel" | "detail"> | undefined {
   if (stringField(payload, "round_purpose") === "runtime_checkpoint") {
     return undefined;
   }
-  const transcriptText = transcriptTextForPayload(payload, transcriptEntriesById);
-  if (transcriptText) {
+  const transcript = transcriptContentForPayload(payload, transcriptEntriesById);
+  if (transcript.text) {
     return {
       kind: "assistant",
       label: "Assistant round",
-      body: transcriptText,
+      body: transcript.text,
+      citations: transcript.citations,
       minDisplayLevel: "verbose",
     };
   }
@@ -662,11 +667,16 @@ function projectKnownToolExecution(
   if (toolName === "ListModelProviders") return projectListModelProvidersTool(payload);
   if (toolName === "ListProviderModels") return projectListProviderModelsTool(payload);
   if (toolName === "WaitFor") return projectWaitForTool(payload);
+  if (isTimerTool(toolName)) return projectTimerTool(toolName, payload);
   return undefined;
 }
 
 function isWorkItemMutationTool(toolName: string): boolean {
   return toolName === "CreateWorkItem" || toolName === "UpdateWorkItem" || toolName === "PickWorkItem" || toolName === "CompleteWorkItem";
+}
+
+function isTimerTool(toolName: string): boolean {
+  return toolName === "CreateTimer" || toolName === "ListTimers" || toolName === "GetTimer" || toolName === "CancelTimer";
 }
 
 /**
@@ -731,7 +741,8 @@ function isReadControlTool(toolName: string): boolean {
     toolName === "MemoryGet" ||
     toolName === "AgentGet" ||
     toolName === "ListModelProviders" ||
-    toolName === "ListProviderModels"
+    toolName === "ListProviderModels" ||
+    isTimerTool(toolName)
   );
 }
 
@@ -1305,6 +1316,101 @@ function projectWaitForTool(payload: Record<string, unknown> | undefined): Pick<
   return { body, detail: undefined };
 }
 
+function projectTimerTool(
+  toolName: string,
+  payload: Record<string, unknown> | undefined,
+): Pick<SessionItemDraft, "body" | "detail"> {
+  const result = unwrapToolResult(payload);
+  const input = asRecord(payload?.input);
+  if (toolName === "ListTimers") {
+    const timers = arrayField(result, "timers");
+    const returned = numberField(result, "returned") ?? timers?.length;
+    const summaries = summarizeTimerRecords(timers);
+    const active = (timers ?? []).filter((timer) => stringField(asRecord(timer), "status") === "active").length;
+    return {
+      body: compactJoin([
+        returned == null ? "Listed timers" : `${returned} timer${returned === 1 ? "" : "s"}`,
+        timers?.length ? `${active} active` : undefined,
+        summaries.length ? summaries.slice(0, 3).join("; ") : undefined,
+      ]),
+      detail: summaries.length
+        ? { label: "Timers", text: summaries.join("\n"), tone: "data" }
+        : undefined,
+    };
+  }
+
+  const timer = firstStringField(result, ["id", "timer_id"]) ? result : undefined;
+  const timerId = firstStringField(timer, ["id", "timer_id"])
+    ?? firstStringField(input, ["timer_id"])
+    ?? stringField(payload, "timer_id");
+  const summary = stringField(timer, "summary") ?? stringField(input, "summary");
+  const status = stringField(timer, "status");
+  const durationMs = numberField(timer, "duration_ms") ?? numberField(input, "duration_ms");
+  const intervalMs = numberField(timer, "interval_ms") ?? numberField(input, "interval_ms");
+  const schedule = timerSchedule(durationMs, intervalMs);
+  const fireCount = numberField(timer, "fire_count");
+  const verb = toolName === "CreateTimer"
+    ? intervalMs != null ? "Created repeating timer" : "Created timer"
+    : toolName === "CancelTimer"
+      ? "Cancelled timer"
+      : "Timer";
+  const body = compactJoin([
+    verb,
+    summary,
+    toolName === "GetTimer" ? status : undefined,
+    toolName !== "CancelTimer" ? schedule : undefined,
+    fireCount ? `fired ${fireCount} ${fireCount === 1 ? "time" : "times"}` : undefined,
+    timerId,
+  ]);
+  const detailText = timer ? summarizeTimerRecord(timer) : undefined;
+  return {
+    body,
+    detail: detailText ? { label: "Timer", text: detailText, tone: "data" } : undefined,
+  };
+}
+
+function summarizeTimerRecords(timers: unknown[] | undefined): string[] {
+  return (timers ?? [])
+    .map(asRecord)
+    .filter((timer): timer is Record<string, unknown> => Boolean(timer))
+    .map(summarizeTimerRecord)
+    .filter(Boolean);
+}
+
+function summarizeTimerRecord(timer: Record<string, unknown>): string {
+  const durationMs = numberField(timer, "duration_ms");
+  const intervalMs = numberField(timer, "interval_ms");
+  const fireCount = numberField(timer, "fire_count");
+  return compactJoin([
+    stringField(timer, "summary"),
+    stringField(timer, "status"),
+    timerSchedule(durationMs, intervalMs),
+    fireCount ? `fired ${fireCount} ${fireCount === 1 ? "time" : "times"}` : undefined,
+    firstStringField(timer, ["id", "timer_id"]),
+  ]);
+}
+
+function timerSchedule(durationMs: number | undefined, intervalMs: number | undefined): string | undefined {
+  if (intervalMs != null) return `every ${formatTimerDuration(intervalMs)}`;
+  if (durationMs != null) return `in ${formatTimerDuration(durationMs)}`;
+  return undefined;
+}
+
+function formatTimerDuration(milliseconds: number): string {
+  if (milliseconds < 1000) return `${milliseconds}ms`;
+  const seconds = milliseconds / 1000;
+  if (seconds < 60) return `${formatTimerDurationValue(seconds)}s`;
+  const minutes = seconds / 60;
+  if (minutes < 60) return `${formatTimerDurationValue(minutes)}m`;
+  const hours = minutes / 60;
+  if (hours < 24) return `${formatTimerDurationValue(hours)}h`;
+  return `${formatTimerDurationValue(hours / 24)}d`;
+}
+
+function formatTimerDurationValue(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
 function summarizeWorkItemRecords(items: unknown[] | undefined): string[] {
   return (items ?? [])
     .map(asRecord)
@@ -1502,7 +1608,11 @@ function toolFriendlyLabel(toolName: string, failed: boolean): string {
   if (toolName === "AgentGet") return failed ? "Agent inspection failed" : "Inspected agent";
   if (toolName === "ListModelProviders") return failed ? "Provider list failed" : "Listed model providers";
   if (toolName === "ListProviderModels") return failed ? "Model list failed" : "Listed provider models";
-  return failed ? "Tool failed" : "Tool finished";
+  if (toolName === "CreateTimer") return failed ? "Timer creation failed" : "Created timer";
+  if (toolName === "ListTimers") return failed ? "Timer list failed" : "Listed timers";
+  if (toolName === "GetTimer") return failed ? "Timer lookup failed" : "Timer";
+  if (toolName === "CancelTimer") return failed ? "Timer cancellation failed" : "Cancelled timer";
+  return failed ? `${toolName} failed` : toolName;
 }
 
 function formatDuration(milliseconds: number): string {
@@ -1684,22 +1794,21 @@ function hydratedMessageForPayload(
   return messageId ? messagesById?.[messageId] : undefined;
 }
 
-function transcriptTextForPayload(
+function transcriptContentForPayload(
   payload: Record<string, unknown> | undefined,
   transcriptEntriesById: Record<string, RuntimeTranscriptEntry> | undefined,
-): string | undefined {
+): { text?: string; citations?: RuntimeCitation[] } {
   const entryId = transcriptEntryIdForPayload(payload);
   const entry = entryId ? transcriptEntriesById?.[entryId] : undefined;
-  return transcriptEntryText(entry);
+  return transcriptEntryContent(entry);
 }
 
-function briefTextForPayload(
+function briefForPayload(
   payload: Record<string, unknown> | undefined,
   briefRecordsById: Record<string, RuntimeBriefRecord> | undefined,
-): string | undefined {
+): RuntimeBriefRecord | undefined {
   const briefId = briefIdForPayload(payload);
-  const text = briefId ? briefRecordsById?.[briefId]?.text : undefined;
-  return text && text.trim() ? text : undefined;
+  return briefId ? briefRecordsById?.[briefId] : undefined;
 }
 
 export function briefIdForPayload(payload: Record<string, unknown> | undefined): string | undefined {
@@ -1713,17 +1822,40 @@ export function transcriptEntryIdForPayload(payload: Record<string, unknown> | u
   return stringField(contentSource, "entry_id");
 }
 
-function transcriptEntryText(entry: RuntimeTranscriptEntry | undefined): string | undefined {
+function transcriptEntryContent(entry: RuntimeTranscriptEntry | undefined): {
+  text?: string;
+  citations?: RuntimeCitation[];
+} {
   const data = asRecord(entry?.data);
   const text = stringField(data, "text");
-  if (text) return text;
+  if (text) return { text };
   const blocks = Array.isArray(data?.blocks) ? data.blocks : [];
   const parts = blocks.flatMap((block) => {
     const record = asRecord(block);
     if (stringField(record, "type") !== "text") return [];
     return stringField(record, "text") ?? stringField(record, "content") ?? [];
   });
-  return compactJoin(parts);
+  const citations = blocks.flatMap((block) => {
+    const record = asRecord(block);
+    return stringField(record, "type") === "citations"
+      ? normalizeCitations(record?.citations) ?? []
+      : [];
+  });
+  return { text: compactJoin(parts), citations: normalizeCitations(citations) };
+}
+
+function normalizeCitations(value: unknown): RuntimeCitation[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const seen = new Set<string>();
+  const citations = value.flatMap((candidate) => {
+    const record = asRecord(candidate);
+    const url = stringField(record, "url")?.trim();
+    if (!url || seen.has(url)) return [];
+    seen.add(url);
+    const title = stringField(record, "title")?.trim();
+    return [{ url, title: title || undefined }];
+  });
+  return citations.length > 0 ? citations : undefined;
 }
 
 function messageBodyText(body: Record<string, unknown> | undefined): string {

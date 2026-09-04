@@ -2,10 +2,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{
-    built_in_provider_endpoint_identity, ModelRef, ModelRouteRef, ProviderEndpointId, ProviderId,
-};
+#[cfg(test)]
+use crate::config::built_in_provider_endpoint_identity;
+use crate::config::{ModelRef, ModelRouteRef, ProviderEndpointId, ProviderId};
 use crate::context::ContextConfig;
+#[cfg(test)]
 use crate::provider::provider_definitions;
 
 const DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT: u8 = 95;
@@ -21,6 +22,10 @@ pub enum ModelMetadataSource {
     ConservativeBuiltin,
     ConfigOverride,
     RemoteDiscovered,
+    /// Checked-in `models.dev/supplemental_catalog.json` entry, drafted by
+    /// `holon models-dev refresh` for already-supported providers and
+    /// admitted through PR review.
+    ModelsDevSupplement,
     UnknownFallback,
 }
 
@@ -203,7 +208,8 @@ impl ModelCapabilityOverride {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct BuiltInModelRoutePolicy {
     display_name: Option<String>,
     description: Option<String>,
@@ -219,6 +225,7 @@ pub struct BuiltInModelRoutePolicy {
 }
 
 impl BuiltInModelRoutePolicy {
+    #[cfg(test)]
     fn from_legacy_route_entry(
         route_entry: &BuiltInModelMetadata,
         model_entry: &BuiltInModelMetadata,
@@ -329,6 +336,7 @@ impl BuiltInModelRoutePolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 struct BuiltInModelRouteDefinition {
     legacy_provider: ProviderId,
     model_ref: ModelRef,
@@ -563,9 +571,15 @@ pub struct BuiltInModelCatalog {
 
 impl BuiltInModelCatalog {
     pub fn new() -> Self {
+        snapshot::built_in_catalog()
+            .unwrap_or_else(|error| panic!("invalid built-in model registry snapshot: {error}"))
+    }
+
+    #[cfg(test)]
+    fn from_legacy_definitions() -> Self {
+        let mut route_entries = HashMap::new();
         let mut entries = HashMap::new();
         let mut preferred_models = HashMap::new();
-        let mut route_entries = HashMap::new();
         let mut preferred_routes = HashMap::new();
         let mut preferred_routes_by_model = HashMap::new();
         let mut aliases = Self::legacy_aliases();
@@ -683,6 +697,7 @@ impl BuiltInModelCatalog {
     }
 
     /// Legacy model ref → canonical model ref aliases for backward compatibility.
+    #[cfg(test)]
     fn legacy_aliases() -> HashMap<ModelRef, ModelRef> {
         let mut aliases = HashMap::new();
         aliases.insert(
@@ -1521,6 +1536,14 @@ impl BuiltInModelCatalog {
     }
 }
 
+/// The compiled-in built-in catalog without the models.dev supplemental
+/// entries. This is the drafting baseline for
+/// `models_dev::supplement::generate` and the collision-check base for
+/// `holon models-dev validate`.
+pub fn legacy_builtin_catalog() -> Result<BuiltInModelCatalog, String> {
+    snapshot::legacy_catalog()
+}
+
 impl Default for BuiltInModelCatalog {
     fn default() -> Self {
         Self::new()
@@ -1549,6 +1572,7 @@ fn select_field<T, const N: usize>(
     None
 }
 
+#[cfg(test)]
 fn field_diff<T: PartialEq>(route: T, model: T) -> Option<T> {
     (route != model).then_some(route)
 }
@@ -1610,6 +1634,7 @@ fn percent_of(total: usize, percent: usize) -> usize {
     total.saturating_mul(percent) / 100
 }
 
+#[cfg(test)]
 fn provider_id(provider: &str) -> ProviderId {
     ProviderId::parse(provider).expect("valid built-in provider id")
 }
@@ -1629,6 +1654,10 @@ fn reasoning_effort_options(
         }
         ("openai-codex", "gpt-5.6-luna") => &["low", "medium", "high", "xhigh", "max"][..],
         ("openai", _) | ("openai-codex", _) => &["low", "medium", "high", "xhigh"][..],
+        ("deepseek", _) if endpoint.is_some_and(|endpoint| endpoint.as_str() == "responses") => {
+            &["none", "minimal", "low", "medium", "high", "xhigh", "max"][..]
+        }
+        ("deepseek", _) => &["low", "high", "max"][..],
         ("xai", "grok-4.3") => &["none", "low", "medium", "high"][..],
         ("xai", "grok-4.5") => &["low", "medium", "high"][..],
         ("stepfun", "step-3.7-flash") => &["low", "medium", "high"][..],
@@ -1645,6 +1674,8 @@ fn reasoning_effort_options(
             &["low", "medium", "high"][..]
         }
         ("zai" | "bigmodel", "glm-5.2") => &["high", "max"][..],
+        ("dashscope", "qwen3.8-flash") => &["low", "medium", "xhigh"][..],
+        ("zai" | "bigmodel", "glm-5.3" | "glm-5.3-flash") => &["low", "high", "max"][..],
         ("moonshot", "kimi-k3") => &["low", "high", "max"][..],
         ("xiaomi", "mimo-v2.5-pro" | "mimo-v2.5")
             if endpoint
@@ -1664,12 +1695,15 @@ fn reasoning_effort_options(
     options.iter().map(|option| (*option).to_string()).collect()
 }
 
+pub mod models_dev;
 mod providers;
+mod snapshot;
 #[cfg(test)]
 use providers::common::catalog_model;
 
 pub(crate) use providers::is_tencent_tokenhub_model_id;
 
+#[cfg(test)]
 fn built_in_entries() -> Vec<BuiltInModelMetadata> {
     let mut registrations = provider_definitions()
         .iter()
@@ -1682,10 +1716,12 @@ fn built_in_entries() -> Vec<BuiltInModelMetadata> {
         .collect()
 }
 
+#[cfg(test)]
 fn built_in_route_definitions() -> Vec<BuiltInModelRouteDefinition> {
     providers::route_definitions()
 }
 
+#[cfg(test)]
 fn is_turn_default_candidate(entry: &BuiltInModelMetadata) -> bool {
     entry.context_window_tokens.is_some()
         || entry.capabilities.parallel_tool_calls
@@ -1701,6 +1737,13 @@ fn default_verbosity_for_model(model_ref: &ModelRef) -> Option<ModelVerbosity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn curated_catalog() -> BuiltInModelCatalog {
+        // Curation-tracking tests document the compiled-in Rust catalog;
+        // models.dev supplement entries are a separate reviewed data layer.
+        legacy_builtin_catalog().expect("legacy catalog must be valid")
+    }
+
     use crate::provider::{provider_definitions, ProviderCatalogPolicy, ProviderMaterializer};
 
     fn base_context() -> ContextConfig {
@@ -1779,7 +1822,7 @@ mod tests {
 
     #[test]
     fn arcee_catalog_tracks_current_hosted_models_conservatively() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let arcee = ProviderId::parse("arcee").unwrap();
         let models = catalog
             .list()
@@ -1823,7 +1866,7 @@ mod tests {
 
     #[test]
     fn anthropic_catalog_tracks_current_generally_available_models() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let expected = [
             ("claude-fable-5", 1_000_000, 128_000),
             ("claude-opus-4-8", 1_000_000, 128_000),
@@ -1866,7 +1909,7 @@ mod tests {
 
     #[test]
     fn gemini_catalog_tracks_current_generate_content_models() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let expected = [
             "gemini-3.5-flash",
             "gemini-3.1-pro-preview",
@@ -1905,7 +1948,7 @@ mod tests {
 
     #[test]
     fn xai_catalog_tracks_current_recommended_models() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let expected = [
             (
                 "grok-4.3",
@@ -1956,7 +1999,7 @@ mod tests {
 
     #[test]
     fn deepseek_catalog_tracks_current_api_models() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
 
         for model in ["deepseek-v4-flash", "deepseek-v4-pro"] {
             let metadata = catalog
@@ -1967,12 +2010,41 @@ mod tests {
             assert_eq!(metadata.max_output_tokens_upper_limit, Some(384_000));
             assert!(metadata.capabilities.supports_reasoning);
             assert!(!metadata.capabilities.image_input);
-            assert!(reasoning_effort_options(
-                &metadata.model_ref,
-                metadata.endpoint.as_ref(),
-                &metadata.capabilities,
-            )
-            .is_empty());
+            assert_eq!(
+                reasoning_effort_options(
+                    &metadata.model_ref,
+                    metadata.endpoint.as_ref(),
+                    &metadata.capabilities,
+                ),
+                ["low", "high", "max"]
+            );
+            let responses_route = ModelRouteRef::new(
+                provider_id("deepseek"),
+                ProviderEndpointId::parse("responses").unwrap(),
+                model,
+            );
+            catalog
+                .get_route(&responses_route)
+                .unwrap_or_else(|| panic!("{model}@responses should be registered"));
+            let responses_policy = catalog.resolve_route_policy(
+                &responses_route,
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+                &base_context(),
+                8192,
+            );
+            assert_eq!(
+                responses_policy.reasoning_effort_options,
+                ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            );
+            assert_eq!(
+                catalog
+                    .preferred_route_for_model(&metadata.model_ref)
+                    .unwrap()
+                    .endpoint,
+                ProviderEndpointId::default_endpoint()
+            );
         }
 
         for removed_model in ["deepseek-chat", "deepseek-reasoner"] {
@@ -2107,7 +2179,7 @@ mod tests {
 
     #[test]
     fn resolves_anthropic_compatible_provider_model_policy() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
 
         let deepseek = catalog.resolve_policy(
             &ModelRef::parse("deepseek/deepseek-v4-flash").unwrap(),
@@ -2209,22 +2281,61 @@ mod tests {
         assert_eq!(bigmodel.reasoning_effort_options, ["high", "max"]);
         assert_eq!(bigmodel.source, ModelMetadataSource::BuiltInCatalog);
 
+        let zai_53 = catalog.resolve_policy(
+            &ModelRef::parse("zai/glm-5.3").unwrap(),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            &base_context(),
+            8192,
+        );
+        assert_eq!(zai_53.display_name, "GLM-5.3");
+        assert_eq!(zai_53.context_window_tokens, Some(1_000_000));
+        assert_eq!(zai_53.runtime_max_output_tokens, 131_072);
+        assert_eq!(zai_53.reasoning_effort_options, ["low", "high", "max"]);
+        assert_eq!(zai_53.source, ModelMetadataSource::BuiltInCatalog);
+
+        for provider in ["zai", "bigmodel"] {
+            let flash = catalog.resolve_policy(
+                &ModelRef::parse(&format!("{provider}/glm-5.3-flash")).unwrap(),
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+                &base_context(),
+                8192,
+            );
+            assert_eq!(flash.display_name, "GLM-5.3 Flash");
+            assert_eq!(flash.context_window_tokens, Some(1_000_000));
+            assert_eq!(flash.runtime_max_output_tokens, 131_072);
+            assert!(flash.capabilities.image_input);
+            assert_eq!(flash.reasoning_effort_options, ["low", "high", "max"]);
+            assert_eq!(flash.source, ModelMetadataSource::BuiltInCatalog);
+        }
+
         assert_eq!(
             catalog
                 .preferred_model_for_provider(&ProviderId::parse("zai").unwrap())
                 .unwrap()
                 .as_string(),
-            "zai/glm-5.2"
+            "zai/glm-5.3"
         );
         assert_eq!(
             catalog
                 .preferred_model_for_provider(&ProviderId::parse("bigmodel").unwrap())
                 .unwrap()
                 .as_string(),
-            "bigmodel/glm-5.2"
+            "bigmodel/glm-5.3"
         );
 
-        for model in ["glm-5.2", "glm-5.1", "glm-5", "glm-4.7", "glm-4.6"] {
+        for model in [
+            "glm-5.3",
+            "glm-5.3-flash",
+            "glm-5.2",
+            "glm-5.1",
+            "glm-5",
+            "glm-4.7",
+            "glm-4.6",
+        ] {
             assert!(catalog
                 .get(&ModelRef::new(ProviderId::parse("zai").unwrap(), model))
                 .is_some());
@@ -2292,6 +2403,15 @@ mod tests {
             .get(&ModelRef::parse("dashscope/qwen3.8-max-preview").unwrap())
             .is_some());
         assert!(catalog
+            .get(&ModelRef::parse("dashscope/qwen3.8-max").unwrap())
+            .is_some());
+        assert!(catalog
+            .get(&ModelRef::parse("dashscope/qwen3.8-flash").unwrap())
+            .is_some());
+        assert!(catalog
+            .get(&ModelRef::parse("dashscope/deepseek-v4-flash-0731").unwrap())
+            .is_some());
+        assert!(catalog
             .get(&ModelRef::parse("dashscope/MiniMax-M2.5").unwrap())
             .is_some());
         assert!(catalog
@@ -2302,6 +2422,9 @@ mod tests {
             .is_some());
         assert!(catalog
             .get(&ModelRef::parse("dashscope/ZHIPU/GLM-5.2").unwrap())
+            .is_some());
+        assert!(catalog
+            .get(&ModelRef::parse("dashscope/ZHIPU/GLM-5.3").unwrap())
             .is_some());
         assert!(catalog
             .get(&ModelRef::parse("dashscope/kimi-k2.6").unwrap())
@@ -2319,10 +2442,13 @@ mod tests {
 
     #[test]
     fn dashscope_catalog_tracks_current_modalities_and_reasoning() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let expected = [
             ("qwen3.5-plus", 1_000_000, true, true),
             ("qwen3.8-max-preview", 1_000_000, true, true),
+            ("qwen3.8-max", 1_000_000, true, true),
+            ("qwen3.8-flash", 1_000_000, true, true),
+            ("deepseek-v4-flash-0731", 1_000_000, true, false),
             ("qwen3-coder-next", 262_144, true, false),
             ("qwen3-coder-plus", 1_000_000, true, false),
             ("glm-5", 202_752, true, false),
@@ -2333,9 +2459,8 @@ mod tests {
         ];
 
         for (model, context_window, reasoning, image_input) in expected {
-            let metadata = catalog
-                .get(&ModelRef::parse(&format!("dashscope/{model}")).unwrap())
-                .unwrap();
+            let model_ref = ModelRef::parse(&format!("dashscope/{model}")).unwrap();
+            let metadata = catalog.get(&model_ref).unwrap();
             assert_eq!(
                 metadata.context_window_tokens,
                 Some(context_window),
@@ -2349,12 +2474,24 @@ mod tests {
                 metadata.capabilities.image_input, image_input,
                 "{model} image input"
             );
+            if model == "qwen3.8-flash" {
+                let policy = catalog.resolve_policy(
+                    &model_ref,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    None,
+                    &base_context(),
+                    8192,
+                );
+                assert_eq!(policy.runtime_max_output_tokens, 131_072);
+                assert_eq!(policy.reasoning_effort_options, ["low", "medium", "xhigh"]);
+            }
         }
     }
 
     #[test]
     fn chutes_catalog_tracks_the_public_live_model_directory() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let expected = [
             ("moonshotai/Kimi-K2.6-TEE", 262_144, Some(65_535), true),
             ("zai-org/GLM-5.2-TEE", 1_048_576, Some(65_535), false),
@@ -2410,7 +2547,7 @@ mod tests {
 
     #[test]
     fn fireworks_catalog_tracks_current_serverless_chat_models() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let expected = [
             (
                 "accounts/fireworks/models/deepseek-v4-flash",
@@ -2485,7 +2622,7 @@ mod tests {
 
     #[test]
     fn nvidia_catalog_tracks_the_public_hosted_model_directory() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let expected = [
             ("nvidia/nemotron-3-super-120b-a12b", 1_000_000, false),
             ("moonshotai/kimi-k2.6", 262_144, true),
@@ -2525,7 +2662,7 @@ mod tests {
 
     #[test]
     fn together_catalog_tracks_current_serverless_chat_models() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let expected = [
             ("MiniMaxAI/MiniMax-M3", 524_288, false, true),
             ("MiniMaxAI/MiniMax-M2.7", 202_752, true, false),
@@ -2640,7 +2777,7 @@ mod tests {
 
     #[test]
     fn kilocode_catalog_tracks_the_current_auto_virtual_models() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let expected = [
             ("kilo-auto/frontier", 1_000_000, 128_000, true),
             ("kilo-auto/balanced", 1_000_000, 65_536, true),
@@ -2668,7 +2805,7 @@ mod tests {
 
     #[test]
     fn synthetic_catalog_tracks_current_always_on_models() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let synthetic = ProviderId::parse("synthetic").unwrap();
         let models = catalog
             .list()
@@ -2721,7 +2858,7 @@ mod tests {
 
     #[test]
     fn vercel_ai_gateway_catalog_tracks_current_picker_defaults() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let expected = [
             ("anthropic/claude-opus-4.6", 1_000_000, 128_000),
             ("openai/gpt-5.4", 1_050_000, 128_000),
@@ -2762,7 +2899,7 @@ mod tests {
 
     #[test]
     fn stepfun_catalog_tracks_current_chat_models_and_reasoning_controls() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let expected = [
             ("step-3.7-flash", true, &["low", "medium", "high"][..]),
             ("step-3.5-flash-2603", false, &["low", "high"][..]),
@@ -2870,7 +3007,7 @@ mod tests {
 
     #[test]
     fn minimax_catalog_tracks_current_anthropic_models_and_modalities() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let minimax = ProviderId::parse("minimax").unwrap();
         let models = catalog
             .list()
@@ -2916,7 +3053,7 @@ mod tests {
 
     #[test]
     fn qianfan_catalog_tracks_current_v2_models_limits_and_modalities() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let qianfan = ProviderId::parse("qianfan").unwrap();
         let models = catalog
             .list()
@@ -2997,6 +3134,9 @@ mod tests {
         for route_ref in [
             "dashscope@token-plan/qwen3.7-max",
             "dashscope@token-plan/qwen3.8-max-preview",
+            "dashscope@token-plan/qwen3.8-max",
+            "dashscope@token-plan/qwen3.8-flash",
+            "dashscope@token-plan/deepseek-v4-flash-0731",
             "dashscope@token-plan/kimi-k2.7-code",
             "dashscope@token-plan/glm-5.2",
             "dashscope@token-plan/MiniMax-M2.5",
@@ -3016,7 +3156,11 @@ mod tests {
         for unsupported in [
             "dashscope@token-plan/ZHIPU/GLM-5.2",
             "dashscope@token-plan/MiniMax/MiniMax-M3",
+            // GLM-5.3 is not part of the DashScope subscription plans yet:
+            // the token-plan endpoint reports "Model not exist" (verified 2026-08).
+            "dashscope@token-plan/glm-5.3",
             "dashscope@coding-plan/glm-5.2",
+            "dashscope@coding-plan/glm-5.3",
             "dashscope@coding-plan/kimi-k2.7-code",
         ] {
             assert!(
@@ -3503,7 +3647,7 @@ mod tests {
             );
         }
 
-        for route_ref in ["volcengine@plan/glm-5.2"] {
+        for route_ref in ["volcengine@plan/glm-5.2", "volcengine@plan/glm-5.3"] {
             let policy = catalog.resolve_route_policy(
                 &ModelRouteRef::parse(route_ref).unwrap(),
                 &HashMap::new(),
@@ -3524,7 +3668,9 @@ mod tests {
         for route_ref in [
             "volcengine@default/doubao-seed-2-0-pro-260215",
             "volcengine@coding/glm-5.2",
+            "volcengine@coding/glm-5.3",
             "volcengine@plan/glm-5.2",
+            "volcengine@plan/glm-5.3",
         ] {
             let policy = catalog.resolve_route_policy(
                 &ModelRouteRef::parse(route_ref).unwrap(),
@@ -3613,7 +3759,7 @@ mod tests {
 
     #[test]
     fn moonshot_catalog_tracks_current_models_and_retirements() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let moonshot = ProviderId::parse("moonshot").unwrap();
         let models = catalog
             .list()
@@ -3689,7 +3835,7 @@ mod tests {
 
     #[test]
     fn mistral_catalog_tracks_current_models_and_retirements() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let mistral = ProviderId::parse("mistral").unwrap();
         let models = catalog
             .list()
@@ -3773,7 +3919,7 @@ mod tests {
 
     #[test]
     fn opencode_go_catalog_tracks_the_current_dual_transport_model_table() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let provider = provider_id("opencode-go");
         let models = catalog
             .list()
@@ -3852,7 +3998,7 @@ mod tests {
 
     #[test]
     fn tencent_tokenhub_catalog_tracks_current_language_and_image_understanding_models() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let provider = provider_id("tencent-tokenhub");
         let models = catalog
             .list()
@@ -3916,7 +4062,7 @@ mod tests {
 
     #[test]
     fn venice_catalog_tracks_stable_trait_defaults() {
-        let catalog = BuiltInModelCatalog::new();
+        let catalog = curated_catalog();
         let provider = provider_id("venice");
         let models = catalog
             .list()

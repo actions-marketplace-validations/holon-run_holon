@@ -10,7 +10,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{ModelRef, ProviderEndpointId, ProviderId, ProviderRuntimeConfig},
+    config::{
+        ModelRef, ProviderEndpointId, ProviderId, ProviderRuntimeConfig, ProviderTransportKind,
+    },
     model_catalog::{
         is_tencent_tokenhub_model_id, BuiltInModelMetadata, ModelCapabilityFlags,
         ModelMetadataSource,
@@ -22,7 +24,21 @@ use crate::{
 };
 
 const OPENAI_COMPATIBLE_MODELS_PATH: &str = "/models";
+const OLLAMA_TAGS_PATH: &str = "/api/tags";
+const OLLAMA_SHOW_PATH: &str = "/api/show";
 pub const DEFAULT_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Transport-level default discovery used for `openai_chat_completions`
+/// providers that have no built-in discovery definition. Custom OpenAI-compatible
+/// providers (for example a local Ollama endpoint) then participate in model
+/// discovery through the standard `GET {base_url}/models` endpoint without a
+/// provider-specific definition; built-in providers keep winning because their
+/// explicit definitions are resolved first.
+const OPENAI_COMPATIBLE_DEFAULT_DISCOVERY: ModelDiscoveryDefinition = ModelDiscoveryDefinition {
+    auth: ModelDiscoveryAuth::Optional,
+    route: ModelDiscoveryRoute::OpenAiCompatible,
+    decoder: ModelDiscoveryDecoder::OpenAiCompatible,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModelDiscoveryCacheFile {
@@ -93,6 +109,11 @@ pub fn provider_supports_model_discovery(provider: &ProviderRuntimeConfig) -> bo
     provider_discovery_definition(provider).is_some()
 }
 
+pub fn provider_discovers_model_capabilities(provider: &ProviderRuntimeConfig) -> bool {
+    provider_discovery_definition(provider)
+        .is_some_and(|definition| definition.decoder == ModelDiscoveryDecoder::Ollama)
+}
+
 fn provider_model_discovery_requires_credential(provider: &ProviderRuntimeConfig) -> bool {
     provider_discovery_definition(provider)
         .is_some_and(|definition| definition.auth == ModelDiscoveryAuth::Required)
@@ -101,14 +122,26 @@ fn provider_model_discovery_requires_credential(provider: &ProviderRuntimeConfig
 fn provider_discovery_definition(
     provider: &ProviderRuntimeConfig,
 ) -> Option<&'static ModelDiscoveryDefinition> {
-    let definition = provider_definition(provider.id.as_str())?;
-    let discovery = definition.discovery.as_ref()?;
-    debug_assert_ne!(
-        definition.catalog_policy,
-        ProviderCatalogPolicy::StaticOnly,
-        "providers with discovery must declare a discovery catalog policy"
-    );
-    Some(discovery)
+    // Built-in providers win: their explicit discovery definitions (when any)
+    // govern response parsing and endpoint construction, so existing behavior
+    // is unchanged.
+    if let Some(definition) = provider_definition(provider.id.as_str()) {
+        let discovery = definition.discovery.as_ref()?;
+        debug_assert_ne!(
+            definition.catalog_policy,
+            ProviderCatalogPolicy::StaticOnly,
+            "providers with discovery must declare a discovery catalog policy"
+        );
+        return Some(discovery);
+    }
+
+    // Custom OpenAI-compatible providers fall back to a transport-level default
+    // so they participate in model discovery without a built-in definition.
+    if provider.transport == ProviderTransportKind::OpenAiChatCompletions {
+        return Some(&OPENAI_COMPATIBLE_DEFAULT_DISCOVERY);
+    }
+
+    None
 }
 
 pub fn discovery_cache_status_for_provider(
@@ -201,6 +234,9 @@ pub async fn refresh_provider_models(
     })?;
 
     let source_url = provider_models_url(provider)?;
+    if discovery.decoder == ModelDiscoveryDecoder::Ollama {
+        return refresh_ollama_models(provider, cache_path, source_url).await;
+    }
     let request = reqwest::Client::builder()
         .user_agent("holon-model-discovery")
         .build()
@@ -247,6 +283,7 @@ pub async fn refresh_provider_models(
                 .context("failed to parse OpenAI-compatible model discovery response")?
                 .into_model_metadata(&provider.id)
         }
+        ModelDiscoveryDecoder::Ollama => unreachable!("Ollama discovery is handled above"),
         ModelDiscoveryDecoder::NearAi => serde_json::from_slice::<NearAiModelsResponse>(&raw)
             .context("failed to parse NEAR AI model discovery response")?
             .into_model_metadata(&provider.id),
@@ -309,9 +346,190 @@ fn provider_models_url(provider: &ProviderRuntimeConfig) -> Result<String> {
     match discovery.route {
         ModelDiscoveryRoute::Fixed(url) => Ok(url.to_string()),
         ModelDiscoveryRoute::OpenAiCompatible => openai_compatible_models_url(&provider.base_url),
+        ModelDiscoveryRoute::Ollama => ollama_tags_url(&provider.base_url),
         ModelDiscoveryRoute::OpenAiV1 => openai_v1_models_url(&provider.base_url),
         ModelDiscoveryRoute::Venice => venice_models_url(&provider.base_url),
         ModelDiscoveryRoute::VercelAiGateway => vercel_models_url(&provider.base_url),
+    }
+}
+
+fn ollama_tags_url(base_url: &str) -> Result<String> {
+    ollama_api_url(base_url, OLLAMA_TAGS_PATH)
+}
+
+fn ollama_show_url(base_url: &str) -> Result<String> {
+    ollama_api_url(base_url, OLLAMA_SHOW_PATH)
+}
+
+fn ollama_api_url(base_url: &str, api_path: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(base_url)
+        .with_context(|| format!("invalid Ollama base_url {base_url:?}"))?;
+    let path = url.path().trim_end_matches('/');
+    let path = path
+        .strip_suffix("/v1")
+        .unwrap_or(path)
+        .trim_end_matches('/');
+    url.set_path(&format!("{path}{api_path}"));
+    Ok(url.to_string())
+}
+
+async fn refresh_ollama_models(
+    provider: &ProviderRuntimeConfig,
+    cache_path: &Path,
+    source_url: String,
+) -> Result<ModelDiscoveryRefreshReport> {
+    let client = reqwest::Client::builder()
+        .user_agent("holon-model-discovery")
+        .build()
+        .context("failed to build model discovery HTTP client")?;
+    let request = client.get(&source_url);
+    let request = if let Some(credential) = provider.credential.as_deref() {
+        request.bearer_auth(credential)
+    } else {
+        request
+    };
+    let raw = request
+        .send()
+        .await
+        .with_context(|| format!("{} model discovery request failed", provider.id.as_str()))?
+        .error_for_status()
+        .with_context(|| {
+            format!(
+                "{} model discovery returned an error status",
+                provider.id.as_str()
+            )
+        })?
+        .bytes()
+        .await
+        .context("failed to read Ollama tags response")?;
+    let mut tags = serde_json::from_slice::<OllamaTagsResponse>(&raw)
+        .context("failed to parse Ollama tags response")?;
+    tags.models
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    tags.models.dedup_by(|left, right| left.name == right.name);
+
+    let show_url = ollama_show_url(&provider.base_url)?;
+    let mut models = Vec::new();
+    for tagged in tags.models {
+        let name = tagged.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let request = client
+            .post(&show_url)
+            .json(&OllamaShowRequest { model: name });
+        let request = if let Some(credential) = provider.credential.as_deref() {
+            request.bearer_auth(credential)
+        } else {
+            request
+        };
+        let raw = request
+            .send()
+            .await
+            .with_context(|| format!("Ollama show request failed for model {name:?}"))?
+            .error_for_status()
+            .with_context(|| format!("Ollama show returned an error status for model {name:?}"))?
+            .bytes()
+            .await
+            .with_context(|| format!("failed to read Ollama show response for model {name:?}"))?;
+        let show = serde_json::from_slice::<OllamaShowResponse>(&raw)
+            .with_context(|| format!("failed to parse Ollama show response for model {name:?}"))?;
+        models.push(show.into_model_metadata(&provider.id, name));
+    }
+    models.sort_by(|left, right| left.model_ref.model.cmp(&right.model_ref.model));
+
+    let response_hash = format!(
+        "sha256:{}",
+        sha256_hex(
+            &serde_json::to_vec(&models)
+                .context("failed to serialize Ollama discovery result for hashing")?
+        )
+    );
+    let fetched_at = Utc::now();
+    let mut cache = load_discovery_cache_at(cache_path)?;
+    cache.providers.insert(
+        provider.id.clone(),
+        ProviderModelDiscoveryCache {
+            provider: provider.id.clone(),
+            fetched_at,
+            source_url: Some(source_url),
+            response_hash: Some(response_hash),
+            models: models.clone(),
+        },
+    );
+    save_discovery_cache_at(cache_path, &cache)?;
+
+    Ok(ModelDiscoveryRefreshReport {
+        provider: provider.id.clone(),
+        fetched_at,
+        model_count: models.len(),
+        cache_path: cache_path.to_path_buf(),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaTagsResponse {
+    #[serde(default)]
+    models: Vec<OllamaTaggedModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaTaggedModel {
+    name: String,
+}
+
+#[derive(Serialize)]
+struct OllamaShowRequest<'a> {
+    model: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaShowResponse {
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    model_info: BTreeMap<String, serde_json::Value>,
+}
+
+impl OllamaShowResponse {
+    fn into_model_metadata(self, provider: &ProviderId, model: &str) -> BuiltInModelMetadata {
+        let has_capability = |expected: &str| {
+            self.capabilities
+                .iter()
+                .any(|capability| capability.eq_ignore_ascii_case(expected))
+        };
+        let context_window_tokens = self
+            .model_info
+            .iter()
+            .filter(|(key, _)| key.ends_with(".context_length"))
+            .filter_map(|(_, value)| {
+                value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .or_else(|| value.as_str().and_then(|value| value.parse::<usize>().ok()))
+            })
+            .max();
+        BuiltInModelMetadata {
+            model_ref: ModelRef::new(provider.clone(), model.to_string()),
+            display_name: model.to_string(),
+            description: "Remote discovered Ollama model.".to_string(),
+            context_window_tokens,
+            effective_context_window_percent: 95,
+            auto_compact_token_limit: None,
+            default_max_output_tokens: None,
+            max_output_tokens_upper_limit: None,
+            default_verbosity: None,
+            tool_output_truncation_estimated_tokens: None,
+            capabilities: ModelCapabilityFlags {
+                image_input: has_capability("vision"),
+                supports_reasoning: has_capability("thinking"),
+                // Ollama's `tools` capability does not imply parallel tool calls.
+                ..ModelCapabilityFlags::default()
+            },
+            reasoning_effort_options: Vec::new(),
+            source: ModelMetadataSource::RemoteDiscovered,
+            endpoint: None,
+        }
     }
 }
 
@@ -1351,6 +1569,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
     fn arcee_provider() -> ProviderRuntimeConfig {
         ProviderRuntimeConfig {
@@ -1590,6 +1813,37 @@ mod tests {
             context_management: Default::default(),
             builtin_web_search: None,
         }
+    }
+
+    fn custom_openai_provider(base_url: String) -> ProviderRuntimeConfig {
+        ProviderRuntimeConfig {
+            id: ProviderId::parse("local-custom").unwrap(),
+            route_provider: ProviderId::parse("local-custom").unwrap(),
+            route_endpoint: ProviderEndpointId::default_endpoint(),
+            transport: ProviderTransportKind::OpenAiChatCompletions,
+            base_url,
+            auth: crate::config::ProviderAuthConfig {
+                source: crate::config::CredentialSource::None,
+                kind: crate::config::CredentialKind::ApiKey,
+                env: None,
+                profile: None,
+                external: None,
+            },
+            credential: None,
+            credential_store_path: None,
+            codex_home: None,
+            originator: None,
+            reasoning_effort: None,
+            context_management: Default::default(),
+            builtin_web_search: None,
+        }
+    }
+
+    fn ollama_provider(base_url: String) -> ProviderRuntimeConfig {
+        let mut provider = custom_openai_provider(base_url);
+        provider.id = ProviderId::parse("ollama").unwrap();
+        provider.route_provider = provider.id.clone();
+        provider
     }
 
     #[test]
@@ -2310,6 +2564,58 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn custom_openai_compatible_provider_discovers_models_without_authentication() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("GET /models HTTP/1.1"));
+            assert!(!request.to_ascii_lowercase().contains("authorization:"));
+
+            let body = r#"{"object":"list","data":[
+                {"id":"custom-chat","object":"model"},
+                {"id":"org/custom-reasoning","object":"model"},
+                {"id":" ","object":"model"}
+            ]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let provider = custom_openai_provider(base_url.clone());
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_path = cache_dir.path().join("model-discovery-cache.json");
+        let report = refresh_provider_models(&provider, &cache_path)
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(report.provider, ProviderId::parse("local-custom").unwrap());
+        assert_eq!(report.model_count, 2);
+        assert_eq!(
+            provider_models_url(&provider).unwrap(),
+            format!("{base_url}/models")
+        );
+
+        let cache = load_discovery_cache_at(&cache_path).unwrap();
+        let models = cache.models();
+        assert!(models.contains_key(&ModelRef::parse("local-custom/custom-chat").unwrap()));
+        assert!(models.contains_key(&ModelRef::parse("local-custom/org/custom-reasoning").unwrap()));
+        assert_eq!(
+            discovery_cache_status_for_provider(&provider, &cache, Duration::from_secs(60), false)
+                .state,
+            ModelDiscoveryCacheState::Fresh
+        );
+    }
+
     #[test]
     fn openai_compatible_discovery_keeps_only_non_empty_server_model_ids() {
         let payload: OpenAiCompatibleModelsResponse = serde_json::from_str(
@@ -2335,6 +2641,16 @@ mod tests {
         assert!(models
             .iter()
             .all(|model| model.capabilities == ModelCapabilityFlags::default()));
+    }
+
+    #[test]
+    fn only_ollama_discovery_currently_supplies_model_capabilities() {
+        assert!(provider_discovers_model_capabilities(&ollama_provider(
+            "http://127.0.0.1:11434".into()
+        )));
+        assert!(!provider_discovers_model_capabilities(
+            &custom_openai_provider("http://127.0.0.1:8000".into())
+        ));
     }
 
     #[test]
@@ -2366,5 +2682,106 @@ mod tests {
         let fresh = discovery_cache_status_for_provider(&provider, &cache, ttl, false);
         assert_eq!(fresh.state, ModelDiscoveryCacheState::Fresh);
         assert!(!discovery_cache_needs_refresh(&provider, &cache, ttl));
+    }
+
+    #[test]
+    fn ollama_discovery_urls_replace_openai_v1_suffix_and_preserve_prefix() {
+        assert_eq!(
+            ollama_tags_url("http://127.0.0.1:11434/v1").unwrap(),
+            "http://127.0.0.1:11434/api/tags"
+        );
+        assert_eq!(
+            ollama_show_url("https://example.test/ollama/v1/").unwrap(),
+            "https://example.test/ollama/api/show"
+        );
+    }
+
+    #[test]
+    fn ollama_show_maps_context_vision_and_thinking_without_parallel_tools() {
+        let show: OllamaShowResponse = serde_json::from_str(
+            r#"{
+                "capabilities":["completion","vision","tools","thinking"],
+                "model_info":{
+                    "general.architecture":"qwen3",
+                    "qwen3.context_length":131072,
+                    "other.context_length":"65536"
+                }
+            }"#,
+        )
+        .unwrap();
+        let model =
+            show.into_model_metadata(&ProviderId::parse("ollama").unwrap(), "qwen3-vl:latest");
+
+        assert_eq!(model.context_window_tokens, Some(131_072));
+        assert!(model.capabilities.image_input);
+        assert!(model.capabilities.supports_reasoning);
+        assert!(!model.capabilities.parallel_tool_calls);
+        assert_eq!(model.source, ModelMetadataSource::RemoteDiscovered);
+    }
+
+    #[tokio::test]
+    async fn ollama_discovery_uses_tags_then_show_without_authentication() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut tags_stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let read = tags_stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("GET /api/tags HTTP/1.1"));
+            assert!(!request.to_ascii_lowercase().contains("authorization:"));
+            let body = r#"{"models":[{"name":"qwen3-vl:latest"}]}"#;
+            write!(
+                tags_stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+
+            let (mut show_stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let read = show_stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /api/show HTTP/1.1"));
+            assert!(!request.to_ascii_lowercase().contains("authorization:"));
+            assert!(request.contains(r#""model":"qwen3-vl:latest""#));
+            let body = r#"{
+                "capabilities":["vision","tools","thinking"],
+                "model_info":{"qwen3.context_length":131072}
+            }"#;
+            write!(
+                show_stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let provider = ollama_provider(base_url);
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_path = cache_dir.path().join("model-discovery-cache.json");
+        let report = refresh_provider_models(&provider, &cache_path)
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(report.model_count, 1);
+        let cache = load_discovery_cache_at(&cache_path).unwrap();
+        let entry = cache.providers.get(&provider.id).unwrap();
+        assert_eq!(
+            entry.source_url.as_deref(),
+            Some(provider_models_url(&provider).unwrap().as_str())
+        );
+        assert!(entry
+            .response_hash
+            .as_deref()
+            .is_some_and(|hash| hash.starts_with("sha256:")));
+        let model = &entry.models[0];
+        assert_eq!(model.context_window_tokens, Some(131_072));
+        assert!(model.capabilities.image_input);
+        assert!(model.capabilities.supports_reasoning);
+        assert!(!model.capabilities.parallel_tool_calls);
     }
 }

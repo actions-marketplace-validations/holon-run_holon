@@ -5,14 +5,15 @@ import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { query, unstable_v2_createSession } from "@anthropic-ai/claude-agent-sdk";
 import {
   ensureBaseShaExists,
   loadBenchmarkSuite,
   loadRealTaskManifest,
   resolveRepoPath
 } from "./lib/manifest.mjs";
+import { loadProjectionEvalSuite } from "./lib/projection-eval.mjs";
 import {
+  artifactDirForTask,
   benchmarkLabelsForTask,
   branchNameForTask,
   prTitleForTask,
@@ -31,6 +32,7 @@ const repoSideEffectLocks = new Map();
 const CACHE_BREAK_ABSOLUTE_DROP_THRESHOLD = 2_000;
 const CACHE_BREAK_RELATIVE_RETAINED_THRESHOLD = 0.95;
 const ANTHROPIC_PROMPT_CACHE_5MIN_TTL_MS = 5 * 60 * 1000;
+let claudeAgentSdkPromise = null;
 
 const DEFAULT_TASKS = [
   "analysis-runtime-architecture.json",
@@ -72,6 +74,26 @@ async function main() {
 
   await mkdir(resultsRoot, { recursive: true });
 
+  if (args.command === "projection-eval") {
+    if (!args.suite) {
+      throw new Error("projection-eval requires --suite");
+    }
+    const summary = await runProjectionEvalCommand(args);
+    console.log(
+      JSON.stringify(
+        {
+          ok: summary.ok,
+          label: summary.label,
+          suite_id: summary.suite_id,
+          results_dir: summary.results_dir
+        },
+        null,
+        2
+      )
+    );
+    return;
+  }
+
   if (args.command === "real") {
     const summary = await runRealManifestCommand(args, runnerEnv);
     console.log(JSON.stringify({ ok: true, label: summary.label, results: summary.results }, null, 2));
@@ -88,9 +110,10 @@ async function main() {
 }
 
 async function runFixtureCommand(args, runnerEnv) {
+  const holonProvider = resolveHolonFixtureProvider(args);
   const runners = args.runners.length > 0 ? args.runners : ["holon", "claude_sdk"];
   if (runners.some((runner) => runner === "holon")) {
-    await ensureHolonBuilt();
+    await ensureDriverHolonBuilt();
   }
 
   const label = args.label ?? `run-${new Date().toISOString().replace(/[:.]/g, "-")}`;
@@ -108,7 +131,8 @@ async function runFixtureCommand(args, runnerEnv) {
           runner,
           repetition,
           label,
-          runnerEnv
+          runnerEnv,
+          holonProvider
         });
         summary.push(result.summary);
       }
@@ -127,10 +151,18 @@ function parseArgs(argv) {
     label: undefined,
     repetitions: 1,
     tasks: [],
-    runners: []
+    runners: [],
+    holonModel: undefined,
+    holonProviderTransport: undefined,
+    holonProviderBaseUrl: undefined,
+    holonProviderApiKeyEnv: undefined
   };
 
-  if (["compare", "fixture", "real", "suite", "validate-manifest"].includes(argv[0])) {
+  if (
+    ["compare", "fixture", "projection-eval", "real", "suite", "validate-manifest"].includes(
+      argv[0]
+    )
+  ) {
     args.command = argv[0];
     argv = argv.slice(1);
   }
@@ -145,6 +177,14 @@ function parseArgs(argv) {
       args.tasks.push(argv[++index]);
     } else if (value === "--runner") {
       args.runners.push(argv[++index]);
+    } else if (value === "--holon-model") {
+      args.holonModel = argv[++index];
+    } else if (value === "--holon-provider-transport") {
+      args.holonProviderTransport = argv[++index];
+    } else if (value === "--holon-provider-base-url") {
+      args.holonProviderBaseUrl = argv[++index];
+    } else if (value === "--holon-provider-api-key-env") {
+      args.holonProviderApiKeyEnv = argv[++index];
     } else if (value === "--baseline") {
       args.baseline = argv[++index];
     } else if (value === "--candidate") {
@@ -174,7 +214,10 @@ async function compareSuites(args) {
   const candidate = await readJson(path.join(resultsRoot, args.candidate, "summary.json"));
   const byKey = (entries) =>
     new Map(
-      entries.map((entry) => [`${entry.task_id ?? entry.task_name}:${entry.runner}`, entry])
+      entries.map((entry) => [
+        `${entry.task_id ?? entry.task_name}:${entry.runner}:${entry.repetition ?? 1}`,
+        entry
+      ])
     );
 
   const baselineMap = byKey(baseline);
@@ -307,6 +350,7 @@ function formatTokenOptimization(entry) {
     return "n/a";
   }
   const cacheRead = diagnostics.summary.cache_read_input_tokens ?? 0;
+  const cacheHitRatio = diagnostics.summary.cache_hit_ratio;
   const highMisses = diagnostics.summary.high_input_zero_cache_read_rounds ?? 0;
   const modes = Object.entries(diagnostics.summary.request_lowering_modes ?? {})
     .map(([mode, count]) => `${mode}:${count}`)
@@ -314,6 +358,9 @@ function formatTokenOptimization(entry) {
   const parts = [];
   if (cacheRead > 0 || highMisses > 0) {
     parts.push(`cache_read=${cacheRead}`);
+  }
+  if (typeof cacheHitRatio === "number") {
+    parts.push(`cache_hit=${(cacheHitRatio * 100).toFixed(2)}%`);
   }
   if (highMisses > 0) {
     parts.push(`high_miss=${highMisses}`);
@@ -323,6 +370,25 @@ function formatTokenOptimization(entry) {
   }
   if ((diagnostics.summary.context_management_enabled_rounds ?? 0) > 0) {
     parts.push(`ctx_mgmt=${diagnostics.summary.context_management_enabled_rounds}`);
+  }
+  parts.push(
+    `stable_prefix=${diagnostics.summary.stable_prefix_available_rounds ?? 0}/${diagnostics.summary.rounds ?? 0}`
+  );
+  if ((diagnostics.summary.stable_prefix_changed_rounds ?? 0) > 0) {
+    parts.push(`prefix_changed=${diagnostics.summary.stable_prefix_changed_rounds}`);
+  }
+  if (diagnostics.summary.turn_local_compaction_telemetry_status === "unavailable") {
+    parts.push("local_compaction=unavailable");
+  } else if ((diagnostics.summary.turn_local_compaction_applied_rounds ?? 0) > 0) {
+    parts.push(
+      `local_compaction=${diagnostics.summary.turn_local_compaction_applied_rounds}`
+    );
+    parts.push(
+      `tool_results_compacted=${diagnostics.summary.turn_local_compacted_tool_results ?? 0}`
+    );
+    parts.push(
+      `cache_warmup=${diagnostics.summary.turn_local_compaction_cache_warmup_hits ?? 0}/${diagnostics.summary.turn_local_compaction_cache_warmup_observed ?? 0}`
+    );
   }
   return parts.length > 0 ? parts.join(" ") : "observed";
 }
@@ -370,7 +436,15 @@ function boolWord(value) {
   return value ? "yes" : "no";
 }
 
-async function runBenchmarkTask({ task, taskFile, runner, repetition, label, runnerEnv }) {
+async function runBenchmarkTask({
+  task,
+  taskFile,
+  runner,
+  repetition,
+  label,
+  runnerEnv,
+  holonProvider
+}) {
   const runId = `run-${String(repetition).padStart(2, "0")}`;
   const suiteDir = path.join(resultsRoot, label);
   const taskDir = path.join(suiteDir, task.name, runner, runId);
@@ -391,7 +465,8 @@ async function runBenchmarkTask({ task, taskFile, runner, repetition, label, run
         task,
         taskDir,
         workspaceDir,
-        runnerEnv
+        runnerEnv,
+        holonProvider
       });
     } else if (runner === "claude_sdk") {
       result = await runClaudeSdkTask({
@@ -507,7 +582,7 @@ async function runRealManifestCommand(args, runnerEnv) {
     )
   );
 
-  await finalizeRealSuite(suiteLabel, results);
+  await finalizeRealSuite(suiteLabel, results, suiteConfig);
   return { label: suiteLabel, results };
 }
 
@@ -548,8 +623,21 @@ async function runRealSuiteCommand(args, runnerEnv) {
   const results = [];
   for (const manifestPath of taskPaths) {
     const manifest = await loadRealTaskManifest(manifestPath);
-    const taskResults = await Promise.all(
-      runnerConfigs.map((runnerConfig) =>
+    for (let repetition = 1; repetition <= (effectiveSuite.repetitions ?? 1); repetition += 1) {
+      const orderedRunners = orderPairedRunners({
+        runnerConfigs,
+        runnerOrder: effectiveSuite.execution?.runner_order ?? "configured",
+        randomSeed: effectiveSuite.execution?.random_seed ?? 0,
+        taskId: manifest.task_id,
+        repetition
+      }).map((runnerConfig, pairIndex) => ({
+        ...runnerConfig,
+        pair_order: pairIndex + 1
+      }));
+      const taskResults = await runWithConcurrency(
+        orderedRunners,
+        effectiveSuite.execution?.max_parallel_runners ?? orderedRunners.length,
+        (runnerConfig) =>
         runRealBenchmarkTask({
           manifest,
           manifestPath,
@@ -557,22 +645,395 @@ async function runRealSuiteCommand(args, runnerEnv) {
           suiteConfig: effectiveSuite,
           suiteLabel,
           runnerEnv,
+          repetition,
           worktreeRootOverride: args.worktreeRoot
-        })
-      )
-    );
-    results.push(...taskResults);
+        }),
+        effectiveSuite.execution?.cooldown_ms ?? 0
+      );
+      results.push(...taskResults);
+    }
   }
 
-  await finalizeRealSuite(suiteLabel, results);
+  await finalizeRealSuite(suiteLabel, results, effectiveSuite);
   return { label: suiteLabel, results };
 }
 
-async function finalizeRealSuite(suiteLabel, results) {
+export function orderPairedRunners({
+  runnerConfigs,
+  runnerOrder = "configured",
+  randomSeed = 0,
+  taskId,
+  repetition
+}) {
+  const ordered = [...runnerConfigs];
+  if (runnerOrder === "alternating") {
+    if (repetition % 2 === 0) {
+      ordered.reverse();
+    }
+    return ordered;
+  }
+  if (runnerOrder !== "paired_randomized") {
+    return ordered;
+  }
+
+  let state = stableSeed(`${randomSeed}:${taskId}:${repetition}`);
+  for (let index = ordered.length - 1; index > 0; index -= 1) {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    const swapIndex = state % (index + 1);
+    [ordered[index], ordered[swapIndex]] = [ordered[swapIndex], ordered[index]];
+  }
+  return ordered;
+}
+
+function stableSeed(value) {
+  let hash = 2166136261;
+  for (const byte of Buffer.from(String(value), "utf8")) {
+    hash ^= byte;
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+async function runWithConcurrency(items, maxParallel, execute, cooldownMs = 0) {
+  const results = [];
+  for (let index = 0; index < items.length; index += maxParallel) {
+    const batch = items.slice(index, index + maxParallel);
+    results.push(...(await Promise.all(batch.map(execute))));
+    if (cooldownMs > 0 && index + maxParallel < items.length) {
+      await sleep(cooldownMs);
+    }
+  }
+  return results;
+}
+
+async function runProjectionEvalCommand(args) {
+  const suitePath = path.resolve(args.suite);
+  const suite = await loadProjectionEvalSuite(suitePath);
+  const suiteCwd = path.dirname(suitePath);
+  const label = args.label ?? `projection-eval-${suite.suite_id}-${timestampLabel()}`;
+  const suiteDir = path.join(resultsRoot, label);
+  const scorecard = [];
+
+  await mkdir(path.join(suiteDir, "cases"), { recursive: true });
+  await copyFile(suitePath, path.join(suiteDir, "suite.json"));
+
+  for (const caseEntry of suite.cases) {
+    const inputPath = path.resolve(suiteCwd, caseEntry.input);
+    for (let repetition = 1; repetition <= (suite.repetitions ?? 1); repetition += 1) {
+      const caseDir = path.join(suiteDir, "cases", caseEntry.id, `repetition-${repetition}`);
+      await mkdir(caseDir, { recursive: true });
+      await writeJson(path.join(caseDir, "assertions.json"), caseEntry.assertions);
+
+      const baseline = await runProjectionEvalCaseCommand({
+        name: "baseline",
+        commandTemplate: suite.baseline_command,
+        inputPath,
+        cwd: suiteCwd,
+        caseDir
+      });
+      const candidate = suite.candidate_command
+        ? await runProjectionEvalCaseCommand({
+            name: "candidate",
+            commandTemplate: suite.candidate_command,
+            inputPath,
+            cwd: suiteCwd,
+            caseDir
+          })
+        : null;
+
+      const evaluation = await evaluateProjectionEvalCase({
+        caseId: caseEntry.id,
+        assertionsPath: path.join(caseDir, "assertions.json"),
+        baselinePath: baseline.manifestPath,
+        candidatePath: candidate?.manifestPath ?? null
+      });
+      const entry = {
+        ...evaluation,
+        repetition,
+        artifacts: {
+          input: inputPath,
+          assertions: path.join(caseDir, "assertions.json"),
+          baseline: baseline.artifacts,
+          candidate: candidate?.artifacts ?? null
+        }
+      };
+      await writeJson(path.join(caseDir, "evaluation.json"), entry);
+      scorecard.push(entry);
+    }
+  }
+
+  const summary = buildProjectionEvalSummary({
+    label,
+    suiteId: suite.suite_id,
+    suitePath,
+    suiteDir,
+    baselineCommand: suite.baseline_command,
+    candidateCommand: suite.candidate_command ?? null,
+    repetitions: suite.repetitions ?? 1,
+    sharedConfig: suite.shared_config ?? {},
+    scorecard
+  });
+  await writeJson(path.join(suiteDir, "scorecard.json"), scorecard);
+  await writeJson(path.join(suiteDir, "summary.json"), summary);
+  return summary;
+}
+
+async function runProjectionEvalCaseCommand({ name, commandTemplate, inputPath, cwd, caseDir }) {
+  const renderedCommand = renderProjectionEvalCommand(commandTemplate, inputPath);
+  const result = await runCommand("sh", ["-c", renderedCommand], cwd, process.env, false);
+  const manifest = JSON.parse(result.stdout);
+  const stdoutPath = path.join(caseDir, `${name}.stdout.json`);
+  const stderrPath = path.join(caseDir, `${name}.stderr.log`);
+  const manifestPath = path.join(caseDir, `${name}.manifest.json`);
+  const commandPath = path.join(caseDir, `${name}.command.txt`);
+
+  await writeFile(stdoutPath, result.stdout, "utf8");
+  await writeFile(stderrPath, result.stderr || "", "utf8");
+  await writeFile(commandPath, `${renderedCommand}\n`, "utf8");
+  await writeJson(manifestPath, manifest);
+
+  return {
+    manifestPath,
+    artifacts: {
+      command: commandPath,
+      stdout: stdoutPath,
+      stderr: stderrPath,
+      manifest: manifestPath
+    }
+  };
+}
+
+async function evaluateProjectionEvalCase({ caseId, assertionsPath, baselinePath, candidatePath }) {
+  const evaluatorPath = path.join(repoRoot, "benchmarks", "projection-eval", "evaluator.mjs");
+  const args = [
+    evaluatorPath,
+    "--case-id",
+    caseId,
+    "--assertions",
+    assertionsPath,
+    "--baseline",
+    baselinePath
+  ];
+  if (candidatePath) {
+    args.push("--candidate", candidatePath);
+  }
+  const result = await runCommand(process.execPath, args, repoRoot, process.env, false);
+  return JSON.parse(result.stdout);
+}
+
+function buildProjectionEvalSummary({
+  label,
+  suiteId,
+  suitePath,
+  suiteDir,
+  baselineCommand,
+  candidateCommand,
+  repetitions,
+  sharedConfig,
+  scorecard
+}) {
+  const baselineCasesPassed = scorecard.filter((entry) => entry.baseline?.pass).length;
+  const candidateCasesPassed = candidateCommand
+    ? scorecard.filter((entry) => entry.candidate?.pass).length
+    : null;
+  const improvedAssertions = scorecard.reduce(
+    (sum, entry) => sum + Number(entry.delta?.improved_assertions ?? 0),
+    0
+  );
+  const regressedAssertions = scorecard.reduce(
+    (sum, entry) => sum + Number(entry.delta?.regressed_assertions ?? 0),
+    0
+  );
+  const changedAssertions = scorecard.reduce(
+    (sum, entry) => sum + Number(entry.delta?.changed_assertions ?? 0),
+    0
+  );
+
+  return {
+    schema_version: 1,
+    label,
+    suite_id: suiteId,
+    suite_path: suitePath,
+    results_dir: suiteDir,
+    baseline_command: baselineCommand,
+    candidate_command: candidateCommand,
+    repetitions,
+    shared_config: sharedConfig,
+    generated_at: new Date().toISOString(),
+    ok: candidateCommand
+      ? candidateCasesPassed === scorecard.length && regressedAssertions === 0
+      : true,
+    totals: {
+      case_count: scorecard.length,
+      baseline_cases_passed: baselineCasesPassed,
+      candidate_cases_passed: candidateCasesPassed,
+      improved_assertions: improvedAssertions,
+      regressed_assertions: regressedAssertions,
+      changed_assertions: changedAssertions
+    }
+  };
+}
+
+function renderProjectionEvalCommand(commandTemplate, inputPath) {
+  const escapedInput = shellEscape(inputPath);
+  return commandTemplate
+    .replaceAll('"{input}"', escapedInput)
+    .replaceAll("'{input}'", escapedInput)
+    .replaceAll("{input}", escapedInput);
+}
+
+function shellEscape(value) {
+  return `'${String(value).split("'").join(`'"'"'`)}'`;
+}
+
+async function finalizeRealSuite(suiteLabel, results, suiteConfig = null) {
   const suiteDir = path.join(resultsRoot, suiteLabel);
+  const pairedSummary = buildPairedSummary(results, suiteConfig?.runners ?? []);
   await mkdir(suiteDir, { recursive: true });
   await writeJson(path.join(suiteDir, "summary.json"), results);
   await writeFile(path.join(suiteDir, "summary.md"), renderSuiteSummary(results), "utf8");
+  await writeJson(path.join(suiteDir, "paired-summary.json"), pairedSummary);
+  await writeFile(
+    path.join(suiteDir, "paired-summary.md"),
+    renderPairedSummary(pairedSummary),
+    "utf8"
+  );
+}
+
+export function buildPairedSummary(results, runnerConfigs = []) {
+  const configuredOrder = new Map(
+    runnerConfigs.map((runner, index) => [runner.runner_id, index])
+  );
+  const expectedRunnerIds = new Set(runnerConfigs.map((runner) => runner.runner_id));
+  const groups = new Map();
+  for (const result of results) {
+    const key = `${result.task_id}#${result.repetition}`;
+    const group = groups.get(key) ?? {
+      task_id: result.task_id,
+      repetition: result.repetition,
+      runs: []
+    };
+    group.runs.push(result);
+    groups.set(key, group);
+  }
+
+  return [...groups.values()]
+    .sort(
+      (left, right) =>
+        left.task_id.localeCompare(right.task_id) ||
+        left.repetition - right.repetition
+    )
+    .map((group) => {
+      const runs = [...group.runs].sort(
+        (left, right) =>
+          (configuredOrder.get(left.runner) ?? Number.MAX_SAFE_INTEGER) -
+            (configuredOrder.get(right.runner) ?? Number.MAX_SAFE_INTEGER) ||
+          left.runner.localeCompare(right.runner)
+      );
+      const comparisons = [];
+      for (let leftIndex = 0; leftIndex < runs.length; leftIndex += 1) {
+        for (let rightIndex = leftIndex + 1; rightIndex < runs.length; rightIndex += 1) {
+          comparisons.push(comparePairedRuns(runs[leftIndex], runs[rightIndex]));
+        }
+      }
+      return {
+        task_id: group.task_id,
+        repetition: group.repetition,
+        complete:
+          runnerConfigs.length === 0 ||
+          (runs.length === expectedRunnerIds.size &&
+            runs.every((run) => expectedRunnerIds.has(run.runner))),
+        scheduled_runner_order: [...runs]
+          .sort((left, right) => (left.pair_order ?? 0) - (right.pair_order ?? 0))
+          .map((run) => run.runner),
+        runs: runs.map(compactPairedRun),
+        comparisons
+      };
+    });
+}
+
+function compactPairedRun(run) {
+  return {
+    runner: run.runner,
+    transport: run.transport ?? null,
+    endpoint: run.endpoint ?? null,
+    pair_order: run.pair_order ?? null,
+    success: run.success,
+    duration_ms: run.duration_ms,
+    input_tokens: run.input_tokens ?? 0,
+    logical_input_tokens: run.logical_input_tokens ?? null,
+    output_tokens: run.output_tokens ?? 0,
+    provider_duration_ms: run.provider_duration_ms ?? 0,
+    provider_retry_count: run.provider_retry_count ?? 0,
+    provider_error_count: run.provider_error_count ?? 0,
+    reasoning_tokens: run.reasoning_tokens ?? 0,
+    cache_read_input_tokens: run.cache_read_input_tokens ?? 0,
+    cache_miss_input_tokens: run.cache_miss_input_tokens ?? null,
+    cache_creation_input_tokens: run.cache_creation_input_tokens ?? 0,
+    estimated_cost_usd: run.estimated_cost_usd ?? null,
+    error_kind: run.error_kind ?? null
+  };
+}
+
+function nullableDelta(left, right) {
+  return Number.isFinite(left) && Number.isFinite(right) ? right - left : null;
+}
+
+function comparePairedRuns(left, right) {
+  return {
+    runner_a: left.runner,
+    runner_b: right.runner,
+    success_delta: Number(Boolean(right.success)) - Number(Boolean(left.success)),
+    duration_ms_delta: (right.duration_ms ?? 0) - (left.duration_ms ?? 0),
+    total_tokens_delta:
+      (right.input_tokens ?? 0) +
+      (right.output_tokens ?? 0) -
+      (left.input_tokens ?? 0) -
+      (left.output_tokens ?? 0),
+    logical_input_tokens_delta: nullableDelta(
+      left.logical_input_tokens,
+      right.logical_input_tokens
+    ),
+    provider_duration_ms_delta:
+      (right.provider_duration_ms ?? 0) - (left.provider_duration_ms ?? 0),
+    provider_retry_count_delta:
+      (right.provider_retry_count ?? 0) - (left.provider_retry_count ?? 0),
+    provider_error_count_delta:
+      (right.provider_error_count ?? 0) - (left.provider_error_count ?? 0),
+    reasoning_tokens_delta:
+      (right.reasoning_tokens ?? 0) - (left.reasoning_tokens ?? 0),
+    cache_read_input_tokens_delta:
+      (right.cache_read_input_tokens ?? 0) - (left.cache_read_input_tokens ?? 0),
+    cache_miss_input_tokens_delta: nullableDelta(
+      left.cache_miss_input_tokens,
+      right.cache_miss_input_tokens
+    ),
+    cache_creation_input_tokens_delta:
+      (right.cache_creation_input_tokens ?? 0) -
+      (left.cache_creation_input_tokens ?? 0),
+    estimated_cost_usd_delta: nullableDelta(
+      left.estimated_cost_usd,
+      right.estimated_cost_usd
+    )
+  };
+}
+
+function renderPairedSummary(entries) {
+  const lines = ["# Paired Benchmark Summary", ""];
+  for (const entry of entries) {
+    lines.push(`## ${entry.task_id} (run ${entry.repetition})`, "");
+    lines.push(
+      "| Runner | Transport | Success | Duration | Provider | Retries | Logical input | Cache read/miss/create | Output | Est. cost USD |"
+    );
+    lines.push("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for (const run of entry.runs) {
+      lines.push(
+        `| ${run.runner} | ${run.transport ?? "-"} | ${boolWord(run.success)} | ${formatMs(run.duration_ms)} | ${formatMs(run.provider_duration_ms)} | ${run.provider_retry_count} | ${run.logical_input_tokens ?? "-"} | ${run.cache_read_input_tokens}/${run.cache_miss_input_tokens ?? "-"}/${run.cache_creation_input_tokens} | ${run.output_tokens} | ${run.estimated_cost_usd === null ? "-" : run.estimated_cost_usd.toFixed(6)} |`
+      );
+    }
+    lines.push("");
+  }
+  return lines.join("\n");
 }
 
 async function runRealBenchmarkTask({
@@ -582,13 +1043,19 @@ async function runRealBenchmarkTask({
   suiteConfig,
   suiteLabel,
   runnerEnv,
+  repetition = 1,
   worktreeRootOverride
 }) {
   const manifestDir = path.dirname(manifestPath);
   const repoPath = resolveRepoPath(manifest.repo.local_path, manifestDir);
   await ensureBaseShaExists(repoPath, manifest.base.sha, runCommand);
   const runnerId = runnerConfig.runner_id;
-  const branchName = branchNameForTask(manifest.task_id, runnerId);
+  const branchName = branchNameForTask(
+    manifest.task_id,
+    runnerId,
+    repetition,
+    suiteLabel
+  );
   const worktreeRoot =
     worktreeRootOverride ??
     path.join(
@@ -599,10 +1066,15 @@ async function runRealBenchmarkTask({
     );
   const worktreePath = path.join(
     worktreeRoot,
-    worktreeNameForTask(manifest.issue.number, runnerId)
+    worktreeNameForTask(manifest.issue.number, runnerId, repetition)
   );
-  const runId = "run-01";
-  const taskDir = path.join(resultsRoot, suiteLabel, manifest.task_id, runnerId, runId);
+  const { runId, path: taskDir } = artifactDirForTask(
+    resultsRoot,
+    suiteLabel,
+    manifest.task_id,
+    runnerId,
+    repetition
+  );
   await mkdir(taskDir, { recursive: true });
   await copyFile(manifestPath, path.join(taskDir, "manifest.yaml"));
 
@@ -635,7 +1107,8 @@ async function runRealBenchmarkTask({
       worktreePath,
       taskDir,
       runnerEnv,
-      manifest
+      manifest,
+      repetition
     });
   } catch (error) {
     await writeFile(path.join(taskDir, "runner-error.log"), `${error?.stack ?? error}\n`, "utf8");
@@ -654,6 +1127,13 @@ async function runRealBenchmarkTask({
     };
   }
 
+  const verifier = shouldRunManifestVerifier(suiteConfig)
+    ? await runVerificationCommands(manifest.verification.commands, worktreePath, runnerEnv)
+    : null;
+  if (verifier) {
+    await writeFile(path.join(taskDir, "verify.log"), verifier.log, "utf8");
+    await writeJson(path.join(taskDir, "verification.json"), verifier);
+  }
   const changedFiles = await diffAgainstBase(repoPath, worktreePath, manifest.base.sha, taskDir);
   await writeJson(path.join(taskDir, "changed-files.json"), changedFiles);
   const scopeViolation = detectScopeViolation(changedFiles, manifest.evaluation);
@@ -711,7 +1191,10 @@ async function runRealBenchmarkTask({
     issue_number: manifest.issue.number,
     issue_title: manifest.issue.title,
     runner: runnerId,
-    repetition: 1,
+    transport: runnerConfig.transport ?? null,
+    endpoint: runnerConfig.endpoint ?? null,
+    pair_order: runnerConfig.pair_order ?? null,
+    repetition,
     success:
       evaluateRealTaskSuccess({
         runnerResult,
@@ -719,9 +1202,11 @@ async function runRealBenchmarkTask({
         scopeViolation,
         scopePolicy: manifest.evaluation.scope_policy,
         expectedOutcome: manifest.evaluation.expected_outcome ?? "change_required"
-      }) && githubCi.success !== false,
-    verify_success: null,
-    verify_status: "not_run_github_ci_source",
+      }) &&
+      githubCi.success !== false &&
+      verifier?.success !== false,
+    verify_success: verifier?.success ?? null,
+    verify_status: verifier?.status ?? "not_run_github_ci_source",
     scope_violation: scopeViolation,
     scope_policy: manifest.evaluation.scope_policy,
     expected_outcome: manifest.evaluation.expected_outcome ?? "change_required",
@@ -735,7 +1220,7 @@ async function runRealBenchmarkTask({
     error_kind: runnerResult.errorKind ?? null,
     completion_classification: runnerResult.completionClassification ?? null,
     completion_terminal_state: runnerResult.terminalState ?? null,
-    verify_exit_code: null,
+    verify_exit_code: verifier?.exitCode ?? null,
     github_ci_status: githubCi.status,
     github_ci_success: githubCi.success,
     github_ci_pending: githubCi.pending,
@@ -749,6 +1234,26 @@ async function runRealBenchmarkTask({
     total_tool_latency_ms: runnerResult.totalToolLatencyMs ?? 0,
     per_tool_latency_ms: runnerResult.perToolLatencyMs ?? {},
     token_optimization: compactTokenOptimization(runnerResult.tokenOptimization),
+    provider_duration_ms:
+      runnerResult.tokenOptimization?.summary?.provider_duration_ms ?? 0,
+    provider_attempt_count:
+      runnerResult.tokenOptimization?.summary?.provider_attempt_count ?? 0,
+    provider_retry_count:
+      runnerResult.tokenOptimization?.summary?.provider_retry_count ?? 0,
+    provider_error_count:
+      runnerResult.tokenOptimization?.summary?.provider_error_count ?? 0,
+    reasoning_tokens:
+      runnerResult.tokenOptimization?.summary?.reasoning_tokens ?? 0,
+    logical_input_tokens:
+      runnerResult.tokenOptimization?.summary?.logical_input_tokens ?? null,
+    cache_read_input_tokens:
+      runnerResult.tokenOptimization?.summary?.cache_read_input_tokens ?? 0,
+    cache_miss_input_tokens:
+      runnerResult.tokenOptimization?.summary?.cache_miss_input_tokens ?? null,
+    cache_creation_input_tokens:
+      runnerResult.tokenOptimization?.summary?.cache_creation_input_tokens ?? 0,
+    estimated_cost_usd:
+      runnerResult.tokenOptimization?.summary?.estimated_cost_usd ?? null,
     base_sha: manifest.base.sha,
     benchmark_mode: manifest.benchmark.mode,
     branch: branchName,
@@ -828,6 +1333,10 @@ function normalizePrPolicy(pr = {}) {
     submit_pr: submitPr,
     draft_pr: submitPr ? draftPr : false
   };
+}
+
+export function shouldRunManifestVerifier(suiteConfig) {
+  return !suiteConfig?.pr?.submit_pr;
 }
 
 async function withRepoSideEffectLock(repoPath, fn) {
@@ -910,9 +1419,25 @@ export function buildHolonBenchmarkEnv(runnerEnv, runnerConfig, manifest) {
   return env;
 }
 
-async function executeRealRunner({ runnerConfig, prompt, worktreePath, taskDir, runnerEnv, manifest }) {
+async function executeRealRunner({
+  runnerConfig,
+  prompt,
+  worktreePath,
+  taskDir,
+  runnerEnv,
+  manifest,
+  repetition
+}) {
   if (runnerConfig.driver === "holon") {
-    return runHolonRealTask({ runnerConfig, prompt, worktreePath, taskDir, runnerEnv, manifest });
+    return runHolonRealTask({
+      runnerConfig,
+      prompt,
+      worktreePath,
+      taskDir,
+      runnerEnv,
+      manifest,
+      repetition
+    });
   }
   if (runnerConfig.driver === "codex") {
     return runCodexRealTask({ runnerConfig, prompt, worktreePath, taskDir, runnerEnv });
@@ -923,12 +1448,20 @@ async function executeRealRunner({ runnerConfig, prompt, worktreePath, taskDir, 
   throw new Error(`unsupported real runner driver ${runnerConfig.driver}`);
 }
 
-async function runHolonRealTask({ runnerConfig, prompt, worktreePath, taskDir, runnerEnv, manifest }) {
+async function runHolonRealTask({
+  runnerConfig,
+  prompt,
+  worktreePath,
+  taskDir,
+  runnerEnv,
+  manifest,
+  repetition
+}) {
   const homeDir = path.join(taskDir, "holon-home");
-  const agentId = manifest.task_id;
+  const agentId = `${manifest.task_id}-${runnerConfig.runner_id}-run-${String(repetition).padStart(2, "0")}`;
   const env = buildHolonBenchmarkEnv(runnerEnv, runnerConfig, manifest);
-  await ensureHolonBuilt(worktreePath);
-  const holonBinary = resolveHolonBinary(worktreePath);
+  await ensureDriverHolonBuilt();
+  const holonBinary = resolveDriverHolonBinary();
   const args = [
     "run",
     prompt,
@@ -961,7 +1494,6 @@ async function runHolonRealTask({ runnerConfig, prompt, worktreePath, taskDir, r
   }
   const agentDir = path.join(homeDir, "agents", agentId);
   await copyAgentJsonlArtifact(agentDir, taskDir, "briefs.jsonl");
-  await copyAgentJsonlArtifact(agentDir, taskDir, "events.jsonl");
   await copyAgentJsonlArtifact(agentDir, taskDir, "tools.jsonl");
   await copyAgentJsonlArtifact(agentDir, taskDir, "transcript.jsonl");
   await copyAgentStateArtifact(agentDir, taskDir, "agent.json");
@@ -971,7 +1503,17 @@ async function runHolonRealTask({ runnerConfig, prompt, worktreePath, taskDir, r
   const briefs = await readAgentJsonlArtifact(agentDir, "briefs.jsonl", taskDir);
   const toolExecutions = await readAgentJsonlArtifact(agentDir, "tools.jsonl", taskDir);
   const toolMetrics = summarizeHolonToolExecutions(toolExecutions);
-  const events = await readAgentJsonlArtifact(agentDir, "events.jsonl", taskDir);
+  const events = await readHolonAuditEvents({
+    holonBinary,
+    agentId,
+    homeDir,
+    cwd: worktreePath,
+    env
+  });
+  await writeJsonl(
+    path.join(taskDir, "events.jsonl"),
+    events.map((event) => JSON.stringify(event))
+  );
   const transcript = await readAgentJsonlArtifact(agentDir, "transcript.jsonl", taskDir);
   const durableState = await summarizeHolonDurableState(agentDir, taskDir);
   await writeJson(path.join(taskDir, "holon-durable-state.json"), durableState);
@@ -987,7 +1529,13 @@ async function runHolonRealTask({ runnerConfig, prompt, worktreePath, taskDir, r
     await writeJson(path.join(taskDir, "holon-run.json"), parsed);
   }
   const tokenOptimization = summarizeHolonTokenOptimization(tokenOptimizationEvents(events, transcript), toolExecutions, {
-    modelRef: runnerConfig.model_ref
+    modelRef: runnerConfig.model_ref,
+    transport: runnerConfig.transport,
+    pricing: runnerConfig.pricing
+  });
+  assertHolonProviderRoundTelemetry({
+    modelRounds: parsed?.model_rounds ?? durableState.agent_total_model_rounds,
+    tokenOptimization
   });
   await writeJson(path.join(taskDir, "token-optimization.json"), tokenOptimization);
   const completion = classifyHolonBenchmarkCompletion({
@@ -1968,15 +2516,20 @@ function timestampLabel() {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
-async function runHolonTask({ task, taskDir, workspaceDir, runnerEnv }) {
+async function loadClaudeAgentSdk() {
+  claudeAgentSdkPromise ??= import("@anthropic-ai/claude-agent-sdk");
+  return claudeAgentSdkPromise;
+}
+
+async function runHolonTask({ task, taskDir, workspaceDir, runnerEnv, holonProvider }) {
   const homeDir = path.join(taskDir, "holon-home");
   const agentId = task.name;
-  const env = {
-    ...runnerEnv,
-    HOLON_HOME: homeDir,
-    HOLON_WORKSPACE_DIR: workspaceDir
-  };
-  const holonBinary = resolveHolonBinary();
+  const env = buildHolonFixtureEnv(runnerEnv, homeDir, workspaceDir, holonProvider);
+  if (holonProvider) {
+    await mkdir(homeDir, { recursive: true });
+    await writeJson(path.join(homeDir, "config.json"), buildHolonFixtureConfig(holonProvider));
+  }
+  const holonBinary = resolveDriverHolonBinary();
   const agentDir = path.join(homeDir, "agents", agentId);
 
   const startedAt = Date.now();
@@ -1993,8 +2546,7 @@ async function runHolonTask({ task, taskDir, workspaceDir, runnerEnv }) {
   let lastRun = null;
   let timedOut = false;
   for (const [index, turn] of turns.entries()) {
-    const args = ["run", turn.prompt, "--agent", agentId, "--json", "--trust"];
-    args.push(task.mode === "controlled" ? "trusted-integration" : "trusted-operator");
+    const args = buildFixtureHolonRunArgs(task, turn.prompt, agentId, index === 0);
     const run = await runCommand(
       holonBinary,
       args,
@@ -2045,7 +2597,13 @@ async function runHolonTask({ task, taskDir, workspaceDir, runnerEnv }) {
     (await readJsonIfExists(path.join(agentDir, "agent.json"))) ??
     (await readJsonIfExists(path.join(agentDir, ".holon", "state", "agent.json")));
   const briefs = await readAgentJsonlArtifact(agentDir, "briefs.jsonl", taskDir);
-  const events = await readAgentJsonlArtifact(agentDir, "events.jsonl", taskDir);
+  const events = await readHolonAuditEvents({
+    holonBinary,
+    agentId,
+    homeDir,
+    cwd: repoRoot,
+    env
+  });
   const tasks = await readAgentJsonlArtifact(agentDir, "tasks.jsonl", taskDir);
 
   await writeJson(path.join(taskDir, "status.json"), { agent: agentState });
@@ -2053,7 +2611,10 @@ async function runHolonTask({ task, taskDir, workspaceDir, runnerEnv }) {
   await writeJson(path.join(taskDir, "events.json"), events);
   await writeJson(path.join(taskDir, "tasks.json"), lastRun?.tasks ?? tasks);
 
-  await copyAgentJsonlArtifact(agentDir, taskDir, "events.jsonl");
+  await writeJsonl(
+    path.join(taskDir, "events.jsonl"),
+    events.map((event) => JSON.stringify(event))
+  );
   await copyAgentJsonlArtifact(agentDir, taskDir, "briefs.jsonl");
   await copyAgentJsonlArtifact(agentDir, taskDir, "tools.jsonl");
   await copyAgentJsonlArtifact(agentDir, taskDir, "transcript.jsonl");
@@ -2061,12 +2622,22 @@ async function runHolonTask({ task, taskDir, workspaceDir, runnerEnv }) {
   const finalMessage = selectHolonFinalMessage(lastRun, briefs);
   await writeFile(path.join(taskDir, "final_message.md"), `${finalMessage}\n`, "utf8");
 
-  const toolExecutions = await readAgentJsonlArtifact(agentDir, "tools.jsonl", taskDir);
+  const toolExecutions = selectHolonToolExecutions(
+    await readAgentJsonlArtifact(agentDir, "tools.jsonl", taskDir),
+    events
+  );
   const toolMetrics = summarizeHolonToolExecutions(toolExecutions);
   const transcript = await readAgentJsonlArtifact(agentDir, "transcript.jsonl", taskDir);
   const tokenOptimization = summarizeHolonTokenOptimization(tokenOptimizationEvents(events, transcript), toolExecutions, {
     modelRef: env.HOLON_MODEL
   });
+  assertHolonProviderRoundTelemetry({
+    modelRounds: lastRun?.model_rounds,
+    tokenOptimization
+  });
+  if (holonProvider) {
+    assertHolonFixtureModel(events, holonProvider.modelRef);
+  }
   await writeJson(path.join(taskDir, "token-optimization.json"), tokenOptimization);
   const failureKind = computeFailureKind(lastRun);
 
@@ -2083,9 +2654,10 @@ async function runHolonTask({ task, taskDir, workspaceDir, runnerEnv }) {
         : failureKind.runner_error_kind ??
           lastRun?.runner_error_kind ??
           (lastRun && lastRun.final_status !== "completed" ? lastRun.final_status : null),
-    inputTokens: lastRun?.input_tokens ?? 0,
-    outputTokens: lastRun?.output_tokens ?? 0,
-    modelRounds: lastRun?.model_rounds ?? 0,
+    inputTokens:
+      Number(lastRun?.input_tokens) || tokenOptimization.summary.logical_input_tokens,
+    outputTokens: Number(lastRun?.output_tokens) || tokenOptimization.summary.output_tokens,
+    modelRounds: Number(lastRun?.model_rounds) || tokenOptimization.summary.rounds,
     tokenOptimization,
     ...toolMetrics
   };
@@ -2125,7 +2697,48 @@ function holonRunFailure(agentId, kind, run, extra = {}) {
   };
 }
 
+export function buildHolonFixtureConfig(holonProvider) {
+  const auth = holonProvider.apiKeyEnv
+    ? {
+        source: "env",
+        kind: "api_key",
+        env: holonProvider.apiKeyEnv
+      }
+    : {
+        source: "none",
+        kind: "none"
+      };
+  return {
+    model: {
+      default: holonProvider.modelRef,
+      fallbacks: []
+    },
+    providers: {
+      [holonProvider.provider]: {
+        transport: holonProvider.transport,
+        base_url: holonProvider.baseUrl,
+        auth
+      }
+    }
+  };
+}
+
+export function buildHolonFixtureEnv(runnerEnv, homeDir, workspaceDir, holonProvider) {
+  const env = {
+    ...runnerEnv,
+    HOLON_HOME: homeDir,
+    HOLON_WORKSPACE_DIR: workspaceDir
+  };
+  if (holonProvider) {
+    env.HOLON_MODEL = holonProvider.modelRef;
+    env.HOLON_DISABLE_PROVIDER_FALLBACK = "1";
+    delete env.HOLON_MODEL_FALLBACKS;
+  }
+  return env;
+}
+
 async function runClaudeSdkTask({ task, taskDir, workspaceDir, runnerEnv }) {
+  const { query } = await loadClaudeAgentSdk();
   if (task.turns && task.turns.length > 1) {
     return runClaudeSdkSessionTask({ task, taskDir, workspaceDir, runnerEnv });
   }
@@ -2251,6 +2864,7 @@ function sdkMaxTurnsForTask(task) {
 }
 
 async function runClaudeSdkSessionTask({ task, taskDir, workspaceDir, runnerEnv }) {
+  const { unstable_v2_createSession } = await loadClaudeAgentSdk();
   const startedAt = Date.now();
   const tools =
     task.tool_profile === "read_only"
@@ -2400,23 +3014,63 @@ async function prepareWorkspace(task, destination) {
   throw new Error(`unsupported workspace type ${task.workspace.type}`);
 }
 
-async function ensureHolonBuilt(buildRoot = repoRoot) {
+async function ensureDriverHolonBuilt() {
   if (process.env.HOLON_BENCHMARK_BINARY) {
     return;
   }
-  await runCommand("cargo", ["build", "--release", "--quiet"], buildRoot, process.env);
+  await runCommand("cargo", ["build", "--release", "--quiet"], repoRoot, process.env);
 }
 
-function resolveHolonBinary(buildRoot = repoRoot) {
+export function resolveDriverHolonBinary() {
   const override = process.env.HOLON_BENCHMARK_BINARY;
   if (!override) {
-    return path.join(buildRoot, "target", "release", "holon");
+    return path.join(repoRoot, "target", "release", "holon");
   }
   return path.isAbsolute(override) ? override : path.resolve(repoRoot, override);
 }
 
+export function buildFixtureHolonRunArgs(task, prompt, agentId, firstTurn) {
+  const args = ["run", prompt, "--agent", agentId];
+  if (firstTurn && task.mode === "runtime") {
+    args.push("--create-agent");
+  }
+  args.push(
+    "--json",
+    "--trust",
+    task.mode === "controlled" ? "trusted-integration" : "trusted-operator"
+  );
+  return args;
+}
+
 async function loadTask(taskFile) {
   return readJson(path.join(tasksRoot, taskFile));
+}
+
+export function resolveHolonFixtureProvider(args) {
+  const values = [
+    args.holonModel,
+    args.holonProviderTransport,
+    args.holonProviderBaseUrl
+  ];
+  if (values.every((value) => value === undefined)) {
+    return null;
+  }
+  if (values.some((value) => value === undefined)) {
+    throw new Error(
+      "fixture provider override requires --holon-model, --holon-provider-transport, and --holon-provider-base-url"
+    );
+  }
+  const separator = args.holonModel.indexOf("/");
+  if (separator <= 0 || separator === args.holonModel.length - 1) {
+    throw new Error("--holon-model must use provider/model format");
+  }
+  return {
+    modelRef: args.holonModel,
+    provider: args.holonModel.slice(0, separator),
+    transport: args.holonProviderTransport,
+    baseUrl: args.holonProviderBaseUrl,
+    apiKeyEnv: args.holonProviderApiKeyEnv
+  };
 }
 
 async function loadClaudeSettingsEnv() {
@@ -2694,6 +3348,162 @@ function summarizeHolonToolExecutions(entries) {
   };
 }
 
+export function selectHolonToolExecutions(toolExecutions, events) {
+  if (toolExecutions.length > 0) {
+    return toolExecutions;
+  }
+  return events
+    .filter(
+      (event) => (event?.kind ?? event?.event ?? event?.type) === "tool_executed"
+    )
+    .map((event) => event?.data ?? event);
+}
+
+function usageNumber(value, field, issues, { required = false } = {}) {
+  if (value === undefined || value === null) {
+    if (required) {
+      issues.push(`${field}_missing`);
+    }
+    return 0;
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    issues.push(`${field}_not_finite`);
+    return 0;
+  }
+  if (numeric < 0) {
+    issues.push(`${field}_negative`);
+    return 0;
+  }
+  return numeric;
+}
+
+function usageSemantics(provider, modelRef, transport) {
+  const normalizedTransport = String(transport ?? "").toLowerCase();
+  if (normalizedTransport === "anthropic_messages") {
+    return "anthropic_messages";
+  }
+  if (normalizedTransport === "openai_responses") {
+    return "openai_responses";
+  }
+  if (normalizedTransport) {
+    return "total_input_with_cache";
+  }
+  if (provider === "anthropic") {
+    return "anthropic_messages";
+  }
+  if (String(modelRef ?? "").toLowerCase().includes("@responses/")) {
+    return "openai_responses";
+  }
+  return "total_input_with_cache";
+}
+
+function turnLocalCompactionDiagnostic(data) {
+  if (!Object.prototype.hasOwnProperty.call(data ?? {}, "turn_local_compaction")) {
+    return { status: "unavailable" };
+  }
+  const compaction = data?.turn_local_compaction;
+  if (compaction === null || typeof compaction !== "object") {
+    return { status: "not_applied" };
+  }
+  return {
+    status: "applied",
+    trigger_reason: compaction.trigger_reason ?? null,
+    prompt_budget_estimated_tokens: numberOrNull(
+      compaction.prompt_budget_estimated_tokens
+    ),
+    compaction_trigger_estimated_tokens: numberOrNull(
+      compaction.compaction_trigger_estimated_tokens
+    ),
+    compaction_keep_recent_estimated_tokens: numberOrNull(
+      compaction.compaction_keep_recent_estimated_tokens
+    ),
+    tool_output_truncation_estimated_tokens: numberOrNull(
+      compaction.tool_output_truncation_estimated_tokens
+    ),
+    pre_compaction_estimated_tokens: numberOrNull(
+      compaction.pre_compaction_estimated_tokens
+    ),
+    projected_estimated_tokens: numberOrNull(
+      compaction.projected_estimated_tokens
+    ),
+    compacted_rounds: numberOrNull(compaction.compacted_rounds),
+    exact_tail_rounds: numberOrNull(compaction.exact_tail_rounds),
+    degraded_rounds: numberOrNull(compaction.degraded_rounds),
+    compacted_tool_results: numberOrNull(compaction.compacted_tool_results),
+    preserved_artifact_refs: numberOrNull(compaction.preserved_artifact_refs),
+    trigger_budget_fallback_applied: Boolean(
+      compaction.trigger_budget_fallback_applied
+    ),
+    strict_fallback_applied: Boolean(compaction.strict_fallback_applied)
+  };
+}
+
+export function normalizeProviderRoundUsage({
+  data,
+  provider,
+  modelRef,
+  transport,
+  pricing
+}) {
+  const issues = [];
+  const rawInputTokens = usageNumber(
+    data?.input_tokens ?? data?.token_usage?.input_tokens,
+    "input_tokens",
+    issues,
+    { required: true }
+  );
+  const outputTokens = usageNumber(
+    data?.output_tokens ?? data?.token_usage?.output_tokens,
+    "output_tokens",
+    issues,
+    { required: true }
+  );
+  const cacheUsage = data?.provider_cache_usage ?? {};
+  const cacheReadInputTokens = usageNumber(
+    cacheUsage.read_input_tokens,
+    "cache_read_input_tokens",
+    issues
+  );
+  const cacheCreationInputTokens = usageNumber(
+    cacheUsage.creation_input_tokens,
+    "cache_creation_input_tokens",
+    issues
+  );
+  const semantics = usageSemantics(provider, modelRef, transport);
+  const logicalInputTokens =
+    semantics === "anthropic_messages"
+      ? rawInputTokens + cacheReadInputTokens + cacheCreationInputTokens
+      : rawInputTokens;
+  if (cacheReadInputTokens > logicalInputTokens) {
+    issues.push("cache_read_exceeds_logical_input");
+  }
+  const cacheMissInputTokens =
+    semantics === "anthropic_messages"
+      ? rawInputTokens
+      : Math.max(0, logicalInputTokens - cacheReadInputTokens);
+  let estimatedCostUsd = null;
+  if (pricing && issues.length === 0) {
+    estimatedCostUsd =
+      (cacheMissInputTokens * pricing.cache_miss_input_per_million +
+        cacheReadInputTokens * pricing.cache_read_input_per_million +
+        cacheCreationInputTokens * pricing.cache_creation_input_per_million +
+        outputTokens * pricing.output_per_million) /
+      1_000_000;
+  }
+  return {
+    usage_semantics: semantics,
+    raw_input_tokens: rawInputTokens,
+    logical_input_tokens: logicalInputTokens,
+    cache_read_input_tokens: cacheReadInputTokens,
+    cache_miss_input_tokens: cacheMissInputTokens,
+    cache_creation_input_tokens: cacheCreationInputTokens,
+    output_tokens: outputTokens,
+    estimated_cost_usd: estimatedCostUsd,
+    usage_validation_issues: issues
+  };
+}
+
 export function summarizeHolonTokenOptimization(events, toolExecutions = [], options = {}) {
   const toolSummaries = toolExecutions.map(summarizeToolPayloadSize);
   const truncatedMutationToolCallRejections = events.filter((event) => {
@@ -2710,6 +3520,7 @@ export function summarizeHolonTokenOptimization(events, toolExecutions = [], opt
     lastPositiveCacheRound: null,
     lastMissRound: null
   };
+  let previousStablePrefix = null;
 
   for (const event of events) {
     const kind = event?.kind ?? event?.event ?? event?.type;
@@ -2735,18 +3546,35 @@ export function summarizeHolonTokenOptimization(events, toolExecutions = [], opt
       options.modelRef ??
       null;
     const provider = attempt?.provider ?? providerFromModelRef(modelRef);
-    const cacheUsage = data?.provider_cache_usage ?? {};
-    const inputTokens = Number(data?.input_tokens ?? data?.token_usage?.input_tokens ?? 0);
-    const cacheReadInputTokens = Number(cacheUsage.read_input_tokens ?? 0);
-    const cacheCreationInputTokens = Number(cacheUsage.creation_input_tokens ?? 0);
+    const attempts = Array.isArray(data?.provider_attempt_timeline?.attempts)
+      ? data.provider_attempt_timeline.attempts
+      : [];
+    const usage = normalizeProviderRoundUsage({
+      data,
+      provider,
+      modelRef,
+      transport: options.transport,
+      pricing: options.pricing
+    });
+    const inputTokens = usage.raw_input_tokens;
+    const cacheReadInputTokens = usage.cache_read_input_tokens;
+    const cacheCreationInputTokens = usage.cache_creation_input_tokens;
     const round = Number(data?.round ?? event?.round ?? rounds.length + 1);
     const requestDiagnostics = data?.provider_request_diagnostics ?? {};
+    const stablePrefix = stablePrefixDiagnostic(requestDiagnostics);
+    const stablePrefixChangedComponents = stablePrefixComponentChanges(
+      previousStablePrefix,
+      stablePrefix
+    );
     const requestLoweringMode = inferRequestLoweringMode({
       provider,
       modelRef,
       round,
       promptCacheKey: data?.prompt_cache_key,
-      cacheUsage,
+      cacheUsage: {
+        read_input_tokens: cacheReadInputTokens,
+        creation_input_tokens: cacheCreationInputTokens
+      },
       requestDiagnostics
     });
     const highInputZeroCacheRead =
@@ -2766,6 +3594,8 @@ export function summarizeHolonTokenOptimization(events, toolExecutions = [], opt
             cacheReadInputTokens,
             eventTimestampMs,
             contextManagement,
+            stablePrefix,
+            stablePrefixChangedComponents,
             state: anthropicCacheState
           })
         : {};
@@ -2776,9 +3606,23 @@ export function summarizeHolonTokenOptimization(events, toolExecutions = [], opt
       model_ref: modelRef,
       request_lowering_mode: requestLoweringMode,
       input_tokens: inputTokens,
-      output_tokens: Number(data?.output_tokens ?? data?.token_usage?.output_tokens ?? 0),
+      ...usage,
+      reasoning_tokens: reasoningTokenCount(data),
+      provider_duration_ms: attempts.reduce(
+        (sum, providerAttempt) => sum + Number(providerAttempt?.duration_ms ?? 0),
+        0
+      ),
+      provider_attempt_count: attempts.length,
+      provider_retry_count: Math.max(0, attempts.length - 1),
+      provider_error_count: attempts.filter(
+        (providerAttempt) => providerAttempt?.outcome !== "succeeded"
+      ).length,
       cache_read_input_tokens: cacheReadInputTokens,
       cache_creation_input_tokens: cacheCreationInputTokens,
+      cache_hit_ratio:
+        usage.logical_input_tokens > 0
+          ? cacheReadInputTokens / usage.logical_input_tokens
+          : null,
       high_input_zero_cache_read: highInputZeroCacheRead,
       prompt_cache_key_present: typeof data?.prompt_cache_key === "string" && data.prompt_cache_key.length > 0,
       working_memory_revision: workingMemoryRevision,
@@ -2790,14 +3634,20 @@ export function summarizeHolonTokenOptimization(events, toolExecutions = [], opt
         requestDiagnostics
       ),
       openai_remote_compaction: openaiRemoteCompactionDiagnostic(provider, requestDiagnostics),
+      turn_local_compaction: turnLocalCompactionDiagnostic(data),
       context_management: contextManagement,
       previous_tool: previousTool,
       anthropic_cache: anthropicCache,
+      stable_prefix: stablePrefix,
+      stable_prefix_changed_components: stablePrefixChangedComponents,
       ...preciseAnthropicCache
     };
     rounds.push(roundEntry);
     if (provider === "anthropic") {
       updateAnthropicCacheState(anthropicCacheState, roundEntry);
+    }
+    if (stablePrefix.status === "available") {
+      previousStablePrefix = stablePrefix;
     }
   }
 
@@ -2807,10 +3657,21 @@ export function summarizeHolonTokenOptimization(events, toolExecutions = [], opt
     exec_command_cost: summarizeExecCommandCost(toolSummaries)
   };
   return {
-    schema_version: 1,
-    generated_from: "holon_events",
+    schema_version: 2,
+    generated_from: "holon_runtime_db_events",
     secret_safe: true,
     large_cache_miss_input_threshold: 10_000,
+    pricing: options.pricing
+      ? {
+          currency: options.pricing.currency,
+          effective_at: options.pricing.effective_at,
+          source: options.pricing.source,
+          cache_miss_input_per_million: options.pricing.cache_miss_input_per_million,
+          cache_read_input_per_million: options.pricing.cache_read_input_per_million,
+          cache_creation_input_per_million: options.pricing.cache_creation_input_per_million,
+          output_per_million: options.pricing.output_per_million
+        }
+      : null,
     summary,
     rounds
   };
@@ -3108,6 +3969,24 @@ function providerFromModelRef(modelRef) {
   return "unknown";
 }
 
+function reasoningTokenCount(data) {
+  const candidates = [
+    data?.reasoning_tokens,
+    data?.token_usage?.reasoning_tokens,
+    data?.token_usage?.output_tokens_details?.reasoning_tokens,
+    data?.provider_attempt_timeline?.aggregated_token_usage?.reasoning_tokens,
+    data?.provider_attempt_timeline?.aggregated_token_usage?.output_tokens_details
+      ?.reasoning_tokens
+  ];
+  for (const candidate of candidates) {
+    const value = Number(candidate ?? Number.NaN);
+    if (Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return 0;
+}
+
 function isProviderRoundEvent(event) {
   const kind = event?.kind ?? event?.event ?? event?.type;
   return kind === "provider_round_completed" || kind === "assistant_round";
@@ -3302,6 +4181,53 @@ function anthropicCacheDiagnostic(provider, requestDiagnostics) {
   };
 }
 
+function stablePrefixDiagnostic(requestDiagnostics) {
+  const stablePrefix = requestDiagnostics?.stable_prefix;
+  if (!stablePrefix || typeof stablePrefix.stable_prefix_fingerprint !== "string") {
+    return {
+      status: "unavailable",
+      schema_version: null,
+      algorithm: null,
+      full_request_fingerprint: null,
+      stable_prefix_fingerprint: null,
+      history_prefix_items: null,
+      dynamic_tail_items: null,
+      components: []
+    };
+  }
+  return {
+    status: "available",
+    schema_version: numberOrNull(stablePrefix.schema_version),
+    algorithm: stablePrefix.algorithm ?? null,
+    full_request_fingerprint: stablePrefix.full_request_fingerprint ?? null,
+    stable_prefix_fingerprint: stablePrefix.stable_prefix_fingerprint,
+    history_prefix_items: numberOrNull(stablePrefix.history_prefix_items),
+    dynamic_tail_items: numberOrNull(stablePrefix.dynamic_tail_items),
+    components: Array.isArray(stablePrefix.components)
+      ? stablePrefix.components.map((component) => ({
+          name: component?.name ?? "unknown",
+          fingerprint: component?.fingerprint ?? null,
+          item_count: numberOrNull(component?.item_count)
+        }))
+      : []
+  };
+}
+
+function stablePrefixComponentChanges(previous, current) {
+  if (previous?.status !== "available" || current?.status !== "available") {
+    return null;
+  }
+  const previousComponents = new Map(
+    previous.components.map((component) => [component.name, component.fingerprint])
+  );
+  const currentComponents = new Map(
+    current.components.map((component) => [component.name, component.fingerprint])
+  );
+  return [...new Set([...previousComponents.keys(), ...currentComponents.keys()])]
+    .sort()
+    .filter((name) => previousComponents.get(name) !== currentComponents.get(name));
+}
+
 function prepareAnthropicCacheRoundDiagnostics({
   modelRef,
   workingMemoryRevision,
@@ -3310,6 +4236,8 @@ function prepareAnthropicCacheRoundDiagnostics({
   cacheReadInputTokens,
   eventTimestampMs,
   contextManagement,
+  stablePrefix,
+  stablePrefixChangedComponents,
   state
 }) {
   const currentShape = anthropicComparableShape({
@@ -3321,6 +4249,11 @@ function prepareAnthropicCacheRoundDiagnostics({
   const shapeChangedFields = state.previousShape
     ? anthropicShapeChangedFields(state.previousShape, currentShape)
     : [];
+  if (Array.isArray(stablePrefixChangedComponents)) {
+    for (const component of stablePrefixChangedComponents) {
+      shapeChangedFields.push(`stable_prefix.components.${component}`);
+    }
+  }
   const previousSegmentPositiveRound =
     shapeChangedFields.length > 0 ? state.lastPositiveCacheRound : null;
   if (shapeChangedFields.length > 0) {
@@ -3345,6 +4278,11 @@ function prepareAnthropicCacheRoundDiagnostics({
   const currentContainsPriorCacheablePrefix = cacheBreakpointsWithReuse.some(
     (breakpoint) => breakpoint.seen_in_previous_comparable_rounds
   );
+  const stablePrefixMatchesBaseline =
+    stablePrefix?.status === "available" &&
+    state.lastPositiveCacheRound?.stable_prefix?.status === "available" &&
+    stablePrefix.stable_prefix_fingerprint ===
+      state.lastPositiveCacheRound.stable_prefix.stable_prefix_fingerprint;
 
   const baseline = state.lastPositiveCacheRound;
   const classificationBaseline = baseline ?? previousSegmentPositiveRound;
@@ -3399,6 +4337,9 @@ function prepareAnthropicCacheRoundDiagnostics({
   ) {
     cacheBreakClassification = "ttl_possible";
     cacheBreakReason = "elapsed time since last positive cache read exceeded 5 minute prompt-cache TTL";
+  } else if (materialDrop && stablePrefixMatchesBaseline) {
+    cacheBreakClassification = "likely_server_side_drop";
+    cacheBreakReason = "provider-visible stable prefix matched the positive cache-read baseline";
   } else if (materialDrop && currentContainsPriorCacheablePrefix) {
     cacheBreakClassification = "likely_server_side_drop";
     cacheBreakReason = "known prior cacheable prefix remained present but cache read dropped";
@@ -3426,6 +4367,7 @@ function prepareAnthropicCacheRoundDiagnostics({
       : null,
     cache_break_baseline_round: classificationBaseline?.round ?? null,
     contains_prior_known_cacheable_prefix: currentContainsPriorCacheablePrefix,
+    stable_prefix_matches_cache_baseline: stablePrefixMatchesBaseline,
     cache_break_classification: cacheBreakClassification,
     cache_break_reason: cacheBreakReason,
     prev_cache_read_input_tokens: previousCacheRead,
@@ -3673,8 +4615,19 @@ function numericField(object, fieldNames) {
 
 function summarizeTokenOptimizationRounds(rounds) {
   const requestLoweringModes = {};
+  let logicalInputTokens = 0;
   let cacheReadInputTokens = 0;
+  let cacheMissInputTokens = 0;
   let cacheCreationInputTokens = 0;
+  let outputTokens = 0;
+  let estimatedCostUsd = 0;
+  let pricedRounds = 0;
+  const usageValidationIssues = {};
+  let reasoningTokens = 0;
+  let providerDurationMs = 0;
+  let providerAttemptCount = 0;
+  let providerRetryCount = 0;
+  let providerErrorCount = 0;
   let highInputZeroCacheReadRounds = 0;
   const incrementalFallbackReasons = {};
   let contextManagementEnabledRounds = 0;
@@ -3700,12 +4653,70 @@ function summarizeTokenOptimizationRounds(rounds) {
   let expectedAfterCompactionCacheBreakRounds = 0;
   let continuedCacheMissRounds = 0;
   let movingBreakpointNonReuseRounds = 0;
+  let stablePrefixAvailableRounds = 0;
+  let stablePrefixChangedRounds = 0;
+  let turnLocalCompactionTelemetryAvailableRounds = 0;
+  let turnLocalCompactionAppliedRounds = 0;
+  let turnLocalCompactionPreTokens = 0;
+  let turnLocalCompactionProjectedTokens = 0;
+  let turnLocalCompactedRounds = 0;
+  let turnLocalDegradedRounds = 0;
+  let turnLocalCompactedToolResults = 0;
+  let turnLocalPreservedArtifactRefs = 0;
+  let turnLocalCompactionCacheWarmupObserved = 0;
+  let turnLocalCompactionCacheWarmupHits = 0;
+  let previousRoundAppliedTurnLocalCompaction = false;
 
   for (const round of rounds) {
     requestLoweringModes[round.request_lowering_mode] =
       (requestLoweringModes[round.request_lowering_mode] ?? 0) + 1;
+    logicalInputTokens += round.logical_input_tokens;
     cacheReadInputTokens += round.cache_read_input_tokens;
+    cacheMissInputTokens += round.cache_miss_input_tokens;
     cacheCreationInputTokens += round.cache_creation_input_tokens;
+    outputTokens += round.output_tokens;
+    if (round.estimated_cost_usd !== null) {
+      estimatedCostUsd += round.estimated_cost_usd;
+      pricedRounds += 1;
+    }
+    for (const issue of round.usage_validation_issues ?? []) {
+      usageValidationIssues[issue] = (usageValidationIssues[issue] ?? 0) + 1;
+    }
+    reasoningTokens += round.reasoning_tokens;
+    providerDurationMs += round.provider_duration_ms;
+    providerAttemptCount += round.provider_attempt_count;
+    providerRetryCount += round.provider_retry_count;
+    providerErrorCount += round.provider_error_count;
+    if (round.stable_prefix?.status === "available") {
+      stablePrefixAvailableRounds += 1;
+    }
+    if ((round.stable_prefix_changed_components?.length ?? 0) > 0) {
+      stablePrefixChangedRounds += 1;
+    }
+    if (round.turn_local_compaction?.status !== "unavailable") {
+      turnLocalCompactionTelemetryAvailableRounds += 1;
+    }
+    if (previousRoundAppliedTurnLocalCompaction) {
+      turnLocalCompactionCacheWarmupObserved += 1;
+      if (round.cache_read_input_tokens > 0) {
+        turnLocalCompactionCacheWarmupHits += 1;
+      }
+    }
+    previousRoundAppliedTurnLocalCompaction =
+      round.turn_local_compaction?.status === "applied";
+    if (previousRoundAppliedTurnLocalCompaction) {
+      turnLocalCompactionAppliedRounds += 1;
+      turnLocalCompactionPreTokens +=
+        round.turn_local_compaction.pre_compaction_estimated_tokens ?? 0;
+      turnLocalCompactionProjectedTokens +=
+        round.turn_local_compaction.projected_estimated_tokens ?? 0;
+      turnLocalCompactedRounds += round.turn_local_compaction.compacted_rounds ?? 0;
+      turnLocalDegradedRounds += round.turn_local_compaction.degraded_rounds ?? 0;
+      turnLocalCompactedToolResults +=
+        round.turn_local_compaction.compacted_tool_results ?? 0;
+      turnLocalPreservedArtifactRefs +=
+        round.turn_local_compaction.preserved_artifact_refs ?? 0;
+    }
     if (round.high_input_zero_cache_read) {
       highInputZeroCacheReadRounds += 1;
     }
@@ -3791,8 +4802,25 @@ function summarizeTokenOptimizationRounds(rounds) {
   return {
     rounds: rounds.length,
     request_lowering_modes: requestLoweringModes,
+    logical_input_tokens: logicalInputTokens,
     cache_read_input_tokens: cacheReadInputTokens,
+    cache_miss_input_tokens: cacheMissInputTokens,
     cache_creation_input_tokens: cacheCreationInputTokens,
+    cache_hit_ratio:
+      logicalInputTokens > 0 ? cacheReadInputTokens / logicalInputTokens : null,
+    output_tokens: outputTokens,
+    estimated_cost_usd:
+      rounds.length > 0 && pricedRounds === rounds.length ? estimatedCostUsd : null,
+    priced_rounds: pricedRounds,
+    usage_validation_issue_counts: usageValidationIssues,
+    usage_validation_issue_rounds: rounds.filter(
+      (round) => (round.usage_validation_issues?.length ?? 0) > 0
+    ).length,
+    reasoning_tokens: reasoningTokens,
+    provider_duration_ms: providerDurationMs,
+    provider_attempt_count: providerAttemptCount,
+    provider_retry_count: providerRetryCount,
+    provider_error_count: providerErrorCount,
     high_input_zero_cache_read_rounds: highInputZeroCacheReadRounds,
     incremental_fallback_reasons: incrementalFallbackReasons,
     incremental_mismatch_kinds: incrementalMismatchKinds,
@@ -3818,6 +4846,24 @@ function summarizeTokenOptimizationRounds(rounds) {
     expected_after_compaction_cache_break_rounds: expectedAfterCompactionCacheBreakRounds,
     continued_cache_miss_rounds: continuedCacheMissRounds,
     moving_breakpoint_non_reuse_rounds: movingBreakpointNonReuseRounds,
+    stable_prefix_available_rounds: stablePrefixAvailableRounds,
+    stable_prefix_changed_rounds: stablePrefixChangedRounds,
+    turn_local_compaction_telemetry_status:
+      turnLocalCompactionTelemetryAvailableRounds === rounds.length
+        ? "available"
+        : turnLocalCompactionTelemetryAvailableRounds === 0
+          ? "unavailable"
+          : "partial",
+    turn_local_compaction_applied_rounds: turnLocalCompactionAppliedRounds,
+    turn_local_compaction_pre_estimated_tokens: turnLocalCompactionPreTokens,
+    turn_local_compaction_projected_estimated_tokens: turnLocalCompactionProjectedTokens,
+    turn_local_compacted_rounds: turnLocalCompactedRounds,
+    turn_local_degraded_rounds: turnLocalDegradedRounds,
+    turn_local_compacted_tool_results: turnLocalCompactedToolResults,
+    turn_local_preserved_artifact_refs: turnLocalPreservedArtifactRefs,
+    turn_local_compaction_cache_warmup_observed:
+      turnLocalCompactionCacheWarmupObserved,
+    turn_local_compaction_cache_warmup_hits: turnLocalCompactionCacheWarmupHits,
     top_cache_miss_rounds: topCacheMissRounds
   };
 }
@@ -4015,6 +5061,147 @@ function agentJsonlArtifactCandidates(agentDir, filename, taskDir = null) {
     path.join(agentDir, filename),
     path.join(agentDir, ".holon", "ledger", filename)
   ].filter(Boolean);
+}
+
+export function normalizeHolonEventEnvelope(envelope) {
+  if (
+    !envelope ||
+    typeof envelope !== "object" ||
+    typeof envelope.type !== "string" ||
+    !envelope.payload ||
+    typeof envelope.payload !== "object" ||
+    Array.isArray(envelope.payload)
+  ) {
+    throw new Error("holon events tail returned an invalid event envelope");
+  }
+  const eventSeq = Number(envelope.event_seq);
+  if (!Number.isSafeInteger(eventSeq) || eventSeq <= 0) {
+    throw new Error("holon events tail returned an invalid event sequence");
+  }
+  return {
+    id: envelope.id,
+    event_seq: eventSeq,
+    event_log_epoch: envelope.event_log_epoch ?? "",
+    contract_version: envelope.contract_version,
+    created_at: envelope.ts,
+    kind: envelope.type,
+    payload_schema: envelope.payload_schema,
+    payload_schema_version: envelope.payload_schema_version,
+    data: envelope.payload
+  };
+}
+
+export function assertHolonProviderRoundTelemetry({ modelRounds, tokenOptimization }) {
+  if (
+    Number(modelRounds ?? 0) > 0 &&
+    Number(tokenOptimization?.summary?.rounds ?? 0) === 0
+  ) {
+    throw new Error(
+      `Holon reported ${modelRounds} model rounds but the runtime DB export contained no provider_round_completed telemetry`
+    );
+  }
+}
+
+export function canonicalHolonModelRef(modelRef) {
+  const separator = String(modelRef).indexOf("/");
+  if (separator <= 0) {
+    return String(modelRef);
+  }
+  const provider = modelRef.slice(0, separator);
+  return provider.includes("@")
+    ? String(modelRef)
+    : `${provider}@default/${modelRef.slice(separator + 1)}`;
+}
+
+export function assertHolonFixtureModel(events, expectedModelRef) {
+  const expected = canonicalHolonModelRef(expectedModelRef);
+  const providerRounds = events.filter((entry) => entry.kind === "provider_round_completed");
+  if (providerRounds.length === 0) {
+    throw new Error(
+      `Holon fixture requested ${expectedModelRef} but emitted no provider round telemetry`
+    );
+  }
+  for (const event of providerRounds) {
+    const actual =
+      event.data?.provider_attempt_timeline?.winning_model_ref ??
+      event.data?.active_model ??
+      event.data?.requested_model;
+    if (actual && canonicalHolonModelRef(actual) !== expected) {
+      throw new Error(
+        `Holon fixture requested ${expectedModelRef} but provider round ${event.data?.round ?? "unknown"} used ${actual}`
+      );
+    }
+  }
+}
+
+export async function readHolonAuditEvents({
+  holonBinary,
+  agentId,
+  homeDir,
+  cwd,
+  env,
+  pageLimit = 512,
+  execute = runCommand
+}) {
+  const events = [];
+  let afterSeq = null;
+  let eventLogEpoch = null;
+  for (;;) {
+    const args = [
+      "events",
+      "tail",
+      "--agent",
+      agentId,
+      "--order",
+      "asc",
+      "--limit",
+      String(pageLimit),
+      "--offline"
+    ];
+    if (afterSeq !== null) {
+      args.push("--after-seq", String(afterSeq));
+    }
+    const result = await execute(
+      holonBinary,
+      args,
+      cwd,
+      { ...env, HOLON_HOME: homeDir },
+      false
+    );
+    if (result.exitCode !== 0) {
+      const detail = String(result.stderr ?? result.stdout ?? "").trim();
+      throw new Error(
+        `holon DB event export failed with exit code ${result.exitCode}${detail ? `: ${detail}` : ""}`
+      );
+    }
+    let page;
+    try {
+      page = JSON.parse(result.stdout);
+    } catch (error) {
+      throw new Error(`failed to parse holon DB event export: ${error.message}`);
+    }
+    if (!page || !Array.isArray(page.events) || typeof page.has_newer !== "boolean") {
+      throw new Error("holon DB event export returned an invalid page");
+    }
+    if (eventLogEpoch !== null && page.event_log_epoch !== eventLogEpoch) {
+      throw new Error("holon DB event export epoch changed during pagination");
+    }
+    eventLogEpoch = page.event_log_epoch;
+    const normalized = page.events.map(normalizeHolonEventEnvelope);
+    events.push(...normalized);
+    if (!page.has_newer) {
+      return events;
+    }
+    const newestSeq = Number(page.newest_seq);
+    if (
+      normalized.length === 0 ||
+      !Number.isSafeInteger(newestSeq) ||
+      newestSeq <= (afterSeq ?? 0)
+    ) {
+      throw new Error("holon DB event export cursor did not advance");
+    }
+    afterSeq = newestSeq;
+  }
 }
 
 async function readAgentJsonlArtifact(agentDir, filename, taskDir = null) {

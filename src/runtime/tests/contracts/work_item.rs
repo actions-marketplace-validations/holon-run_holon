@@ -23,6 +23,19 @@ async fn work_item_runtime_path_rolls_back_each_pre_commit_fault() {
             .unwrap();
         let after = harness.snapshot();
         assert_eq!(after.work_items, vec![created]);
+        let execution = after
+            .execution_protocol
+            .as_ref()
+            .expect("create initializes execution protocol");
+        let execution_work = execution
+            .work_items
+            .get(&after.work_items[0].id)
+            .expect("create registers WorkItem execution state");
+        assert_eq!(execution_work.source_revision, after.work_items[0].revision);
+        assert!(matches!(
+            execution_work.state,
+            crate::domain::execution_protocol::WorkItemExecutionState::Runnable { .. }
+        ));
         assert_eq!(
             after.index_outbox_high_watermark,
             before.index_outbox_high_watermark + 1
@@ -63,6 +76,14 @@ async fn work_item_post_commit_fault_recovers_projection_after_restart() {
             fault != crate::runtime_db::transitions::TransitionFaultPoint::BeforeCacheUpdate
         );
         let committed = harness.snapshot();
+        assert_eq!(
+            committed
+                .execution_protocol
+                .as_ref()
+                .and_then(|state| state.work_items.get(&created.id))
+                .map(|record| record.source_revision),
+            Some(created.revision)
+        );
 
         harness.restart();
 
@@ -127,6 +148,37 @@ async fn work_item_focus_and_continuation_survive_restart() {
     harness
         .runtime()
         .complete_work_item(callee.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        harness
+            .runtime()
+            .agent_state()
+            .await
+            .unwrap()
+            .current_work_item_id,
+        None
+    );
+    let pending = harness
+        .runtime()
+        .storage()
+        .latest_work_item_continuations()
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].state,
+        crate::types::WorkItemContinuationState::Active
+    );
+
+    harness
+        .runtime()
+        .promote_work_item_completion_report(
+            callee.id.clone(),
+            "callee completed".into(),
+            None,
+            None,
+            Vec::new(),
+        )
         .await
         .unwrap();
     assert_eq!(

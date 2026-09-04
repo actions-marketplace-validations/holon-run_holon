@@ -1,7 +1,9 @@
 use std::{
-    ffi::OsString,
+    env,
+    ffi::{OsStr, OsString},
     fs,
     future::Future,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::Duration,
 };
@@ -17,25 +19,63 @@ use crate::{
     client::LocalClient,
     config::AppConfig,
     host::RuntimeHost,
+    runtime_db::RuntimeDbLock,
     types::{RuntimeFailurePhase, RuntimeFailureSummary},
 };
 
 use super::state::latest_known_runtime_failure;
 use super::{
     cleanup_daemon_state, clear_persisted_daemon_lifecycle_failures, config_fingerprint,
-    daemon_log_hint, daemon_paths, load_daemon_metadata, persist_daemon_lifecycle_failure,
-    read_daemon_log_excerpt, runtime_activity_message, stale_files, DaemonLifecycleAction,
+    daemon_log_hint, daemon_paths, load_daemon_desired_running, load_daemon_metadata,
+    persist_daemon_desired_running, persist_daemon_lifecycle_failure, read_daemon_log_excerpt,
+    runtime_activity_message, stale_files, DaemonLifecycleAction, DaemonLifecycleOwner,
     DaemonLifecycleResult, DaemonLifecycleState, DaemonStatusView, RuntimeServiceHandle,
-    RuntimeServiceMetadata, RuntimeStatusResponse,
+    RuntimeServiceMetadata, RuntimeStatusResponse, DAEMON_CONTROL_PROTOCOL_VERSION,
 };
 
-const START_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_START_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_START_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 const START_STABILITY_WINDOW: Duration = Duration::from_secs(2);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub const PRE_SERVER_PREPARED_ENV: &str = "HOLON_PRE_SERVER_RUNTIME_PREPARED";
 pub const DAEMON_SERVE_ARGS_ENV: &str = "HOLON_DAEMON_SERVE_ARGS";
+pub const DAEMON_START_TIMEOUT_ENV: &str = "HOLON_DAEMON_START_TIMEOUT_SECS";
 const UNIX_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+pub(crate) fn web_url(http_addr: &str) -> String {
+    if http_addr.starts_with("http://") || http_addr.starts_with("https://") {
+        return http_addr.into();
+    }
+    if let Some(port) = http_addr.strip_prefix("0.0.0.0:") {
+        return format!("http://127.0.0.1:{port}");
+    }
+    if let Some(port) = http_addr.strip_prefix("[::]:") {
+        return format!("http://[::1]:{port}");
+    } else {
+        format!("http://{http_addr}")
+    }
+}
+
+fn optional_nonempty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn optional_nonzero(value: u32) -> Option<u32> {
+    (value != 0).then_some(value)
+}
+
+fn optional_path(value: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    (!value.as_os_str().is_empty()).then_some(value)
+}
+
+pub(crate) async fn lifecycle_lock(config: &AppConfig) -> Result<RuntimeDbLock> {
+    let path = daemon_paths(config).lifecycle_lock_path;
+    tokio::task::spawn_blocking(move || RuntimeDbLock::lock(path))
+        .await
+        .context("daemon lifecycle lock task failed")?
+        .context("failed to acquire daemon lifecycle lock")
+}
 
 #[cfg(test)]
 static PREPARE_RUNTIME_BEFORE_SERVER_HOOK: std::sync::Mutex<
@@ -49,11 +89,21 @@ pub async fn daemon_status(config: &AppConfig) -> Result<DaemonStatusView> {
     match probe_runtime(config).await {
         ProbeRuntime::Running(status) => Ok(DaemonStatusView {
             ok: true,
-            state: DaemonLifecycleState::Running,
-            healthy: true,
+            state: if status.healthy {
+                DaemonLifecycleState::Running
+            } else {
+                DaemonLifecycleState::Degraded
+            },
+            healthy: status.healthy,
             home_dir: status.home_dir.clone(),
             socket_path: status.socket_path.clone(),
             http_addr: status.http_addr.clone(),
+            web_url: web_url(&status.http_addr),
+            product_version: optional_nonempty(status.product_version.clone()),
+            control_protocol_version: optional_nonzero(status.control_protocol_version),
+            lifecycle_owner: Some(status.lifecycle_owner),
+            executable_path: optional_path(status.executable_path.clone()),
+            desired_running: load_daemon_desired_running(config)?.unwrap_or(true),
             pid: Some(status.pid),
             control_connectivity: true,
             runtime_config_fingerprint: Some(status.config_fingerprint.clone()),
@@ -61,12 +111,16 @@ pub async fn daemon_status(config: &AppConfig) -> Result<DaemonStatusView> {
             activity: status.activity.clone(),
             last_failure: merge_latest_failure(status.last_failure.clone(), persisted_failure),
             stale_files: Vec::new(),
-            message: status
-                .activity
-                .as_ref()
-                .map(runtime_activity_message)
-                .unwrap_or("runtime is healthy")
-                .into(),
+            message: if status.healthy {
+                status
+                    .activity
+                    .as_ref()
+                    .map(runtime_activity_message)
+                    .unwrap_or("runtime is healthy")
+                    .into()
+            } else {
+                "runtime process is alive, but the control surface is unavailable".into()
+            },
         }),
         ProbeRuntime::Stopped { occupied_socket } => {
             let stale_files = stale_files(config);
@@ -90,6 +144,18 @@ pub async fn daemon_status(config: &AppConfig) -> Result<DaemonStatusView> {
                 home_dir: config.home_dir.clone(),
                 socket_path: config.socket_path.clone(),
                 http_addr: config.http_addr.clone(),
+                web_url: web_url(&config.http_addr),
+                product_version: metadata
+                    .as_ref()
+                    .and_then(|record| optional_nonempty(record.product_version.clone())),
+                control_protocol_version: metadata
+                    .as_ref()
+                    .and_then(|record| optional_nonzero(record.control_protocol_version)),
+                lifecycle_owner: metadata.as_ref().map(|record| record.lifecycle_owner),
+                executable_path: metadata
+                    .as_ref()
+                    .and_then(|record| optional_path(record.executable_path.clone())),
+                desired_running: load_daemon_desired_running(config)?.unwrap_or(false),
                 pid,
                 control_connectivity: false,
                 runtime_config_fingerprint: metadata.map(|record| record.config_fingerprint),
@@ -102,11 +168,23 @@ pub async fn daemon_status(config: &AppConfig) -> Result<DaemonStatusView> {
         }
         ProbeRuntime::Incompatible { details } => Ok(DaemonStatusView {
             ok: true,
-            state: DaemonLifecycleState::Stale,
+            state: DaemonLifecycleState::VersionMismatch,
             healthy: false,
             home_dir: config.home_dir.clone(),
             socket_path: config.socket_path.clone(),
             http_addr: config.http_addr.clone(),
+            web_url: web_url(&config.http_addr),
+            product_version: metadata
+                .as_ref()
+                .and_then(|record| optional_nonempty(record.product_version.clone())),
+            control_protocol_version: metadata
+                .as_ref()
+                .and_then(|record| optional_nonzero(record.control_protocol_version)),
+            lifecycle_owner: metadata.as_ref().map(|record| record.lifecycle_owner),
+            executable_path: metadata
+                .as_ref()
+                .and_then(|record| optional_path(record.executable_path.clone())),
+            desired_running: load_daemon_desired_running(config)?.unwrap_or(false),
             pid: metadata.as_ref().map(|record| record.pid),
             control_connectivity: false,
             runtime_config_fingerprint: metadata.map(|record| record.config_fingerprint),
@@ -125,6 +203,30 @@ pub async fn daemon_start(
     config: &AppConfig,
     serve_args: &[OsString],
     control_token_env: Option<&str>,
+) -> Result<DaemonLifecycleResult> {
+    daemon_start_with_timeout(config, serve_args, control_token_env, None).await
+}
+
+pub async fn daemon_start_with_timeout(
+    config: &AppConfig,
+    serve_args: &[OsString],
+    control_token_env: Option<&str>,
+    start_timeout_secs: Option<u64>,
+) -> Result<DaemonLifecycleResult> {
+    let _lock = lifecycle_lock(config).await?;
+    persist_daemon_desired_running(config, true)?;
+    let start_timeout = resolve_start_timeout(start_timeout_secs)?;
+    let mut result =
+        daemon_start_unlocked(config, serve_args, control_token_env, start_timeout).await?;
+    result.status.desired_running = true;
+    Ok(result)
+}
+
+async fn daemon_start_unlocked(
+    config: &AppConfig,
+    serve_args: &[OsString],
+    control_token_env: Option<&str>,
+    start_timeout: Duration,
 ) -> Result<DaemonLifecycleResult> {
     let current_fingerprint = config_fingerprint(config)?;
     match probe_runtime(config).await {
@@ -203,10 +305,10 @@ pub async fn daemon_start(
     command.env(PRE_SERVER_PREPARED_ENV, "1");
     let mut child = command.spawn().context("failed to spawn 'holon serve'")?;
 
-    let deadline = tokio::time::Instant::now() + START_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + start_timeout;
     loop {
         match probe_runtime(config).await {
-            ProbeRuntime::Running(status) => {
+            ProbeRuntime::Running(status) if status.healthy => {
                 if status.config_fingerprint != current_fingerprint {
                     let details = effective_config_mismatch_summary(config, &status);
                     best_effort_cleanup_spawned_start(config, &mut child).await;
@@ -256,6 +358,7 @@ pub async fn daemon_start(
                     status: daemon_status(config).await?,
                 });
             }
+            ProbeRuntime::Running(_) => {}
             ProbeRuntime::Stopped { .. } => {}
             ProbeRuntime::Incompatible { details } => {
                 best_effort_cleanup_spawned_start(config, &mut child).await;
@@ -303,8 +406,9 @@ pub async fn daemon_start(
                 &RuntimeFailureSummary {
                     occurred_at: Utc::now(),
                     summary: format!(
-                        "timed out waiting for runtime on {}",
-                        config.socket_path.display()
+                        "timed out waiting for healthy runtime on {} after {}s",
+                        config.socket_path.display(),
+                        start_timeout.as_secs()
                     ),
                     phase: RuntimeFailurePhase::Startup,
                     detail_hint: Some(daemon_log_hint()),
@@ -312,13 +416,30 @@ pub async fn daemon_start(
                 },
             );
             return Err(anyhow!(
-                "timed out waiting for runtime on {}; {}",
+                "timed out waiting for healthy runtime on {} after {}s; {}",
                 config.socket_path.display(),
+                start_timeout.as_secs(),
                 daemon_log_hint()
             ));
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+fn resolve_start_timeout(explicit_secs: Option<u64>) -> Result<Duration> {
+    let secs = explicit_secs
+        .or_else(|| {
+            env::var(DAEMON_START_TIMEOUT_ENV)
+                .ok()
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(DEFAULT_START_TIMEOUT.as_secs());
+    if secs == 0 || secs > MAX_START_TIMEOUT_SECS {
+        return Err(anyhow!(
+            "daemon start timeout must be between 1 and {MAX_START_TIMEOUT_SECS} seconds"
+        ));
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 pub fn prepare_runtime_before_server(config: &AppConfig) -> Result<()> {
@@ -355,6 +476,23 @@ pub(crate) fn set_prepare_runtime_before_server_hook(
 }
 
 pub async fn daemon_stop(config: &AppConfig) -> Result<DaemonLifecycleResult> {
+    let _lock = lifecycle_lock(config).await?;
+    persist_daemon_desired_running(config, false)?;
+    let mut result = daemon_stop_unlocked(config).await?;
+    result.status.desired_running = false;
+    Ok(result)
+}
+
+pub async fn daemon_prepare_update(config: &AppConfig) -> Result<DaemonLifecycleResult> {
+    let _lock = lifecycle_lock(config).await?;
+    let desired_running = load_daemon_desired_running(config)?.unwrap_or(false);
+    let mut result = daemon_stop_unlocked(config).await?;
+    result.action = DaemonLifecycleAction::PrepareUpdate;
+    result.status.desired_running = desired_running;
+    Ok(result)
+}
+
+async fn daemon_stop_unlocked(config: &AppConfig) -> Result<DaemonLifecycleResult> {
     let before = daemon_status(config).await?;
     let stop_probe = probe_runtime(config).await;
     match &stop_probe {
@@ -491,6 +629,12 @@ fn stopped_status(config: &AppConfig) -> Result<DaemonStatusView> {
         home_dir: config.home_dir.clone(),
         socket_path: config.socket_path.clone(),
         http_addr: config.http_addr.clone(),
+        web_url: web_url(&config.http_addr),
+        product_version: None,
+        control_protocol_version: None,
+        lifecycle_owner: Some(DaemonLifecycleOwner::Standalone),
+        executable_path: None,
+        desired_running: load_daemon_desired_running(config)?.unwrap_or(false),
         pid: None,
         control_connectivity: false,
         runtime_config_fingerprint: None,
@@ -507,13 +651,194 @@ pub async fn daemon_restart(
     serve_args: &[OsString],
     control_token_env: Option<&str>,
 ) -> Result<DaemonLifecycleResult> {
-    let _ = daemon_stop(config).await?;
-    let started = daemon_start(config, serve_args, control_token_env).await?;
+    daemon_restart_with_timeout(config, serve_args, control_token_env, None).await
+}
+
+pub async fn daemon_restart_with_timeout(
+    config: &AppConfig,
+    serve_args: &[OsString],
+    control_token_env: Option<&str>,
+    start_timeout_secs: Option<u64>,
+) -> Result<DaemonLifecycleResult> {
+    let _lock = lifecycle_lock(config).await?;
+    persist_daemon_desired_running(config, true)?;
+    match probe_runtime(config).await {
+        ProbeRuntime::Incompatible { details } => {
+            replace_incompatible_runtime_unlocked(config, &details).await?;
+        }
+        _ => {
+            let _ = daemon_stop_unlocked(config).await?;
+        }
+    }
+    let start_timeout = resolve_start_timeout(start_timeout_secs)?;
+    let mut started =
+        daemon_start_unlocked(config, serve_args, control_token_env, start_timeout).await?;
+    started.status.desired_running = true;
     Ok(DaemonLifecycleResult {
         ok: true,
         action: DaemonLifecycleAction::Restart,
         status: started.status,
     })
+}
+
+async fn replace_incompatible_runtime_unlocked(config: &AppConfig, details: &str) -> Result<()> {
+    let metadata = load_daemon_metadata(config)?.ok_or_else(|| {
+        anyhow!("cannot replace incompatible runtime because daemon metadata is missing: {details}")
+    })?;
+    validate_incompatible_runtime_identity(config, &metadata)?;
+
+    match send_signal(metadata.pid, 15, "-TERM")? {
+        SignalOutcome::Delivered => {}
+        SignalOutcome::MissingProcess => {
+            cleanup_daemon_state(config)?;
+            return Ok(());
+        }
+        SignalOutcome::PermissionDenied => {
+            return Err(anyhow!(
+                "cannot replace incompatible Holon runtime PID {}: permission denied",
+                metadata.pid
+            ));
+        }
+    }
+
+    if wait_for_pid_exit(metadata.pid, STOP_TIMEOUT).await.is_err() {
+        match send_signal(metadata.pid, 9, "-KILL")? {
+            SignalOutcome::Delivered | SignalOutcome::MissingProcess => {}
+            SignalOutcome::PermissionDenied => {
+                return Err(anyhow!(
+                    "cannot replace incompatible Holon runtime PID {}: permission denied",
+                    metadata.pid
+                ));
+            }
+        }
+        wait_for_pid_exit(metadata.pid, STOP_TIMEOUT).await?;
+    }
+
+    clear_persisted_daemon_lifecycle_failures(config)?;
+    cleanup_daemon_state(config)
+}
+
+fn validate_incompatible_runtime_identity(
+    config: &AppConfig,
+    metadata: &RuntimeServiceMetadata,
+) -> Result<()> {
+    let actual_executable = process_executable_path(metadata.pid).with_context(|| {
+        format!(
+            "failed to identify incompatible runtime PID {}",
+            metadata.pid
+        )
+    })?;
+    validate_incompatible_runtime_identity_with_executable(config, metadata, &actual_executable)
+}
+
+pub(super) fn validate_incompatible_runtime_identity_with_executable(
+    config: &AppConfig,
+    metadata: &RuntimeServiceMetadata,
+    actual_executable: &Path,
+) -> Result<()> {
+    if metadata.home_dir != config.home_dir || metadata.socket_path != config.socket_path {
+        return Err(anyhow!(
+            "refusing to replace incompatible runtime PID {} because its recorded home or control socket does not match the current configuration",
+            metadata.pid
+        ));
+    }
+
+    let pid_path = daemon_paths(config).pid_path;
+    let recorded_pid = fs::read_to_string(&pid_path)
+        .with_context(|| format!("failed to read {}", pid_path.display()))?
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("failed to decode {}", pid_path.display()))?;
+    if recorded_pid != metadata.pid {
+        return Err(anyhow!(
+            "refusing to replace incompatible runtime because {} records PID {}, but daemon metadata records PID {}",
+            pid_path.display(),
+            recorded_pid,
+            metadata.pid
+        ));
+    }
+
+    if actual_executable.file_name() != Some(OsStr::new("holon")) {
+        return Err(anyhow!(
+            "refusing to replace incompatible runtime PID {} because its executable is {}",
+            metadata.pid,
+            actual_executable.display()
+        ));
+    }
+    if !metadata.executable_path.as_os_str().is_empty()
+        && !paths_refer_to_same_file(actual_executable, &metadata.executable_path)
+    {
+        return Err(anyhow!(
+            "refusing to replace incompatible runtime PID {} because its executable {} does not match recorded executable {}",
+            metadata.pid,
+            actual_executable.display(),
+            metadata.executable_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+async fn wait_for_pid_exit(pid: u32, timeout: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while pid_is_alive(pid) {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "timed out waiting for Holon runtime PID {pid} to exit"
+            ));
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn process_executable_path(pid: u32) -> Result<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/exe"))
+        .with_context(|| format!("failed to read /proc/{pid}/exe"))
+}
+
+#[cfg(target_os = "macos")]
+fn process_executable_path(pid: u32) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
+    #[link(name = "proc")]
+    unsafe extern "C" {
+        fn proc_pidpath(pid: i32, buffer: *mut libc::c_void, buffersize: u32) -> i32;
+    }
+
+    let mut buffer = vec![0_u8; PROC_PIDPATHINFO_MAXSIZE];
+    let length =
+        unsafe { proc_pidpath(pid as i32, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    if length <= 0 {
+        return Err(std::io::Error::last_os_error()).context("proc_pidpath failed");
+    }
+    buffer.truncate(length as usize);
+    Ok(PathBuf::from(OsString::from_vec(buffer)))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn process_executable_path(_pid: u32) -> Result<PathBuf> {
+    Err(anyhow!(
+        "safe incompatible-runtime replacement is not supported on this platform"
+    ))
+}
+
+#[cfg(not(unix))]
+fn process_executable_path(_pid: u32) -> Result<PathBuf> {
+    Err(anyhow!(
+        "safe incompatible-runtime replacement is not supported on this platform"
+    ))
 }
 
 pub async fn ensure_serve_preflight(config: &AppConfig) -> Result<()> {
@@ -919,13 +1244,13 @@ pub(crate) async fn probe_runtime(config: &AppConfig) -> ProbeRuntime {
             }
         };
         match tokio::time::timeout(UNIX_PROBE_TIMEOUT, client.runtime_readiness_unix_only()).await {
-            Ok(Ok(status)) => return ProbeRuntime::Running(Box::new(status)),
+            Ok(Ok(status)) => return compatible_runtime(status),
             Ok(Err(err)) => {
                 return match unix_probe_stopped_socket_occupancy(err.root_cause()) {
                     Some(occupied_socket) => {
                         if !occupied_socket {
                             if let Some(status) = metadata_status_if_pid_alive(config).await {
-                                return ProbeRuntime::Running(Box::new(status));
+                                return compatible_runtime(status);
                             }
                         }
                         ProbeRuntime::Stopped { occupied_socket }
@@ -947,7 +1272,7 @@ pub(crate) async fn probe_runtime(config: &AppConfig) -> ProbeRuntime {
     // live process, the daemon is still running (the socket may have been
     // removed externally — see https://github.com/holon-run/holon/issues/1448).
     if let Some(status) = metadata_status_if_pid_alive(config).await {
-        return ProbeRuntime::Running(Box::new(status));
+        return compatible_runtime(status);
     }
 
     let client = match LocalClient::new(config.clone()) {
@@ -959,7 +1284,7 @@ pub(crate) async fn probe_runtime(config: &AppConfig) -> ProbeRuntime {
         }
     };
     match client.runtime_readiness().await {
-        Ok(status) => ProbeRuntime::Running(Box::new(status)),
+        Ok(status) => compatible_runtime(status),
         Err(_) => ProbeRuntime::Stopped {
             occupied_socket: false,
         },
@@ -990,6 +1315,18 @@ async fn metadata_status_if_pid_alive(config: &AppConfig) -> Option<RuntimeStatu
     Some(status_from_metadata(metadata))
 }
 
+fn compatible_runtime(status: RuntimeStatusResponse) -> ProbeRuntime {
+    if status.control_protocol_version != DAEMON_CONTROL_PROTOCOL_VERSION {
+        return ProbeRuntime::Incompatible {
+            details: format!(
+                "control protocol version {} is incompatible with client version {}",
+                status.control_protocol_version, DAEMON_CONTROL_PROTOCOL_VERSION
+            ),
+        };
+    }
+    ProbeRuntime::Running(Box::new(status))
+}
+
 pub(crate) fn runtime_status_matches_metadata(
     status: &RuntimeStatusResponse,
     metadata: &RuntimeServiceMetadata,
@@ -1010,6 +1347,10 @@ fn status_from_metadata(metadata: RuntimeServiceMetadata) -> RuntimeStatusRespon
         pid: metadata.pid,
         started_at: metadata.started_at,
         config_fingerprint: metadata.config_fingerprint,
+        product_version: metadata.product_version,
+        control_protocol_version: metadata.control_protocol_version,
+        lifecycle_owner: metadata.lifecycle_owner,
+        executable_path: metadata.executable_path,
         activity: None,
         startup_surface: None,
         runtime_surface: None,

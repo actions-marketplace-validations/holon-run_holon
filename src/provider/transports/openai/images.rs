@@ -136,6 +136,7 @@ pub(super) async fn send_openai_images_request(
     );
     if !response.status().is_success() {
         let status = response.status();
+        let retry_after = parse_retry_after(response.headers());
         let body = match tokio::time::timeout(response_body_timeout(), response.text()).await {
             Ok(Ok(text)) => text,
             _ => String::new(),
@@ -150,6 +151,7 @@ pub(super) async fn send_openai_images_request(
             status,
             body,
             request_trace.as_ref(),
+            retry_after,
         ));
     }
     let body = match tokio::time::timeout(response_body_timeout(), response.text()).await {
@@ -254,8 +256,17 @@ pub(super) async fn send_openai_codex_image_generation_request(
     trace: Option<&ProviderHttpTrace>,
     agent_id: Option<&str>,
 ) -> Result<Vec<ProviderGeneratedImage>> {
-    let terminal_response =
-        send_openai_responses_streaming_request(client, url, body, headers, trace, agent_id)
-            .await?;
+    let model_ref = provider_model_ref("openai-codex", &body);
+    let terminal_response = send_openai_responses_streaming_request(
+        client,
+        url,
+        body,
+        headers,
+        trace,
+        agent_id,
+        "openai-codex",
+        &model_ref,
+    )
+    .await?;
     parse_openai_codex_image_generation_response_items(terminal_response.output_items)
 }

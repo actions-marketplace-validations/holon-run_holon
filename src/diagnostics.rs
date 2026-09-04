@@ -35,6 +35,12 @@ static SCHEDULER_POLL_STOPPED: MetricAccumulator = MetricAccumulator::new("sched
 static SCHEDULER_POLL_SHUTDOWN: MetricAccumulator =
     MetricAccumulator::new("scheduler.poll.shutdown");
 static SCHEDULER_POLL_SKIPPED: MetricAccumulator = MetricAccumulator::new("scheduler.poll.skipped");
+static SCHEDULER_MISSING_TERMINAL_TURN: MetricAccumulator =
+    MetricAccumulator::new("scheduler.missing_terminal_turn_detected");
+static SCHEDULER_UNSETTLED_CLAIM_RECOVERY: MetricAccumulator =
+    MetricAccumulator::new("scheduler.unsettled_claim_recovery");
+static SCHEDULER_POISON_MESSAGE_QUARANTINED: MetricAccumulator =
+    MetricAccumulator::new("scheduler.poison_message_quarantined");
 
 // Turn lifecycle
 static TURN_TOTAL: MetricAccumulator = MetricAccumulator::new("turn.total");
@@ -79,6 +85,13 @@ static PROJECTION_STATE_SOURCE_STORAGE: MetricAccumulator =
 static PROJECTION_STATE_RUNTIME_SPAWN_AVOIDED: MetricAccumulator =
     MetricAccumulator::new("projection.agent_state.runtime_spawn_avoided");
 static PROJECTION_AGENTS_LIST: MetricAccumulator = MetricAccumulator::new("projection.agents_list");
+static ROSTER_SNAPSHOT_ASSEMBLY: MetricAccumulator =
+    MetricAccumulator::new("observer_sync.roster_snapshot.assembly");
+static ROSTER_SNAPSHOT_MEMBER_ROWS: AtomicU64 = AtomicU64::new(0);
+static ROSTER_SNAPSHOT_FAILURES: AtomicU64 = AtomicU64::new(0);
+static PROJECTION_SNAPSHOT_ASSEMBLY: MetricAccumulator =
+    MetricAccumulator::new("observer_sync.projection_snapshot.assembly");
+static PROJECTION_SNAPSHOT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static PROJECTION_GATE_LEADERS: AtomicU64 = AtomicU64::new(0);
 static PROJECTION_GATE_JOINED_WAITERS: AtomicU64 = AtomicU64::new(0);
 static PROJECTION_GATE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
@@ -227,6 +240,21 @@ pub fn record_scheduler_poll(outcome: &'static str, elapsed: Duration) {
     scheduler_poll_accumulator(outcome).record(elapsed, None);
 }
 
+pub fn record_missing_terminal_turn_detected() {
+    process_started_at();
+    SCHEDULER_MISSING_TERMINAL_TURN.record(Duration::ZERO, None);
+}
+
+pub fn record_unsettled_claim_recovery() {
+    process_started_at();
+    SCHEDULER_UNSETTLED_CLAIM_RECOVERY.record(Duration::ZERO, None);
+}
+
+pub fn record_poison_message_quarantined() {
+    process_started_at();
+    SCHEDULER_POISON_MESSAGE_QUARANTINED.record(Duration::ZERO, None);
+}
+
 // Turn lifecycle recording
 
 pub fn record_turn_total(elapsed: Duration) {
@@ -352,6 +380,41 @@ pub fn record_projection_agents_list(elapsed: Duration) {
     PROJECTION_AGENTS_LIST.record(elapsed, None);
 }
 
+/// Records one successful roster snapshot assembly: wall-clock duration of
+/// the committed read view plus per-Agent entry assembly, the membership
+/// count, and the serialized response size.
+pub fn record_roster_snapshot(elapsed: Duration, agent_count: usize, bytes: usize) {
+    process_started_at();
+    ROSTER_SNAPSHOT_ASSEMBLY.record(elapsed, Some(bytes));
+    ROSTER_SNAPSHOT_MEMBER_ROWS
+        .fetch_add(agent_count.min(u64::MAX as usize) as u64, Ordering::Relaxed);
+}
+
+/// Records one roster snapshot request that ended without a response body:
+/// capability off, limit exceeded, timeout, or an all-or-nothing assembly
+/// failure. Counts only; agent identities are never recorded.
+pub fn record_roster_snapshot_failure() {
+    process_started_at();
+    ROSTER_SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records one successful per-Agent projection snapshot assembly:
+/// wall-clock duration of the committed read view plus assembly, and the
+/// serialized response size.
+pub fn record_projection_snapshot(elapsed: Duration, bytes: usize) {
+    process_started_at();
+    PROJECTION_SNAPSHOT_ASSEMBLY.record(elapsed, Some(bytes));
+}
+
+/// Records one projection snapshot request that ended without a response
+/// body: capability off, not-found, limit exceeded, timeout, or an
+/// all-or-nothing assembly failure. Counts only; agent identities are
+/// never recorded.
+pub fn record_projection_snapshot_failure() {
+    process_started_at();
+    PROJECTION_SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn record_projection_gate_cache_hit() {
     process_started_at();
     PROJECTION_GATE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
@@ -455,6 +518,9 @@ pub fn performance_snapshot() -> PerformanceDiagnosticsSnapshot {
             SCHEDULER_POLL_STOPPED.snapshot(false),
             SCHEDULER_POLL_SHUTDOWN.snapshot(false),
             SCHEDULER_POLL_SKIPPED.snapshot(false),
+            SCHEDULER_MISSING_TERMINAL_TURN.snapshot(false),
+            SCHEDULER_UNSETTLED_CLAIM_RECOVERY.snapshot(false),
+            SCHEDULER_POISON_MESSAGE_QUARANTINED.snapshot(false),
         ],
         turn: vec![
             TURN_TOTAL.snapshot(false),

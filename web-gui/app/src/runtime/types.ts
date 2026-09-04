@@ -363,6 +363,7 @@ export interface RuntimeModelOption {
   displayName: string;
   available: boolean;
   unavailableReason?: string;
+  availabilityWarning?: string;
   supportsImageInput: boolean;
   supportsImageGeneration: boolean;
   supportsReasoningEffort: boolean;
@@ -370,8 +371,10 @@ export interface RuntimeModelOption {
 }
 
 export interface RuntimeModelCatalog {
-  source: "http" | "fixture";
+  source: "http" | "cache" | "fixture";
   options: RuntimeModelOption[];
+  stale?: boolean;
+  cachedAt?: number;
   error?: string;
 }
 
@@ -380,6 +383,12 @@ export interface RuntimeBriefRecord {
   created_at?: string;
   text?: string;
   kind?: string;
+  citations?: RuntimeCitation[];
+}
+
+export interface RuntimeCitation {
+  url: string;
+  title?: string;
 }
 
 export interface RuntimeProviderSummary {
@@ -525,7 +534,20 @@ export interface SearchResultItem {
 export interface SearchResponse {
   query: string;
   limit: number;
+  indexStatus: SearchIndexStatus;
   results: SearchResultItem[];
+}
+
+export interface SearchIndexStatus {
+  freshness: string;
+  cursor: number;
+  highWatermark: number;
+  lag: number;
+  lastIndexedAt?: string;
+  indexingNeeded: boolean;
+  resultsMayBeIncomplete: boolean;
+  consumptionWasLimited: boolean;
+  skippedErrorCount: number;
 }
 
 export interface MemorySourceContent {
@@ -775,6 +797,7 @@ export interface AgentTimelineItem {
   meta: string;
   minDisplayLevel: DisplayLevel;
   sourceIds: string[];
+  citations?: RuntimeCitation[];
   stateObjectRef?: TimelineStateObjectRef;
   relatedStateObjectRef?: TimelineStateObjectRef;
   detail?: AgentTimelineItemDetail;
@@ -837,7 +860,41 @@ export interface AgentDeletionStatus {
 
 export interface RuntimeBootstrap {
   attentionCount: number;
+  /** Capabilities advertised by the remote handshake, when known. */
+  capabilities?: string[];
   connection: RuntimeConnection;
   metrics: DashboardMetric[];
   agents: AgentSummary[];
+}
+
+/** How the Web GUI currently discovers the Agent roster. */
+export type RosterDiscoveryMode =
+  | "pending"
+  | "authoritative";
+
+/**
+ * Roster discovery health. `stale` keeps the last complete roster visible
+ * while a transient snapshot failure retries; `unauthorized` stops
+ * presenting the cached roster as currently authorized data until the
+ * operator reauthenticates.
+ */
+export type RosterDiscoveryFreshness = "fresh" | "stale" | "unauthorized";
+
+/** Roster identity anchors from the last applied authoritative snapshot. */
+export interface RosterDiscoveryIdentity {
+  runtimeId: string;
+  visibilityScopeId: string;
+  eventLogEpoch: string;
+}
+
+export interface RosterDiscoveryState {
+  mode: RosterDiscoveryMode;
+  freshness: RosterDiscoveryFreshness;
+  identity?: RosterDiscoveryIdentity;
+  /** Transient snapshot failure message; the roster stays visible but stale. */
+  staleReason?: string;
+  /** Authorization failure message; cached data is not currently authorized. */
+  unauthorizedReason?: string;
+  retryAttempt: number;
+  retryAt?: number;
 }

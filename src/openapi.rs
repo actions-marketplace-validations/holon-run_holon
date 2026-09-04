@@ -72,15 +72,18 @@ const ROUTES: &[RouteSpec] = &[
     route("get", "/", "root", "discovery", "Root discovery", "Return the default agent id.", None, AuthKind::RemoteAccess),
     route("get", "/handshake", "handshake", "discovery", "Protocol handshake", "Return auth mode, protocol version, capabilities, and runtime hints.", None, AuthKind::RemoteAccess),
     route("get", "/models", "models", "discovery", "List available models", "Return model catalog entries and runtime availability.", None, AuthKind::RemoteAccess),
+    route("post", "/models/refresh", "refreshModels", "discovery", "Refresh available models", "Discover models for providers with missing or expired caches, then return the model catalog and runtime availability.", None, AuthKind::RemoteAccess),
     aide_route("get", "/agents/list", "listAgents", "agents", "List agents", "Return lightweight public agent entries.", None, AuthKind::RemoteAccess),
+    route_with_response("get", "/agents/snapshot", "agentsSnapshot", "agents", "Agent roster snapshot", "Authoritative roster snapshot (RFC: observer sync): all-or-nothing membership with per-Agent event windows and latest Brief anchors from one committed read view. Served only while the agents.roster-snapshot.v1 capability is advertised; route registration alone is never sufficient.", None, "AgentRosterSnapshot", AuthKind::RemoteAccess),
+    route_with_response("get", "/agents/{agent_id}/projection-snapshot", "agentProjectionSnapshot", "agents", "Agent projection snapshot", "Per-Agent canonical projection snapshot (RFC: observer sync): compact current state plus revision anchors at one committed consistency boundary. snapshot_through_seq equals the committed per-Agent event head of the same view; clients replay only event_seq greater than it. Served only while the agents.projection-snapshot.v1 capability is advertised; route registration alone is never sufficient.", None, "AgentProjectionSnapshot", AuthKind::RemoteAccess),
     aide_route("get", "/agents/{agent_id}/status", "agentStatus", "agents", "Agent status", "Return the public AgentSummary read model.", None, AuthKind::RemoteAccess),
     aide_route("get", "/agents/{agent_id}/briefs", "agentBriefs", "agents", "Recent briefs", "Return recent user-facing delivery briefs. Query parameter: limit.", None, AuthKind::RemoteAccess),
     route_with_response("post", "/agents/{agent_id}/briefs:batchGet", "agentBriefsBatchGet", "agents", "Batch get briefs", "Return persisted briefs for the selected agent. Missing or cross-agent ids are reported in missing_brief_ids.", Some("BatchGetBriefsRequest"), "BatchGetBriefsResponse", AuthKind::RemoteAccess),
     route_with_response("get", "/agents/{agent_id}/briefs/{brief_id}", "agentBrief", "agents", "Brief detail", "Return a persisted user-facing delivery brief by id.", None, "BriefRecord", AuthKind::RemoteAccess),
     route_with_response("get", "/agents/{agent_id}/state", "agentState", "agents", "Agent state snapshot", "Return the lightweight bootstrap snapshot for an agent. Heavy task, work-item, operator notification, and execution details are available through dedicated routes and events.", None, "AgentStateSnapshotDto", AuthKind::RemoteAccess),
     event_stream_route("get", "/events/stream", "eventsStream", "events", "Global event stream", "Return Server-Sent Events carrying raw StreamEventEnvelope JSON data for all public agents. This live stream uses the in-memory event watcher and does not provide historical replay or a global cursor. If the receiver lags, the server closes the stream; clients must backfill each agent from its last contiguous event_seq before reconnecting.", None, AuthKind::RemoteAccess),
-    route_with_response("get", "/agents/{agent_id}/events", "agentEvents", "events", "Agent event page", "Return a bounded page of versioned runtime event envelopes. Query parameters: before_seq, after_seq, limit, order, max_level. Identity is (event_log_epoch, agent_id, event_seq); unknown kinds retain their opaque payload.", None, "EventsPageResponse", AuthKind::RemoteAccess),
-    event_stream_route("get", "/agents/{agent_id}/events/stream", "agentEventsStream", "events", "Agent event stream", "Return Server-Sent Events carrying raw StreamEventEnvelope JSON data. Query parameters: after_seq, limit. SSE id is event_seq; SSE event is the audit event kind; missing replay cursors return cursor_not_found before the stream opens. If the receiver lags, the server closes the stream so clients can backfill after the last contiguous SSE id before reconnecting. Breaking change: the projection query parameter and StreamEventEnvelope.projection field have been removed.", None, AuthKind::RemoteAccess),
+    route_with_response("get", "/agents/{agent_id}/events", "agentEvents", "events", "Agent event page", "Return a bounded page of versioned runtime event envelopes. Query parameters: before_seq, after_seq, limit, order, max_level. Identity is (event_log_epoch, agent_id, event_seq); unknown kinds retain their opaque payload. While events.projection-effect.v1 is advertised every envelope carries the additive projection_effect classification derived from the runtime event registry (envelope contract version 3); a max_level-filtered page changes presentation only and is never proof of raw continuity.", None, "EventsPageResponse", AuthKind::RemoteAccess),
+    event_stream_route("get", "/agents/{agent_id}/events/stream", "agentEventsStream", "events", "Agent event stream", "Return Server-Sent Events carrying raw StreamEventEnvelope JSON data. Query parameters: after_seq, limit. SSE id is event_seq; SSE event is the audit event kind; missing replay cursors return cursor_not_found before the stream opens, carrying event_log_epoch, oldest_retained_seq, and event_head_seq from one committed read view so clients can distinguish a retained-prefix gap from an epoch change. Envelopes carry the additive projection_effect field while events.projection-effect.v1 is advertised. If the receiver lags, the server closes the stream so clients can backfill after the last contiguous SSE id before reconnecting. Breaking change: the projection query parameter and StreamEventEnvelope.projection field have been removed.", None, AuthKind::RemoteAccess),
     route("get", "/agents/{agent_id}/messages/{message_id}", "agentMessage", "messages", "Message detail", "Return a persisted message envelope by id for the selected agent.", None, AuthKind::RemoteAccess),
     route_with_response("post", "/agents/{agent_id}/messages:batchGet", "agentMessagesBatchGet", "messages", "Batch get messages", "Return persisted message envelopes for the selected agent. Missing or cross-agent ids are reported in missing_message_ids.", Some("BatchGetMessagesRequest"), "BatchGetMessagesResponse", AuthKind::RemoteAccess),
     aide_route("get", "/agents/{agent_id}/transcript", "agentTranscript", "agents", "Recent transcript", "Return recent transcript entries. Query parameter: limit.", None, AuthKind::RemoteAccess),
@@ -155,6 +158,7 @@ const ROUTES: &[RouteSpec] = &[
     route("delete", "/control/runtime/credentials/{profile}", "deleteRuntimeCredential", "runtime", "Delete runtime credential", "Remove a credential profile from the runtime credential store.", None, AuthKind::Control),
     route("post", "/auth/codex/device/start", "startCodexDeviceLogin", "auth", "Start Codex device login", "Request an OpenAI Codex device code and start a background job that persists the OAuth credential profile after user authorization.", None, AuthKind::Control),
     route("post", "/auth/{provider}/device/start", "startOAuthDeviceLogin", "auth", "Start OAuth device login", "Request a provider OAuth device code and start a background job that persists the OAuth credential profile after user authorization. Supported providers include openai-codex and xai.", None, AuthKind::Control),
+    route("get", "/auth/method", "authMethod", "auth", "Authentication method", "Return the configured authentication mode used by the Web login page.", None, AuthKind::None),
     route("post", "/control/runtime/shutdown", "runtimeShutdown", "runtime", "Runtime shutdown", "Request graceful runtime shutdown.", None, AuthKind::Control),
     route("post", "/control/agents/{agent_id}/debug-prompt", "debugPrompt", "control", "Debug prompt", "Render a diagnostic prompt preview.", Some("DebugPromptRequest"), AuthKind::Control),
     route("post", "/control/agents/{agent_id}/wake", "controlWake", "control", "Wake agent", "Submit a trusted wake hint.", Some("ControlWakeRequest"), AuthKind::Control),
@@ -810,6 +814,226 @@ fn component_schemas() -> Value {
     schemas.insert(
         "SyncTemplateRemoteSourcesRequest".into(),
         component_schema::<SyncTemplateRemoteSourcesRequest>(),
+    );
+    schemas.insert(
+        "AgentRosterSnapshot".into(),
+        json!({
+            "type": "object",
+            "description": "Authoritative roster snapshot (RFC: observer sync). All-or-nothing membership with per-Agent event windows and latest Brief anchors. Served by GET /api/agents/snapshot only while the agents.roster-snapshot.v1 capability is advertised; route registration alone is never sufficient.",
+            "properties": {
+                "contract_version": { "type": "integer", "const": 1 },
+                "runtime_id": { "type": "string", "description": "Stable public identity of the runtime installation. Distinguishes a replaced server at the same URL from an ordinary restart. Not a secret." },
+                "event_log_epoch": { "type": "string", "description": "Current event log epoch; a changed value means historical event continuity is intentionally reset." },
+                "visibility_scope_id": { "type": "string", "description": "Server-generated scope id derived from stable runtime identity, resolved authority, normalized visibility entitlement, and policy generation. Never contains credentials or tokens." },
+                "agents": {
+                    "type": "array",
+                    "description": "Active public Agents visible to the caller in one committed read view. Private child Agents are never included. A failure to assemble one Agent fails the whole response.",
+                    "items": { "$ref": "#/components/schemas/AgentRosterEntry" }
+                }
+            },
+            "required": ["contract_version", "runtime_id", "event_log_epoch", "visibility_scope_id", "agents"],
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "AgentRosterEntry".into(),
+        json!({
+            "type": "object",
+            "properties": {
+                "agent": { "$ref": "#/components/schemas/AgentListEntry" },
+                "event_window": { "$ref": "#/components/schemas/AgentEventWindow" },
+                "latest_brief": {
+                    "oneOf": [
+                        { "$ref": "#/components/schemas/AgentLatestBrief" },
+                        { "type": "null" }
+                    ],
+                    "description": "Latest canonical Brief; null when the Agent has no Brief yet."
+                }
+            },
+            "required": ["agent", "event_window", "latest_brief"],
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "AgentListEntry".into(),
+        json!({
+            "type": "object",
+            "description": "Public Agent entry, same shape as GET /api/agents/list response entries. Baseline object schema until the agents/list DTO stabilizes under a named schema.",
+            "additionalProperties": true
+        }),
+    );
+    schemas.insert(
+        "AgentEventWindow".into(),
+        json!({
+            "type": "object",
+            "description": "Committed event window for one Agent inside one snapshot read view. Values come from a committed database view, never from an in-memory watcher or a sequence allocator.",
+            "properties": {
+                "event_head_seq": { "type": "integer", "minimum": 0, "description": "Greatest committed event_seq visible in the response read view." },
+                "oldest_retained_seq": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Durable retention floor. Zero means no retained prefix has ever been deleted; a positive value is the earliest sequence that may still be replayable."
+                }
+            },
+            "required": ["event_head_seq", "oldest_retained_seq"],
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "AgentLatestBrief".into(),
+        json!({
+            "type": "object",
+            "description": "Latest Brief anchor derived from canonical Brief storage, not a second UI-summary table.",
+            "properties": {
+                "brief_id": { "type": "string" },
+                "created_event_seq": {
+                    "oneOf": [
+                        { "type": "integer", "minimum": 0 },
+                        { "type": "null" }
+                    ],
+                    "description": "Immutable brief_created event linkage; null when the Brief cannot be linked to a unique retained event. Null-linked Briefs do not participate in exact unread calculation."
+                },
+                "created_at": { "type": "string", "format": "date-time" },
+                "preview": { "type": "string", "maxLength": 512, "description": "Bounded to 512 UTF-8 bytes. Full Brief content remains available from the canonical Brief APIs." }
+            },
+            "required": ["brief_id", "created_event_seq", "created_at", "preview"],
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "AgentProjectionSnapshot".into(),
+        json!({
+            "type": "object",
+            "description": "Per-Agent canonical projection snapshot at one consistency boundary (RFC: observer sync). Served by GET /api/agents/{agent_id}/projection-snapshot only while the agents.projection-snapshot.v1 capability is advertised.",
+            "properties": {
+                "contract_version": { "type": "integer", "const": 1 },
+                "runtime_id": { "type": "string" },
+                "event_log_epoch": { "type": "string" },
+                "visibility_scope_id": { "type": "string" },
+                "agent_id": { "type": "string" },
+                "snapshot_through_seq": { "type": "integer", "minimum": 0, "description": "Every event with event_seq <= snapshot_through_seq that affects current canonical state is already reflected in the projection or its revision anchors." },
+                "event_head_seq": { "type": "integer", "minimum": 0, "description": "May exceed snapshot_through_seq; names a committed event available through the event page. Clients replay (snapshot_through_seq, event_head_seq] and later events." },
+                "oldest_retained_seq": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Durable retention floor; zero means no retained prefix has ever been deleted."
+                },
+                "projection": { "$ref": "#/components/schemas/AgentCanonicalProjection" }
+            },
+            "required": ["contract_version", "runtime_id", "event_log_epoch", "visibility_scope_id", "agent_id", "snapshot_through_seq", "event_head_seq", "oldest_retained_seq", "projection"],
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "AgentCanonicalProjection".into(),
+        json!({
+            "type": "object",
+            "description": "First concrete AgentCanonicalProjection: compact current state plus stable revision anchors only. Deliberately excludes verbose timelines and full transcript/message history (see docs/implementation-decisions/104-agent-canonical-projection-v1-boundary.md).",
+            "properties": {
+                "agent": { "$ref": "#/components/schemas/AgentListEntry" },
+                "current_work_item": {
+                    "oneOf": [
+                        { "$ref": "#/components/schemas/AgentWorkItemAnchor" },
+                        { "type": "null" }
+                    ],
+                    "description": "Current WorkItem anchor; null when the Agent has no current WorkItem."
+                },
+                "conversation": { "$ref": "#/components/schemas/ConversationRevisionAnchors" },
+                "latest_brief": {
+                    "oneOf": [
+                        { "$ref": "#/components/schemas/AgentLatestBrief" },
+                        { "type": "null" }
+                    ]
+                },
+                "hydration_tombstones": {
+                    "type": "array",
+                    "description": "Records deleted at or before the snapshot boundary; they terminate pending hydration without fetching a record that no longer exists.",
+                    "items": { "$ref": "#/components/schemas/AgentHydrationKey" }
+                },
+                "hydration_references": {
+                    "type": "array",
+                    "description": "Records referenced by the projection but still resolvable through the batch record APIs.",
+                    "items": { "$ref": "#/components/schemas/AgentHydrationKey" }
+                }
+            },
+            "required": ["agent", "current_work_item", "conversation", "latest_brief", "hydration_tombstones", "hydration_references"],
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "AgentWorkItemAnchor".into(),
+        json!({
+            "type": "object",
+            "properties": {
+                "work_item_id": { "type": "string" },
+                "state": { "type": "string" },
+                "plan_status": { "type": "string" },
+                "revision": { "type": "integer", "minimum": 0, "description": "Canonical WorkItem revision at the snapshot boundary." },
+                "updated_at": { "type": "string", "format": "date-time" }
+            },
+            "required": ["work_item_id", "state", "plan_status", "revision", "updated_at"],
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "ConversationRevisionAnchors".into(),
+        json!({
+            "type": "object",
+            "description": "Latest-record anchors for conversation families whose canonical records carry no per-record revision counter. Always present; null fields mean the family has no record at the boundary.",
+            "properties": {
+                "latest_message_id": {
+                    "oneOf": [{ "type": "string" }, { "type": "null" }]
+                },
+                "latest_transcript_entry_id": {
+                    "oneOf": [{ "type": "string" }, { "type": "null" }]
+                }
+            },
+            "required": ["latest_message_id", "latest_transcript_entry_id"],
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "AgentHydrationKey".into(),
+        json!({
+            "type": "object",
+            "description": "Identifies one canonical record for hydration termination (tombstone) or batch resolution (reference).",
+            "properties": {
+                "record_kind": { "type": "string", "enum": ["message", "brief", "transcript_entry"] },
+                "record_id": { "type": "string" }
+            },
+            "required": ["record_kind", "record_id"],
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "ProjectionEffect".into(),
+        json!({
+            "type": "string",
+            "enum": ["none", "display_invalidation"],
+            "description": "Additive top-level StreamEventEnvelope classification shared by event pages and SSE. The runtime event registry is the source of truth; legacy or otherwise unclassified events default conservatively to display_invalidation. Emitted only while events.projection-effect.v1 is advertised; introducing the field increments the envelope contract version."
+        }),
+    );
+    schemas.insert(
+        "CursorNotFoundError".into(),
+        json!({
+            "type": "object",
+            "description": "Rich cursor_not_found body for event pages and SSE. event_log_epoch, oldest_retained_seq, and event_head_seq must come from one committed read view so clients can distinguish a retained-prefix gap from an epoch change and select the correct reset path.",
+            "properties": {
+                "ok": { "type": "boolean", "const": false },
+                "error": { "type": "string" },
+                "code": { "type": "string", "const": "cursor_not_found" },
+                "after_seq": { "type": "integer", "minimum": 0 },
+                "event_log_epoch": { "type": "string" },
+                "oldest_retained_seq": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Durable retention floor; zero means no retained prefix has ever been deleted."
+                },
+                "event_head_seq": { "type": "integer", "minimum": 0 }
+            },
+            "required": ["ok", "error", "code", "after_seq", "event_log_epoch", "oldest_retained_seq", "event_head_seq"],
+            "additionalProperties": true
+        }),
     );
     for name in [
         "EnqueueRequest",

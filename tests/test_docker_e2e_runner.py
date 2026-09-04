@@ -2,10 +2,15 @@
 
 import importlib.util
 import io
+import inspect
 import json
 import copy
+import os
+import sqlite3
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -18,9 +23,41 @@ SPEC = importlib.util.spec_from_file_location("docker_e2e_runner", RUNNER_PATH)
 assert SPEC is not None and SPEC.loader is not None
 runner = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runner)
+STUB_PATH = ROOT / "tests/e2e/docker/openai_stub/server.py"
+STUB_SPEC = importlib.util.spec_from_file_location("openai_stub", STUB_PATH)
+assert STUB_SPEC is not None and STUB_SPEC.loader is not None
+stub = importlib.util.module_from_spec(STUB_SPEC)
+STUB_SPEC.loader.exec_module(stub)
 
 
 class DockerE2ERunnerTests(unittest.TestCase):
+    def test_skip_build_only_covers_candidate_image(self) -> None:
+        source = inspect.getsource(runner.main)
+        self.assertIn("if not args.skip_build:", source)
+        self.assertIn("if any(", source)
+        self.assertNotIn("if not args.skip_build and any(", source)
+
+    def test_previous_schema_revision_accepts_supported_release_schemas(self) -> None:
+        self.assertEqual(
+            runner.require_previous_schema_revision({"schema_revision": 25}),
+            25,
+        )
+        self.assertEqual(
+            runner.require_previous_schema_revision({"schema_revision": 46}),
+            46,
+        )
+
+    def test_previous_schema_revision_rejects_invalid_revision(self) -> None:
+        for snapshot in ({"schema_revision": 0}, {}):
+            with (
+                self.subTest(snapshot=snapshot),
+                self.assertRaisesRegex(
+                    AssertionError,
+                    "previous release produced an invalid schema revision",
+                ),
+            ):
+                runner.require_previous_schema_revision(snapshot)
+
     def setUp(self) -> None:
         self.manifest = json.loads(runner.DEFAULT_MANIFEST.read_text())
         runner.validate_manifest(self.manifest)
@@ -33,6 +70,8 @@ class DockerE2ERunnerTests(unittest.TestCase):
             [case["id"] for case in selected],
             [
                 "runtime-auth-model-delivery",
+                "runtime-upgrade-v030",
+                "runtime-upgrade-interrupted-schema47",
                 "memory-agent-home-persistence",
                 "workspace-restart-lifecycle",
                 "workitem-wait-restart-complete",
@@ -64,6 +103,57 @@ class DockerE2ERunnerTests(unittest.TestCase):
             runner.provider_base_url_env("anthropic/claude-sonnet-4-6"),
             "ANTHROPIC_BASE_URL",
         )
+
+    def test_runtime_config_merges_model_override_without_mutating_source(self) -> None:
+        source = {"providers": {"custom": {"base_url": "https://example.invalid"}}}
+        merged = runner.merged_runtime_config(
+            source,
+            "custom/model",
+            {"max_output_tokens": 4096},
+        )
+
+        self.assertEqual(
+            merged["models"]["catalog"]["custom/model"]["max_output_tokens"],
+            4096,
+        )
+        self.assertNotIn("models", source)
+
+    def test_load_runtime_config_requires_json_object(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "config.json"
+            path.write_text("[]")
+            with self.assertRaisesRegex(AssertionError, "JSON object"):
+                runner.load_runtime_config(path)
+
+    def test_provider_file_paths_accept_new_names_before_legacy_aliases(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HOLON_E2E_PROVIDER_ENV_FILE": "provider.env",
+                "HOLON_E2E_DOCKER_ENV_FILE": "legacy.env",
+                "HOLON_E2E_PROVIDER_CONFIG_FILE": "provider.json",
+                "HOLON_E2E_CONFIG_FILE": "legacy.json",
+            },
+            clear=True,
+        ):
+            env_file, config_file = runner.provider_file_paths(None, None)
+
+        self.assertEqual(env_file, Path("provider.env").resolve())
+        self.assertEqual(config_file, Path("provider.json").resolve())
+
+    def test_provider_file_paths_keep_legacy_aliases(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HOLON_E2E_DOCKER_ENV_FILE": "legacy.env",
+                "HOLON_E2E_CONFIG_FILE": "legacy.json",
+            },
+            clear=True,
+        ):
+            env_file, config_file = runner.provider_file_paths(None, None)
+
+        self.assertEqual(env_file, Path("legacy.env").resolve())
+        self.assertEqual(config_file, Path("legacy.json").resolve())
 
     def test_work_queue_message_evidence_extracts_retry_identity(self) -> None:
         snapshot = {
@@ -118,11 +208,869 @@ class DockerE2ERunnerTests(unittest.TestCase):
             ],
         )
 
+    def test_recovered_retry_ticks_accepts_existing_interrupted_tick(self) -> None:
+        key = "work_queue:continue_active:work-1:1"
+        failed = [
+            {
+                "message_id": "message-1",
+                "idempotency_key": key,
+                "status": "aborted",
+            },
+            {
+                "message_id": "message-2",
+                "idempotency_key": key,
+                "status": "interrupted",
+            },
+        ]
+        recovered = [
+            failed[0],
+            {
+                "message_id": "message-2",
+                "idempotency_key": key,
+                "status": "processed",
+            },
+        ]
+
+        self.assertEqual(
+            runner.recovered_retry_ticks(failed, recovered),
+            [recovered[1]],
+        )
+
+    def test_recovered_retry_ticks_rejects_changed_idempotency(self) -> None:
+        failed = [
+            {
+                "message_id": "message-1",
+                "idempotency_key": "work_queue:continue_active:work-1:1",
+                "status": "aborted",
+            }
+        ]
+        recovered = [
+            {
+                "message_id": "message-2",
+                "idempotency_key": "work_queue:continue_active:work-1:2",
+                "status": "processed",
+            }
+        ]
+
+        self.assertEqual(runner.recovered_retry_ticks(failed, recovered), [])
+
     def test_manifest_rejects_unregistered_case(self) -> None:
         invalid = json.loads(json.dumps(self.manifest))
         invalid["cases"][0]["id"] = "not-implemented"
         with self.assertRaisesRegex(AssertionError, "no registered runner"):
             runner.validate_manifest(invalid)
+
+    def test_scheduler_live_canary_profile_is_observational(self) -> None:
+        profile = runner.resolve_profile(self.manifest, "scheduler-live-canary")
+        self.assertEqual(profile["gate_kind"], "live_canary")
+        self.assertEqual(profile["provider_mode"], "live")
+        self.assertEqual(profile["tool_assertion_mode"], "observe")
+        self.assertEqual(
+            profile["case_ids"],
+            ["scheduler-external-wait-resume"],
+        )
+
+    def test_workflows_keep_required_gate_independent_and_publish_canary(self) -> None:
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        nightly = (ROOT / ".github/workflows/e2e-scheduler-nightly.yml").read_text()
+        release = (ROOT / ".github/workflows/release-e2e.yml").read_text()
+
+        self.assertLess(
+            nightly.index("Run deterministic scheduler matrix"),
+            nightly.index("Prepare provider configuration"),
+        )
+        self.assertIn("if: steps.provider-env.outcome == 'success'", nightly)
+        self.assertIn("continue-on-error: true", nightly)
+        for workflow in (ci, nightly, release):
+            self.assertIn("scheduler-live-canary-report.json", workflow)
+            self.assertIn("behavioral_variances", workflow)
+            self.assertIn("tool_counts", workflow)
+            self.assertIn("HOLON_E2E_SCHEDULER_CREDENTIAL", workflow)
+            self.assertIn("HOLON_E2E_SCHEDULER_CONFIG_JSON", workflow)
+            self.assertIn("--config-file", workflow)
+        self.assertIn("name: scheduler-live-canary", ci)
+        self.assertIn("name: scheduler-e2e-nightly", nightly)
+        self.assertIn("Detect scheduler code changes", nightly)
+        self.assertIn("needs.changes.outputs.should-run == 'true'", nightly)
+        self.assertIn("Unable to detect scheduler code changes", nightly)
+        self.assertIn("comparison.data.truncation === true", nightly)
+        self.assertIn("files.length >= 300", nightly)
+        self.assertIn("Require dispatched live canary success", nightly)
+        self.assertIn('test "${LIVE_CANARY_OUTCOME}" = success', nightly)
+        self.assertIn("HOLON_E2E_PROVIDER_CONFIG_FILE:", nightly)
+        self.assertNotIn("HOLON_E2E_CONFIG_FILE:", nightly)
+        for workflow in (ci, nightly, release):
+            live_step = workflow.split("      - name: Run scheduler live canary\n", 1)[
+                1
+            ].split("      - name:", 1)[0]
+            self.assertNotIn("HOLON_E2E_PROVIDER_CONFIG_FILE", live_step)
+            self.assertIn("config_file=/tmp/holon-e2e-config.json", live_step)
+        nightly_job_env = nightly.split("  nightly:\n", 1)[1].split("    steps:\n", 1)[
+            0
+        ]
+        release_job_env = release.split("  core:\n", 1)[1].split("    steps:\n", 1)[0]
+        for job_env in (nightly_job_env, release_job_env):
+            self.assertNotIn("HOLON_E2E_PROVIDER_ENV_FILE", job_env)
+            self.assertNotIn("HOLON_E2E_PROVIDER_CONFIG_FILE", job_env)
+
+    def test_release_workflow_fails_closed_for_previous_release_inputs(self) -> None:
+        release = (ROOT / ".github/workflows/release-e2e.yml").read_text()
+        inputs = release.split("    inputs:\n", 1)[1].split("\npermissions:", 1)[0]
+        prepare = release.split("      - name: Prepare previous release image\n", 1)[
+            1
+        ].split("      - name:", 1)[0]
+
+        self.assertNotIn("default: v0.30.0", inputs)
+        self.assertIn(
+            "previous_image and previous_ref are mutually exclusive",
+            prepare,
+        )
+        self.assertIn(
+            'if ! docker manifest inspect "${PREVIOUS_IMAGE_INPUT}"',
+            prepare,
+        )
+        self.assertIn(
+            "previous_image is not a resolvable container image",
+            prepare,
+        )
+        self.assertIn(
+            "one of previous_image or previous_ref is required",
+            prepare,
+        )
+        self.assertIn("source=previous_image", prepare)
+        self.assertIn("source=previous_ref", prepare)
+        self.assertIn('"previous_release": {', release)
+        self.assertIn('"image": os.environ["PREVIOUS_IMAGE"]', release)
+        self.assertIn('"source": os.environ["PREVIOUS_SOURCE"]', release)
+        self.assertIn('"ref": os.environ["PREVIOUS_REF"] or None', release)
+        self.assertIn('"runtime-upgrade-interrupted-schema47"', release)
+        self.assertIn('"interrupted_schema47_upgrade": {', release)
+        self.assertIn('"evidence_sha256": recovery_sha256', release)
+        self.assertIn(
+            'recovery["previous_schema_revision"]\n'
+            '              != old_snapshot.get("schema_revision")',
+            release,
+        )
+        self.assertIn(
+            'recovery["candidate_schema_revision"]\n'
+            '              != migrated_snapshot.get("schema_revision")',
+            release,
+        )
+        self.assertIn('recovery["candidate_schema_revision"] < 47', release)
+        self.assertIn(
+            'recovery["candidate_schema_revision"]\n'
+            '              <= recovery["previous_schema_revision"]',
+            release,
+        )
+        self.assertIn(
+            'recovery.get("old_snapshot_sha256") != old_snapshot_sha256',
+            release,
+        )
+        self.assertIn(
+            'recovery.get("migrated_snapshot_sha256")',
+            release,
+        )
+        self.assertIn("!= migrated_snapshot_sha256", release)
+        self.assertIn(
+            'not report_before.get("before", {}).get("blockers")',
+            release,
+        )
+        self.assertIn('not apply.get("apply", {}).get("changed")', release)
+        self.assertIn('apply.get("after", {}).get("blockers")', release)
+        self.assertIn('report_after.get("before", {}).get("blockers")', release)
+        self.assertIn('report_after.get("reports")', release)
+        publish = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn(".previous_release.image", publish)
+        self.assertIn(
+            '.previous_release.source == "previous_image"',
+            publish,
+        )
+        self.assertIn(
+            '.previous_release.source == "previous_ref"',
+            publish,
+        )
+
+    def test_scheduler_required_profile_selects_all_stub_cases(self) -> None:
+        profile = runner.resolve_profile(self.manifest, "scheduler-required")
+        selected = runner.select_cases(
+            self.manifest,
+            requested=profile["case_ids"],
+            suite="core",
+            tags=[],
+        )
+        expected = [
+            case["id"]
+            for case in self.manifest["cases"]
+            if "scheduler" in case.get("tags", [])
+        ]
+        self.assertEqual(profile["gate_kind"], "required")
+        self.assertEqual(profile["provider_mode"], "stub")
+        self.assertEqual(profile["tool_assertion_mode"], "strict")
+        self.assertEqual([case["id"] for case in selected], expected)
+        self.assertEqual(profile["required_coverage_ids"], expected)
+        self.assertTrue(all(case.get("stub_scenario") for case in selected))
+        self.assertTrue(all(case["timeout_seconds"] <= 120 for case in selected))
+
+    def test_manifest_rejects_live_canary_with_strict_tools(self) -> None:
+        invalid = json.loads(json.dumps(self.manifest))
+        invalid["profiles"]["scheduler-live-canary"]["tool_assertion_mode"] = "strict"
+        with self.assertRaisesRegex(
+            AssertionError,
+            "live canary must observe tool assertions",
+        ):
+            runner.validate_manifest(invalid)
+
+    def test_manifest_rejects_required_case_without_stub_scenario(self) -> None:
+        invalid = json.loads(json.dumps(self.manifest))
+        invalid["cases"][-1].pop("stub_scenario")
+        with self.assertRaisesRegex(
+            AssertionError,
+            "cases require stub_scenario",
+        ):
+            runner.validate_manifest(invalid)
+
+    def test_scheduler_live_canary_report_records_model_and_retries(self) -> None:
+        report = runner.scheduler_live_canary_report(
+            run_record={
+                "git_sha": "git-sha",
+                "image_digest": "image@sha256:digest",
+                "manifest_sha256": "manifest-hash",
+                "profile": "scheduler-live-canary",
+                "provider_mode": "live",
+                "model_route": "provider/model",
+                "tool_assertion_mode": "observe",
+            },
+            case_results=[
+                {
+                    "id": "scheduler-external-wait-resume-canonical",
+                    "base_id": "scheduler-external-wait-resume",
+                    "scheduler_engine": "canonical",
+                    "status": "pass",
+                    "error": "",
+                    "provider_rounds": 2,
+                    "provider_attempts": 3,
+                    "provider_retries": 1,
+                    "tool_counts": {"WaitFor": 1},
+                    "behavioral_variances": [
+                        {
+                            "scope": "scheduler-external-resume",
+                            "missing_tools": ["GetWorkItem"],
+                            "forbidden_tools_used": [],
+                        }
+                    ],
+                },
+            ],
+            scheduler_acceptance_status="pass",
+            scheduler_coverage_status="pass",
+            secret_scan_status="pass",
+        )
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["model_route"], "provider/model")
+        self.assertEqual(report["provider_rounds"], 2)
+        self.assertEqual(report["provider_attempts"], 3)
+        self.assertEqual(report["provider_retries"], 1)
+        self.assertEqual(
+            report["behavioral_variances"],
+            [
+                {
+                    "case_id": "scheduler-external-wait-resume-canonical",
+                    "scope": "scheduler-external-resume",
+                    "missing_tools": ["GetWorkItem"],
+                    "forbidden_tools_used": [],
+                }
+            ],
+        )
+
+    def test_collect_case_metrics_deduplicates_overlapping_event_snapshots(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            events = [
+                {
+                    "event_seq": 10,
+                    "type": "tool_executed",
+                    "payload": {"tool_name": "WaitFor"},
+                },
+                {
+                    "event_seq": 11,
+                    "type": "provider_round_completed",
+                    "payload": {
+                        "provider_attempt_timeline": {
+                            "attempts": [{"status": "failed"}, {"status": "success"}]
+                        },
+                        "token_usage": {
+                            "input_tokens": 3,
+                            "output_tokens": 2,
+                            "total_tokens": 5,
+                        },
+                    },
+                },
+            ]
+            (evidence / "first-events.json").write_text(json.dumps({"events": events}))
+            (evidence / "second-events.json").write_text(json.dumps({"events": events}))
+
+            metrics = runner.collect_case_metrics(evidence)
+
+        self.assertEqual(metrics["tool_counts"], {"WaitFor": 1})
+        self.assertEqual(metrics["provider_rounds"], 1)
+        self.assertEqual(metrics["provider_attempts"], 2)
+        self.assertEqual(metrics["provider_retries"], 1)
+        self.assertEqual(metrics["token_usage"]["total_tokens"], 5)
+
+    def test_collect_case_schema_revision_uses_declared_result_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            (evidence / "old-runtime-db.json").write_text(
+                json.dumps({"schema_revision": 46})
+            )
+            (evidence / "migrated-runtime-db.json").write_text(
+                json.dumps({"schema_revision": 47})
+            )
+
+            revision = runner.collect_case_schema_revision(evidence, "migrated")
+
+        self.assertEqual(revision, 47)
+
+    def test_collect_case_schema_revision_requires_declared_result_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+
+            with self.assertRaisesRegex(
+                AssertionError,
+                "result schema revision snapshot is missing",
+            ):
+                runner.collect_case_schema_revision(evidence, "migrated")
+
+    def test_scheduler_coverage_reports_missing_and_duplicate_ids(self) -> None:
+        report = runner.scheduler_coverage_report(
+            run_record={
+                "git_sha": "git-sha",
+                "image_digest": "image@sha256:digest",
+                "manifest_sha256": "manifest-hash",
+                "profile": "scheduler-required",
+            },
+            case_results=[
+                {"id": "a-legacy", "coverage_ids": ["a"], "status": "pass"},
+                {"id": "a-canonical", "coverage_ids": ["a"], "status": "pass"},
+                {"id": "a-extra", "coverage_ids": ["a"], "status": "pass"},
+            ],
+            required_coverage_ids={"a", "b"},
+            secret_scan_status="pass",
+        )
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(report["missing_coverage_ids"], ["b"])
+        self.assertEqual(
+            report["duplicate_or_incomplete_coverage_ids"]["a"],
+            ["a-legacy", "a-canonical", "a-extra"],
+        )
+
+    def test_openai_stub_consumes_transcript_deterministically(self) -> None:
+        scenario = stub.Scenario("scheduler-external")
+        status, response = scenario.consume(
+            {
+                "instructions": "Reply with exactly OK.",
+                "input": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {"type": "input_text", "text": "Reply with exactly OK."}
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][0]["content"][0]["text"], "OK")
+        self.assertEqual(scenario.phase, 0)
+        status, response = scenario.consume(
+            {
+                "instructions": "normal agent instructions mentioning Reply with exactly OK.",
+                "input": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "## recent_turns\nThis is the first run of Holon\n"
+                                    "## current_input\nCurrent input:\n"
+                                    "- [operator] SCHEDULER-EXTERNAL-WAIT-abcd "
+                                    "SCHEDULER-EXTERNAL-COMPLETE-abcd docker-e2e:abcd"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][0]["name"], "CreateWorkItem")
+        self.assertEqual(scenario.phase, 1)
+        scenario.phase = 0
+        status, response = scenario.consume(
+            {
+                "input": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "## current_input\nCurrent input:\n"
+                                    "- [system][runtime_system][runtime_owned]"
+                                    "[trigger:internal_followup][runtime_instruction]"
+                                    "[InternalFollowup]\n"
+                                    "  This is the first run of Holon"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            response["output"][0]["content"][0]["text"],
+            "Deterministic Holon test runtime ready.",
+        )
+        self.assertEqual(scenario.phase, 0)
+        status, response = scenario.consume(
+            {
+                "input": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "SCHEDULER-EXTERNAL-WAIT-abcd SCHEDULER-EXTERNAL-COMPLETE-abcd docker-e2e:abcd",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][0]["name"], "CreateWorkItem")
+        status, response = scenario.consume(
+            {
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "output": '{"work_item":{"id":"work_0123456789abcde"}}',
+                    }
+                ]
+            }
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][0]["name"], "PickWorkItem")
+        scenario.phase = 5
+        status, response = scenario.consume({"input": []})
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][1]["name"], "CompleteWorkItem")
+        self.assertEqual(scenario.phase, 6)
+        self.assertTrue(scenario.status()["complete"])
+        status, response = scenario.consume({"input": []})
+        self.assertEqual(status, 409)
+        self.assertEqual(response["error"]["type"], "transcript_exhausted")
+        self.assertEqual(scenario.status()["extra_requests"], 1)
+        self.assertFalse(scenario.status()["complete"])
+
+    def test_openai_stub_upgrade_v030_echoes_current_marker_not_history(self) -> None:
+        scenario = stub.Scenario("runtime-upgrade-v030")
+        old_prompt = {
+            "instructions": "agent instructions",
+            "input": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "## current_input\nCurrent input:\n"
+                                "- [operator] Reply with the exact marker "
+                                "UPGRADE-V030-OLD-0011aabb."
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+        status, response = scenario.consume(old_prompt)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            response["output"][0]["content"][0]["text"],
+            "UPGRADE-V030-OLD-0011aabb",
+        )
+        self.assertEqual(scenario.phase, 1)
+
+        new_prompt = {
+            "instructions": "agent instructions",
+            "input": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "## recent_turns\n"
+                                "- [operator] Reply with the exact marker "
+                                "UPGRADE-V030-OLD-0011aabb.\n"
+                                "- [assistant] UPGRADE-V030-OLD-0011aabb\n"
+                                "## current_input\nCurrent input:\n"
+                                "- [operator] Reply with the exact marker "
+                                "UPGRADE-V030-NEW-0022ccdd."
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+        status, response = scenario.consume(new_prompt)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            response["output"][0]["content"][0]["text"],
+            "UPGRADE-V030-NEW-0022ccdd",
+        )
+        self.assertEqual(scenario.phase, 2)
+
+        status, response = scenario.consume(new_prompt)
+        self.assertEqual(status, 409)
+        self.assertEqual(response["error"]["type"], "transcript_exhausted")
+        self.assertEqual(scenario.status()["extra_requests"], 1)
+        self.assertFalse(scenario.status()["complete"])
+
+    def test_openai_stub_multi_waits_for_second_autonomous_turn(self) -> None:
+        scenario = stub.Scenario("scheduler-multi")
+        scenario.phase = 7
+        scenario.work_ids = [
+            "work_0123456789abcde",
+            "work_fedcba987654321",
+        ]
+        scenario.markers = {
+            "multi_a": "SCHEDULER-MULTI-A-abcd",
+            "multi_b": "SCHEDULER-MULTI-B-abcd",
+        }
+        status, response = scenario.consume({"input": []})
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            response["output"][0]["content"][0]["text"],
+            "Completed the first deterministic WorkItem.",
+        )
+        self.assertEqual(scenario.phase, 7)
+        status, response = scenario.consume({"input": []})
+        self.assertEqual(status, 409)
+        self.assertEqual(response["error"]["type"], "transcript_exhausted")
+        status, response = scenario.consume(
+            {
+                "input": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "## current_input\nCurrent input:\n"
+                                    "- [system][trigger:system_tick] "
+                                    "SCHEDULER-MULTI-B-abcd"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][0]["name"], "GetWorkspaceState")
+        self.assertEqual(scenario.phase, 8)
+
+    def test_openai_stub_operator_wait_uses_operator_input_wake(self) -> None:
+        scenario = stub.Scenario("scheduler-operator")
+        scenario.phase = 2
+        scenario.work_ids = ["work_0123456789abcde"]
+
+        status, response = scenario.consume({"input": []})
+
+        self.assertEqual(status, 200)
+        call = response["output"][0]
+        self.assertEqual(call["name"], "WaitFor")
+        self.assertEqual(json.loads(call["arguments"])["wake"], "operator_input")
+
+    def test_openai_stub_task_wait_closes_creation_turn(self) -> None:
+        scenario = stub.Scenario("scheduler-task-wait")
+        scenario.phase = 1
+        scenario.work_ids = ["work_0123456789abcde"]
+        scenario.markers = {"task_result": "SCHEDULER-TASK-RESULT-abcd"}
+
+        status, response = scenario.consume({"input": []})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][0]["type"], "message")
+        self.assertEqual(scenario.phase, 2)
+
+        status, response = scenario.consume({"input": []})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][0]["name"], "ExecCommand")
+
+    def test_openai_stub_concurrent_callback_starts_a_resume_tools(self) -> None:
+        scenario = stub.Scenario("scheduler-concurrent")
+        scenario.phase = 5
+        scenario.work_ids = [
+            "work_0123456789abcde",
+            "work_fedcba987654321",
+        ]
+        scenario.markers = {"concurrent_a": "SCHEDULER-CONCURRENT-A-abcd"}
+        callback = {
+            "input": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "## current_input\nCurrent input:\n"
+                                "- [system][trigger:system_tick] "
+                                "SCHEDULER-CONCURRENT-A-abcd"
+                            ),
+                        }
+                    ],
+                }
+            ]
+        }
+
+        status, response = scenario.consume({"input": []})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][-1]["name"], "CompleteWorkItem")
+        self.assertEqual(scenario.phase, 6)
+
+        status, response = scenario.consume(callback)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["output"][0]["name"], "GetWorkItem")
+        self.assertEqual(scenario.phase, 8)
+
+    def test_openai_stub_registers_every_required_scenario(self) -> None:
+        selected = [
+            case for case in self.manifest["cases"] if case.get("stub_scenario")
+        ]
+        self.assertEqual(
+            {case["stub_scenario"] for case in selected},
+            set(stub.SCENARIOS),
+        )
+        for case in selected:
+            scenario = stub.Scenario(case["stub_scenario"])
+            if case["stub_scenario"] == "runtime-upgrade-interrupted-schema47":
+                self.assertEqual(scenario.expected_phase(), 0)
+            else:
+                self.assertGreater(scenario.expected_phase(), 0)
+
+    def test_interrupted_schema47_stub_attests_both_blocked_request_kinds(self) -> None:
+        scenario = stub.Scenario("runtime-upgrade-interrupted-schema47")
+        workers = []
+        for marker in (
+            "UPGRADE-SCHEMA47-LIFECYCLE-deadbeef",
+            "UPGRADE-SCHEMA47-WORKITEM-deadbeef",
+        ):
+            request = {
+                "input": [{"content": [{"text": marker}]}],
+            }
+            worker = threading.Thread(
+                target=scenario.consume,
+                args=(request,),
+                daemon=True,
+            )
+            worker.start()
+            workers.append(worker)
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and not scenario.status()["complete"]:
+            time.sleep(0.01)
+
+        self.assertTrue(scenario.interrupted_schema47_seen)
+        self.assertTrue(scenario.status()["complete"])
+
+    def test_openai_stub_required_scenarios_reach_exact_completion(self) -> None:
+        expected_calls = {
+            "scheduler-task-wait": [
+                "CreateWorkItem",
+                "ExecCommand",
+                "WaitFor",
+                "GetWorkItem",
+                "WaitFor",
+                "GetWorkItem",
+                "UpdateWorkItem",
+                "CompleteWorkItem",
+            ],
+            "scheduler-provider-retry": ["ListWorkItems", "CompleteWorkItem"],
+            "scheduler-multi": [
+                "CreateWorkItem",
+                "CreateWorkItem",
+                "AgentGet",
+                "ListWorkItems",
+                "UpdateWorkItem",
+                "CompleteWorkItem",
+                "GetWorkspaceState",
+                "ListWorkItems",
+                "UpdateWorkItem",
+                "CompleteWorkItem",
+            ],
+            "scheduler-external": [
+                "CreateWorkItem",
+                "PickWorkItem",
+                "WaitFor",
+                "GetWorkItem",
+                "UpdateWorkItem",
+                "CompleteWorkItem",
+            ],
+            "scheduler-operator": [
+                "CreateWorkItem",
+                "PickWorkItem",
+                "WaitFor",
+                "GetWorkItem",
+                "UpdateWorkItem",
+                "CompleteWorkItem",
+            ],
+            "scheduler-concurrent": [
+                "CreateWorkItem",
+                "PickWorkItem",
+                "WaitFor",
+                "ListWorkItems",
+                "UpdateWorkItem",
+                "CompleteWorkItem",
+                "GetWorkItem",
+                "UpdateWorkItem",
+                "CompleteWorkItem",
+            ],
+            "scheduler-interject": [
+                "CreateWorkItem",
+                "PickWorkItem",
+                "WaitFor",
+                "CreateWorkItem",
+                "ListWorkItems",
+                "UpdateWorkItem",
+                "CompleteWorkItem",
+                "GetWorkItem",
+                "UpdateWorkItem",
+                "CompleteWorkItem",
+            ],
+            "scheduler-compaction": [
+                "CreateWorkItem",
+                "PickWorkItem",
+                "ExecCommand",
+                "ExecCommand",
+                "ExecCommand",
+                "WaitFor",
+                "GetWorkItem",
+                "UpdateWorkItem",
+                "CompleteWorkItem",
+            ],
+            "scheduler-worktree": [
+                "CreateWorkItem",
+                "PickWorkItem",
+                "GetWorkspaceState",
+                "CreateWorktree",
+                "GetWorkspaceState",
+                "SwitchWorkspace",
+                "GetWorkspaceState",
+                "RemoveWorktree",
+                "GetWorkspaceState",
+                "UpdateWorkItem",
+                "CompleteWorkItem",
+            ],
+            "scheduler-spawn": [
+                "CreateWorkItem",
+                "PickWorkItem",
+                "SpawnAgent",
+                "TaskStatus",
+                "UpdateWorkItem",
+                "CompleteWorkItem",
+            ],
+            "scheduler-checkpoint": [
+                "CreateWorkItem",
+                "CreateWorkItem",
+                "ListWorkItems",
+                "WaitFor",
+                "ListWorkItems",
+                "UpdateWorkItem",
+                "CompleteWorkItem",
+                "GetWorkItem",
+                "UpdateWorkItem",
+                "CompleteWorkItem",
+            ],
+        }
+        transcript = (
+            "## current_input\nCurrent input:\n"
+            "- [system][trigger:system_tick] Scheduler Docker E2E case "
+            "SCHEDULER-TASK-WAIT-abcd SCHEDULER-TASK-RESULT-abcd "
+            "SCHEDULER-TASK-WAIT-COMPLETE-abcd "
+            "SCHEDULER-PROVIDER-RETRY-abcd "
+            "SCHEDULER-PROVIDER-RETRY-COMPLETE-abcd "
+            "SCHEDULER-MULTI-A-abcd SCHEDULER-MULTI-B-abcd "
+            "SCHEDULER-MULTI-COMPLETE-A-abcd "
+            "SCHEDULER-MULTI-COMPLETE-B-abcd "
+            "SCHEDULER-EXTERNAL-WAIT-abcd "
+            "SCHEDULER-EXTERNAL-COMPLETE-abcd "
+            "SCHEDULER-OPERATOR-WAIT-abcd "
+            "SCHEDULER-OPERATOR-COMPLETE-abcd "
+            "SCHEDULER-CONCURRENT-A-abcd SCHEDULER-CONCURRENT-B-abcd "
+            "SCHEDULER-CONCURRENT-COMPLETE-A-abcd "
+            "SCHEDULER-CONCURRENT-COMPLETE-B-abcd "
+            "SCHEDULER-INTERJECT-A-abcd SCHEDULER-INTERJECT-B-abcd "
+            "SCHEDULER-INTERJECT-COMPLETE-A-abcd "
+            "SCHEDULER-INTERJECT-COMPLETE-B-abcd "
+            "SCHEDULER-COMPACTION-abcd "
+            "SCHEDULER-COMPACTION-COMPLETE-abcd "
+            "SCHEDULER-WORKTREE-abcd "
+            "SCHEDULER-WORKTREE-COMPLETE-abcd "
+            "SCHEDULER-SPAWN-abcd SCHEDULER-SPAWN-CHILD-abcd "
+            "SCHEDULER-SPAWN-COMPLETE-abcd "
+            "SCHEDULER-REPLAY-A-abcd SCHEDULER-REPLAY-B-abcd "
+            "SCHEDULER-REPLAY-COMPLETE-A-abcd "
+            "SCHEDULER-REPLAY-COMPLETE-B-abcd "
+            "docker-e2e:abcd e2e-worktree-abcd "
+            "work_0123456789abcde work_fedcba987654321 "
+            "task_0123456789abcde ws_0123456789abcdef "
+            "git_worktree_root:deterministic"
+        )
+        request = {
+            "input": [
+                {
+                    "type": "message",
+                    "content": [{"type": "input_text", "text": transcript}],
+                }
+            ]
+        }
+        for name, expected in expected_calls.items():
+            scenario = stub.Scenario(name)
+            actual = []
+            for _ in range(scenario.expected_phase()):
+                phase_request = request
+                if name == "scheduler-concurrent" and scenario.phase == 6:
+                    phase_request = {
+                        "input": [
+                            {
+                                "type": "function_call_output",
+                                "output": "{}",
+                            }
+                        ]
+                    }
+                status, value = scenario.consume(phase_request)
+                self.assertEqual(status, 200, name)
+                actual.extend(
+                    item["name"]
+                    for item in value["output"]
+                    if item["type"] == "function_call"
+                )
+            self.assertEqual(actual, expected, name)
+            self.assertTrue(scenario.status()["complete"], name)
+            status, value = scenario.consume(request)
+            self.assertEqual(status, 409, name)
+            self.assertEqual(value["error"]["type"], "transcript_exhausted")
 
     def test_secret_scan_reports_value_without_echoing_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -193,9 +1141,7 @@ class DockerE2ERunnerTests(unittest.TestCase):
         self.assertEqual(runner.memory_value(memory), memory)
 
     def test_evidence_redacts_callback_capability(self) -> None:
-        value = {
-            "url": "http://localhost/api/callbacks/wake/cb_secret-capability"
-        }
+        value = {"url": "http://localhost/api/callbacks/wake/cb_secret-capability"}
         redacted = runner.redact_evidence(value)
         self.assertEqual(
             redacted["url"],
@@ -317,8 +1263,7 @@ class DockerE2ERunnerTests(unittest.TestCase):
 
             failure = json.loads(
                 (
-                    harness.evidence
-                    / "scheduler-runtime-state-copy-failure.json"
+                    harness.evidence / "scheduler-runtime-state-copy-failure.json"
                 ).read_text()
             )
             self.assertEqual(failure["status"], "timeout")
@@ -328,6 +1273,39 @@ class DockerE2ERunnerTests(unittest.TestCase):
             )
             self.assertEqual(failure["stdout"], "partial")
             self.assertEqual(failure["stderr"], "daemon stalled")
+
+    def test_offline_runtime_db_snapshot_can_write_host_evidence_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = runner.CaseHarness(
+                case_id="offline-snapshot-user-test",
+                image="holon:test",
+                model="deepseek/deepseek-v4-flash",
+                credential_envs=[],
+                env_file=None,
+                runtime_env={},
+                evidence_root=Path(directory),
+                timeout_seconds=1,
+                keep=False,
+            )
+            docker_args: tuple[str, ...] | None = None
+
+            def capture_docker(
+                *args: str, **_: object
+            ) -> subprocess.CompletedProcess[str]:
+                nonlocal docker_args
+                docker_args = args
+                raise RuntimeError("stop after command capture")
+
+            harness.docker = capture_docker
+            with self.assertRaisesRegex(RuntimeError, "command capture"):
+                harness.offline_runtime_db_snapshot("scheduler")
+
+            self.assertIsNotNone(docker_args)
+            assert docker_args is not None
+            user_index = docker_args.index("--user")
+            self.assertEqual(docker_args[user_index + 1], "0:0")
 
     def test_docker_circuit_breaker_opens_after_consecutive_timeouts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -408,13 +1386,54 @@ class DockerE2ERunnerTests(unittest.TestCase):
                 include_conversation=False,
             )
             self.assertTrue(
-                any(
-                    "events?limit=300&order=asc&after_seq=12" in path
-                    for path in paths
-                )
+                any("events?limit=300&order=asc&after_seq=12" in path for path in paths)
             )
             self.assertFalse(any("/briefs?" in path for path in paths))
             self.assertFalse(any("/transcript?" in path for path in paths))
+
+    def test_event_batch_pages_until_the_latest_event(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = runner.CaseHarness(
+                case_id="event-pagination-test",
+                image="holon:test",
+                model="deepseek/deepseek-v4-flash",
+                credential_envs=[],
+                env_file=None,
+                runtime_env={},
+                evidence_root=Path(directory),
+                timeout_seconds=1,
+                keep=False,
+            )
+            harness.agent_id = "default"
+            pages = [
+                {
+                    "events": [{"type": "turn_started", "payload": {}}],
+                    "newest_seq": 12,
+                    "has_newer": True,
+                },
+                {
+                    "events": [{"type": "turn_terminal", "payload": {}}],
+                    "newest_seq": 14,
+                    "has_newer": False,
+                },
+            ]
+            paths: list[str] = []
+
+            def request(method: str, path: str, *_: object, **__: object) -> object:
+                self.assertEqual(method, "GET")
+                paths.append(path)
+                return pages.pop(0)
+
+            harness.request = request
+            batch = harness.event_batch("paged", after_seq=10, limit=2)
+
+            self.assertEqual(
+                [event["type"] for event in batch["events"]],
+                ["turn_started", "turn_terminal"],
+            )
+            self.assertEqual(batch["newest_seq"], 14)
+            self.assertIn("after_seq=10", paths[0])
+            self.assertIn("after_seq=12", paths[1])
 
     def test_cleanup_fails_when_resource_still_exists(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -430,7 +1449,9 @@ class DockerE2ERunnerTests(unittest.TestCase):
                 keep=False,
             )
 
-            def fake_docker(*args: str, **_: object) -> subprocess.CompletedProcess[str]:
+            def fake_docker(
+                *args: str, **_: object
+            ) -> subprocess.CompletedProcess[str]:
                 if args[:2] == ("volume", "inspect"):
                     return subprocess.CompletedProcess(["docker", *args], 0, "", "")
                 return subprocess.CompletedProcess(["docker", *args], 1, "", "")
@@ -474,6 +1495,190 @@ class DockerE2ERunnerTests(unittest.TestCase):
                 "runtime failure occurred in complete: provider: connection closed",
             ):
                 harness.assert_tools("complete", 3, ["CompleteWorkItem"])
+
+    def test_tool_assertion_uses_turn_started_index_for_all_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = runner.CaseHarness(
+                case_id="turn-index-scope-test",
+                image="holon:test",
+                model="deepseek/deepseek-v4-flash",
+                credential_envs=[],
+                env_file=None,
+                runtime_env={},
+                evidence_root=Path(directory),
+                timeout_seconds=1,
+                keep=False,
+            )
+            harness.events = lambda _: [
+                {
+                    "type": "turn_started",
+                    "payload": {"turn_id": "turn-target", "turn_index": 4},
+                },
+                {
+                    "type": "runtime_error",
+                    "payload": {
+                        "turn_id": "turn-target",
+                        "turn_index": 1,
+                        "domain": "provider",
+                        "error": "provider request failed",
+                    },
+                },
+            ]
+
+            with self.assertRaisesRegex(
+                AssertionError,
+                "runtime failure occurred in complete: provider",
+            ):
+                harness.assert_tools("complete", 3, ["CompleteWorkItem"])
+
+    def test_prompt_waits_for_the_submitted_message_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = runner.CaseHarness(
+                case_id="prompt-target-test",
+                image="holon:test",
+                model="deepseek/deepseek-v4-flash",
+                credential_envs=[],
+                env_file=None,
+                runtime_env={},
+                evidence_root=Path(directory),
+                timeout_seconds=1,
+                keep=False,
+            )
+            harness.agent_id = "default"
+            state = {
+                "agent": {
+                    "agent": {
+                        "turn_index": 8,
+                        "status": "awake_idle",
+                        "current_run_id": None,
+                        "last_runtime_failure": None,
+                    }
+                },
+                "session": {"pending_count": 4},
+            }
+            requests: list[tuple[str, str]] = []
+
+            def request(
+                method: str,
+                path: str,
+                body: object = None,
+                **_: object,
+            ) -> object:
+                requests.append((method, path))
+                if method == "POST":
+                    self.assertEqual(body, {"text": "target prompt"})
+                    return {"ok": True, "message_id": "message-target"}
+                if "events?limit=1" in path:
+                    return {"events": [], "cursor_seq": 10}
+                if path.endswith("/state"):
+                    return state
+                if "events?limit=300" in path:
+                    return {
+                        "events": [
+                            {
+                                "type": "turn_started",
+                                "payload": {
+                                    "message_id": "message-target",
+                                    "turn_id": "turn-target",
+                                    "turn_index": 8,
+                                },
+                            },
+                            {
+                                "type": "turn_terminal",
+                                "payload": {
+                                    "turn_id": "turn-target",
+                                    "turn_index": 8,
+                                    "kind": "completed",
+                                },
+                            },
+                        ]
+                    }
+                if "/work-items?" in path:
+                    return []
+                raise AssertionError(f"unexpected request: {method} {path}")
+
+            harness.request = request
+            with patch.object(harness, "capture_context"):
+                baseline, final_state = harness.prompt(
+                    "target",
+                    "target prompt",
+                )
+
+            self.assertEqual(baseline, 8)
+            self.assertIs(final_state, state)
+            self.assertEqual(
+                harness.prompt_scope("target"),
+                {
+                    "message_id": "message-target",
+                    "turn_id": "turn-target",
+                    "turn_index": 8,
+                    "terminal_kind": "completed",
+                },
+            )
+            self.assertEqual(state["session"]["pending_count"], 4)
+
+    def test_tool_assertion_can_scope_to_prompt_message(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = runner.CaseHarness(
+                case_id="tool-scope-test",
+                image="holon:test",
+                model="deepseek/deepseek-v4-flash",
+                credential_envs=[],
+                env_file=None,
+                runtime_env={},
+                evidence_root=Path(directory),
+                timeout_seconds=1,
+                keep=False,
+            )
+            harness.events = lambda _: [
+                {
+                    "type": "turn_started",
+                    "payload": {
+                        "message_id": "message-target",
+                        "turn_id": "turn-target",
+                        "turn_index": 4,
+                    },
+                },
+                {
+                    "type": "turn_started",
+                    "payload": {
+                        "message_id": "message-other",
+                        "turn_id": "turn-other",
+                        "turn_index": 5,
+                    },
+                },
+                {
+                    "type": "tool_executed",
+                    "payload": {
+                        "turn_id": "turn-target",
+                        "turn_index": 4,
+                        "tool_name": "CreateWorkItem",
+                        "status": "success",
+                    },
+                },
+                {
+                    "type": "tool_executed",
+                    "payload": {
+                        "turn_id": "turn-other",
+                        "turn_index": 5,
+                        "tool_name": "CompleteWorkItem",
+                        "status": "success",
+                    },
+                },
+            ]
+
+            events = harness.assert_tools(
+                "create",
+                3,
+                ["CreateWorkItem"],
+                ["CompleteWorkItem"],
+                message_id="message-target",
+            )
+
+            self.assertEqual(
+                [event["payload"]["tool_name"] for event in events],
+                ["CreateWorkItem"],
+            )
 
     def test_no_model_harness_uses_inert_provider_bootstrap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -553,6 +1758,70 @@ class DockerE2ERunnerTests(unittest.TestCase):
                 docker_run,
             )
 
+    def test_stub_start_forces_endpoint_and_seeds_model_override_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = runner.CaseHarness(
+                case_id="stub-model-override",
+                image="holon:test",
+                model="external/model",
+                credential_envs=[],
+                env_file=None,
+                runtime_env={
+                    "HOLON_OPENAI_BASE_URL": "https://external.invalid/v1",
+                },
+                evidence_root=Path(directory),
+                timeout_seconds=1,
+                keep=True,
+                provider_mode="stub",
+                stub_scenario="scheduler-compaction",
+                model_runtime_override={
+                    "prompt_budget_estimated_tokens": 80_000,
+                    "compaction_trigger_estimated_tokens": 70_000,
+                    "compaction_keep_recent_estimated_tokens": 8_000,
+                },
+            )
+            commands: list[tuple[str, ...]] = []
+
+            def fake_docker(
+                *args: str, **_: object
+            ) -> subprocess.CompletedProcess[str]:
+                commands.append(args)
+                if args[:2] in {
+                    ("network", "inspect"),
+                    ("inspect", "--format"),
+                }:
+                    return subprocess.CompletedProcess(["docker", *args], 1, "", "")
+                if args[:2] == ("port", harness.container):
+                    return subprocess.CompletedProcess(
+                        ["docker", *args], 0, "127.0.0.1:49152\n", ""
+                    )
+                return subprocess.CompletedProcess(["docker", *args], 0, "", "")
+
+            harness.docker = fake_docker
+            harness.wait_readiness = lambda: None
+            harness.wait_agent_idle = lambda: None
+
+            harness.start()
+            harness.start()
+
+            self.assertEqual(harness.model, "openai/gpt-5.4")
+            self.assertEqual(
+                harness.runtime_env["HOLON_OPENAI_BASE_URL"],
+                "http://provider-stub:8080/v1",
+            )
+            seed_runs = [
+                command
+                for command in commands
+                if command[0] == "run"
+                and "/var/lib/holon/config.json" in " ".join(command)
+            ]
+            self.assertEqual(len(seed_runs), 1)
+            seeded = json.loads(seed_runs[0][-1])
+            self.assertEqual(
+                seeded["models"]["catalog"]["openai/gpt-5.4"],
+                harness.model_runtime_override,
+            )
+
     def test_scheduler_extended_cases_use_real_lifecycle_fixtures(self) -> None:
         selected = runner.select_cases(
             self.manifest, requested=None, suite="extended", tags=["scheduler"]
@@ -575,19 +1844,75 @@ class DockerE2ERunnerTests(unittest.TestCase):
         )
         task_wait = selected[0]
         self.assertEqual(len(task_wait["phases"]), 1)
-        self.assertIn(
-            "ExecCommand", task_wait["phases"][0]["required_tools"]
-        )
+        self.assertIn("ExecCommand", task_wait["phases"][0]["required_tools"])
         self.assertIn("WaitFor", task_wait["phases"][0]["required_tools"])
-        self.assertNotIn(
-            "PickWorkItem", task_wait["phases"][0]["required_tools"]
-        )
+        self.assertNotIn("PickWorkItem", task_wait["phases"][0]["required_tools"])
         for case in selected:
             self.assertNotIn(
                 "HOLON_SCHEDULER_ACCEPTANCE_FIXTURES",
                 case.get("runtime_env", {}),
             )
             self.assertNotIn("HOLON_SCHEDULER", case.get("runtime_env", {}))
+
+    def test_scheduler_task_wait_crashes_daemon_before_task_result_rejoin(self) -> None:
+        source = inspect.getsource(runner.run_scheduler_task_wait_resume_case)
+        self.assertLess(
+            source.index('expected_scheduling_state="waiting_task"'),
+            source.index("harness.crash_restart(wait_idle=False)"),
+        )
+        self.assertLess(
+            source.index("harness.crash_restart(wait_idle=False)"),
+            source.index('expected_scheduling_state="waiting_external"'),
+        )
+        self.assertNotIn(
+            'harness.work_items("scheduler-task-wait-after-restart")',
+            source,
+        )
+
+    def test_crash_restart_uses_docker_sigkill(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = runner.CaseHarness(
+                case_id="crash-restart-test",
+                image="holon:test",
+                model="deepseek/deepseek-v4-flash",
+                credential_envs=[],
+                env_file=None,
+                runtime_env={},
+                evidence_root=Path(directory),
+                timeout_seconds=1,
+                keep=False,
+            )
+            commands: list[tuple[str, ...]] = []
+
+            def fake_docker(
+                *args: str, **_: object
+            ) -> subprocess.CompletedProcess[str]:
+                commands.append(args)
+                if args[:2] == ("inspect", "--format"):
+                    return subprocess.CompletedProcess(
+                        ["docker", *args], 0, "false\n", ""
+                    )
+                return subprocess.CompletedProcess(["docker", *args], 0, "", "")
+
+            harness.docker = fake_docker
+            harness.capture_logs = lambda: None
+            harness.start = lambda *, wait_idle=True: commands.append(
+                ("start", str(wait_idle))
+            )
+
+            harness.crash_restart(wait_idle=False)
+
+            self.assertEqual(
+                commands[0],
+                (
+                    "kill",
+                    "--signal",
+                    "KILL",
+                    harness.container,
+                ),
+            )
+            self.assertIn(("rm", "-f", harness.container), commands)
+            self.assertEqual(commands[-1], ("start", "False"))
 
     def test_scheduler_matrix_expands_only_scheduler_cases(self) -> None:
         selected = runner.select_cases(
@@ -603,10 +1928,11 @@ class DockerE2ERunnerTests(unittest.TestCase):
             [(case["id"], engine) for case, engine in expanded],
             [
                 ("runtime-auth-model-delivery", None),
+                ("runtime-upgrade-v030", None),
+                ("runtime-upgrade-interrupted-schema47", None),
                 ("memory-agent-home-persistence", None),
                 ("workspace-restart-lifecycle", None),
                 ("workitem-wait-restart-complete", None),
-                ("scheduler-task-wait-resume", "legacy"),
                 ("scheduler-task-wait-resume", "canonical"),
             ],
         )
@@ -653,6 +1979,17 @@ class DockerE2ERunnerTests(unittest.TestCase):
                 f"{case['id']} should not use acceptance fixtures",
             )
             self.assertEqual(len(case["phases"]), 1)
+        compaction = next(
+            case for case in selected if case["id"] == "scheduler-compaction-continuity"
+        )
+        self.assertEqual(
+            compaction["model_runtime_override"],
+            {
+                "prompt_budget_estimated_tokens": 80000,
+                "compaction_trigger_estimated_tokens": 16000,
+                "compaction_keep_recent_estimated_tokens": 8000,
+            },
+        )
 
     def test_manifest_rejects_non_boolean_requires_model(self) -> None:
         invalid = json.loads(json.dumps(self.manifest))
@@ -685,6 +2022,7 @@ class DockerE2ERunnerTests(unittest.TestCase):
             run_record=run_record,
             case_results=case_results,
             fixture_corpus_revision="scheduler-release-acceptance-v1",
+            required_coverage_ids={"scheduler-task-wait-resume"},
         )
         self.assertEqual(
             report["schema_version"],
@@ -703,10 +2041,12 @@ class DockerE2ERunnerTests(unittest.TestCase):
         )
         self.assertEqual(
             [engine["engine"] for engine in report["engines"]],
-            ["legacy", "canonical"],
+            ["canonical"],
         )
 
-    def test_scheduler_acceptance_report_rejects_schema_drift(self) -> None:
+    def test_scheduler_acceptance_report_rejects_duplicate_canonical_coverage(
+        self,
+    ) -> None:
         run_record = {
             "git_sha": "abc123",
             "image": {"ref": "holon:test", "id": None, "repo_digests": []},
@@ -715,24 +2055,75 @@ class DockerE2ERunnerTests(unittest.TestCase):
         }
         case_results = [
             {
-                "id": f"scheduler-task-wait-resume-{engine}",
+                "id": f"scheduler-task-wait-resume-canonical-{revision}",
                 "base_id": "scheduler-task-wait-resume",
-                "scheduler_engine": engine,
+                "scheduler_engine": "canonical",
                 "status": "pass",
                 "schema_revision": revision,
             }
-            for engine, revision in (("legacy", 39), ("canonical", 40))
+            for revision in (40, 40)
         ]
         report = runner.scheduler_acceptance_report(
             run_record=run_record,
             case_results=case_results,
             fixture_corpus_revision="scheduler-release-acceptance-v1",
+            required_coverage_ids={"scheduler-task-wait-resume"},
         )
         self.assertEqual(report["status"], "fail")
-        self.assertIsNone(report["runtime_schema_revision"])
+        self.assertEqual(report["runtime_schema_revision"], 40)
         self.assertIn(
-            "scheduler_schema_revision_mismatch",
+            "engine_case_matrix_incomplete",
             {diagnostic["code"] for diagnostic in report["diagnostics"]},
+        )
+
+    def test_scheduler_acceptance_report_distinguishes_missing_schema_evidence(
+        self,
+    ) -> None:
+        run_record = {
+            "git_sha": "abc123",
+            "image": {"ref": "holon:test", "id": None, "repo_digests": []},
+            "image_digest": None,
+            "manifest_sha256": "manifest-hash",
+        }
+        case_results = [
+            {
+                "id": "scheduler-task-wait-resume-canonical",
+                "base_id": "scheduler-task-wait-resume",
+                "scheduler_engine": "canonical",
+                "status": "fail",
+                "schema_revision": None,
+                "failure_kind": "case_timeout",
+                "evidence_collection_error": "docker cp failed",
+            }
+        ]
+
+        report = runner.scheduler_acceptance_report(
+            run_record=run_record,
+            case_results=case_results,
+            fixture_corpus_revision="scheduler-release-acceptance-v1",
+            required_coverage_ids={"scheduler-task-wait-resume"},
+        )
+
+        diagnostic = next(
+            value
+            for value in report["diagnostics"]
+            if value["code"] == "missing_schema_revision_cases"
+        )
+        self.assertEqual(
+            report["missing_schema_revision_cases"],
+            ["scheduler-task-wait-resume-canonical"],
+        )
+        self.assertEqual(
+            diagnostic["case_timeouts"],
+            ["scheduler-task-wait-resume-canonical"],
+        )
+        self.assertEqual(
+            diagnostic["evidence_collection_failures"],
+            ["scheduler-task-wait-resume-canonical"],
+        )
+        self.assertNotIn(
+            "scheduler_schema_revision_mismatch",
+            {value["code"] for value in report["diagnostics"]},
         )
 
     def test_scheduler_queue_oracle_uses_current_processed_state(self) -> None:
@@ -751,19 +2142,19 @@ class DockerE2ERunnerTests(unittest.TestCase):
                 {"scheduler-tick"},
             )
 
-    def test_canonical_wait_resolution_rejects_consuming_activation(self) -> None:
+    def test_canonical_wait_resolution_requires_exact_resolved_owner(self) -> None:
         harness = type(
             "CanonicalHarness",
             (),
-            {"canonical_scheduler_enabled": True},
+            {"canonical_scheduler_enabled": True, "agent_id": "default"},
         )()
         canonical_wait = {
-            "wait_id": "wait-1",
-            "owner_work_item_id": "work-1",
-            "lifecycle_state": "resolved",
-            "consuming_activation_id": None,
+            "wait_condition_id": "wait-1",
+            "agent_id": "default",
+            "work_item_id": "work-1",
+            "status": "resolved",
         }
-        snapshot = {"scheduler_wait_generations": [canonical_wait]}
+        snapshot = {"wait_conditions": [canonical_wait]}
         runner.require_scheduler_engine_wait_resolution(
             harness,
             snapshot,
@@ -771,7 +2162,7 @@ class DockerE2ERunnerTests(unittest.TestCase):
             wait_ids={"wait-1"},
         )
 
-        canonical_wait["consuming_activation_id"] = "activation-unexpected"
+        canonical_wait["work_item_id"] = "work-unexpected"
         with self.assertRaisesRegex(
             AssertionError, "canonical waits did not resolve exactly once"
         ):
@@ -780,6 +2171,474 @@ class DockerE2ERunnerTests(unittest.TestCase):
                 snapshot,
                 work_item_id="work-1",
                 wait_ids={"wait-1"},
+            )
+
+    def test_canonical_wait_terminal_requires_callback_evidence(self) -> None:
+        harness = type(
+            "CanonicalHarness",
+            (),
+            {"canonical_scheduler_enabled": True},
+        )()
+        snapshot = {
+            "wait_conditions": [
+                {
+                    "wait_condition_id": "wait-1",
+                    "work_item_id": "work-1",
+                    "kind": "external",
+                    "status": "resolved",
+                }
+            ],
+            "audit_events": [],
+        }
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "lacked callback trigger evidence",
+        ):
+            runner.require_scheduler_wait_terminal(
+                harness,
+                snapshot,
+                work_item_id="work-1",
+                wait_kind="external",
+                require_callback_trigger=True,
+                callback_external_trigger_id="trigger-target",
+            )
+
+        snapshot["audit_events"] = [
+            {
+                "kind": "callback_delivered",
+                "data_json": json.dumps(
+                    {
+                        "data": {
+                            "disposition": "triggered",
+                            "external_trigger_id": "trigger-target",
+                        }
+                    }
+                ),
+            }
+        ]
+        waits = runner.require_scheduler_wait_terminal(
+            harness,
+            snapshot,
+            work_item_id="work-1",
+            wait_kind="external",
+            require_callback_trigger=True,
+            callback_external_trigger_id="trigger-target",
+        )
+        self.assertEqual(waits[0]["status"], "resolved")
+
+    def test_canonical_activation_oracle_distinguishes_conversation_and_work_item(
+        self,
+    ) -> None:
+        harness = type(
+            "CanonicalHarness",
+            (),
+            {
+                "canonical_scheduler_enabled": True,
+                "agent_id": "default",
+            },
+        )()
+        snapshot = {
+            "execution_protocol_attempts": [
+                {
+                    "agent_id": "default",
+                    "attempt_id": "attempt-conversation",
+                    "lifecycle_state": "settled",
+                    "terminal_outcome_id": "outcome-conversation",
+                    "payload_json": json.dumps(
+                        {
+                            "attempt_id": "attempt-conversation",
+                            "source_message_id": "message-create",
+                            "source": {
+                                "identity": {
+                                    "kind": "queue_message",
+                                    "message_id": "message-create",
+                                }
+                            },
+                            "binding": {
+                                "kind": "conversation",
+                                "interaction_id": "interaction-1",
+                            },
+                        }
+                    ),
+                },
+                {
+                    "agent_id": "default",
+                    "attempt_id": "attempt-resume",
+                    "lifecycle_state": "settled",
+                    "terminal_outcome_id": "outcome-resume",
+                    "payload_json": json.dumps(
+                        {
+                            "attempt_id": "attempt-resume",
+                            "source_message_id": "message-resume",
+                            "source": {
+                                "identity": {
+                                    "kind": "triggered_wait",
+                                    "wait_id": "wait-1",
+                                    "trigger_message_id": "message-resume",
+                                }
+                            },
+                            "binding": {
+                                "kind": "work_item",
+                                "work_item_id": "work-1",
+                            },
+                        }
+                    ),
+                },
+            ],
+            "execution_protocol_outcomes": [
+                {
+                    "agent_id": "default",
+                    "outcome_id": "outcome-conversation",
+                    "payload_json": json.dumps({"attempt_id": "attempt-conversation"}),
+                },
+                {
+                    "agent_id": "default",
+                    "outcome_id": "outcome-resume",
+                    "payload_json": json.dumps({"attempt_id": "attempt-resume"}),
+                },
+            ],
+        }
+
+        runner.require_scheduler_engine_activation_chain(
+            harness,
+            snapshot,
+            work_item_id="work-1",
+            expected_source_kinds=("triggered_wait",),
+            conversation_message_ids={"message-create"},
+        )
+
+        conversation = json.loads(
+            snapshot["execution_protocol_attempts"][0]["payload_json"]
+        )
+        conversation["binding"] = {"kind": "work_item", "work_item_id": "work-1"}
+        snapshot["execution_protocol_attempts"][0]["payload_json"] = json.dumps(
+            conversation
+        )
+        with self.assertRaisesRegex(
+            AssertionError,
+            "Conversation attempts did not settle without claiming a WorkItem",
+        ):
+            runner.require_scheduler_engine_activation_chain(
+                harness,
+                snapshot,
+                work_item_id="work-1",
+                expected_source_kinds=("triggered_wait",),
+                conversation_message_ids={"message-create"},
+            )
+
+    def test_lifecycle_wait_adoption_accepts_exact_conversation_owner(self) -> None:
+        snapshot = {
+            "turn_records": [
+                {
+                    "agent_id": "default",
+                    "turn_id": "turn-conversation",
+                    "trigger_message_id": "message-conversation",
+                    "owner_kind": "conversation",
+                    "owner_id": "interaction-1",
+                }
+            ],
+            "execution_protocol_attempts": [
+                {
+                    "agent_id": "default",
+                    "attempt_id": "attempt-conversation",
+                    "lifecycle_state": "settled",
+                    "terminal_outcome_id": "outcome-conversation",
+                    "payload_json": json.dumps(
+                        {
+                            "attempt_id": "attempt-conversation",
+                            "source_message_id": "message-conversation",
+                            "binding": {
+                                "kind": "conversation",
+                                "interaction_id": "interaction-1",
+                            },
+                        }
+                    ),
+                }
+            ],
+            "execution_protocol_outcomes": [
+                {
+                    "agent_id": "default",
+                    "outcome_id": "outcome-conversation",
+                    "payload_json": json.dumps(
+                        {
+                            "attempt_id": "attempt-conversation",
+                            "outcome": {
+                                "owner": "conversation",
+                                "outcome": {
+                                    "kind": "handoff_to_work_item_wait",
+                                    "work_item_id": "work-1",
+                                    "wait": {"wait_id": "wait-1"},
+                                },
+                            },
+                        }
+                    ),
+                }
+            ],
+        }
+
+        runner.require_lifecycle_wait_adoption(
+            snapshot,
+            agent_id="default",
+            work_item_id="work-1",
+            wait={
+                "wait_condition_id": "wait-1",
+                "last_turn_id": "turn-conversation",
+            },
+        )
+
+    def test_turn_record_owner_columns_adapt_to_previous_release_schema(self) -> None:
+        source = inspect.getsource(runner.CaseHarness.runtime_db_snapshot)
+        self.assertIn("turn_record_owner_columns(connection)", source)
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "runtime.sqlite")
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "CREATE TABLE turn_records (turn_id TEXT PRIMARY KEY)"
+                )
+                connection.commit()
+                self.assertEqual(runner.turn_record_owner_columns(connection), "")
+                connection.execute(
+                    "ALTER TABLE turn_records ADD COLUMN owner_kind TEXT"
+                )
+                connection.commit()
+                self.assertEqual(runner.turn_record_owner_columns(connection), "")
+                connection.execute(
+                    "ALTER TABLE turn_records ADD COLUMN owner_id TEXT"
+                )
+                connection.commit()
+                self.assertEqual(
+                    runner.turn_record_owner_columns(connection),
+                    "owner_kind, owner_id, ",
+                )
+            finally:
+                connection.close()
+
+    def test_external_wait_resume_drains_queue_before_runtime_snapshot(self) -> None:
+        source = inspect.getsource(runner.run_scheduler_external_wait_resume_case)
+        self.assertLess(
+            source.index("harness.wait_queue_drained()"),
+            source.index('harness.runtime_db_snapshot("scheduler-external")'),
+        )
+
+    def test_checkpoint_replay_tracks_wait_and_completion_continuations(self) -> None:
+        source = inspect.getsource(runner.run_scheduler_checkpoint_replay_case)
+        self.assertIn(
+            'expected_source_kinds=(\n'
+            '            "work_item_continuation",\n'
+            '            "work_item_continuation",\n'
+            '            "triggered_wait",\n'
+            "        )",
+            source,
+        )
+
+    def test_result_brief_waits_for_its_source_turn_to_reach_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = runner.CaseHarness(
+                case_id="terminal-turn-race",
+                image="unused",
+                model="unused",
+                credential_envs=[],
+                env_file=None,
+                runtime_env={},
+                evidence_root=Path(directory),
+                timeout_seconds=1,
+                keep=True,
+            )
+            events = [
+                [
+                    {
+                        "type": "tool_execution_completed",
+                        "payload": {"turn_id": "turn-source"},
+                    }
+                ],
+                [
+                    {
+                        "type": "turn_terminal",
+                        "payload": {
+                            "turn_id": "turn-source",
+                            "kind": "completed",
+                        },
+                    }
+                ],
+            ]
+            with (
+                patch.object(harness, "events", side_effect=events) as event_poll,
+                patch.object(runner.time, "sleep"),
+            ):
+                source_turn_id = harness.wait_result_brief_terminal_turn(
+                    brief={"turn_id": "turn-source"},
+                    label="terminal-race",
+                )
+
+            self.assertEqual(source_turn_id, "turn-source")
+            self.assertEqual(event_poll.call_count, 2)
+
+    def test_multi_workitem_waits_for_terminal_turns_before_snapshot(self) -> None:
+        source = inspect.getsource(runner.run_scheduler_multi_workitem_case)
+        self.assertLess(
+            source.index("harness.wait_result_brief_terminal_turn"),
+            source.index('harness.runtime_db_snapshot("scheduler-multi")'),
+        )
+
+    def test_compaction_oracle_requires_actual_compaction_evidence(self) -> None:
+        event = {
+            "kind": "turn_local_compaction_applied",
+            "data_json": json.dumps(
+                {"data": {"compacted_rounds": 2, "exact_tail_rounds": 1}}
+            ),
+        }
+        events = runner.require_turn_local_compaction(
+            {"audit_events": [event]},
+            label="test",
+        )
+        self.assertEqual(events[0]["compacted_rounds"], 2)
+
+        event["data_json"] = json.dumps(
+            {
+                "data": {
+                    "compacted_rounds": 0,
+                    "compacted_tool_results": 1,
+                    "exact_tail_rounds": 3,
+                }
+            }
+        )
+        events = runner.require_turn_local_compaction(
+            {"audit_events": [event]},
+            label="test",
+        )
+        self.assertEqual(events[0]["compacted_tool_results"], 1)
+
+        event["data_json"] = json.dumps(
+            {
+                "data": {
+                    "compacted_rounds": 0,
+                    "compacted_tool_results": 0,
+                    "exact_tail_rounds": 3,
+                }
+            }
+        )
+        with self.assertRaisesRegex(
+            AssertionError,
+            "compaction stimulus did not compact rounds or tool results",
+        ):
+            runner.require_turn_local_compaction(
+                {
+                    "audit_events": [
+                        event,
+                        {
+                            "kind": "provider_round_completed",
+                            "data_json": json.dumps({"data": {"compression_epoch": 1}}),
+                        },
+                    ]
+                },
+                label="test",
+            )
+
+    def test_checkpoint_restart_lineage_binds_wait_generation(self) -> None:
+        def attempt(
+            attempt_id: str,
+            message_id: str,
+            generation: int,
+            identity: dict[str, object],
+        ) -> dict[str, object]:
+            return {
+                "attempt_id": attempt_id,
+                "source_message_id": message_id,
+                "source": {"identity": identity},
+                "binding": {"kind": "work_item", "work_item_id": "work-1"},
+                "admitted_fences": {"work_item_generation": generation},
+            }
+
+        before_restart_snapshot = {
+            "execution_protocol_attempts": [
+                {
+                    "payload_json": json.dumps(
+                        attempt(
+                            "attempt-schedule",
+                            "message-schedule",
+                            1,
+                            {
+                                "kind": "work_item_continuation",
+                                "work_item_id": "work-1",
+                            },
+                        )
+                    ),
+                }
+            ]
+        }
+        snapshot = {
+            "execution_protocol_attempts": [
+                {
+                    "payload_json": json.dumps(
+                        attempt(
+                            "attempt-schedule",
+                            "message-schedule",
+                            1,
+                            {
+                                "kind": "work_item_continuation",
+                                "work_item_id": "work-1",
+                            },
+                        )
+                    ),
+                },
+                {
+                    "payload_json": json.dumps(
+                        attempt(
+                            "attempt-resume",
+                            "message-resume",
+                            2,
+                            {
+                                "kind": "triggered_wait",
+                                "wait_id": "wait-1",
+                                "trigger_message_id": "message-resume",
+                            },
+                        )
+                    ),
+                },
+                {
+                    "payload_json": json.dumps(
+                        attempt(
+                            "attempt-completion",
+                            "message-completion",
+                            3,
+                            {
+                                "kind": "work_item_continuation",
+                                "work_item_id": "work-1",
+                            },
+                        )
+                    ),
+                },
+            ],
+            "wait_conditions": [
+                {
+                    "wait_condition_id": "wait-1",
+                    "work_item_id": "work-1",
+                    "status": "resolved",
+                }
+            ],
+        }
+
+        runner.require_checkpoint_restart_activation_lineage(
+            before_restart_snapshot,
+            snapshot,
+            work_item_id="work-1",
+            wait_id="wait-1",
+        )
+
+        resume = json.loads(snapshot["execution_protocol_attempts"][1]["payload_json"])
+        resume["source"]["identity"]["wait_id"] = "other-wait"
+        snapshot["execution_protocol_attempts"][1]["payload_json"] = json.dumps(resume)
+        with self.assertRaisesRegex(
+            AssertionError,
+            "wait-resume attempt mismatch",
+        ):
+            runner.require_checkpoint_restart_activation_lineage(
+                before_restart_snapshot,
+                snapshot,
+                work_item_id="work-1",
+                wait_id="wait-1",
             )
 
     def test_wait_work_item_fails_fast_on_duplicate_objective_marker(self) -> None:
@@ -810,6 +2669,85 @@ class DockerE2ERunnerTests(unittest.TestCase):
                     expected_state="completed",
                     label="duplicate",
                 )
+
+    def _route_oracle_harness(self, model: str) -> "runner.CaseHarness":
+        harness = runner.CaseHarness(
+            case_id="runtime-auth-model-delivery",
+            image="unused",
+            model=model,
+            credential_envs=[],
+            env_file=None,
+            runtime_env={},
+            evidence_root=Path(tempfile.mkdtemp()),
+            timeout_seconds=1,
+            keep=True,
+        )
+        harness.agent_id = "default"
+        return harness
+
+    def _models_payload(self) -> dict:
+        return {
+            "model_availability": [
+                {
+                    "model": "dashscope/qwen3.7-max",
+                    "provider_family": "dashscope",
+                    "endpoint": "token-plan",
+                    "route_provider": "dashscope-token-plan",
+                    "available": True,
+                    "policy": {"model_ref": "dashscope/qwen3.7-max"},
+                },
+                {
+                    "model": "dashscope/qwen3.7-max",
+                    "provider_family": "dashscope",
+                    "endpoint": "default",
+                    "route_provider": "dashscope",
+                    "available": False,
+                    "unavailable_reason": "credential_missing",
+                    "policy": {"model_ref": "dashscope/qwen3.7-max"},
+                },
+            ]
+        }
+
+    def test_runtime_model_route_accepts_confirmed_canonical_resolution(self) -> None:
+        harness = self._route_oracle_harness("dashscope-token-plan/qwen-3.7")
+        runner.require_runtime_model_route(
+            harness,
+            "runtime default",
+            "dashscope@token-plan/qwen3.7-max",
+            self._models_payload(),
+        )
+
+    def test_runtime_model_route_accepts_literal_match(self) -> None:
+        harness = self._route_oracle_harness("openai/gpt-5.4")
+        runner.require_runtime_model_route(
+            harness,
+            "winning",
+            "openai/gpt-5.4",
+            {"model_availability": []},
+        )
+
+    def test_runtime_model_route_rejects_unconfirmed_provider(self) -> None:
+        harness = self._route_oracle_harness("dashscope-token-plan/qwen-3.7")
+        with self.assertRaisesRegex(AssertionError, "model catalog did not confirm"):
+            runner.require_runtime_model_route(
+                harness,
+                "runtime default",
+                "deepseek@default/deepseek-chat",
+                self._models_payload(),
+            )
+
+    def test_runtime_model_route_rejects_unavailable_canonical_route(self) -> None:
+        harness = self._route_oracle_harness("dashscope-token-plan/qwen-3.7")
+        payload = self._models_payload()
+        payload["model_availability"][0]["available"] = False
+        payload["model_availability"][0]["unavailable_reason"] = "credential_missing"
+        with self.assertRaisesRegex(AssertionError, "not available"):
+            runner.require_runtime_model_route(
+                harness,
+                "runtime default",
+                "dashscope@token-plan/qwen3.7-max",
+                payload,
+            )
 
 
 if __name__ == "__main__":

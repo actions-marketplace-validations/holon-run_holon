@@ -1,8 +1,7 @@
 //! Turn execution module: drives the provider conversation loop, context
 //! projection, checkpointing, tool execution, and completion handling.
 //!
-//! Public entrypoints are [`RuntimeHandle::run_agent_loop`],
-//! [`RuntimeHandle::persist_turn_record`], and
+//! Public entrypoints are [`RuntimeHandle::run_agent_loop`] and
 //! [`RuntimeHandle::persist_turn_aborted_record`].
 
 mod checkpoint;
@@ -17,14 +16,16 @@ mod tool_summary;
 mod tests;
 
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::config::ModelRouteRef;
 use crate::provider::{ModelBlock, ToolResultBlock};
 use crate::tool::{spec::ToolResultEnvelope, ToolCall};
 use crate::types::{
-    AuditEvent, BriefKind, MessageEnvelope, TurnRecord, TurnTerminalKind, TurnTerminalRecord,
-    TurnTerminalSummary, TurnTriggerSummary,
+    AuditEvent, BriefKind, Citation, ExecutionAdmissionProvenance, MessageEnvelope,
+    TurnNoBriefReason, TurnRecord, TurnTerminalKind, TurnTerminalRecord, TurnTerminalSummary,
+    TurnTriggerSummary,
 };
 
 use super::{message_dispatch::message_text, RuntimeHandle};
@@ -36,6 +37,7 @@ pub(crate) use projection::estimate_tool_specs_tokens;
 
 pub(crate) struct AgentLoopOutcome {
     pub(super) final_text: String,
+    pub(super) final_citations: Vec<Citation>,
     pub(super) final_text_source_assistant_round_id: Option<String>,
     pub(super) turn_index: u64,
     pub(super) terminal: TurnTerminalRecord,
@@ -43,16 +45,44 @@ pub(crate) struct AgentLoopOutcome {
     pub(super) sleep_duration_ms: Option<u64>,
     pub(super) allow_sleep_runnable_work_override: bool,
     pub(super) terminal_kind: TurnTerminalKind,
+    pub(super) prepared_work_item_completion:
+        Option<Box<crate::runtime::PreparedWorkItemCompletion>>,
+    pub(super) terminal_tool_executions: Vec<crate::types::ToolExecutionRecord>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct TurnTerminalTransition {
     pub(super) terminal: TurnTerminalRecord,
     pub(super) turn_record: TurnRecord,
+    pub(super) prepared_work_item_completion:
+        Option<Box<crate::runtime::PreparedWorkItemCompletion>>,
+    pub(super) terminal_tool_executions: Vec<crate::types::ToolExecutionRecord>,
 }
 
 pub(crate) struct LoopControlOptions {
     pub(super) max_tool_rounds: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct ProviderRecoveryDirective {
+    pub(super) fallback_model_ref: ModelRouteRef,
+    pub(super) source_turn_id: String,
+    pub(super) source_message_id: String,
+    pub(super) source_terminal_kind: TurnTerminalKind,
+    pub(super) source_round: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TurnModelSelection {
+    pub(super) recovery: Option<ProviderRecoveryDirective>,
+}
+
+impl TurnModelSelection {
+    pub(super) fn fallback_model(&self) -> Option<&ModelRouteRef> {
+        self.recovery
+            .as_ref()
+            .map(|directive| &directive.fallback_model_ref)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -150,11 +180,67 @@ fn render_operator_interjection_text(message: &MessageEnvelope) -> String {
 }
 
 impl RuntimeHandle {
+    pub(super) async fn begin_reducer_only_turn(
+        &self,
+        message: &MessageEnvelope,
+        execution_admission_provenance: ExecutionAdmissionProvenance,
+    ) -> Result<()> {
+        let (operator_binding_id, operator_reply_route_id) =
+            Self::operator_transport_from_message(message);
+        self.begin_interactive_turn_with_provenance(
+            Some(message),
+            operator_binding_id.as_deref(),
+            operator_reply_route_id.as_deref(),
+            execution_admission_provenance,
+        )
+        .await
+    }
+
+    pub(super) async fn build_reducer_only_terminal_transition(
+        &self,
+        reason: impl Into<String>,
+        produced_brief: bool,
+    ) -> Result<TurnTerminalTransition> {
+        let reason = reason.into();
+        let no_brief_reason = reason
+            .strip_prefix("reducer_only/")
+            .unwrap_or(&reason)
+            .to_string();
+        let terminal = {
+            let guard = self.inner.agent.lock().await;
+            let turn_id = guard
+                .state
+                .current_turn_id
+                .clone()
+                .filter(|turn_id| !turn_id.trim().is_empty())
+                .unwrap_or_else(crate::ids::turn_id);
+            TurnTerminalRecord {
+                turn_id,
+                turn_index: guard.state.turn_index,
+                kind: TurnTerminalKind::Completed,
+                reason: Some(reason.clone()),
+                last_assistant_message: None,
+                no_brief_reason: (!produced_brief).then_some(TurnNoBriefReason::ReducerOnly {
+                    reason: no_brief_reason,
+                }),
+                checkpoint: None,
+                completed_at: chrono::Utc::now(),
+                duration_ms: 0,
+            }
+        };
+        Ok(TurnTerminalTransition {
+            turn_record: self.build_turn_record(&terminal).await?,
+            terminal,
+            prepared_work_item_completion: None,
+            terminal_tool_executions: Vec::new(),
+        })
+    }
+
     pub(super) async fn build_turn_record(
         &self,
         terminal: &TurnTerminalRecord,
     ) -> Result<TurnRecord> {
-        let (agent_id, run_id, current_work_item_id) = {
+        let (agent_id, run_id, current_work_item_id, owner) = {
             let guard = self.inner.agent.lock().await;
             let current_work_item_id = guard
                 .state
@@ -168,10 +254,26 @@ impl RuntimeHandle {
                         .clone()
                         .or_else(|| guard.state.current_work_item_id.clone())
                 });
+            let owner = guard
+                .state
+                .current_execution_binding
+                .as_ref()
+                .and_then(|binding| binding.owner.clone())
+                .or_else(|| {
+                    current_work_item_id.as_ref().map(|work_item_id| {
+                        crate::types::TurnOwner::WorkItem {
+                            work_item_id: work_item_id.clone(),
+                        }
+                    })
+                })
+                .unwrap_or_else(|| crate::types::TurnOwner::AgentLifecycle {
+                    agent_id: guard.state.id.clone(),
+                });
             (
                 guard.state.id.clone(),
                 guard.state.current_run_id.clone(),
                 current_work_item_id,
+                owner,
             )
         };
         let turn_id = terminal.turn_id.trim();
@@ -195,14 +297,29 @@ impl RuntimeHandle {
             .storage
             .read_recent_wait_conditions(TURN_RECORD_SCAN_LIMIT)?;
 
+        let source_message_id = {
+            let guard = self.inner.agent.lock().await;
+            guard
+                .state
+                .current_execution_binding
+                .as_ref()
+                .map(|binding| binding.source_message_id.clone())
+        };
         let input_messages = messages
             .iter()
-            .filter(|message| turn_optional_id_matches(message.turn_id.as_deref(), turn_id))
+            .filter(|message| {
+                turn_optional_id_matches(message.turn_id.as_deref(), turn_id)
+                    || source_message_id.as_deref() == Some(message.id.as_str())
+            })
             .collect::<Vec<_>>();
 
         let mut record = TurnRecord::new(agent_id, turn_id, terminal.turn_index);
+        if let Some(existing) = self.inner.storage.read_turn_by_id(turn_id)? {
+            record.created_at = existing.created_at;
+        }
         record.run_id = run_id;
         record.current_work_item_id = current_work_item_id;
+        record.owner = Some(owner);
         record.trigger = input_messages
             .first()
             .map(|message| TurnTriggerSummary::from_message(message));
@@ -236,10 +353,36 @@ impl RuntimeHandle {
             .map(|condition| condition.id.clone())
             .collect();
         record.terminal = Some(TurnTerminalSummary::from_terminal(terminal));
+        record.replay = source_message_id
+            .as_deref()
+            .and_then(|source_message_id| {
+                input_messages
+                    .iter()
+                    .find(|message| message.id == source_message_id)
+            })
+            .and_then(|message| {
+                let source_turn_id = message.turn_id.as_deref()?.trim();
+                (!source_turn_id.is_empty() && source_turn_id != turn_id).then(|| {
+                    let prior_terminal = self
+                        .inner
+                        .storage
+                        .read_turn_by_id(source_turn_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|turn| turn.terminal);
+                    crate::types::TurnReplayProvenance {
+                        source_message_id: message.id.clone(),
+                        source_turn_id: source_turn_id.to_string(),
+                        reason: "interrupted_queue_claim_reentry".into(),
+                        prior_terminal,
+                    }
+                })
+            });
 
         Ok(record)
     }
 
+    #[cfg(test)]
     pub(super) async fn persist_turn_record(&self, terminal: &TurnTerminalRecord) -> Result<()> {
         let record = self.build_turn_record(terminal).await?;
         self.persist_built_turn_record(&record)
@@ -249,19 +392,16 @@ impl RuntimeHandle {
         &self,
         transition: &TurnTerminalTransition,
     ) -> Result<()> {
-        {
-            let mut guard = self.inner.agent.lock().await;
-            guard.state.current_turn_id = Some(transition.terminal.turn_id.clone());
-            guard.state.last_turn_terminal = Some(transition.terminal.clone());
-            guard.persist_state(&self.inner.storage)?;
-        }
-        self.inner.storage.append_event(&AuditEvent::legacy(
-            "turn_terminal",
-            serde_json::to_value(&transition.terminal)?,
-        ))?;
-        self.persist_built_turn_record(&transition.turn_record)
+        anyhow::ensure!(
+            transition.prepared_work_item_completion.is_none(),
+            "prepared WorkItem completion requires the canonical queue terminal settlement"
+        );
+        self.commit_terminal_transition(transition, Vec::new())
+            .await
+            .map(|_| ())
     }
 
+    #[cfg(test)]
     pub(super) fn persist_built_turn_record(&self, record: &TurnRecord) -> Result<()> {
         self.inner.storage.append_turn(&record)?;
         self.inner
@@ -284,6 +424,7 @@ impl RuntimeHandle {
                 "completed_work_item_ids": record.completed_work_item_ids,
                 "waiting_condition_ids": record.waiting_condition_ids,
                 "terminal": record.terminal,
+                "replay": record.replay,
                 "created_at": record.created_at,
             }),
         )
@@ -301,29 +442,28 @@ impl RuntimeHandle {
             .build_turn_aborted_record(reason, last_assistant_message, duration_ms)
             .await;
         if persist {
-            {
-                let mut guard = self.inner.agent.lock().await;
-                guard.state.current_turn_id = Some(record.turn_id.clone());
-                guard.state.last_turn_terminal = Some(record.clone());
-                guard.persist_state(&self.inner.storage)?;
-            }
-            self.persist_turn_record(&record).await?;
-            self.inner.storage.append_event(&AuditEvent::legacy(
-                "turn_terminal",
-                serde_json::to_value(&record)?,
-            ))?;
-            self.inner.storage.append_event(&AuditEvent::legacy(
-                "turn_terminal_aborted",
-                serde_json::json!({
-                    "run_id": run_id,
-                    "reason": reason,
-                    "turn_id": record.turn_id.clone(),
-                    "turn_index": record.turn_index,
-                    "kind": record.kind,
-                    "completed_at": record.completed_at,
-                    "duration_ms": record.duration_ms,
-                }),
-            ))?;
+            let transition = TurnTerminalTransition {
+                turn_record: self.build_turn_record(&record).await?,
+                terminal: record.clone(),
+                prepared_work_item_completion: None,
+                terminal_tool_executions: Vec::new(),
+            };
+            self.commit_terminal_transition(
+                &transition,
+                vec![AuditEvent::legacy(
+                    "turn_terminal_aborted",
+                    serde_json::json!({
+                        "run_id": run_id,
+                        "reason": reason,
+                        "turn_id": record.turn_id.clone(),
+                        "turn_index": record.turn_index,
+                        "kind": record.kind,
+                        "completed_at": record.completed_at,
+                        "duration_ms": record.duration_ms,
+                    }),
+                )],
+            )
+            .await?;
         }
         Ok(record)
     }
@@ -347,6 +487,7 @@ impl RuntimeHandle {
             kind: TurnTerminalKind::Aborted,
             reason: Some(reason.to_string()),
             last_assistant_message,
+            no_brief_reason: Some(TurnNoBriefReason::Aborted),
             checkpoint: None,
             completed_at: chrono::Utc::now(),
             duration_ms,

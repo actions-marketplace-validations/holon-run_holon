@@ -1293,6 +1293,22 @@ impl TaskRepository<'_> {
         )
     }
 
+    pub fn active_owner_agent_ids(&self) -> Result<Vec<String>> {
+        let connection = self.db.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT t.owner_agent_id
+             FROM tasks t
+             JOIN agent_identities i
+               ON i.agent_id = t.owner_agent_id
+              AND i.status = 'active'
+             WHERE t.status IN ('queued', 'running', 'cancelling')
+             ORDER BY t.owner_agent_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     fn query_for_agent(
         &self,
         _agent_id: &str,
@@ -1347,7 +1363,7 @@ impl WaitConditionRepository<'_> {
         let mut statement = connection.prepare(
             "SELECT wait_condition_id, agent_id, work_item_id, status, kind, source,
                 subject_ref, waiting_for, created_at, updated_at, expires_at,
-                resolved_at, cancelled_at, last_turn_id,
+                resolved_at, cancelled_at, last_turn_id, trigger_message_id, triggered_at,
                 wake_sources_json, continuation_json
              FROM wait_conditions
              ORDER BY wait_condition_id ASC",
@@ -1368,7 +1384,7 @@ impl WaitConditionRepository<'_> {
         let mut statement = connection.prepare(
             "SELECT wait_condition_id, agent_id, work_item_id, status, kind, source,
                 subject_ref, waiting_for, created_at, updated_at, expires_at,
-                resolved_at, cancelled_at, last_turn_id,
+                resolved_at, cancelled_at, last_turn_id, trigger_message_id, triggered_at,
                 wake_sources_json, continuation_json
              FROM wait_conditions
              ORDER BY updated_at DESC, created_at DESC, wait_condition_id ASC
@@ -1397,7 +1413,7 @@ impl WaitConditionRepository<'_> {
         let mut statement = connection.prepare(
             "SELECT wait_condition_id, agent_id, work_item_id, status, kind, source,
                 subject_ref, waiting_for, created_at, updated_at, expires_at,
-                resolved_at, cancelled_at, last_turn_id,
+                resolved_at, cancelled_at, last_turn_id, trigger_message_id, triggered_at,
                 wake_sources_json, continuation_json
              FROM wait_conditions
              WHERE agent_id = ?1
@@ -1419,7 +1435,7 @@ impl WaitConditionRepository<'_> {
         let mut statement = connection.prepare(
             "SELECT wait_condition_id, agent_id, work_item_id, status, kind, source,
                 subject_ref, waiting_for, created_at, updated_at, expires_at,
-                resolved_at, cancelled_at, last_turn_id,
+                resolved_at, cancelled_at, last_turn_id, trigger_message_id, triggered_at,
                 wake_sources_json, continuation_json
              FROM wait_conditions
              WHERE agent_id = ?1 AND status = 'active'
@@ -1432,12 +1448,30 @@ impl WaitConditionRepository<'_> {
             .map_err(|e| anyhow::anyhow!("reading wait conditions: {e}"))
     }
 
+    pub fn unresolved_for_agent(&self, agent_id: &str) -> Result<Vec<WaitConditionRecord>> {
+        let connection = self.db.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT wait_condition_id, agent_id, work_item_id, status, kind, source,
+                subject_ref, waiting_for, created_at, updated_at, expires_at,
+                resolved_at, cancelled_at, last_turn_id, trigger_message_id, triggered_at,
+                wake_sources_json, continuation_json
+             FROM wait_conditions
+             WHERE agent_id = ?1 AND status IN ('active', 'triggered')
+             ORDER BY updated_at DESC, created_at DESC, wait_condition_id ASC",
+        )?;
+        let rows = statement.query_map([agent_id], |row| {
+            decode_wait_condition_row(row).map_err(wait_condition_decode_error)
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("reading unresolved wait conditions: {e}"))
+    }
+
     pub fn active_all(&self) -> Result<Vec<WaitConditionRecord>> {
         let connection = self.db.connection()?;
         let mut statement = connection.prepare(
             "SELECT wait_condition_id, agent_id, work_item_id, status, kind, source,
                 subject_ref, waiting_for, created_at, updated_at, expires_at,
-                resolved_at, cancelled_at, last_turn_id,
+                resolved_at, cancelled_at, last_turn_id, trigger_message_id, triggered_at,
                 wake_sources_json, continuation_json
              FROM wait_conditions
              WHERE status = 'active'
@@ -1475,6 +1509,19 @@ impl QueueEntryRepository<'_> {
     pub fn try_claim_queued_message(&self, record: &QueueEntryRecord) -> Result<bool> {
         self.db
             .transaction(|tx| try_claim_queued_message_tx(tx, record))
+    }
+
+    pub fn latest(&self, message_id: &str) -> Result<Option<QueueEntryRecord>> {
+        let connection = self.db.connection()?;
+        connection
+            .query_row(
+                "SELECT payload_json FROM queue_entries WHERE message_id = ?1",
+                [message_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|payload| decode_queue_entry_payload(&payload))
+            .transpose()
     }
 
     pub fn latest_all(&self) -> Result<Vec<QueueEntryRecord>> {
@@ -1540,6 +1587,39 @@ impl QueueEntryRepository<'_> {
         Ok(exists.is_some())
     }
 
+    pub fn recovery_candidate_agent_ids(&self) -> Result<Vec<String>> {
+        let connection = self.db.connection()?;
+        let dequeued_status = enum_string(&crate::types::QueueEntryStatus::Dequeued)?;
+        let interrupted_status = enum_string(&crate::types::QueueEntryStatus::Interrupted)?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT q.agent_id
+             FROM queue_entries q
+             JOIN agent_identities i
+               ON i.agent_id = q.agent_id
+              AND i.status = 'active'
+             WHERE q.status IN (?1, ?2)
+             ORDER BY q.agent_id ASC",
+        )?;
+        let rows = statement.query_map(params![dequeued_status, interrupted_status], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn has_interrupted_for_agent(&self, agent_id: &str) -> Result<bool> {
+        let connection = self.db.connection()?;
+        let interrupted_status = enum_string(&crate::types::QueueEntryStatus::Interrupted)?;
+        let exists: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM queue_entries WHERE agent_id = ?1 AND status = ?2 LIMIT 1",
+                params![agent_id, interrupted_status],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(exists.is_some())
+    }
+
     /// Returns only entries currently queued for a specific agent.
     pub fn queued_for_agent(&self, agent_id: &str) -> Result<Vec<QueueEntryRecord>> {
         let connection = self.db.connection()?;
@@ -1560,6 +1640,23 @@ impl QueueEntryRepository<'_> {
             .collect::<Result<_>>()?;
         records.reverse();
         Ok(records)
+    }
+
+    /// Abort all pending (Queued or Interrupted) queue entries for an agent.
+    ///
+    /// Used during agent stop/deletion to prevent orphaned entries that would
+    /// never be consumed. Returns the number of entries aborted.
+    pub fn abort_pending_for_agent(&self, agent_id: &str) -> Result<usize> {
+        let entries = self.queued_for_agent(agent_id)?;
+        let now = chrono::Utc::now();
+        let mut count = 0;
+        for mut entry in entries {
+            entry.status = QueueEntryStatus::Aborted;
+            entry.updated_at = now;
+            self.upsert(&entry)?;
+            count += 1;
+        }
+        Ok(count)
     }
 }
 
@@ -1681,7 +1778,8 @@ impl TurnRecordRepository<'_> {
                     wait_conditions,
                 )?;
                 for record in &records {
-                    upsert_turn_record_tx(tx, record)?;
+                    let record = merge_legacy_turn_evidence_tx(tx, record)?;
+                    upsert_turn_record_tx(tx, &record)?;
                 }
                 Ok(serde_json::json!({
                     "imported_records": records.len(),
@@ -1693,6 +1791,36 @@ impl TurnRecordRepository<'_> {
 
     pub fn upsert(&self, record: &TurnRecord) -> Result<()> {
         self.db.transaction(|tx| upsert_turn_record_tx(tx, record))
+    }
+
+    pub fn by_id(&self, agent_id: Option<&str>, turn_id: &str) -> Result<Option<TurnRecord>> {
+        let connection = self.db.connection()?;
+        let payload = if let Some(agent_id) = agent_id {
+            connection
+                .query_row(
+                    "SELECT payload_json
+                     FROM turn_records
+                     WHERE agent_id = ?1 AND turn_id = ?2
+                     LIMIT 1",
+                    params![agent_id, turn_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+        } else {
+            connection
+                .query_row(
+                    "SELECT payload_json
+                     FROM turn_records
+                     WHERE turn_id = ?1
+                     LIMIT 1",
+                    [turn_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+        };
+        payload
+            .map(|payload| decode_turn_record_payload(&payload))
+            .transpose()
     }
 
     pub fn recent_for_agent(&self, agent_id: &str, limit: usize) -> Result<Vec<TurnRecord>> {
@@ -1709,6 +1837,37 @@ impl TurnRecordRepository<'_> {
              LIMIT ?2",
         )?;
         let rows = statement.query_map(params![agent_id, limit], |row| row.get::<_, String>(0))?;
+        let mut records = rows
+            .map(|row| decode_turn_record_payload(&row?))
+            .collect::<Result<Vec<_>>>()?;
+        records.reverse();
+        Ok(records)
+    }
+
+    pub fn recent_for_owner(
+        &self,
+        agent_id: &str,
+        owner: &crate::types::TurnOwner,
+        limit: usize,
+    ) -> Result<Vec<TurnRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let (owner_kind, owner_id) = owner.index_parts();
+        let connection = self.db.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT payload_json
+             FROM turn_records
+             WHERE agent_id = ?1
+               AND owner_kind = ?2
+               AND owner_id IS ?3
+             ORDER BY turn_index DESC, created_at DESC, turn_id ASC
+             LIMIT ?4",
+        )?;
+        let rows = statement.query_map(params![agent_id, owner_kind, owner_id, limit], |row| {
+            row.get::<_, String>(0)
+        })?;
         let mut records = rows
             .map(|row| decode_turn_record_payload(&row?))
             .collect::<Result<Vec<_>>>()?;
@@ -2198,6 +2357,21 @@ impl EvidenceRepository<'_> {
         self.db.transaction(|tx| {
             insert_brief_evidence_tx(tx, brief)?;
             insert_runtime_index_changes_tx(tx, changes)
+        })
+    }
+
+    /// Single-transaction Brief publication: audit event sequence
+    /// allocation, the `brief_created` event, the Brief record, and its
+    /// immutable `created_event_seq` linkage commit together.
+    pub fn append_brief_with_created_event(
+        &self,
+        agent_id: Option<&str>,
+        brief: &BriefRecord,
+        event: &crate::types::AuditEvent,
+        changes: &[RuntimeIndexChange],
+    ) -> Result<crate::runtime_db::evidence::BriefCreatedCommit> {
+        self.db.transaction(|tx| {
+            append_brief_with_created_event_tx(tx, agent_id, brief, event, changes)
         })
     }
 
@@ -3297,9 +3471,9 @@ pub(crate) fn upsert_wait_condition_tx(
         "INSERT INTO wait_conditions (
             wait_condition_id, agent_id, work_item_id, status, kind, source,
             subject_ref, waiting_for, created_at, updated_at, expires_at,
-            resolved_at, cancelled_at, last_turn_id,
+            resolved_at, cancelled_at, last_turn_id, trigger_message_id, triggered_at,
             wake_sources_json, continuation_json, payload_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
          ON CONFLICT(wait_condition_id) DO UPDATE SET
             agent_id = excluded.agent_id,
             work_item_id = excluded.work_item_id,
@@ -3314,6 +3488,8 @@ pub(crate) fn upsert_wait_condition_tx(
             resolved_at = excluded.resolved_at,
             cancelled_at = excluded.cancelled_at,
             last_turn_id = excluded.last_turn_id,
+            trigger_message_id = excluded.trigger_message_id,
+            triggered_at = excluded.triggered_at,
             wake_sources_json = excluded.wake_sources_json,
             continuation_json = excluded.continuation_json,
             payload_json = excluded.payload_json
@@ -3333,6 +3509,8 @@ pub(crate) fn upsert_wait_condition_tx(
             record.resolved_at.map(timestamp),
             record.cancelled_at.map(timestamp),
             record.turn_id,
+            record.trigger_message_id(),
+            record.triggered_at().map(timestamp),
             wake_sources_json,
             continuation_json,
             payload_json,
@@ -3515,13 +3693,41 @@ pub(crate) fn wait_condition_transition(
     if incoming.updated_at < existing.updated_at {
         return Ok(StateTransitionOutcome::Idempotent);
     }
+    let valid = matches!(
+        (&existing.status, &incoming.status),
+        (WaitConditionStatus::Active, WaitConditionStatus::Triggered)
+            | (WaitConditionStatus::Active, WaitConditionStatus::Resolved)
+            | (WaitConditionStatus::Active, WaitConditionStatus::Cancelled)
+            | (WaitConditionStatus::Active, WaitConditionStatus::Expired)
+            | (
+                WaitConditionStatus::Triggered,
+                WaitConditionStatus::Resolved
+            )
+            | (
+                WaitConditionStatus::Triggered,
+                WaitConditionStatus::Cancelled
+            )
+            | (WaitConditionStatus::Triggered, WaitConditionStatus::Expired)
+    );
+    if !valid {
+        return Err(RuntimeStateTransitionConflict::new(
+            "wait condition",
+            &existing.id,
+            enum_string(&existing.status)?,
+            enum_string(&incoming.status)?,
+        )
+        .into());
+    }
     Ok(StateTransitionOutcome::Applied)
 }
 
 fn is_terminal_queue_entry_status(status: &QueueEntryStatus) -> bool {
     matches!(
         status,
-        QueueEntryStatus::Processed | QueueEntryStatus::Aborted | QueueEntryStatus::Dropped
+        QueueEntryStatus::Processed
+            | QueueEntryStatus::Aborted
+            | QueueEntryStatus::Dropped
+            | QueueEntryStatus::Quarantined
     )
 }
 
@@ -3744,7 +3950,118 @@ fn upsert_timer_tx(tx: &Transaction<'_>, record: &TimerRecord) -> Result<()> {
     Ok(())
 }
 
+fn merge_legacy_turn_evidence_tx(tx: &Transaction<'_>, derived: &TurnRecord) -> Result<TurnRecord> {
+    let Some(mut existing) = tx
+        .query_row(
+            "SELECT payload_json FROM turn_records WHERE turn_id = ?1",
+            [&derived.turn_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|payload| decode_turn_record_payload(&payload))
+        .transpose()?
+    else {
+        return Ok(derived.clone());
+    };
+    if existing.agent_id != derived.agent_id {
+        return Err(RuntimeStateTransitionConflict::new(
+            "turn identity",
+            &derived.turn_id,
+            &existing.agent_id,
+            &derived.agent_id,
+        )
+        .into());
+    }
+    existing
+        .input_message_ids
+        .extend(derived.input_message_ids.iter().cloned());
+    existing
+        .tool_execution_ids
+        .extend(derived.tool_execution_ids.iter().cloned());
+    existing
+        .produced_brief_ids
+        .extend(derived.produced_brief_ids.iter().cloned());
+    existing
+        .delivery_summary_ids
+        .extend(derived.delivery_summary_ids.iter().cloned());
+    existing
+        .completed_work_item_ids
+        .extend(derived.completed_work_item_ids.iter().cloned());
+    existing
+        .waiting_condition_ids
+        .extend(derived.waiting_condition_ids.iter().cloned());
+    existing.input_message_ids.sort();
+    existing.input_message_ids.dedup();
+    existing.tool_execution_ids.sort();
+    existing.tool_execution_ids.dedup();
+    existing.produced_brief_ids.sort();
+    existing.produced_brief_ids.dedup();
+    existing.delivery_summary_ids.sort();
+    existing.delivery_summary_ids.dedup();
+    existing.completed_work_item_ids.sort();
+    existing.completed_work_item_ids.dedup();
+    existing.waiting_condition_ids.sort();
+    existing.waiting_condition_ids.dedup();
+    Ok(existing)
+}
+
 pub(crate) fn upsert_turn_record_tx(tx: &Transaction<'_>, record: &TurnRecord) -> Result<()> {
+    if let Some(owner) = record.owner.as_ref() {
+        let owner_work_item_id = owner.work_item_id();
+        if record.current_work_item_id.as_deref() != owner_work_item_id {
+            return Err(RuntimeStateTransitionConflict::new(
+                "turn owner",
+                &record.turn_id,
+                owner_work_item_id.unwrap_or("unbound"),
+                record.current_work_item_id.as_deref().unwrap_or("unbound"),
+            )
+            .into());
+        }
+    }
+    let existing = tx
+        .query_row(
+            "SELECT payload_json FROM turn_records WHERE turn_id = ?1",
+            [&record.turn_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|payload| decode_turn_record_payload(&payload))
+        .transpose()?;
+    if let Some(existing) = existing.as_ref() {
+        let replay_identity_matches = match (&existing.replay, &record.replay) {
+            (Some(existing), Some(record)) => {
+                existing.source_message_id == record.source_message_id
+                    && existing.source_turn_id == record.source_turn_id
+                    && existing.reason == record.reason
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        let identity_matches = existing.agent_id == record.agent_id
+            && existing.turn_index == record.turn_index
+            && existing.run_id == record.run_id
+            && existing.current_work_item_id == record.current_work_item_id
+            && (existing.owner == record.owner || existing.owner.is_none())
+            && existing
+                .trigger
+                .as_ref()
+                .and_then(|trigger| trigger.message_id.as_deref())
+                == record
+                    .trigger
+                    .as_ref()
+                    .and_then(|trigger| trigger.message_id.as_deref())
+            && existing.created_at == record.created_at
+            && replay_identity_matches;
+        if !identity_matches {
+            return Err(RuntimeStateTransitionConflict::new(
+                "turn identity",
+                &record.turn_id,
+                "immutable",
+                "conflicting",
+            )
+            .into());
+        }
+    }
     let payload_json = serde_json::to_string(record)?;
     let terminal_kind = record
         .terminal
@@ -3755,38 +4072,82 @@ pub(crate) fn upsert_turn_record_tx(tx: &Transaction<'_>, record: &TurnRecord) -
         .terminal
         .as_ref()
         .map(|terminal| timestamp(terminal.completed_at));
-    tx.execute(
-        "INSERT INTO turn_records (
-            turn_id, turn_index, agent_id, run_id, current_work_item_id,
-            trigger_message_id, terminal_kind, created_at, completed_at, payload_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-         ON CONFLICT(turn_id) DO UPDATE SET
-            turn_index = excluded.turn_index,
-            agent_id = excluded.agent_id,
-            run_id = excluded.run_id,
-            current_work_item_id = excluded.current_work_item_id,
-            trigger_message_id = excluded.trigger_message_id,
-            terminal_kind = excluded.terminal_kind,
-            created_at = excluded.created_at,
-            completed_at = excluded.completed_at,
-            payload_json = excluded.payload_json
-         WHERE COALESCE(excluded.completed_at, excluded.created_at) >= COALESCE(turn_records.completed_at, turn_records.created_at)",
-        params![
-            record.turn_id,
-            record.turn_index as i64,
-            record.agent_id,
-            record.run_id,
-            record.current_work_item_id,
-            record
-                .trigger
-                .as_ref()
-                .and_then(|trigger| trigger.message_id.as_deref()),
-            terminal_kind,
-            timestamp(record.created_at),
-            completed_at,
-            payload_json,
-        ],
-    )?;
+    let (owner_kind, owner_id) = match record.owner.as_ref() {
+        Some(owner) => {
+            let (kind, id) = owner.index_parts();
+            (Some(kind), id)
+        }
+        None => (None, None),
+    };
+    let has_owner_columns = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+              FROM pragma_table_info('turn_records')
+             WHERE name = 'owner_kind'
+        )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if has_owner_columns {
+        tx.execute(
+            "INSERT INTO turn_records (
+                turn_id, turn_index, agent_id, run_id, current_work_item_id,
+                owner_kind, owner_id, trigger_message_id, terminal_kind, created_at,
+                completed_at, payload_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(turn_id) DO UPDATE SET
+                owner_kind = COALESCE(turn_records.owner_kind, excluded.owner_kind),
+                owner_id = COALESCE(turn_records.owner_id, excluded.owner_id),
+                terminal_kind = excluded.terminal_kind,
+                completed_at = excluded.completed_at,
+                payload_json = excluded.payload_json
+             WHERE COALESCE(excluded.completed_at, excluded.created_at) >= COALESCE(turn_records.completed_at, turn_records.created_at)",
+            params![
+                record.turn_id,
+                record.turn_index as i64,
+                record.agent_id,
+                record.run_id,
+                record.current_work_item_id,
+                owner_kind,
+                owner_id,
+                record
+                    .trigger
+                    .as_ref()
+                    .and_then(|trigger| trigger.message_id.as_deref()),
+                terminal_kind,
+                timestamp(record.created_at),
+                completed_at,
+                payload_json,
+            ],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO turn_records (
+                turn_id, turn_index, agent_id, run_id, current_work_item_id,
+                trigger_message_id, terminal_kind, created_at, completed_at, payload_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(turn_id) DO UPDATE SET
+                terminal_kind = excluded.terminal_kind,
+                completed_at = excluded.completed_at,
+                payload_json = excluded.payload_json
+             WHERE COALESCE(excluded.completed_at, excluded.created_at) >= COALESCE(turn_records.completed_at, turn_records.created_at)",
+            params![
+                record.turn_id,
+                record.turn_index as i64,
+                record.agent_id,
+                record.run_id,
+                record.current_work_item_id,
+                record
+                    .trigger
+                    .as_ref()
+                    .and_then(|trigger| trigger.message_id.as_deref()),
+                terminal_kind,
+                timestamp(record.created_at),
+                completed_at,
+                payload_json,
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -4324,8 +4685,10 @@ pub(crate) fn decode_wait_condition_row(row: &rusqlite::Row<'_>) -> Result<WaitC
     let resolved_at_str: Option<String> = row.get(11)?;
     let cancelled_at_str: Option<String> = row.get(12)?;
     let turn_id: Option<String> = row.get(13)?;
-    let wake_sources_json: String = row.get(14)?;
-    let continuation_json: Option<String> = row.get(15)?;
+    let trigger_message_id: Option<String> = row.get(14)?;
+    let triggered_at_str: Option<String> = row.get(15)?;
+    let wake_sources_json: String = row.get(16)?;
+    let continuation_json: Option<String> = row.get(17)?;
     let status: WaitConditionStatus = serde_json::from_value(serde_json::Value::String(status_str))
         .context("parsing wait condition status")?;
     let kind: WaitConditionKind = serde_json::from_value(serde_json::Value::String(kind_str))
@@ -4354,6 +4717,8 @@ pub(crate) fn decode_wait_condition_row(row: &rusqlite::Row<'_>) -> Result<WaitC
         resolved_at: parse_optional_timestamp(resolved_at_str.as_deref())?,
         cancelled_at: parse_optional_timestamp(cancelled_at_str.as_deref())?,
         turn_id,
+        trigger_message_id,
+        triggered_at: parse_optional_timestamp(triggered_at_str.as_deref())?,
     })
 }
 

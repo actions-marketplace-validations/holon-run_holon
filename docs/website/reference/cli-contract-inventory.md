@@ -115,7 +115,10 @@ These commands require a reachable local control plane unless noted otherwise.
 | `holon task stop` | `<TASK_ID>` | `--agent <AGENT>` | pretty JSON `TaskStopResult` | `experimental` | Requests managed-task cancellation through the control plane. |
 | `holon work-item list` | none | `--limit <LIMIT>` default `50`; `--agent <AGENT>` | pretty JSON array of `WorkItemRecord` | `experimental` | Initial WorkItem CLI surface is read-only. The JSON schema owner is the HTTP/API `WorkItemRecord` read model returned by `/agents/:agent_id/work-items`. |
 | `holon work-item get` | `<WORK_ITEM_ID>` | `--agent <AGENT>` | pretty JSON `WorkItemRecord` | `experimental` | Reads a single work item through `/agents/:agent_id/work-items/:work_item_id`; create/update/pick/complete commands are deferred until those mutation API contracts are stabilized. |
-| `holon timer` | none | required `--after-ms <MS>`; `--every-ms <MS>`; `--summary <SUMMARY>`; `--agent <AGENT>` | pretty JSON control-plane response | `experimental` | Timer surface should be aligned with WorkItem/waiting-plane contract. |
+| `holon timer` | none | legacy create syntax: required `--after-ms <MS>`; `--every-ms <MS>`; `--summary <SUMMARY>`; `--agent <AGENT>` | pretty JSON `TimerRecord` | `experimental` | Backward-compatible alias for `holon timer create`. |
+| `holon timer create` | none | required `--after-ms <MS>`; `--every-ms <MS>`; `--summary <SUMMARY>`; `--agent <AGENT>` | pretty JSON `TimerRecord` | `experimental` | Creates a one-shot or repeating timer through the control plane. |
+| `holon timer list` | none | `--limit <LIMIT>` default `50`; `--agent <AGENT>` | pretty JSON array of `TimerRecord` | `experimental` | Reads recent timers through the agent timer API. |
+| `holon timer cancel` | `<TIMER_ID>` | `--agent <AGENT>` | pretty JSON `TimerRecord` | `experimental` | Cancels an active timer; already-cancelled timers are idempotent. |
 
 ### Agent lifecycle and model selection
 
@@ -183,7 +186,7 @@ Skill management is split into library operations and agent enablement:
 | `holon debug prompt` | `<TEXT>` | `--agent <AGENT>`; `--trust <TRUST>` default `trusted-operator` | human prompt dump | `internal` | Debug-only prompt inspection. |
 | `holon debug latency` | none | `--agent <AGENT>`; `--limit <LIMIT>` default `10`; `--events-limit <EVENTS_LIMIT>` default `5000` | human latency report | `internal` | Useful diagnostics; prose should not be machine contract. |
 | `holon debug scheduler-fixture` | none | `--agent <AGENT>`; required `--output <OUTPUT>` | writes JSON/JSONL fixture files; prints export summary | `internal` | Fixture file shape may be useful for tests but should be documented separately if stabilized. |
-| `holon debug scheduler-recovery` | none | `--agent <AGENT>`; `--json`; `--apply` | read-only canonical recovery and retired-rollout diagnosis; optional typed apply result | `internal` | Default is read-only. `--json` emits `{ "report": ..., "apply": null | { "changed": ..., "backup_path": ... } }`. `--apply` requires the daemon to be stopped, creates and verifies a SQLite backup before mutation, and never repairs retired rollout rows into new authority. |
+| `holon debug scheduler-recovery` | none | `--agent <AGENT>`; `--json`; `--apply`; `--no-backup` (requires `--apply`) | read-only canonical recovery diagnosis; optional typed apply result | `internal` | Default is read-only. It is the only current-binary command permitted to open the immediately preceding scheduler schema without migrating it, so blocked cleanup migrations remain recoverable. `--json` emits `{ "report": ..., "apply": null | { "changed": ..., "backup_path": ..., "backup_policy": ..., "backup_created": ... } }`. `--apply` requires the daemon to be stopped and creates a verified SQLite backup by default. Explicit `--no-backup` skips only that backup; typed source fences, recovery commands, and audit evidence remain required. |
 
 ## Environment and config inputs touched by CLI
 

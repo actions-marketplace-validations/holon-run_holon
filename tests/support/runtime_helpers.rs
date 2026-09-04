@@ -251,7 +251,12 @@ pub fn compact_request_snapshot(
                     .filter_map(|block| match block {
                         ModelBlock::Text { text } => Some(text.clone()),
                         ModelBlock::ToolUse { .. } => None,
-                        ModelBlock::Thinking { .. } | ModelBlock::RedactedThinking { .. } => None,
+                        ModelBlock::Thinking { .. }
+                        | ModelBlock::ReasoningText { .. }
+                        | ModelBlock::RedactedThinking { .. }
+                        | ModelBlock::Citations { .. }
+                        | ModelBlock::ProviderToolUse { .. }
+                        | ModelBlock::ProviderToolResult { .. } => None,
                     })
                     .collect::<Vec<_>>()
                     .join("\n"),

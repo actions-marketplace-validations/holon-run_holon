@@ -1,12 +1,18 @@
+#[cfg(test)]
 mod china;
+#[cfg(test)]
 pub(super) mod common;
+#[cfg(test)]
 mod core;
+#[cfg(test)]
 mod gateways;
+#[cfg(test)]
 mod hosted;
 mod tencent_tokenhub;
 
 pub(crate) use tencent_tokenhub::is_tencent_tokenhub_model_id;
 
+#[cfg(test)]
 pub(super) fn entries_for_registration(
     registration: crate::provider::ProviderCatalogRegistration,
 ) -> Vec<super::BuiltInModelMetadata> {
@@ -25,8 +31,20 @@ pub(super) fn entries_for_registration(
     }
 }
 
+#[cfg(test)]
 pub(super) fn route_definitions() -> Vec<super::BuiltInModelRouteDefinition> {
     let mut definitions = china::route_definitions();
     definitions.extend(tencent_tokenhub::route_definitions());
+    definitions.extend(
+        ["deepseek-v4-flash", "deepseek-v4-pro"]
+            .into_iter()
+            .map(|model| super::BuiltInModelRouteDefinition {
+                legacy_provider: super::provider_id("deepseek"),
+                model_ref: super::ModelRef::new(super::provider_id("deepseek"), model),
+                endpoint: super::ProviderEndpointId::parse("responses")
+                    .expect("valid built-in endpoint"),
+                policy: super::BuiltInModelRoutePolicy::default(),
+            }),
+    );
     definitions
 }

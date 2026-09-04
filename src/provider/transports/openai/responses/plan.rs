@@ -15,10 +15,11 @@ pub(crate) fn build_openai_responses_request(
         .tools
         .iter()
         .map(|tool| {
+            let name = contract.wire_tool_name(&tool.name);
             if let Some(grammar) = tool.freeform_grammar.as_ref() {
                 Ok(json!({
                     "type": "custom",
-                    "name": tool.name,
+                    "name": name,
                     "description": tool.description,
                     "format": {
                         "type": "grammar",
@@ -29,7 +30,7 @@ pub(crate) fn build_openai_responses_request(
             } else {
                 Ok(json!({
                     "type": "function",
-                    "name": tool.name,
+                    "name": name,
                     "description": tool.description,
                     "parameters": emitted_tool_json_schema(&tool.input_schema, tool_schema_contract)?,
                     "strict": matches!(tool_schema_contract, ToolSchemaContract::Strict),
@@ -44,7 +45,7 @@ pub(crate) fn build_openai_responses_request(
     let mut body = json!({
         "model": model,
         "instructions": request.prompt_frame.system_prompt,
-        "input": build_openai_input(&request.conversation)?,
+        "input": build_openai_input_for_contract(&request.conversation, contract)?,
         "store": false,
     });
     if !tools.is_empty() {
@@ -77,6 +78,13 @@ pub(crate) fn build_openai_responses_request(
                 body["include"] = Value::Array(Vec::new());
             }
         }
+        OpenAiResponsesTransportContract::DeepSeekStreaming => {
+            body["stream"] = Value::Bool(true);
+            body["max_output_tokens"] = Value::from(max_output_tokens);
+            body.as_object_mut()
+                .expect("OpenAI Responses request body should be an object")
+                .remove("prompt_cache_key");
+        }
     }
     Ok(body)
 }
@@ -96,6 +104,9 @@ fn openai_native_web_search_tool(request: &ProviderTurnRequest) -> Option<Value>
     let native = request.native_web_search.as_ref()?;
     match native.kind {
         ProviderNativeWebSearchKind::OpenAi => Some(json!({ "type": native.advertised_tool_type })),
+        ProviderNativeWebSearchKind::DeepSeek => {
+            Some(json!({ "type": native.advertised_tool_type }))
+        }
         ProviderNativeWebSearchKind::Xai => Some(json!({ "type": native.advertised_tool_type })),
         _ => None,
     }
@@ -329,6 +340,12 @@ pub(in super::super) fn plan_openai_responses_request(
                 replay_is_compacted,
                 continuation_contract,
             ),
+            provider_id: None,
+            provider_model_ref: None,
+            provider_transport: None,
+            endpoint_dialect: None,
+            streaming: None,
+            reasoning_effort: None,
             anthropic_cache: None,
             anthropic_context_management: None,
             openai_request_controls: request_controls,
@@ -355,6 +372,7 @@ pub(in super::super) fn plan_openai_responses_request(
             }),
             native_web_search: native_web_search_diagnostics(request),
             response_format: response_format_diagnostics(true, request),
+            stable_prefix: None,
         },
     })
 }
@@ -379,7 +397,15 @@ fn openai_append_match_lowering_mode(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn build_openai_input(conversation: &[ConversationMessage]) -> Result<Vec<Value>> {
+    build_openai_input_for_contract(conversation, OpenAiResponsesTransportContract::StandardJson)
+}
+
+fn build_openai_input_for_contract(
+    conversation: &[ConversationMessage],
+    contract: OpenAiResponsesTransportContract,
+) -> Result<Vec<Value>> {
     let mut items = Vec::new();
     let mut tool_call_kinds = HashMap::<String, ModelToolCallKind>::new();
     for message in conversation {
@@ -429,7 +455,7 @@ pub(crate) fn build_openai_input(conversation: &[ConversationMessage]) -> Result
                                 ModelToolCallKind::Function => items.push(json!({
                                     "type": "function_call",
                                     "call_id": id,
-                                    "name": name,
+                                    "name": contract.wire_tool_name(name),
                                     "arguments": canonical_json(
                                         &normalize_openai_function_arguments(Some(input))
                                     ),
@@ -437,12 +463,26 @@ pub(crate) fn build_openai_input(conversation: &[ConversationMessage]) -> Result
                                 ModelToolCallKind::Custom => items.push(json!({
                                     "type": "custom_tool_call",
                                     "call_id": id,
-                                    "name": name,
+                                    "name": contract.wire_tool_name(name),
                                     "input": openai_custom_tool_input(input)?,
                                 })),
                             }
                         }
-                        ModelBlock::Thinking { .. } | ModelBlock::RedactedThinking { .. } => {}
+                        ModelBlock::ReasoningText { text } => {
+                            flush_assistant_text(&mut items, &mut pending_text);
+                            items.push(json!({
+                                "type": "reasoning",
+                                "content": [{
+                                    "type": "reasoning_text",
+                                    "text": text,
+                                }],
+                            }));
+                        }
+                        ModelBlock::Thinking { .. }
+                        | ModelBlock::RedactedThinking { .. }
+                        | ModelBlock::Citations { .. }
+                        | ModelBlock::ProviderToolUse { .. }
+                        | ModelBlock::ProviderToolResult { .. } => {}
                     }
                 }
                 flush_assistant_text(&mut items, &mut pending_text);

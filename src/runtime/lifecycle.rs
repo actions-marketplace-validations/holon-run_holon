@@ -131,7 +131,7 @@ impl RuntimeHandle {
                 Value::Null,
             ));
             let agent_id = self.agent_id().await?;
-            let commit = self.inner.runtime_db.transitions().commit_work_item(
+            let commit = self.commit_work_item_transition(
                 &crate::runtime_db::transitions::WorkItemTransitionCommand {
                     agent_id,
                     mutation: crate::runtime_db::transitions::WorkItemMutation::Update {
@@ -196,7 +196,7 @@ impl RuntimeHandle {
                 updated_at: Utc::now(),
                 ..existing
             };
-            let commit = self.inner.runtime_db.transitions().commit_work_item(
+            let commit = self.commit_work_item_transition(
                 &crate::runtime_db::transitions::WorkItemTransitionCommand {
                     agent_id: record.agent_id.clone(),
                     mutation: crate::runtime_db::transitions::WorkItemMutation::Update {
@@ -824,6 +824,7 @@ impl RuntimeHandle {
                 active_workspace_id.as_deref(),
                 include_all_workspaces,
                 &agent_ids,
+                &[],
                 &agent_storages,
             )
         })
@@ -904,7 +905,6 @@ impl RuntimeHandle {
         let mut next_state = self.agent_state().await?;
         next_state.model_override = Some(model_override.clone());
         next_state.model_override_reasoning_effort = reasoning_effort.clone();
-        next_state.pending_fallback_model = None;
         let turn_in_progress = next_state.current_run_id.is_some();
         if !turn_in_progress {
             self.reconfigure_provider_for_state(&next_state).await?;
@@ -915,7 +915,6 @@ impl RuntimeHandle {
             let mut guard = self.inner.agent.lock().await;
             guard.state.model_override = Some(model_override);
             guard.state.model_override_reasoning_effort = reasoning_effort;
-            guard.state.pending_fallback_model = None;
             guard.persist_state(&self.inner.storage)?;
         }
         self.append_audit_event(
@@ -937,7 +936,6 @@ impl RuntimeHandle {
         let mut next_state = self.agent_state().await?;
         next_state.model_override = None;
         next_state.model_override_reasoning_effort = None;
-        next_state.pending_fallback_model = None;
         let turn_in_progress = next_state.current_run_id.is_some();
         if !turn_in_progress {
             self.reconfigure_provider_for_state(&next_state).await?;
@@ -948,7 +946,6 @@ impl RuntimeHandle {
             let mut guard = self.inner.agent.lock().await;
             guard.state.model_override = None;
             guard.state.model_override_reasoning_effort = None;
-            guard.state.pending_fallback_model = None;
             guard.persist_state(&self.inner.storage)?;
         }
         self.append_audit_event(
@@ -1790,24 +1787,73 @@ impl RuntimeHandle {
             )
             .await?;
         self.append_state_changed_events(&state)?;
+        if sleeping_until.is_none() {
+            self.observe_indefinite_sleep_without_wake_source(&state)?;
+        }
         if let (Some(duration_ms), Some(sleeping_until)) = (duration_ms, sleeping_until) {
             self.spawn_session_sleep_wake(duration_ms, sleeping_until);
         }
         Ok(())
     }
 
+    fn observe_indefinite_sleep_without_wake_source(&self, state: &AgentState) -> Result<()> {
+        let projection = scheduler::SchedulerProjection::from_state(&self.inner.storage, state)?;
+        let has_runnable_work = projection.work_reactivation_signal().is_some();
+        let has_queue_entries = projection.queue_len > 0 || projection.queued_work_items > 0;
+        let has_pending_task = !projection.active_tasks.is_empty();
+        let has_wake_source = has_queue_entries
+            || has_runnable_work
+            || projection.active_waiting_intents > 0
+            || has_pending_task
+            || projection.active_timers > 0
+            || projection.pending_wake_hint
+            || projection.has_interrupted_replay;
+        if state.status != AgentStatus::Asleep || state.sleeping_until.is_some() || has_wake_source
+        {
+            return Ok(());
+        }
+
+        self.inner.storage.append_event(&AuditEvent::legacy(
+            "orphan_sleep_observed",
+            serde_json::json!({
+                "agent_id": state.id,
+                "sleeping_until": state.sleeping_until,
+                "evidence": [
+                    "indefinite_sleep".to_string(),
+                    "queue_len=0".to_string(),
+                    "queued_work_items=0".to_string(),
+                    "active_waiting_intents=0".to_string(),
+                    "active_tasks=0".to_string(),
+                    "active_timers=0".to_string(),
+                    "pending_wake_hint=false".to_string(),
+                    "has_interrupted_replay=false".to_string(),
+                ],
+                "severity": "warning",
+            }),
+        ))?;
+        Ok(())
+    }
+
     fn indefinite_sleep_runnable_work(
         &self,
     ) -> Result<Option<(crate::types::WorkItemRecord, &'static str)>> {
-        let projection = self.inner.storage.work_queue_prompt_projection()?;
-        if let Some(current) = projection.current_runnable {
-            return Ok(Some((current.work_item, "continue_active")));
-        }
+        let state = self
+            .inner
+            .storage
+            .read_agent()?
+            .ok_or_else(|| anyhow!("agent state is missing for lifecycle sleep"))?;
+        let projection = scheduler::SchedulerProjection::from_state(&self.inner.storage, &state)?;
         Ok(projection
-            .queued_runnable
-            .into_iter()
-            .next()
-            .map(|queued| (queued.work_item, "queued_available")))
+            .work_reactivation_work_item()
+            .map(|(work_item, mode)| {
+                (
+                    work_item.clone(),
+                    match mode {
+                        crate::types::WorkReactivationMode::ContinueActive => "continue_active",
+                        crate::types::WorkReactivationMode::ActivateQueued => "queued_available",
+                    },
+                )
+            }))
     }
 
     fn spawn_session_sleep_wake(

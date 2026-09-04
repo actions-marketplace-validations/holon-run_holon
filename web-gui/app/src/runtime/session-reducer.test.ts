@@ -11,14 +11,14 @@ import {
 } from "./session-reducer";
 
 describe("reduceAgentSessionTimeline", () => {
-  it("preserves unknown v2 schemas outside the domain projection", () => {
+  it("preserves unknown current schemas outside the domain projection", () => {
     const timeline = reduceAgentSessionTimeline({
       events: {
         events: [
           {
             id: "event-unknown-schema",
             event_seq: 1,
-            contract_version: 2,
+            contract_version: 3,
             payload_schema: "holon.runtime_event.future_message",
             payload_schema_version: 1,
             ts: "2026-07-16T10:00:00Z",
@@ -220,7 +220,7 @@ describe("reduceAgentSessionTimeline", () => {
     expect(timeline[0]).toEqual(
       expect.objectContaining({
         kind: "tool",
-        label: "Tool finished",
+        label: "ViewImage",
         body: "Viewed image · Screenshot.png · 1200×800 · A browser screenshot showing the conversation timeline.",
         executionMeta: expect.objectContaining({ outcome: "completed", durationMs: 9700 }),
       }),
@@ -302,6 +302,127 @@ describe("reduceAgentSessionTimeline", () => {
         },
       }),
     );
+  });
+
+  it("projects timer tools as readable scheduling summaries without API duration noise", () => {
+    const timer = {
+      id: "timer_123",
+      agent_id: "agent-1",
+      created_at: "2026-08-26T10:00:00Z",
+      duration_ms: 300_000,
+      interval_ms: null,
+      repeat: false,
+      status: "active",
+      summary: "Check deployment",
+      next_fire_at: "2026-08-26T10:05:00Z",
+      last_fired_at: null,
+      fire_count: 0,
+    };
+    const timeline = reduceAgentSessionTimeline({
+      events: {
+        events: [
+          toolEvent("create-timer-1", "CreateTimer", {
+            input: { duration_ms: 300_000, summary: "Check deployment" },
+            output: { envelope: { result: timer } },
+          }),
+          toolEvent("get-timer-2", "GetTimer", {
+            input: { timer_id: "timer_123" },
+            output: { envelope: { result: timer } },
+          }),
+          toolEvent("cancel-timer-3", "CancelTimer", {
+            input: { timer_id: "timer_123" },
+            output: { envelope: { result: { ...timer, status: "cancelled" } } },
+          }),
+        ],
+      },
+    });
+
+    expect(timeline.map((item) => ({
+      label: item.label,
+      body: item.body,
+      durationMs: item.executionMeta?.durationMs,
+    }))).toEqual([
+      {
+        label: "Created timer",
+        body: "Created timer · Check deployment · in 5m · timer_123",
+        durationMs: undefined,
+      },
+      {
+        label: "Timer",
+        body: "Timer · Check deployment · active · in 5m · timer_123",
+        durationMs: undefined,
+      },
+      {
+        label: "Cancelled timer",
+        body: "Cancelled timer · Check deployment · timer_123",
+        durationMs: undefined,
+      },
+    ]);
+  });
+
+  it("projects timer lists with status, schedule, and fire count", () => {
+    const timeline = reduceAgentSessionTimeline({
+      events: {
+        events: [
+          toolEvent("list-timers-1", "ListTimers", {
+            output: {
+              envelope: {
+                result: {
+                  returned: 2,
+                  limit: 50,
+                  timers: [
+                    {
+                      id: "timer_active",
+                      status: "active",
+                      summary: "Check deployment",
+                      duration_ms: 300_000,
+                      interval_ms: null,
+                      fire_count: 0,
+                    },
+                    {
+                      id: "timer_repeat",
+                      status: "active",
+                      summary: "Poll CI",
+                      duration_ms: 60_000,
+                      interval_ms: 60_000,
+                      fire_count: 3,
+                    },
+                  ],
+                },
+              },
+            },
+          }),
+        ],
+      },
+    });
+
+    expect(timeline[0]).toEqual(expect.objectContaining({
+      label: "Listed timers",
+      body: "2 timers · 2 active · Check deployment · active · in 5m · timer_active; Poll CI · active · every 1m · fired 3 times · timer_repeat",
+      detail: {
+        label: "Timers",
+        text: "Check deployment · active · in 5m · timer_active\nPoll CI · active · every 1m · fired 3 times · timer_repeat",
+        tone: "data",
+      },
+      executionMeta: expect.objectContaining({ durationMs: undefined }),
+    }));
+  });
+
+  it("uses the tool name as the timeline label for generic fallbacks", () => {
+    const timeline = reduceAgentSessionTimeline({
+      events: {
+        events: [
+          toolEvent("future-tool-1", "FutureRuntimeTool", {
+            summary: "Completed future operation",
+          }),
+        ],
+      },
+    });
+
+    expect(timeline[0]).toEqual(expect.objectContaining({
+      label: "FutureRuntimeTool",
+      body: "Completed future operation",
+    }));
   });
 
   it("projects TaskOutput with task status and output preview", () => {
@@ -1307,6 +1428,7 @@ describe("reduceAgentSessionTimeline", () => {
           id: "brief_123",
           text: "Full persisted brief text.",
           kind: "result",
+          citations: [{ url: "https://example.com/source", title: "Source" }],
         },
       },
     });
@@ -1316,6 +1438,7 @@ describe("reduceAgentSessionTimeline", () => {
         id: "brief:brief_123",
         label: "Result",
         body: "Full persisted brief text.",
+        citations: [{ url: "https://example.com/source", title: "Source" }],
       }),
     );
   });
@@ -1415,6 +1538,10 @@ describe("reduceAgentSessionTimeline", () => {
             blocks: [
               { type: "thinking", text: "Internal reasoning must not be visible." },
               { type: "text", text: "Operator-visible response." },
+              {
+                type: "citations",
+                citations: [{ url: "https://example.com/source", title: "Source" }],
+              },
               { type: "tool_use", content: "Internal tool block." },
             ],
           },
@@ -1426,6 +1553,7 @@ describe("reduceAgentSessionTimeline", () => {
       expect.objectContaining({
         id: "assistant_round:round_123",
         body: "Operator-visible response.",
+        citations: [{ url: "https://example.com/source", title: "Source" }],
         minDisplayLevel: "verbose",
       }),
     );
@@ -1548,7 +1676,7 @@ describe("debugAgentSessionEvents", () => {
     );
     expect(timeline[1]).toEqual(
       expect.objectContaining({
-        label: "Tool finished",
+        label: "CreateWorkItem",
         body: expect.stringContaining("Track debug visibility"),
         detail: expect.objectContaining({
           label: "Work item change",

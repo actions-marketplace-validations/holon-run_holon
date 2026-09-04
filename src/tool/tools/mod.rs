@@ -5,7 +5,9 @@ use std::{future::Future, pin::Pin};
 
 use crate::{
     runtime::RuntimeHandle,
-    tool::{apply_patch::ApplyPatchSurface, ToolCall, ToolResult, ToolSpec},
+    tool::{
+        apply_patch::ApplyPatchSurface, spec::ToolExecutionContext, ToolCall, ToolResult, ToolSpec,
+    },
     types::{AuthorityClass, ToolCapabilityFamily},
 };
 
@@ -39,6 +41,7 @@ pub(crate) mod task_list;
 pub(crate) mod task_output;
 pub(crate) mod task_status;
 pub(crate) mod task_stop;
+pub(crate) mod timer;
 pub(crate) mod update_work_item;
 pub(crate) mod use_workspace;
 pub(crate) mod view_image;
@@ -54,10 +57,19 @@ pub(crate) struct BuiltinToolDefinition {
     pub(crate) spec: ToolSpec,
 }
 
+pub(crate) struct ToolModelRenderContext<'a> {
+    pub(crate) tool_execution_id: &'a str,
+    pub(crate) tool_output_budget_estimated_tokens: usize,
+}
+
 pub(crate) fn builtin_tool_definitions() -> Result<Vec<BuiltinToolDefinition>> {
     Ok(vec![
         sleep::definition()?,
         wait_for::definition()?,
+        timer::create_definition()?,
+        timer::list_definition()?,
+        timer::get_definition()?,
+        timer::cancel_definition()?,
         agent_get::definition()?,
         enqueue::definition()?,
         spawn_agent::definition()?,
@@ -110,17 +122,32 @@ pub(crate) fn builtin_tool_definitions_for_apply_patch_surface(
         .collect()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn execute_builtin_tool<'a>(
     runtime: &'a RuntimeHandle,
     agent_id: &'a str,
     authority_class: &'a AuthorityClass,
     call: &'a ToolCall,
 ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+    Box::pin(async move {
+        let context = ToolExecutionContext::default();
+        execute_builtin_tool_inner(runtime, agent_id, authority_class, call, &context).await
+    })
+}
+
+pub(crate) fn execute_builtin_tool_with_context<'a>(
+    runtime: &'a RuntimeHandle,
+    agent_id: &'a str,
+    authority_class: &'a AuthorityClass,
+    call: &'a ToolCall,
+    context: &'a ToolExecutionContext,
+) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
     Box::pin(execute_builtin_tool_inner(
         runtime,
         agent_id,
         authority_class,
         call,
+        context,
     ))
 }
 
@@ -129,10 +156,15 @@ async fn execute_builtin_tool_inner(
     agent_id: &str,
     authority_class: &AuthorityClass,
     call: &ToolCall,
+    context: &ToolExecutionContext,
 ) -> Result<ToolResult> {
     match call.name.as_str() {
         sleep::NAME => sleep::execute(runtime, agent_id, authority_class, &call.input).await,
         wait_for::NAME => wait_for::execute(runtime, agent_id, authority_class, &call.input).await,
+        timer::CREATE_NAME => timer::create(runtime, &call.input).await,
+        timer::LIST_NAME => timer::list(runtime, &call.input).await,
+        timer::GET_NAME => timer::get(runtime, &call.input).await,
+        timer::CANCEL_NAME => timer::cancel(runtime, &call.input).await,
         agent_get::NAME => {
             agent_get::execute(runtime, agent_id, authority_class, &call.input).await
         }
@@ -183,7 +215,8 @@ async fn execute_builtin_tool_inner(
             update_work_item::execute(runtime, agent_id, authority_class, &call.input).await
         }
         complete_work_item::NAME => {
-            complete_work_item::execute(runtime, agent_id, authority_class, &call.input).await
+            complete_work_item::execute(runtime, agent_id, authority_class, &call.input, context)
+                .await
         }
         memory_search::NAME => {
             memory_search::execute(runtime, agent_id, authority_class, &call.input).await
@@ -260,6 +293,57 @@ pub(crate) fn render_tool_result_for_model(result: &ToolResult) -> Result<String
     }
 }
 
+pub(crate) fn render_tool_result_for_model_with_context(
+    result: &ToolResult,
+    context: &ToolModelRenderContext<'_>,
+) -> Result<String> {
+    let rendered = if result.envelope.tool_name == get_workspace_state::NAME && !result.is_error() {
+        get_workspace_state::render_for_model(result, context)?
+    } else {
+        render_tool_result_for_model(result)?
+    };
+    if estimated_tokens(&rendered) <= context.tool_output_budget_estimated_tokens {
+        return Ok(rendered);
+    }
+
+    let output_ref = format!("tool_execution:{}:output", context.tool_execution_id);
+    let mut receipt = serde_json::json!({
+        "tool_name": result.envelope.tool_name,
+        "status": result.envelope.status,
+        "summary_text": truncate_chars(result.envelope.summary_text.as_deref().unwrap_or(""), 512),
+        "output_ref": output_ref,
+        "provider_projection_truncated": true,
+    });
+    if let Some(error) = result.envelope.error.as_ref() {
+        receipt["error"] = serde_json::json!({
+            "kind": error.kind,
+            "message": truncate_chars(&error.message, 512),
+            "recovery_hint": error
+                .recovery_hint
+                .as_deref()
+                .map(|value| truncate_chars(value, 512)),
+            "retryable": error.retryable,
+        });
+    }
+    serde_json::to_string(&receipt).map_err(Into::into)
+}
+
+fn estimated_tokens(text: &str) -> usize {
+    text.chars().count().saturating_add(3) / 4
+}
+
+pub(crate) fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut truncated = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
 pub(crate) fn canonical_json_render(result: &ToolResult) -> Result<String> {
     serde_json::to_string(&result.envelope).map_err(Into::into)
 }
@@ -293,8 +377,10 @@ mod tests {
             "ApplyPatch" => "src/tool/tool_descriptions/apply_patch_unified_diff_json.md",
             "AttachWorkspace" => "src/tool/tool_descriptions/attach_workspace.md",
             "CancelExternalTrigger" => "src/tool/tool_descriptions/cancel_external_trigger.md",
+            "CancelTimer" => "src/tool/tool_descriptions/cancel_timer.md",
             "CompleteWorkItem" => "src/tool/tool_descriptions/complete_work_item.md",
             "CreateExternalTrigger" => "src/tool/tool_descriptions/create_external_trigger.md",
+            "CreateTimer" => "src/tool/tool_descriptions/create_timer.md",
             "CreateWorkItem" => "src/tool/tool_descriptions/create_work_item.md",
             "CreateWorktree" => "src/tool/tool_descriptions/create_worktree.md",
             "DetachWorkspace" => "src/tool/tool_descriptions/detach_workspace.md",
@@ -302,11 +388,13 @@ mod tests {
             "ExecCommand" => "src/tool/tool_descriptions/exec_command.md",
             "ExecCommandBatch" => "src/tool/tool_descriptions/exec_command_batch.md",
             "GenerateImage" => "src/tool/tool_descriptions/generate_image.md",
+            "GetTimer" => "src/tool/tool_descriptions/get_timer.md",
             "GetWorkItem" => "src/tool/tool_descriptions/get_work_item.md",
             "GetWorkspaceState" => "src/tool/tool_descriptions/get_workspace_state.md",
             "ListModelProviders" => "src/tool/tool_descriptions/list_model_providers.md",
             "ListProviderModels" => "src/tool/tool_descriptions/list_provider_models.md",
             "ListTasks" => "src/tool/tool_descriptions/list_tasks.md",
+            "ListTimers" => "src/tool/tool_descriptions/list_timers.md",
             "ListWorkItems" => "src/tool/tool_descriptions/list_work_items.md",
             "MemoryGet" => "src/tool/tool_descriptions/memory_get.md",
             "MemorySearch" => "src/tool/tool_descriptions/memory_search.md",

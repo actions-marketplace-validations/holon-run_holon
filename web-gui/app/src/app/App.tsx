@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import {
@@ -14,6 +14,7 @@ import {
   LayoutTemplate,
   ListTree,
   LoaderCircle,
+  LogOut,
   RefreshCw,
   Search as SearchIcon,
   Settings as SettingsIcon,
@@ -24,6 +25,7 @@ import type { ComponentType } from "react";
 
 import holonMarkUrl from "../assets/holon-mark.png";
 import { AgentPage } from "../features/agent/AgentPage";
+import { LoginPage } from "../features/auth/LoginPage";
 import { Button } from "../components/ui/Button";
 import { EmptyState } from "../components/ui/EmptyState";
 import { SegmentedControl, SegmentedControlButton } from "../components/ui/SegmentedControl";
@@ -42,7 +44,13 @@ import {
   subscribeRuntimeTrace,
 } from "../runtime/runtime-trace";
 import { selectSelectedAgent } from "../runtime/runtime-selectors";
-import { canUseRemoteRuntimeConnections, readStoredRemoteConnectionProfiles, skillDetailCacheKey, useRuntimeStore } from "../runtime/runtime-store";
+import { unreadBadgeView, type LedgerUnreadView } from "../runtime/read-state";
+import {
+  canUseRemoteRuntimeConnections,
+  readStoredRemoteConnectionProfiles,
+  skillDetailCacheKey,
+  useRuntimeStore,
+} from "../runtime/runtime-store";
 import { useAgentDetail } from "../runtime/useAgentDetail";
 import { useRuntimeDashboard } from "../runtime/useRuntimeDashboard";
 import type { AgentSummary, DisplayLevel, RouteKey, RuntimeConnection, RuntimeConnectionConfig, RuntimeConnectionProfile } from "../runtime/types";
@@ -60,6 +68,7 @@ const APP_WINDOW_TITLE = "Holon";
 
 export function App() {
   const { bootstrap, loading, refresh } = useRuntimeDashboard();
+  const discovery = useRuntimeStore((state) => state.discovery);
   const { t } = useTranslation();
   useSyncExternalStore(subscribeRuntimeTrace, getRuntimeTraceRevision, getRuntimeTraceRevision);
   const developerDiagnosticsEnabled = isRuntimeTraceEnabled();
@@ -79,9 +88,13 @@ export function App() {
   const resumeRevision = useRuntimeStore((state) => state.resumeRevision);
   const rightPanelOpen = useRuntimeStore((state) => state.rightPanelOpen);
   const rightPanelView = useRuntimeStore((state) => state.rightPanelView);
+  const rightPanelMode = useRuntimeStore((state) => state.rightPanelMode);
+  const toggleRightPanelExpanded = useRuntimeStore((state) => state.toggleRightPanelExpanded);
   const navCollapsed = useRuntimeStore((state) => state.navCollapsed);
   const setRoute = useRuntimeStore((state) => state.setRoute);
   const openAgent = useRuntimeStore((state) => state.openAgent);
+  const markAgentConversationRead = useRuntimeStore((state) => state.markAgentConversationRead);
+  const acknowledgeAgentTruncation = useRuntimeStore((state) => state.acknowledgeAgentTruncation);
   const openSkill = useRuntimeStore((state) => state.openSkill);
   const openTemplate = useRuntimeStore((state) => state.openTemplate);
   const setDisplayLevel = useRuntimeStore((state) => state.setDisplayLevel);
@@ -92,6 +105,7 @@ export function App() {
   const showTimelineEvents = useRuntimeStore((state) => state.showTimelineEvents);
   const refreshTimelineEvents = useRuntimeStore((state) => state.refreshTimelineEvents);
   const loadOlderTimelineEvents = useRuntimeStore((state) => state.loadOlderTimelineEvents);
+  const retryAgentSync = useRuntimeStore((state) => state.retryAgentSync);
   const showWorkItemDetail = useRuntimeStore((state) => state.showWorkItemDetail);
   const showTaskDetail = useRuntimeStore((state) => state.showTaskDetail);
   const showFileBrowser = useRuntimeStore((state) => state.showFileBrowser);
@@ -101,11 +115,33 @@ export function App() {
   const setRuntimeConnection = useRuntimeStore((state) => state.setRuntimeConnection);
   const selectedAgent = useRuntimeStore(selectSelectedAgent);
   const rosterActivityByAgentId = useRuntimeStore((state) => state.rosterActivityByAgentId);
+  const ledgerUnreadByAgentId = useRuntimeStore((state) => state.ledgerUnreadByAgentId);
+  const ledgerReadinessRevisionByAgentId = useRuntimeStore(
+    (state) => state.ledgerReadinessRevisionByAgentId,
+  );
+  const discoveryFreshness = useRuntimeStore((state) => state.discovery.freshness);
   const activeAgentId = route === "agent" ? selectedAgent?.id ?? selectedAgentId : undefined;
+  const activeAgentLedgerUnread = activeAgentId
+    ? ledgerUnreadByAgentId[activeAgentId]
+    : undefined;
   const sidePanelAgentId = selectedAgent?.id ?? selectedAgentId;
   const selectedAgentSession = useRuntimeStore((state) =>
     sidePanelAgentId ? state.sessionsByAgentId[sidePanelAgentId] : undefined,
   );
+  const markSelectedAgentConversationRead = useCallback(() => {
+    if (activeAgentId) markAgentConversationRead(activeAgentId);
+  }, [
+    activeAgentId,
+    activeAgentLedgerUnread,
+    discoveryFreshness,
+    activeAgentId ? ledgerReadinessRevisionByAgentId[activeAgentId] : undefined,
+    markAgentConversationRead,
+    selectedAgentSession?.briefHydrationById,
+    selectedAgentSession?.gaps.length,
+    selectedAgentSession?.liveStatus,
+    selectedAgentSession?.loading,
+    selectedAgentSession?.syncStatus,
+  ]);
   const selectedAgentTimelineEvents = useRuntimeStore((state) =>
     sidePanelAgentId ? state.timelineEventsByAgentId[sidePanelAgentId] : undefined,
   );
@@ -209,6 +245,8 @@ export function App() {
     refresh: refreshAgentDetail,
   } = useAgentDetail(activeAgentId, effectiveDisplayLevel);
   const activeAgent = selectedAgent ?? selectedAgentDetail?.agent;
+  const selectedSemanticHistory =
+    selectedAgentSession?.semanticHistoryByDisplayLevel[effectiveDisplayLevel];
   const selectedAgentLiveStatus = selectedAgentSession?.liveStatus ?? "idle";
   const selectedAgentLiveTitle = liveStatusTitle(selectedAgentLiveStatus, t, selectedAgentSession?.lastStreamActivityAt, selectedAgentSession?.error);
   const selectedAgentStatus = route === "agent" && activeAgent ? deriveAgentDisplayStatus(activeAgent, t) : undefined;
@@ -302,9 +340,23 @@ export function App() {
   }, [openAgent, openSkill, openTemplate, setRoute]);
 
   useEffect(() => {
-    if ((route !== "agent" && route !== "settings") || modelCatalogLoading || modelCatalog.options.length > 0) return;
+    if (
+      (route !== "agent" && route !== "settings") ||
+      modelCatalogLoading ||
+      modelCatalog.source === "http" ||
+      (modelCatalog.source !== "cache" && modelCatalog.cachedAt !== undefined) ||
+      Boolean(modelCatalog.error)
+    ) return;
     void refreshModelCatalog();
-  }, [modelCatalog.options.length, modelCatalogLoading, refreshModelCatalog, route]);
+  }, [
+    modelCatalog.cachedAt,
+    modelCatalog.error,
+    modelCatalog.source,
+    modelCatalog.stale,
+    modelCatalogLoading,
+    refreshModelCatalog,
+    route,
+  ]);
 
   useEffect(() => {
     if (route !== "settings" || runtimeConfigLoading || runtimeConfig.surface) return;
@@ -437,11 +489,15 @@ export function App() {
   if (isInitialBootstrapping) {
     return <BootstrappingPage connection={bootstrap.connection} onSetConnection={setRuntimeConnection} />;
   }
+  if (bootstrap.connection.authRequired) {
+    return <LoginPage />;
+  }
 
   return (
     <div
       className="app-shell"
       data-panel={rightPanelOpen ? "open" : "closed"}
+      data-panel-mode={rightPanelMode}
       data-nav-collapsed={navCollapsed}
     >
       <aside className="sidebar" aria-label="Holon navigation">
@@ -531,7 +587,10 @@ export function App() {
             visibleAgents.map((agent) => {
               const status = deriveAgentDisplayStatus(agent, t);
               const workSummary = agent.currentWork?.objective;
-              const unreadCount = rosterActivityByAgentId[agent.id]?.unreadCount ?? 0;
+              const unreadView = unreadBadgeView(
+                rosterActivityByAgentId[agent.id]?.unreadCount,
+                ledgerUnreadByAgentId[agent.id],
+              );
 
               return (
                 <button
@@ -545,9 +604,17 @@ export function App() {
                   <span className="agent-row-main">
                     <span className="agent-row-title">
                       <strong>{agent.id}</strong>
-                      {unreadCount > 0 ? (
-                        <span className="agent-row-unread" aria-label={t("app.unreadUpdates", { count: unreadCount })} title={t("app.unreadUpdates", { count: unreadCount })}>
-                          {formatUnreadCount(unreadCount)}
+                      {unreadView?.mode === "stale_sync_error" ? (
+                        <span className="agent-row-unread is-stale" aria-label={t("app.unreadSyncError")} title={t("app.unreadSyncError")}>
+                          !
+                        </span>
+                      ) : unreadView && unreadView.count > 0 ? (
+                        <span
+                          className={`agent-row-unread ${unreadView.mode === "truncated" ? "is-truncated" : ""}`}
+                          aria-label={unreadTitle(unreadView, t)}
+                          title={unreadTitle(unreadView, t)}
+                        >
+                          {formatUnreadCount(unreadView.count)}{unreadView.mode === "truncated" ? "+" : ""}
                         </span>
                       ) : null}
                       <span className={`agent-row-status-dot ${status.tone}`} aria-label={status.title} title={status.title}>
@@ -633,6 +700,7 @@ export function App() {
             agents={visibleAgents}
             metrics={bootstrap.metrics}
             connection={bootstrap.connection}
+            discovery={discovery}
             loading={loading}
             onRefresh={() => {
               void refresh();
@@ -654,16 +722,24 @@ export function App() {
             modelCatalog={modelCatalog}
             modelCatalogLoading={modelCatalogLoading}
             modelCatalogError={selectedAgentSession?.modelError ?? modelCatalogError}
-            hasOlderEvents={selectedAgentSession?.hasOlder ?? selectedAgentDetail?.hasOlderEvents ?? false}
-            loadingOlderEvents={selectedAgentSession?.loadingOlder ?? false}
-            historyError={selectedAgentSession?.historyError ?? selectedAgentSession?.error}
+            hasOlderEvents={selectedSemanticHistory?.hasOlder ?? false}
+            loadingOlderEvents={selectedSemanticHistory?.loading ?? false}
+            historyError={selectedSemanticHistory?.error ?? selectedAgentSession?.targetEventError ?? selectedAgentSession?.error}
+            syncError={selectedAgentSession?.syncError}
+            syncRetryAttempt={selectedAgentSession?.syncRetryAttempt}
+            historyTruncated={ledgerUnreadByAgentId[activeAgent.id]?.mode === "truncated"}
+            onAcknowledgeTruncation={() => {
+              void acknowledgeAgentTruncation(activeAgent.id);
+            }}
             targetEventSeq={selectedAgentSession?.targetEventSeq}
             resumeRevision={resumeRevision}
             onRefreshModels={refreshModelCatalog}
             onSetModel={(model, reasoningEffort) => setAgentModel(activeAgent.id, model, effectiveDisplayLevel, reasoningEffort)}
             onClearModel={() => clearAgentModel(activeAgent.id, effectiveDisplayLevel)}
             onLoadOlderEvents={() => loadOlderAgentEvents(activeAgent.id, effectiveDisplayLevel)}
+            onRetrySync={() => retryAgentSync(activeAgent.id)}
             onSendPrompt={(text, attachments) => sendOperatorPrompt(activeAgent.id, text, effectiveDisplayLevel, attachments)}
+            onConversationRead={markSelectedAgentConversationRead}
             onOpenInspector={() => {
               showAgentOverview(activeAgent.id);
             }}
@@ -790,6 +866,8 @@ export function App() {
           session={selectedAgentSession}
           view={rightPanelView?.agentId === selectedAgent.id ? rightPanelView : undefined}
           open={rightPanelOpen}
+          mode={rightPanelMode}
+          onToggleMode={toggleRightPanelExpanded}
           onLoadWorkItemDetail={(workItemId) => loadAgentWorkItemDetail(selectedAgent.id, workItemId)}
           onOpenWorkItemDetail={(workItem) => {
             showWorkItemDetail(selectedAgent.id, workItem);
@@ -978,8 +1056,14 @@ function ConnectionSwitcher({
       >
         <span className={`runtime-dot ${connection.error ? "error" : ""}`} />
         <span>
-          <strong>{connection.mode}</strong>
-          <small>{connection.summary}</small>
+          <strong>
+            {connection.mode === "local" && !remoteConnectionsAllowed ? t("connection.currentServer") : connection.mode}
+          </strong>
+          <small>
+            {connection.mode === "local" && !remoteConnectionsAllowed
+              ? globalThis.location?.host ?? connection.summary
+              : connection.summary}
+          </small>
         </span>
       </button>
       {open ? (
@@ -1034,8 +1118,14 @@ function ConnectionSwitcher({
             onClick={() => void applyConnection({ mode: "local" })}
           >
             <span>
-              <strong>{t("connection.localhost")}</strong>
-              <small>{remoteConnectionsAllowed ? t("connection.localRuntime") : t("connection.sameOrigin")}</small>
+              <strong>
+                {remoteConnectionsAllowed ? t("connection.localhost") : t("connection.currentServer")}
+              </strong>
+              <small>
+                {remoteConnectionsAllowed
+                  ? t("connection.localRuntime")
+                  : globalThis.location?.host ?? t("connection.currentSite")}
+              </small>
             </span>
             <span>{connection.mode === "local" ? t("status.current") : t("status.use")}</span>
           </button>
@@ -1102,8 +1192,50 @@ function ConnectionSwitcher({
               </Button>
             </div>
           ) : null}
+          {!connection.hasToken ? <SessionLogout /> : null}
         </form>
       ) : null}
+    </div>
+  );
+}
+
+function SessionLogout() {
+  const { t } = useTranslation();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(false);
+
+  async function logout() {
+    setBusy(true);
+    setError(false);
+    try {
+      const response = await fetch("/api/auth/session/logout", {
+        method: "POST",
+        credentials: "include",
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) throw new Error("Logout failed");
+      const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+      window.location.replace(`/login?return_to=${encodeURIComponent(returnTo || "/")}`);
+    } catch {
+      setError(true);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="session-logout">
+      <button
+        className="session-logout-button"
+        type="button"
+        onClick={() => void logout()}
+        disabled={busy}
+        aria-label={t("connection.logout")}
+        title={t("connection.logout")}
+      >
+        <LogOut size={16} />
+        <span>{busy ? t("connection.loggingOut") : t("connection.logout")}</span>
+      </button>
+      {error ? <span className="session-logout-error" role="alert">{t("connection.logoutFailed")}</span> : null}
     </div>
   );
 }
@@ -1159,6 +1291,14 @@ function MissingAgentPage({ agentId, loading }: { agentId: string; loading: bool
   );
 }
 
+function unreadTitle(
+  view: LedgerUnreadView,
+  t: (key: string, options?: { count?: number }) => string,
+): string {
+  if (view.mode === "truncated") return t("app.unreadTruncated", { count: view.count });
+  if (view.mode === "stale_sync_error") return t("app.unreadSyncError");
+  return t("app.unreadUpdates", { count: view.count });
+}
 function formatUnreadCount(count: number): string {
   return count > 99 ? "99+" : String(count);
 }

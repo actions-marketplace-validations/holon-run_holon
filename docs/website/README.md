@@ -40,6 +40,9 @@ holon --help
 
 Or download binaries from [GitHub Releases](https://github.com/holon-run/holon/releases/latest).
 
+macOS 13 or later users can install the universal `Holon-<version>.dmg` from
+the same release page for a native menu bar app with launch-at-login support.
+
 ### Configure a provider
 
 ```bash
@@ -105,7 +108,7 @@ waitable, delegable, and deliverable.
 ## Status and compatibility
 
 The current recommended release is
-[`v0.30.0`](https://github.com/holon-run/holon/releases/tag/v0.30.0).
+[`v0.36.0`](https://github.com/holon-run/holon/releases/tag/v0.36.0).
 
 `v0.15.0` is the baseline release where the Holon Rust runtime enters public
 compatibility maintenance. Starting from this version, the project maintains

@@ -77,7 +77,14 @@ Returns auth mode, capabilities, and runtime info.
 
 **`GET /models`** — Available models
 
-Returns model catalog and runtime availability.
+Returns the cached model catalog and runtime availability without contacting
+providers.
+
+**`POST /models/refresh`** — Refresh available models
+
+Discovers models for providers whose discovery cache is missing or expired,
+then returns the same catalog shape as `GET /models`. A discovery failure for
+one provider does not prevent other available models from being returned.
 
 ```json
 {
@@ -402,12 +409,18 @@ requires a non-empty blocker.
 
 **`POST /api/control/agents/:id/work-items/:work_item_id/complete`** — Complete work item
 
-Marks an open work item completed and returns the updated `WorkItemRecord`.
-Cancel, close-without-completion, and delete are intentionally out of scope for
+For an open work item, atomically persists the supplied report as the canonical
+result brief, binds the completion intent, applies completion scheduling side
+effects, and returns the `WorkItemRecord` in the `completed` state. The same
+endpoint also finalizes an existing legacy `completing` record. Empty reports,
+cancel, close-without-completion, and delete are intentionally out of scope for
 this lifecycle surface.
 
 ```json
-{ "authority_class": "operator_instruction" }
+{
+  "report_text": "Build fixed and all checks passed.",
+  "authority_class": "operator_instruction"
+}
 ```
 
 **`POST /api/control/agents/:id/timers`** — Create timer

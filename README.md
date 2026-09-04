@@ -74,6 +74,13 @@ holon --help
 
 You can also download prebuilt binaries for Linux amd64, macOS amd64, and macOS
 arm64 from [GitHub Releases](https://github.com/holon-run/holon/releases/latest).
+The Linux amd64 binary supports Ubuntu 22.04 or newer (glibc 2.35 or newer).
+
+macOS 13 or later users on Apple Silicon or Intel Macs can install the
+universal `Holon-<version>.dmg` from the same release page. The native menu
+bar app controls the same daemon as the CLI, supports
+launch at login, and can install its bundled CLI into `~/.local/bin` without
+overwriting another installation.
 
 The examples below assume `holon` is installed on `PATH`.
 
@@ -95,9 +102,9 @@ docker run --rm \
 
 Replace the model and credential environment variable when using another
 provider. Holon validates that the configured model provider is available
-before the service starts. The canonical scheduler remains the default and
-long-term production path. During the bounded compatibility window,
-`HOLON_SCHEDULER=legacy|canonical` selects one process-wide engine at startup.
+before the service starts. Scheduling is canonical-only. A legacy selector is
+rejected at startup; use Holon v0.31.1 with a pre-migration database backup if
+legacy rollback is required.
 
 The base image includes Git and common shell/network utilities. Mount a
 writable workspace at `/workspace`, or derive a project-specific image when
@@ -146,7 +153,7 @@ For more detailed explanations, see [Concepts](docs/website/concepts/).
 ## Status and compatibility
 
 Holon is under active development. The current recommended release is
-[`v0.30.0`](https://github.com/holon-run/holon/releases/tag/v0.30.0).
+[`v0.36.0`](https://github.com/holon-run/holon/releases/tag/v0.36.0).
 
 The current project focus remains the Rust runtime: agent lifecycle, queues,
 WaitFor/wake, tasks, WorkItems, trust boundaries, local workspaces, and

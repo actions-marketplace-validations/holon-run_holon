@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { createRuntimeClient, projectModelOptions } from "./client";
+import {
+  createRuntimeClient,
+  projectModelOptions,
+  REQUIRED_OBSERVER_SYNC_CAPABILITIES,
+} from "./client";
 import type { components } from "./generated/openapi";
 import {
   createSessionProjectionState,
@@ -206,9 +210,106 @@ describe("projectModelOptions", () => {
       }),
     );
   });
+
+  it("keeps cached catalog models selectable when a runtime check fails retryably", () => {
+    const options = projectModelOptions({
+      available_models: [{
+        model: "openai/gpt-5.4",
+        provider: "openai",
+        display_name: "GPT-5.4",
+      }],
+      model_availability: [{
+        model: "openai/gpt-5.4",
+        provider: "openai",
+        available: false,
+        unavailable_reason: "connection failed",
+        failure_kind: "connection",
+        failure_disposition: "retryable",
+      }],
+    });
+
+    expect(options[0]).toEqual(expect.objectContaining({
+      available: true,
+      availabilityWarning: "connection failed",
+      unavailableReason: undefined,
+    }));
+  });
+
+  it("keeps deterministic configuration failures unavailable", () => {
+    const options = projectModelOptions({
+      available_models: ["openai/gpt-5.4"],
+      model_availability: [{
+        model: "openai/gpt-5.4",
+        provider: "openai",
+        available: false,
+        unavailable_reason: "credential_missing",
+        failure_kind: "auth_error",
+        failure_disposition: "fail_fast",
+      }],
+    });
+
+    expect(options[0]).toEqual(expect.objectContaining({
+      available: false,
+      unavailableReason: "credential_missing",
+      availabilityWarning: undefined,
+    }));
+  });
+
+  it("does not drop catalog models that lack an availability entry", () => {
+    const options = projectModelOptions({
+      available_models: ["openai/gpt-5.4", "anthropic/claude-sonnet-4-6"],
+      model_availability: [{
+        model: "openai/gpt-5.4",
+        provider: "openai",
+        available: true,
+      }],
+    });
+
+    expect(options.map((option) => option.model)).toEqual([
+      "anthropic/claude-sonnet-4-6",
+      "openai/gpt-5.4",
+    ]);
+    expect(options.every((option) => option.available)).toBe(true);
+  });
 });
 
 describe("createRuntimeClient", () => {
+  it("uses the explicit refresh endpoint when refreshing the model catalog", async () => {
+    const seen: Array<{ url: string; method: string; body: unknown }> = [];
+    const client = createRuntimeClient({
+      mode: "remote",
+      baseUrl: "http://example.test:7878",
+      fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        seen.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+          body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        });
+        return Response.json({
+          available_models: [{
+            model: "ollama/qwen3:latest",
+            provider: "ollama",
+            route_provider: "ollama",
+          }],
+          model_availability: [],
+        });
+      }) as typeof fetch,
+    });
+
+    await expect(client.refreshModels()).resolves.toEqual(expect.objectContaining({
+      source: "http",
+      options: [expect.objectContaining({
+        model: "ollama/qwen3:latest",
+        routeProvider: "ollama",
+      })],
+    }));
+    expect(seen).toEqual([{
+      url: "http://example.test:7878/api/models/refresh",
+      method: "POST",
+      body: {},
+    }]);
+  });
+
   it("uses the agent-scoped endpoint when loading an agent skill detail", async () => {
     const seen: string[] = [];
     const client = createRuntimeClient({
@@ -319,7 +420,10 @@ describe("createRuntimeClient", () => {
     const fetchImpl = async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/handshake")) {
-        return Response.json({ auth: { mode: "local" } });
+        return Response.json({
+          auth: { mode: "local" },
+          capabilities: REQUIRED_OBSERVER_SYNC_CAPABILITIES,
+        });
       }
       if (url.endsWith("/agents/list")) {
         return Response.json([]);
@@ -352,7 +456,10 @@ describe("createRuntimeClient", () => {
       const url = String(input);
       seen.push(url);
       if (url.endsWith("/handshake")) {
-        return Response.json({ auth: { mode: "local" } });
+        return Response.json({
+          auth: { mode: "local" },
+          capabilities: REQUIRED_OBSERVER_SYNC_CAPABILITIES,
+        });
       }
       if (url.endsWith("/agents/list")) {
         return Response.json([]);
@@ -626,24 +733,26 @@ describe("createRuntimeClient", () => {
 
   it("fetches an agent event window and decodes legacy envelopes with pagination parameters", async () => {
     const seen: string[] = [];
+    const responseBody = {
+      events: [
+        {
+          id: "event-740",
+          agent_id: "agent/one",
+          event_seq: 740,
+          ts: "2026-06-22T00:00:00Z",
+          type: "message_enqueued",
+          payload: { message_id: "message-740" },
+        },
+      ],
+      has_older: true,
+      cursor_seq: 819,
+      transport_padding: "界".repeat(64),
+    };
     const fetchImpl = async (input: RequestInfo | URL) => {
       const url = String(input);
       seen.push(url);
       if (url.endsWith("/agents/agent%2Fone/events?after_seq=739&limit=80&order=asc&max_level=info")) {
-        return Response.json({
-          events: [
-            {
-              id: "event-740",
-              agent_id: "agent/one",
-              event_seq: 740,
-              ts: "2026-06-22T00:00:00Z",
-              type: "message_enqueued",
-              payload: { message_id: "message-740" },
-            },
-          ],
-          has_older: true,
-          cursor_seq: 819,
-        });
+        return Response.json(responseBody);
       }
       return new Response("not found", { status: 404 });
     };
@@ -673,6 +782,7 @@ describe("createRuntimeClient", () => {
           }),
         ],
         cursor_seq: 819,
+        responseBytes: new TextEncoder().encode(JSON.stringify(responseBody)).byteLength,
       }),
     );
     expect(seen).toEqual(["http://example.test:7878/api/agents/agent%2Fone/events?after_seq=739&limit=80&order=asc&max_level=info"]);
@@ -716,7 +826,21 @@ describe("createRuntimeClient", () => {
       const url = String(input);
       seen.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
       if (url.endsWith("/search")) {
-        return Response.json({ query: "needle", limit: 10, results: [] });
+        return Response.json({
+          query: "needle",
+          limit: 10,
+          index_status: {
+            freshness: "stale",
+            cursor: 8,
+            high_watermark: 10,
+            lag: 2,
+            indexing_needed: true,
+            results_may_be_incomplete: true,
+            consumption_was_limited: false,
+            skipped_error_count: 1,
+          },
+          results: [],
+        });
       }
       return new Response("not found", { status: 404 });
     };
@@ -733,7 +857,22 @@ describe("createRuntimeClient", () => {
         includeAllWorkspaces: true,
         limit: 10,
       }),
-    ).resolves.toEqual({ query: "needle", limit: 10, results: [] });
+    ).resolves.toEqual({
+      query: "needle",
+      limit: 10,
+      indexStatus: {
+        freshness: "stale",
+        cursor: 8,
+        highWatermark: 10,
+        lag: 2,
+        lastIndexedAt: undefined,
+        indexingNeeded: true,
+        resultsMayBeIncomplete: true,
+        consumptionWasLimited: false,
+        skippedErrorCount: 1,
+      },
+      results: [],
+    });
     expect(seen).toEqual([
       {
         url: "http://example.test:7878/api/search",
@@ -784,6 +923,17 @@ describe("createRuntimeClient", () => {
     await expect(client.search("needle", { limit: 1 })).resolves.toEqual({
       query: "needle",
       limit: 1,
+      indexStatus: {
+        freshness: "fresh",
+        cursor: 0,
+        highWatermark: 0,
+        lag: 0,
+        lastIndexedAt: undefined,
+        indexingNeeded: false,
+        resultsMayBeIncomplete: false,
+        consumptionWasLimited: false,
+        skippedErrorCount: 0,
+      },
       results: [
         expect.objectContaining({
           kind: "message",

@@ -149,6 +149,7 @@ fn chat_completion_request_builds_openai_function_tools() {
         &request,
         ToolSchemaContract::Relaxed,
         false,
+        None,
     )
     .expect("should build chat completion request");
 
@@ -192,6 +193,7 @@ fn chat_completion_request_includes_tool_choice_auto() {
         &request,
         ToolSchemaContract::Relaxed,
         false,
+        None,
     )
     .expect("should build chat completion request");
 
@@ -721,18 +723,48 @@ fn chat_completion_request_includes_stream_flag() {
     let request = provider_turn_request();
 
     // Test with stream = true
-    let streaming_request =
-        build_chat_completion_request("gpt-4", 1000, &request, ToolSchemaContract::Relaxed, true)
-            .expect("should build streaming request");
+    let streaming_request = build_chat_completion_request(
+        "gpt-4",
+        1000,
+        &request,
+        ToolSchemaContract::Relaxed,
+        true,
+        None,
+    )
+    .expect("should build streaming request");
 
     assert_eq!(streaming_request["stream"], true);
 
     // Test with stream = false
-    let non_streaming_request =
-        build_chat_completion_request("gpt-4", 1000, &request, ToolSchemaContract::Relaxed, false)
-            .expect("should build non-streaming request");
+    let non_streaming_request = build_chat_completion_request(
+        "gpt-4",
+        1000,
+        &request,
+        ToolSchemaContract::Relaxed,
+        false,
+        None,
+    )
+    .expect("should build non-streaming request");
 
     assert_eq!(non_streaming_request["stream"], false);
+}
+
+#[test]
+fn chat_completion_request_forwards_reasoning_effort_when_configured() {
+    use crate::provider::transports::build_chat_completion_request;
+
+    let request = provider_turn_request();
+    let body = build_chat_completion_request(
+        "qwen3.8:27b-mlx",
+        1000,
+        &request,
+        ToolSchemaContract::Relaxed,
+        false,
+        Some("none"),
+    )
+    .expect("should build chat completion request");
+
+    assert_eq!(body["reasoning_effort"], "none");
 }
 
 #[test]
@@ -776,6 +808,7 @@ fn chat_completion_provider_classifies_rate_limit_errors() {
         Some("openai/gpt-test"),
         Some("https://example.com/v1/chat/completions"),
         None,
+        None,
     );
     let classification = classify_provider_error(&error);
 
@@ -813,6 +846,7 @@ fn chat_completion_provider_classifies_auth_errors() {
         None,
         None,
         None,
+        None,
     );
     let classification = classify_provider_error(&error);
 
@@ -837,6 +871,7 @@ fn chat_completion_provider_classifies_context_length_errors() {
         "test context",
         &error_json["error"],
         reqwest::StatusCode::BAD_REQUEST,
+        None,
         None,
         None,
         None,
@@ -867,6 +902,7 @@ fn chat_completion_provider_classifies_server_errors() {
         None,
         None,
         None,
+        None,
     );
     let classification = classify_provider_error(&error);
 
@@ -891,6 +927,7 @@ fn chat_completion_provider_classifies_unknown_errors_as_contract_errors() {
         "test context",
         &error_json["error"],
         reqwest::StatusCode::BAD_REQUEST,
+        None,
         None,
         None,
         None,
@@ -1107,6 +1144,7 @@ fn chat_completion_request_handles_empty_tools_list() {
         &request,
         ToolSchemaContract::Relaxed,
         false,
+        None,
     );
 
     assert!(chat_request.is_ok());

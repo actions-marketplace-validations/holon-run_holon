@@ -64,6 +64,7 @@ fn test_config() -> AppConfig {
         max_relevant_episodes: 3,
         control_token: Some("secret".into()),
         control_auth_mode: crate::config::ControlAuthMode::Auto,
+        auth: Default::default(),
         api_cors: Default::default(),
         config_file_path: temp.join("config.json"),
         stored_config: Default::default(),
@@ -79,7 +80,6 @@ fn test_config() -> AppConfig {
         default_tool_output_tokens: crate::tool::helpers::DEFAULT_TOOL_OUTPUT_TOKENS as u32,
         max_tool_output_tokens: crate::tool::helpers::MAX_TOOL_OUTPUT_TOKENS as u32,
         disable_provider_fallback: false,
-        scheduler_engine: crate::config::SchedulerEngineMode::Canonical,
         tui_alternate_screen: AltScreenMode::Auto,
         validated_model_overrides: std::collections::HashMap::new(),
         validated_unknown_model_fallback: None,
@@ -313,6 +313,8 @@ fn sample_model_availability(
         credential_configured: available,
         available,
         unavailable_reason: (!available).then_some("credential_missing".into()),
+        failure_kind: None,
+        failure_disposition: None,
         policy: crate::model_catalog::ResolvedRuntimeModelPolicy {
             model_ref,
             display_name: display_name.into(),
@@ -529,6 +531,7 @@ fn apply_brief_event(app: &mut TuiApp, brief: BriefRecord) {
             id: event_id.clone(),
             event: "brief_created".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -556,6 +559,7 @@ fn apply_event(app: &mut TuiApp, event_type: &str, payload: serde_json::Value) {
             id: event_id.clone(),
             event: event_type.into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -613,6 +617,7 @@ fn collect_chat_items_does_not_write_presentation_debug_log() {
     let mut app = TuiApp::new(client, log_writer);
     let snapshot = sample_snapshot("default", "evt-assistant");
     let events_tail = vec![StreamEventEnvelope {
+        projection_effect: None,
         event_log_epoch: Some("epoch-test".into()),
         contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
         payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -967,9 +972,11 @@ fn build_chat_text_includes_structured_operator_messages() {
             content_source: BriefContentSource::Inline,
             finalizes_assistant_round_id: None,
             text: "I started a worktree task.".into(),
+            citations: None,
             attachments: None,
             related_message_id: None,
             related_task_id: None,
+            created_event_seq: None,
         },
     );
 
@@ -1007,9 +1014,11 @@ fn build_chat_text_renders_message_block_header_above_body() {
             content_source: BriefContentSource::Inline,
             finalizes_assistant_round_id: None,
             text: "First line\nSecond line".into(),
+            citations: None,
             attachments: None,
             related_message_id: None,
             related_task_id: None,
+            created_event_seq: None,
         },
     );
 
@@ -1160,11 +1169,14 @@ fn build_chat_text_groups_agent_cells_by_turn_index() {
         content_source: BriefContentSource::Inline,
         finalizes_assistant_round_id: None,
         text: "PR is merged.".into(),
+        citations: None,
         attachments: None,
         related_message_id: None,
         related_task_id: None,
+        created_event_seq: None,
     };
     let brief_event = StreamEventEnvelope {
+        projection_effect: None,
         event_log_epoch: Some("epoch-test".into()),
         contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
         payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -2747,9 +2759,11 @@ fn chat_text_renders_markdown_body() {
             content_source: BriefContentSource::Inline,
             finalizes_assistant_round_id: None,
             text: "**Done**\n- first\n- second".into(),
+            citations: None,
             attachments: None,
             related_message_id: None,
             related_task_id: None,
+            created_event_seq: None,
         },
     );
 
@@ -2784,9 +2798,11 @@ fn chat_text_renders_brief_events_from_projection() {
             content_source: BriefContentSource::Inline,
             finalizes_assistant_round_id: None,
             text: "### Title\n\nBody".into(),
+            citations: None,
             attachments: None,
             related_message_id: None,
             related_task_id: None,
+            created_event_seq: None,
         },
     );
 
@@ -2829,9 +2845,11 @@ fn chat_text_ignores_ack_lifecycle_event_but_keeps_result_brief_events() {
             content_source: BriefContentSource::Inline,
             finalizes_assistant_round_id: None,
             text: "Real response".into(),
+            citations: None,
             attachments: None,
             related_message_id: None,
             related_task_id: None,
+            created_event_seq: None,
         },
     );
 
@@ -2865,9 +2883,11 @@ fn chat_text_summarizes_task_brief_output() {
             content_source: BriefContentSource::Inline,
             finalizes_assistant_round_id: None,
             text: "Task task-1 completed: line one\nline two\nline three".into(),
+            citations: None,
             attachments: None,
             related_message_id: None,
             related_task_id: Some("task-1".into()),
+            created_event_seq: None,
         },
     );
 
@@ -2893,6 +2913,7 @@ fn chat_text_shows_active_assistant_preview_without_durable_system_event() {
             id: "evt-work".into(),
             event: "work_item_written".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -2926,6 +2947,7 @@ fn chat_text_shows_active_assistant_preview_without_durable_system_event() {
             id: "evt-assistant".into(),
             event: "assistant_round_recorded".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -2971,6 +2993,7 @@ fn chat_display_mode_debug_shows_debug_events_and_keeps_working_row() {
             id: "evt-tool".into(),
             event: "tool_executed".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -2994,6 +3017,7 @@ fn chat_display_mode_debug_shows_debug_events_and_keeps_working_row() {
             id: "evt-state".into(),
             event: "agent_state_changed".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -3044,6 +3068,7 @@ fn chat_display_mode_info_shows_hidden_stream_activity_in_working_body() {
             id: "evt-tool".into(),
             event: "tool_executed".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -3090,6 +3115,7 @@ fn chat_display_mode_info_suppresses_successful_work_item_tool_activity() {
             id: "evt-work-item-tool".into(),
             event: "tool_executed".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -3138,6 +3164,7 @@ fn chat_display_mode_info_uses_rendered_list_work_items_activity() {
             id: "evt-list-work-items".into(),
             event: "tool_executed".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -3200,6 +3227,7 @@ fn chat_display_mode_verbose_keeps_working_marker_without_activity_body() {
             id: "evt-tool".into(),
             event: "tool_executed".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -3246,6 +3274,7 @@ fn chat_text_omits_task_system_events() {
             id: "evt-task".into(),
             event: "task_result_received".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
             event_log_epoch: Some("epoch-test".into()),
             contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
             payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -3303,6 +3332,7 @@ fn chat_text_keeps_active_activity_after_brief_event() {
             id: "evt-tool".into(),
             event: "tool_executed".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -3326,6 +3356,7 @@ fn chat_text_keeps_active_activity_after_brief_event() {
             id: "evt-brief".into(),
             event: "brief_created".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -3385,6 +3416,7 @@ fn chat_text_keeps_active_action_after_snapshot_refresh() {
             id: "evt-tool".into(),
             event: "tool_executed".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -3430,6 +3462,7 @@ fn chat_text_uses_selected_agent_events_tail_after_switch() {
             id: "evt-a-tool".into(),
             event: "tool_executed".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -3460,6 +3493,7 @@ fn chat_text_uses_selected_agent_events_tail_after_switch() {
     let mut switched_snapshot = sample_snapshot("agent-b", "evt-b-tool");
     switched_snapshot.agent.agent.status = AgentStatus::AwakeRunning;
     let events_tail = vec![StreamEventEnvelope {
+        projection_effect: None,
         event_log_epoch: Some("epoch-test".into()),
         contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
         payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -3508,6 +3542,7 @@ fn chat_text_does_not_show_stale_activity_when_agent_is_idle() {
             id: "evt-tool".into(),
             event: "tool_executed".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -3584,9 +3619,11 @@ fn active_activity_timestamp_does_not_sort_before_tail_history() {
             content_source: BriefContentSource::Inline,
             finalizes_assistant_round_id: None,
             text: "Latest durable response".into(),
+            citations: None,
             attachments: None,
             related_message_id: None,
             related_task_id: None,
+            created_event_seq: None,
         },
     );
     let projection = app.projection.as_mut().expect("projection");
@@ -3596,6 +3633,7 @@ fn active_activity_timestamp_does_not_sort_before_tail_history() {
             id: "evt-tool".into(),
             event: "tool_executed".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -3776,9 +3814,11 @@ fn collect_chat_items_orders_equal_timestamps_deterministically() {
             content_source: BriefContentSource::Inline,
             finalizes_assistant_round_id: None,
             text: "same instant".into(),
+            citations: None,
             attachments: None,
             related_message_id: None,
             related_task_id: None,
+            created_event_seq: None,
         },
     );
 
@@ -4398,6 +4438,7 @@ fn events_overlay_selection_stays_pinned_to_same_event_id() {
             id: "evt-old".into(),
             event: "provider_round_completed".into(),
             data: StreamEventEnvelope {
+                projection_effect: None,
                 event_log_epoch: Some("epoch-test".into()),
                 contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                 payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -4425,6 +4466,7 @@ fn events_overlay_selection_stays_pinned_to_same_event_id() {
                 id: "evt-new".into(),
                 event: "provider_round_completed".into(),
                 data: StreamEventEnvelope {
+                    projection_effect: None,
                     event_log_epoch: Some("epoch-test".into()),
                     contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
                     payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -4501,9 +4543,11 @@ fn chat_text_renders_full_long_brief_events() {
             content_source: BriefContentSource::Inline,
             finalizes_assistant_round_id: None,
             text: long_text,
+            citations: None,
             attachments: None,
             related_message_id: None,
             related_task_id: None,
+            created_event_seq: None,
         },
     );
 
@@ -4564,9 +4608,11 @@ fn chat_text_cache_reuses_unchanged_content_and_replaces_stale_entries() {
             content_source: BriefContentSource::Inline,
             finalizes_assistant_round_id: None,
             text: "**Done**".into(),
+            citations: None,
             attachments: None,
             related_message_id: None,
             related_task_id: None,
+            created_event_seq: None,
         },
     );
 
@@ -4601,9 +4647,11 @@ fn chat_text_cache_reuses_unchanged_content_and_replaces_stale_entries() {
             content_source: BriefContentSource::Inline,
             finalizes_assistant_round_id: None,
             text: "**Failed**".into(),
+            citations: None,
             attachments: None,
             related_message_id: None,
             related_task_id: None,
+            created_event_seq: None,
         },
     );
 
@@ -4799,6 +4847,7 @@ fn stale_projection_event_schedules_refresh() {
         id: "evt-stale".into(),
         event: "callback_delivered".into(),
         data: StreamEventEnvelope {
+            projection_effect: None,
             event_log_epoch: Some("epoch-test".into()),
             contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
             payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),
@@ -4904,9 +4953,11 @@ fn apply_agent_list_clears_stale_projection_when_selected_agent_disappears() {
             content_source: BriefContentSource::Inline,
             finalizes_assistant_round_id: None,
             text: "stale brief".into(),
+            citations: None,
             attachments: None,
             related_message_id: None,
             related_task_id: None,
+            created_event_seq: None,
         },
     );
 
@@ -5084,6 +5135,7 @@ fn pipeline_event_envelope(
     payload: serde_json::Value,
 ) -> StreamEventEnvelope {
     StreamEventEnvelope {
+        projection_effect: None,
         event_log_epoch: Some("epoch-test".into()),
         contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
         payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),

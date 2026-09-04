@@ -1,7 +1,10 @@
 use super::*;
 use crate::{
     config::RuntimeModelCatalog,
-    model_discovery::{discovery_cache_path, load_discovery_cache_at},
+    model_discovery::{
+        discovery_cache_needs_refresh, discovery_cache_path, load_discovery_cache_at,
+        provider_supports_model_discovery, refresh_provider_models, DEFAULT_DISCOVERY_CACHE_TTL,
+    },
     provider::resolved_model_availability,
 };
 
@@ -29,17 +32,55 @@ pub async fn models_handler(
     let started_at = std::time::Instant::now();
     authorize_remote_access(&headers, &state).map_err(|err| auth_required(err.to_string()))?;
     let mut config = (*state.host.config()).clone();
+    load_model_discovery_cache(&mut config).await?;
+    models_response("/models", started_at, &config)
+}
+
+pub async fn refresh_models_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    let started_at = std::time::Instant::now();
+    authorize_remote_access(&headers, &state).map_err(|err| auth_required(err.to_string()))?;
+    let mut config = (*state.host.config()).clone();
+    load_model_discovery_cache(&mut config).await?;
+    let cache_path = discovery_cache_path(&config.home_dir);
+    for provider in model_discovery_refresh_candidates(&config) {
+        if let Err(error) = refresh_provider_models(&provider, &cache_path).await {
+            warn!(
+                provider = %provider.id.as_str(),
+                error = %error,
+                "explicit model discovery refresh failed"
+            );
+        }
+    }
+
+    load_model_discovery_cache(&mut config).await?;
+    models_response("/models/refresh", started_at, &config)
+}
+
+async fn load_model_discovery_cache(
+    config: &mut crate::config::AppConfig,
+) -> Result<(), (StatusCode, Json<Value>)> {
     let cache_path = discovery_cache_path(&config.home_dir);
     config.model_discovery_cache =
         tokio::task::spawn_blocking(move || load_discovery_cache_at(&cache_path))
             .await
             .map_err(|error| error_response(error.into()))?
             .map_err(error_response)?;
+    Ok(())
+}
+
+fn models_response(
+    route: &'static str,
+    started_at: std::time::Instant,
+    config: &crate::config::AppConfig,
+) -> Result<AxumResponse, (StatusCode, Json<Value>)> {
     let available_models = RuntimeModelCatalog::from_config(&config).available_models();
     let model_availability = resolved_model_availability(&config);
     let model_discovery_cache = Vec::<crate::model_discovery::ModelDiscoveryCacheStatus>::new();
     traced_json(
-        "/models",
+        route,
         started_at,
         json!({
             "available_models": available_models,
@@ -47,6 +88,26 @@ pub async fn models_handler(
             "model_discovery_cache": model_discovery_cache,
         }),
     )
+}
+
+fn model_discovery_refresh_candidates(
+    config: &crate::config::AppConfig,
+) -> Vec<crate::config::ProviderRuntimeConfig> {
+    config
+        .providers
+        .values()
+        .filter(|provider| {
+            provider_supports_model_discovery(provider)
+                && (provider.auth.kind == CredentialKind::None
+                    || provider.has_configured_credential())
+                && discovery_cache_needs_refresh(
+                    provider,
+                    &config.model_discovery_cache,
+                    DEFAULT_DISCOVERY_CACHE_TTL,
+                )
+        })
+        .cloned()
+        .collect()
 }
 
 pub async fn search(
@@ -65,19 +126,25 @@ pub async fn search(
         .unwrap_or(SEARCH_DEFAULT_LIMIT)
         .clamp(1, SEARCH_MAX_LIMIT);
     let agent_ids = normalize_search_agent_ids(request.agent_ids)?;
+    let source_kinds = normalize_search_types(&request.types);
     let search_result = state
         .host
-        .search_memory_read_only(&query, limit, request.include_all_workspaces, &agent_ids)
+        .search_memory_read_only(
+            &query,
+            limit,
+            request.include_all_workspaces,
+            &agent_ids,
+            &source_kinds,
+        )
         .await
         .map_err(error_response)?;
-    let results = filter_search_results(search_result.results, &request.types);
     traced_json(
         "/search",
         started_at,
         SearchResponse {
             query,
             limit,
-            results,
+            results: search_result.results,
             index_status: search_result.index_status,
         },
     )
@@ -103,17 +170,15 @@ pub async fn memory_get(
     traced_json("/memory/get", started_at, memory)
 }
 
-fn filter_search_results(
-    results: Vec<crate::memory::MemorySearchResult>,
-    types: &[String],
-) -> Vec<crate::memory::MemorySearchResult> {
-    if types.is_empty() {
-        return results;
+fn normalize_search_types(types: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for kind in types {
+        let kind = kind.trim();
+        if !kind.is_empty() && !normalized.iter().any(|existing| existing == kind) {
+            normalized.push(kind.to_string());
+        }
     }
-    results
-        .into_iter()
-        .filter(|result| types.iter().any(|kind| kind == &result.kind))
-        .collect()
+    normalized
 }
 
 fn normalize_search_agent_ids(
@@ -135,6 +200,51 @@ fn normalize_search_agent_ids(
     Ok(normalized)
 }
 
+/// Legacy control-plane capabilities plus the observer-sync capabilities
+/// evaluated from durable verification results. Observer-sync capabilities
+/// require their storage and consistency invariants to be verified for the
+/// current database; a verification load failure degrades to the all-disabled
+/// evaluator instead of failing the handshake.
+fn handshake_capabilities(state: &AppState) -> Vec<&'static str> {
+    let mut capabilities = vec![
+        "agents.list",
+        "agents.state",
+        "agents.events",
+        "agents.control",
+        "tui.remote",
+    ];
+    let verification = load_observer_sync_verification(state);
+    capabilities.extend(advertised_observer_sync_capabilities(&verification));
+    capabilities
+}
+
+/// Loads the durable observer-sync verification rows into the capability
+/// evaluator input. A verification load failure degrades to the
+/// all-disabled evaluator instead of failing the caller.
+pub(crate) fn load_observer_sync_verification(
+    state: &AppState,
+) -> ObserverSyncCapabilityVerification {
+    let mut verification = ObserverSyncCapabilityVerification::default();
+    match state.host.runtime_db().observer_sync_foundations() {
+        Ok(foundations) => {
+            verification.runtime_identity_stable = foundations.runtime_identity_stable;
+            verification.agent_identity_reserved = foundations.agent_identity_reserved;
+            verification.roster_snapshot_verified = foundations.roster_snapshot_verified;
+            verification.projection_snapshot_verified = foundations.projection_snapshot_verified;
+            verification.event_projection_effect_complete =
+                foundations.event_projection_effect_complete;
+            verification.brief_atomic_linkage_verified = foundations.brief_atomic_linkage_verified;
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "observer-sync foundation verification unavailable; keeping capabilities disabled"
+            );
+        }
+    }
+    verification
+}
+
 pub async fn handshake(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -151,13 +261,7 @@ pub async fn handshake(
             "mode": if state.require_control_token { "bearer" } else { "local" },
             "required": state.require_control_token,
         },
-        "capabilities": [
-            "agents.list",
-            "agents.state",
-            "agents.events",
-            "agents.control",
-            "tui.remote"
-        ],
+        "capabilities": handshake_capabilities(&state),
         "runtime": {
             "default_agent": config.default_agent_id,
             "workspace_dir": config.workspace_dir,

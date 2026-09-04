@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     fs,
-    io::{IsTerminal, Write},
+    io::{IsTerminal, Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
@@ -24,13 +24,17 @@ use holon::{
     },
     config::{AgentTemplateRemoteSourceConfigFile, AgentTemplatesConfigFile},
     daemon::{
-        daemon_logs, daemon_restart, daemon_start, daemon_status, daemon_stop,
-        ensure_serve_preflight, prepare_runtime_before_server, RuntimeServiceHandle,
-        DAEMON_SERVE_ARGS_ENV, PRE_SERVER_PREPARED_ENV,
+        daemon_logs, daemon_prepare_update, daemon_restart_with_timeout, daemon_start_with_timeout,
+        daemon_status, daemon_stop, ensure_serve_preflight, prepare_runtime_before_server,
+        RuntimeServiceHandle, DAEMON_SERVE_ARGS_ENV, PRE_SERVER_PREPARED_ENV,
     },
     fd_limit::{apply_nofile_limit_policy, DEFAULT_NOFILE_TARGET},
     host::RuntimeHost,
-    http::{self, AppState, ControlRequest, CreateCommandTaskRequest, CreateTimerRequest},
+    http::{
+        self, AppState, CompleteWorkItemRequest, ControlRequest, CreateCommandTaskRequest,
+        CreateWorkItemRequest, PickWorkItemRequest, TaskInputRequest, TaskStopRequest,
+        UpdateWorkItemRequest,
+    },
     memory::{rebuild_memory_index, request_memory_index_rebuild},
     model_discovery::{discovery_cache_path, refresh_provider_models},
     onboarding::{
@@ -41,13 +45,16 @@ use holon::{
     provider::{provider_doctor, resolved_model_availability},
     run_once::{run_once, RunOnceRequest},
     runtime::{maybe_enqueue_first_run_intro, seed_scheduler_terminal_recovery_fixture},
-    runtime_db::{RuntimeDb, RuntimeDbLock},
+    runtime_db::{
+        RuntimeDb, RuntimeDbAuditCheck, RuntimeDbAuditOptions, RuntimeDbAuditReport, RuntimeDbLock,
+    },
     solve::{run_solve, SolveRequest},
     storage::AppStorage,
     tui::run_tui,
     types::{
-        AgentDeletionPhase, AgentDeletionStatus, AgentRegistryStatus, AuditEvent, AuthorityClass,
-        ControlAction, TimerStatus,
+        AgentDeletionPhase, AgentDeletionStatus, AgentInvocationContext, AgentRegistryStatus,
+        AuditEvent, AuthorityClass, ControlAction, TimerStatus, TodoItem, WorkItemPlanStatus,
+        HOLON_CALLER_AUTHORITY_CLASS_ENV,
     },
 };
 use tokio::net::TcpListener;
@@ -57,8 +64,9 @@ use tracing_subscriber::EnvFilter;
 use holon::cli::{
     AgentCommands, AgentModelCommands, Cli, Commands, ConfigCommands, ConfigCredentialCommands,
     ConfigModelCommands, ConfigProviderCommands, ControlCommandAction, DaemonCommands,
-    DebugCommands, EventsCommands, MemoryIndexCommands, ServeAccess, ServeOptions, SkillsCommands,
-    TaskCommands, WorkItemCommands, WorkspaceCommands,
+    DebugCommands, EventsCommands, MemoryIndexCommands, ModelsDevCommands, ServeAccess,
+    ServeOptions, SkillsCommands, TaskCommands, TimerCommands, TimerCreateArgs, WorkItemCommands,
+    WorkspaceCommands,
 };
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -185,6 +193,16 @@ async fn run_runtime_command(command: Commands) -> Result<()> {
         AppConfig::load()?
     };
     match command {
+        Commands::Context => {
+            let context = AgentInvocationContext::from_env().map_err(|error| anyhow!(error))?;
+            print_json(&serde_json::json!({
+                "mode": if context.is_some() { "agent" } else { "operator" },
+                "context": context,
+                "declaration_based": true,
+                "authenticated": false,
+            }))
+        }
+        Commands::Commands => print_json(&serde_json::to_value(holon::cli::collect_snapshot())?),
         Commands::Serve { options } => serve(config, options).await,
         Commands::Daemon { command } => handle_daemon_command(config, command).await,
         Commands::Prompt { text, agent } => {
@@ -211,24 +229,23 @@ async fn run_runtime_command(command: Commands) -> Result<()> {
         Commands::Task { command } => handle_task_command(&config, command).await,
         Commands::WorkItem { command } => handle_work_item_command(&config, command).await,
         Commands::MemoryIndex { command } => handle_memory_index_command(&config, command).await,
-        Commands::Timer {
-            after_ms,
-            every_ms,
-            summary,
-            agent,
-        } => {
-            let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
-            post_control_json(
-                &config,
-                &format!("/control/agents/{agent}/timers"),
-                &CreateTimerRequest {
-                    duration_ms: after_ms,
-                    interval_ms: every_ms,
-                    summary,
-                    authority_class: Some(AuthorityClass::OperatorInstruction),
+        Commands::Timer { command, legacy } => {
+            let command = match command {
+                Some(command) => command,
+                None => TimerCommands::Create {
+                    options: TimerCreateArgs {
+                        after_ms: legacy.after_ms.ok_or_else(|| {
+                            anyhow!(
+                                "`holon timer` requires `--after-ms <ms>` or a timer subcommand"
+                            )
+                        })?,
+                        every_ms: legacy.every_ms,
+                        summary: legacy.summary,
+                        agent: legacy.agent,
+                    },
                 },
-            )
-            .await
+            };
+            handle_timer_command(&config, command).await
         }
         Commands::Control { action, agent } => {
             let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
@@ -270,6 +287,7 @@ async fn run_runtime_command(command: Commands) -> Result<()> {
         Commands::Run { .. } => unreachable!("run command is handled separately"),
         Commands::Solve { .. } => unreachable!("solve command is handled separately"),
         Commands::Debug { command } => handle_debug_command(config, command).await,
+        Commands::ModelsDev { command } => handle_models_dev_command(command).await,
         Commands::Onboard { .. } => unreachable!("onboard command is handled before runtime load"),
         Commands::Config { .. } => unreachable!("config commands are handled separately"),
     }
@@ -278,10 +296,17 @@ async fn run_runtime_command(command: Commands) -> Result<()> {
 fn runtime_command_uses_config_inspection(command: &Commands) -> bool {
     matches!(
         command,
-        Commands::Debug {
-            command: DebugCommands::SchedulerRecoveryFixture { .. }
-                | DebugCommands::SchedulerRestartFixture { .. }
-        }
+        Commands::Context
+            | Commands::Commands
+            | Commands::Events {
+                command: EventsCommands::Tail { offline: true, .. }
+            }
+            | Commands::Debug {
+                command: DebugCommands::SchedulerRecovery { .. }
+                    | DebugCommands::SchedulerRecoveryFixture { .. }
+                    | DebugCommands::SchedulerRestartFixture { .. }
+            }
+            | Commands::ModelsDev { .. }
     )
 }
 
@@ -840,6 +865,25 @@ async fn serve(mut config: AppConfig, options: ServeOptions) -> Result<()> {
     }
 
     let host = RuntimeHost::new(config.clone())?;
+    let runtime_service = RuntimeServiceHandle::new_starting(&config)?;
+    #[cfg(unix)]
+    let unix_server = {
+        ensure_socket_parent(&config.socket_path)?;
+        let unix_listener = tokio::net::UnixListener::bind(&config.socket_path)
+            .with_context(|| format!("failed to bind {}", config.socket_path.display()))?;
+        runtime_service.write_state_files(&config)?;
+        println!("Holon control socket on {}", config.socket_path.display());
+        let unix_router = http::router(
+            AppState::for_unix_with_runtime_service(host.clone(), Some(runtime_service.clone()))
+                .with_web_dist(web_dist.clone()),
+        );
+        Some(tokio::spawn(http::serve_unix(
+            unix_listener,
+            unix_router,
+            runtime_service.shutdown_signal(),
+        )))
+    };
+
     host.recover_orphaned_queue_claims_at_startup().await?;
     let runtime = host.default_runtime().await?;
     host.spawn_daemon_memory_indexer();
@@ -847,7 +891,7 @@ async fn serve(mut config: AppConfig, options: ServeOptions) -> Result<()> {
     host.spawn_daemon_deletion_coordinator();
     spawn_stale_agent_template_remote_source_sync(&config, &host);
     emit_first_run_intro(&config, &runtime).await;
-    let runtime_service = RuntimeServiceHandle::new(&config)?;
+    runtime_service.mark_healthy();
 
     let tcp_router = http::router(
         AppState::for_tcp_with_runtime_service(host.clone(), Some(runtime_service.clone()))
@@ -884,30 +928,34 @@ async fn serve(mut config: AppConfig, options: ServeOptions) -> Result<()> {
 
     #[cfg(unix)]
     {
-        ensure_socket_parent(&config.socket_path)?;
-        let unix_listener = tokio::net::UnixListener::bind(&config.socket_path)
-            .with_context(|| format!("failed to bind {}", config.socket_path.display()))?;
-        runtime_service.write_state_files(&config)?;
-        println!("Holon control socket on {}", config.socket_path.display());
-        let unix_router = http::router(
-            AppState::for_unix_with_runtime_service(host.clone(), Some(runtime_service.clone()))
-                .with_web_dist(web_dist.clone()),
-        );
-        let tcp_server = axum::serve(listener, tcp_router)
-            .with_graceful_shutdown(wait_for_shutdown(runtime_service.shutdown_signal()));
-        let unix_server = http::serve_unix(
-            unix_listener,
-            unix_router,
-            runtime_service.shutdown_signal(),
-        );
+        let tcp_server = async {
+            axum::serve(listener, tcp_router)
+                .with_graceful_shutdown(wait_for_shutdown(runtime_service.shutdown_signal()))
+                .await
+                .context("TCP server failed")?;
+            Ok::<(), anyhow::Error>(())
+        };
+        let unix_server =
+            unix_server.expect("unix control server was initialized before runtime recovery");
+        let unix_server = async {
+            unix_server
+                .await
+                .context("unix control server task failed")??;
+            Ok::<(), anyhow::Error>(())
+        };
         let result = if let Some(local) = local_listener {
             let local_router = http::router(
                 AppState::for_tcp_with_runtime_service(host.clone(), Some(runtime_service.clone()))
                     .with_advertise_url(advertise_url.clone())
                     .with_web_dist(web_dist.clone()),
             );
-            let local_server = axum::serve(local, local_router)
-                .with_graceful_shutdown(wait_for_shutdown(runtime_service.shutdown_signal()));
+            let local_server = async {
+                axum::serve(local, local_router)
+                    .with_graceful_shutdown(wait_for_shutdown(runtime_service.shutdown_signal()))
+                    .await
+                    .context("localhost server failed")?;
+                Ok::<(), anyhow::Error>(())
+            };
             tokio::try_join!(tcp_server, unix_server, local_server)
                 .map(|_| ())
                 .context("runtime servers failed")
@@ -1046,13 +1094,23 @@ async fn dump_prompt(
     text: String,
     agent: Option<String>,
     authority_class: AuthorityClass,
+    manifest: bool,
+    budget: Option<usize>,
 ) -> Result<()> {
     let host = RuntimeHost::new(config.clone())?;
     let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
-    let prompt = host
-        .preview_agent_prompt(&agent, text, authority_class)
-        .await?;
-    println!("{}", prompt.render_dump());
+    let prompt = if let Some(budget) = budget {
+        host.preview_agent_prompt_with_budget(&agent, text, authority_class, budget)
+            .await?
+    } else {
+        host.preview_agent_prompt(&agent, text, authority_class)
+            .await?
+    };
+    if manifest {
+        print!("{}", prompt.projection_manifest().canonical_json()?);
+    } else {
+        println!("{}", prompt.render_dump());
+    }
     Ok(())
 }
 
@@ -1086,6 +1144,7 @@ mod tests {
             max_relevant_episodes: 3,
             control_token: Some("secret".into()),
             control_auth_mode: ControlAuthMode::Auto,
+            auth: Default::default(),
             api_cors: Default::default(),
             config_file_path: home.join("config.json"),
             stored_config: Default::default(),
@@ -1098,7 +1157,6 @@ mod tests {
             default_tool_output_tokens: 8_000,
             max_tool_output_tokens: 64_000,
             disable_provider_fallback: false,
-            scheduler_engine: holon::config::SchedulerEngineMode::Canonical,
             tui_alternate_screen: AltScreenMode::Auto,
             validated_model_overrides: Default::default(),
             validated_unknown_model_fallback: None,
@@ -1106,6 +1164,30 @@ mod tests {
             providers: provider_registry_for_tests(None, Some("dummy"), home.join(".codex")),
             web_config: holon::web::WebConfig::default(),
         }
+    }
+
+    #[test]
+    fn agent_cli_context_without_inherited_authority_rejects_operator_fallback() {
+        let error = authority_class_for_cli_context(Some(AgentInvocationContext {
+            caller_agent_id: "agent-a".into(),
+            source_task_id: None,
+            source_turn_id: None,
+            source_work_item_id: None,
+            source_activation_id: None,
+            inherited_authority_class: None,
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains(HOLON_CALLER_AUTHORITY_CLASS_ENV));
+        assert!(error.to_string().contains("operator authority"));
+    }
+
+    #[test]
+    fn context_free_cli_uses_operator_authority() {
+        assert_eq!(
+            authority_class_for_cli_context(None).unwrap(),
+            AuthorityClass::OperatorInstruction
+        );
     }
 
     #[test]
@@ -1172,7 +1254,7 @@ mod tests {
             "/tmp/holon.token",
         ]);
         let Commands::Daemon {
-            command: DaemonCommands::Start { options },
+            command: DaemonCommands::Start { options, .. },
         } = cli.command
         else {
             panic!("expected daemon start command");
@@ -1345,7 +1427,79 @@ mod tests {
     }
 
     #[test]
+    fn timer_commands_parse_new_and_legacy_creation_shapes() {
+        let cli = Cli::parse_from(["holon", "timer", "--after-ms", "100", "--every-ms", "50"]);
+        let Commands::Timer { command, legacy } = cli.command else {
+            panic!("expected timer command");
+        };
+        assert!(command.is_none());
+        assert_eq!(legacy.after_ms, Some(100));
+        assert_eq!(legacy.every_ms, Some(50));
+
+        let cli = Cli::parse_from([
+            "holon",
+            "timer",
+            "create",
+            "--after-ms",
+            "100",
+            "--agent",
+            "runner",
+        ]);
+        let Commands::Timer {
+            command:
+                Some(TimerCommands::Create {
+                    options:
+                        TimerCreateArgs {
+                            after_ms, agent, ..
+                        },
+                }),
+            ..
+        } = cli.command
+        else {
+            panic!("expected timer create command");
+        };
+        assert_eq!(after_ms, 100);
+        assert_eq!(agent.as_deref(), Some("runner"));
+
+        let cli = Cli::parse_from(["holon", "timer", "list", "--limit", "10"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Timer {
+                command: Some(TimerCommands::List { limit: 10, .. }),
+                ..
+            }
+        ));
+
+        let cli = Cli::parse_from(["holon", "timer", "cancel", "timer-1"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Timer {
+                command: Some(TimerCommands::Cancel { timer_id, .. }),
+                ..
+            } if timer_id == "timer-1"
+        ));
+    }
+
+    #[test]
+    fn timer_command_rejects_conflicting_or_incomplete_shapes() {
+        assert!(Cli::try_parse_from(["holon", "timer", "--after-ms", "100", "list"]).is_err());
+        assert!(Cli::try_parse_from(["holon", "timer", "create"]).is_err());
+        assert!(Cli::try_parse_from(["holon", "timer", "list", "--limit", "0"]).is_err());
+    }
+
+    #[test]
     fn task_lifecycle_commands_parse_with_agent_options() {
+        let cli = Cli::parse_from(["holon", "task", "list", "--limit", "12"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Task {
+                command: TaskCommands::List {
+                    limit: 12,
+                    agent: None
+                }
+            }
+        ));
+
         let cli = Cli::parse_from(["holon", "task", "status", "task-1", "--agent", "runner"]);
         let Commands::Task {
             command: TaskCommands::Status { task_id, agent },
@@ -1452,6 +1606,28 @@ mod tests {
         };
         assert_eq!(work_item_id, "work_123");
         assert_eq!(agent, None);
+
+        assert!(Cli::try_parse_from(["holon", "work-item", "complete", "work_123"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "holon",
+            "work-item",
+            "complete",
+            "work_123",
+            "--report",
+            "completed"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "holon",
+            "work-item",
+            "complete",
+            "work_123",
+            "--report",
+            "completed",
+            "--report-file",
+            "-"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -1486,13 +1662,115 @@ mod tests {
             "--json",
         ]);
         let Commands::Debug {
-            command: DebugCommands::SchedulerRecovery { agent, json, apply },
+            command:
+                DebugCommands::SchedulerRecovery {
+                    agent,
+                    message_id,
+                    all_affected,
+                    json,
+                    apply,
+                    no_backup,
+                },
         } = cli.command
         else {
             panic!("expected debug scheduler-recovery command");
         };
         assert_eq!(agent.as_deref(), Some("pm"));
+        assert!(message_id.is_none());
+        assert!(!all_affected);
         assert!(json);
+        assert!(!apply);
+        assert!(!no_backup);
+    }
+
+    #[test]
+    fn debug_scheduler_recovery_all_affected_conflicts_with_selectors() {
+        let cli = Cli::parse_from([
+            "holon",
+            "debug",
+            "scheduler-recovery",
+            "--all-affected",
+            "--json",
+        ]);
+        let Commands::Debug {
+            command:
+                DebugCommands::SchedulerRecovery {
+                    agent,
+                    message_id,
+                    all_affected,
+                    json,
+                    apply,
+                    no_backup,
+                },
+        } = cli.command
+        else {
+            panic!("expected debug scheduler-recovery command");
+        };
+        assert!(agent.is_none());
+        assert!(message_id.is_none());
+        assert!(all_affected);
+        assert!(json);
+        assert!(!apply);
+        assert!(!no_backup);
+
+        for selector in [["--agent", "pm"], ["--message-id", "message-1"]] {
+            assert!(Cli::try_parse_from([
+                "holon",
+                "debug",
+                "scheduler-recovery",
+                "--all-affected",
+                selector[0],
+                selector[1],
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn debug_scheduler_recovery_no_backup_requires_apply() {
+        assert!(
+            Cli::try_parse_from(["holon", "debug", "scheduler-recovery", "--no-backup",]).is_err()
+        );
+
+        let cli = Cli::parse_from([
+            "holon",
+            "debug",
+            "scheduler-recovery",
+            "--apply",
+            "--no-backup",
+        ]);
+        let Commands::Debug {
+            command:
+                DebugCommands::SchedulerRecovery {
+                    apply, no_backup, ..
+                },
+        } = cli.command
+        else {
+            panic!("expected debug scheduler-recovery command");
+        };
+        assert!(apply);
+        assert!(no_backup);
+    }
+
+    #[test]
+    fn debug_scheduler_recovery_command_parses_message_selector() {
+        let cli = Cli::parse_from([
+            "holon",
+            "debug",
+            "scheduler-recovery",
+            "--message-id",
+            "message:task-restart:task-1",
+        ]);
+        let Commands::Debug {
+            command:
+                DebugCommands::SchedulerRecovery {
+                    message_id, apply, ..
+                },
+        } = cli.command
+        else {
+            panic!("expected debug scheduler-recovery command");
+        };
+        assert_eq!(message_id.as_deref(), Some("message:task-restart:task-1"));
         assert!(!apply);
     }
 
@@ -1561,6 +1839,10 @@ mod tests {
     #[test]
     fn hidden_offline_scheduler_commands_skip_runtime_model_resolution() {
         for args in [
+            vec!["holon", "context"],
+            vec!["holon", "commands"],
+            vec!["holon", "events", "tail", "--agent", "runner", "--offline"],
+            vec!["holon", "debug", "scheduler-recovery"],
             vec![
                 "holon",
                 "debug",
@@ -1581,9 +1863,60 @@ mod tests {
             let cli = Cli::parse_from(args);
             assert!(runtime_command_uses_config_inspection(&cli.command));
         }
+    }
 
-        let cli = Cli::parse_from(["holon", "debug", "scheduler-recovery"]);
-        assert!(!runtime_command_uses_config_inspection(&cli.command));
+    #[test]
+    fn offline_event_page_reads_runtime_db_in_stable_envelope_shape() {
+        let config = test_config();
+        let runtime_db =
+            RuntimeDb::open_and_migrate(config.runtime_db_path(), config.runtime_db_lock_path())
+                .unwrap();
+        runtime_db
+            .audit_events()
+            .append(
+                Some("runner"),
+                &AuditEvent::legacy(
+                    "provider_round_completed",
+                    serde_json::json!({ "round": 1, "input_tokens": 10 }),
+                ),
+            )
+            .unwrap();
+        runtime_db
+            .audit_events()
+            .append(
+                Some("runner"),
+                &AuditEvent::legacy("tool_executed", serde_json::json!({ "tool_name": "Read" })),
+            )
+            .unwrap();
+
+        let page = offline_event_page(
+            &config,
+            "runner",
+            None,
+            None,
+            1,
+            holon::cli::EventPageOrderCli::Asc,
+        )
+        .unwrap();
+
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].event_type, "provider_round_completed");
+        assert_eq!(page.events[0].payload["round"], 1);
+        assert_eq!(page.newest_seq, Some(page.events[0].event_seq));
+        assert!(page.has_newer);
+        assert!(!page.has_older);
+
+        let clamped = offline_event_page(
+            &config,
+            "runner",
+            None,
+            None,
+            0,
+            holon::cli::EventPageOrderCli::Asc,
+        )
+        .unwrap();
+        assert_eq!(clamped.limit, 1);
+        assert_eq!(clamped.events.len(), 1);
     }
 
     #[test]
@@ -1700,6 +2033,10 @@ mod tests {
             http_addr: config.http_addr.clone(),
             started_at: chrono::Utc::now(),
             config_fingerprint: "test-fingerprint".into(),
+            product_version: env!("HOLON_VERSION").into(),
+            control_protocol_version: holon::daemon::DAEMON_CONTROL_PROTOCOL_VERSION,
+            lifecycle_owner: holon::daemon::DaemonLifecycleOwner::Standalone,
+            executable_path: std::env::current_exe().unwrap(),
             serve_args: args.into_iter().map(String::from).collect(),
             control_token_env_configured,
         }
@@ -2262,8 +2599,18 @@ async fn handle_events_command(config: &AppConfig, command: EventsCommands) -> R
             order,
             max_level,
             agent,
+            offline,
         } => {
             let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
+            if offline {
+                anyhow::ensure!(
+                    max_level.is_none(),
+                    "--max-level is not supported with --offline"
+                );
+                return print_json(&serde_json::to_value(offline_event_page(
+                    config, &agent, before_seq, after_seq, limit, order,
+                )?)?);
+            }
             let client = LocalClient::new(config.clone())?;
             let page = client
                 .agent_events_page(
@@ -2306,13 +2653,104 @@ async fn handle_events_command(config: &AppConfig, command: EventsCommands) -> R
     }
 }
 
+fn offline_event_page(
+    config: &AppConfig,
+    agent_id: &str,
+    before_seq: Option<u64>,
+    after_seq: Option<u64>,
+    limit: usize,
+    order: holon::cli::EventPageOrderCli,
+) -> Result<holon::client::EventPageResponse> {
+    let limit = limit.clamp(1, holon::http::MAX_EVENT_STREAM_WINDOW);
+    let runtime_db =
+        RuntimeDb::open_and_migrate(config.runtime_db_path(), config.runtime_db_lock_path())?;
+    let descending = matches!(order, holon::cli::EventPageOrderCli::Desc);
+    let mut events = runtime_db.audit_events().range(
+        Some(agent_id),
+        before_seq,
+        after_seq,
+        descending,
+        limit.saturating_add(1),
+    )?;
+    let has_more = events.len() > limit;
+    if has_more {
+        events.truncate(limit);
+    }
+    let oldest_seq = events.iter().map(|event| event.event_seq).min();
+    let newest_seq = events.iter().map(|event| event.event_seq).max();
+    let event_log_epoch = runtime_db.event_log_epoch()?;
+    let envelopes = events
+        .into_iter()
+        .map(|event| holon::client::StreamEventEnvelope {
+            projection_effect: None,
+            id: event.id,
+            event_seq: event.event_seq,
+            event_log_epoch: Some(if event.event_log_epoch.is_empty() {
+                event_log_epoch.clone()
+            } else {
+                event.event_log_epoch
+            }),
+            contract_version: event.contract_version,
+            ts: event.created_at,
+            agent_id: agent_id.to_string(),
+            event_type: event.kind,
+            payload_schema: event.payload_schema,
+            payload_schema_version: event.payload_schema_version,
+            provenance: Some(event_replay_provenance(&event.data)),
+            payload: event.data,
+        })
+        .collect();
+    Ok(holon::client::EventPageResponse {
+        events: envelopes,
+        event_log_epoch,
+        oldest_seq,
+        newest_seq,
+        cursor_seq: runtime_db.audit_events().latest_event_seq(Some(agent_id))?,
+        has_older: descending && has_more,
+        has_newer: !descending && has_more,
+        order: order.to_string(),
+        limit,
+    })
+}
+
+fn event_replay_provenance(payload: &serde_json::Value) -> serde_json::Value {
+    let fields = [
+        "origin",
+        "authority_class",
+        "delivery_surface",
+        "admission_context",
+        "transport",
+        "source",
+        "reply_route",
+        "message_id",
+        "task_id",
+        "work_item_id",
+        "correlation_id",
+        "causation_id",
+    ];
+    serde_json::Value::Object(
+        fields
+            .into_iter()
+            .filter_map(|field| {
+                payload
+                    .get(field)
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                    .map(|value| (field.to_string(), value))
+            })
+            .collect(),
+    )
+}
+
 async fn handle_debug_command(config: AppConfig, command: DebugCommands) -> Result<()> {
     match command {
         DebugCommands::Prompt {
             text,
             agent,
             authority_class,
-        } => dump_prompt(config, text, agent, authority_class).await,
+            manifest,
+            budget,
+        } => dump_prompt(config, text, agent, authority_class, manifest, budget).await,
         DebugCommands::Latency {
             agent,
             limit,
@@ -2323,9 +2761,22 @@ async fn handle_debug_command(config: AppConfig, command: DebugCommands) -> Resu
         DebugCommands::SchedulerFixture { agent, output } => {
             export_scheduler_fixture(&config, agent, &output)
         }
-        DebugCommands::SchedulerRecovery { agent, json, apply } => {
-            print_scheduler_recovery_report(&config, agent, json, apply)
-        }
+        DebugCommands::SchedulerRecovery {
+            agent,
+            message_id,
+            all_affected,
+            json,
+            apply,
+            no_backup,
+        } => print_scheduler_recovery_report(
+            &config,
+            agent,
+            message_id,
+            all_affected,
+            json,
+            apply,
+            no_backup,
+        ),
         DebugCommands::SchedulerRecoveryFixture {
             agent,
             objective,
@@ -2393,52 +2844,73 @@ async fn seed_scheduler_restart_fixture(
 fn print_scheduler_recovery_report(
     config: &AppConfig,
     agent: Option<String>,
+    message_id: Option<String>,
+    all_affected: bool,
     json: bool,
     apply: bool,
+    no_backup: bool,
 ) -> Result<()> {
+    let runtime_db = RuntimeDb::open_for_scheduler_recovery(
+        config.runtime_db_path(),
+        config.runtime_db_lock_path(),
+    )?;
+    let _maintenance_lock = apply
+        .then(|| RuntimeDbLock::try_lock(config.runtime_db_maintenance_lock_path()))
+        .transpose()
+        .context("scheduler recovery apply requires holon serve to be stopped")?;
+    if all_affected {
+        return print_all_scheduler_recovery_reports(config, &runtime_db, json, apply, no_backup);
+    }
     let agent_id = agent.unwrap_or_else(|| config.default_agent_id.clone());
-    let host = RuntimeHost::new(config.clone())?;
-    let storage = host.agent_storage(&agent_id)?;
-    let mut report =
-        holon::runtime::scheduler_recovery_report(&storage, host.runtime_db(), &agent_id)?;
+    let storage = AppStorage::new_for_agent(
+        config.agent_root_dir().join(&agent_id),
+        agent_id.clone(),
+        runtime_db.clone(),
+    )?;
+    let mut report = holon::runtime::scheduler_recovery_report(&storage, &runtime_db, &agent_id)?;
+    filter_scheduler_recovery_report(&mut report, message_id.as_deref(), true)?;
     let mut apply_result = None;
     if apply {
-        let _maintenance_lock = RuntimeDbLock::try_lock(config.runtime_db_maintenance_lock_path())
-            .context("scheduler recovery apply requires holon serve to be stopped")?;
-        apply_result = Some(holon::runtime::apply_scheduler_recovery_plan(
-            &storage,
-            host.runtime_db(),
-            &agent_id,
-            &report,
-        )?);
-        report = holon::runtime::scheduler_recovery_report(&storage, host.runtime_db(), &agent_id)?;
+        let backup_policy = if no_backup {
+            holon::runtime::SchedulerRecoveryBackupPolicy::SkipApproved
+        } else {
+            holon::runtime::SchedulerRecoveryBackupPolicy::Required
+        };
+        apply_result = Some((
+            holon::runtime::apply_scheduler_recovery_plan_with_backup_policy(
+                &storage,
+                &runtime_db,
+                &agent_id,
+                &report,
+                backup_policy,
+            )?,
+            backup_policy,
+        ));
+        report = holon::runtime::scheduler_recovery_report(&storage, &runtime_db, &agent_id)?;
+        filter_scheduler_recovery_report(&mut report, message_id.as_deref(), false)?;
     }
     if json {
         return print_json(&serde_json::json!({
             "report": report,
-            "apply": apply_result.map(|(changed, backup_path)| serde_json::json!({
+            "apply": apply_result.map(|((changed, backup_path), backup_policy)| serde_json::json!({
                 "changed": changed,
                 "backup_path": backup_path,
+                "backup_policy": backup_policy,
+                "backup_created": backup_path.is_some(),
             })),
         }));
     }
     println!(
-        "Scheduler recovery candidates for {} (partition initialized: {})",
-        report.agent_id, report.partition_initialized
+        "Scheduler recovery candidates for {} (execution partition initialized: {})",
+        report.agent_id, report.execution_partition_initialized
     );
-    println!(
-        "- retired rollout metadata: marked={} present={} mode={} stale_authoritative={}",
-        report.retired_rollout_metadata.retirement_marked,
-        report.retired_rollout_metadata.compatibility_data_present,
-        report.retired_rollout_metadata.protocol_mode,
-        report
-            .retired_rollout_metadata
-            .stale_authoritative_scenario_count,
-    );
-    if let Some((changed, backup_path)) = apply_result {
+    if let Some(((changed, backup_path), backup_policy)) = apply_result {
         println!(
-            "- applied recovery changes={} backup={}",
+            "- applied recovery changes={} backup_policy={} backup={}",
             changed,
+            serde_json::to_value(backup_policy)?
+                .as_str()
+                .unwrap_or("unknown"),
             backup_path
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "not-created".into())
@@ -2453,13 +2925,378 @@ fn print_scheduler_recovery_report(
             candidate.target_queue_status
         );
     }
-    for candidate in report.legacy_adoptions {
+    for candidate in report.task_result_claim_recoveries {
         println!(
-            "- work_item:{}: adoption eligible={} reason={}",
-            candidate.work_item_id, candidate.eligible, candidate.reason
+            "- task_result_claim:{} attempt={} work_item={} health={:?} lane_blocked={} age_seconds={} eligible={} decision={} generation={} reason={} target={:?}",
+            candidate.message_id,
+            candidate.activation_id,
+            candidate.work_item_id,
+            candidate.health,
+            candidate.lane_blocked,
+            candidate.claim_age_seconds,
+            candidate.eligible,
+            candidate.recovery_decision,
+            candidate.recovery_generation,
+            candidate.reason,
+            candidate
+                .proposed_queue_entry
+                .as_ref()
+                .map(|entry| &entry.status),
+        );
+    }
+    for candidate in report.continuation_reconciliations {
+        println!(
+            "- continuation:{} parent={} stale_target={:?} active_target={} eligible={} reason={}",
+            candidate.continuation_id,
+            candidate.work_item_id,
+            candidate.stale_active_work_item_id,
+            candidate.active_work_item_id,
+            candidate.eligible,
+            candidate.reason,
         );
     }
     Ok(())
+}
+
+fn print_all_scheduler_recovery_reports(
+    config: &AppConfig,
+    runtime_db: &RuntimeDb,
+    json: bool,
+    apply: bool,
+    no_backup: bool,
+) -> Result<()> {
+    let before = runtime_db.retired_scheduler_cleanup_inventory()?;
+    let agent_ids = before.affected_agents();
+    let mut storages = Vec::with_capacity(agent_ids.len());
+    let mut reports = Vec::with_capacity(agent_ids.len());
+    let mut report_errors = Vec::new();
+    for agent_id in &agent_ids {
+        let storage = AppStorage::new_for_agent(
+            config.agent_root_dir().join(agent_id),
+            agent_id.clone(),
+            runtime_db.clone(),
+        )?;
+        match holon::runtime::scheduler_recovery_report(&storage, runtime_db, agent_id) {
+            Ok(report) => reports.push(Some(report)),
+            Err(error) => {
+                report_errors.push(serde_json::json!({
+                    "agent_id": agent_id,
+                    "error": format!("{error:#}"),
+                }));
+                reports.push(None);
+            }
+        }
+        storages.push(storage);
+    }
+
+    let mut changed = 0;
+    let mut backup_path = None;
+    let mut fallback_results = Vec::new();
+    if apply && !before.is_fixed_point() {
+        if !no_backup {
+            backup_path = Some(runtime_db.create_scheduler_recovery_backup()?);
+        }
+        for ((storage, report), agent_id) in storages.iter().zip(&reports).zip(&agent_ids) {
+            let Some(report) = report else {
+                continue;
+            };
+            changed += holon::runtime::apply_scheduler_recovery_plan_with_backup_policy(
+                storage,
+                runtime_db,
+                agent_id,
+                report,
+                holon::runtime::SchedulerRecoveryBackupPolicy::SkipApproved,
+            )?
+            .0;
+        }
+        let after_exact = runtime_db.retired_scheduler_cleanup_inventory()?;
+        for result in
+            runtime_db.apply_retired_scheduler_cleanup_fallbacks(&after_exact.affected_agents())?
+        {
+            changed += result.actions.len();
+            fallback_results.push(result);
+        }
+    }
+
+    let after = runtime_db.retired_scheduler_cleanup_inventory()?;
+    if json {
+        print_json(&serde_json::json!({
+            "before": before,
+            "reports": reports,
+            "report_errors": report_errors,
+            "apply": apply.then(|| serde_json::json!({
+                "changed": changed,
+                "backup_path": backup_path,
+                "backup_policy": if no_backup { "skip_approved" } else { "required" },
+                "backup_created": backup_path.is_some(),
+                "fallback_results": fallback_results,
+            })),
+            "after": after,
+        }))?;
+    } else {
+        println!(
+            "Scheduler recovery affected agents={} blockers={}",
+            agent_ids.join(","),
+            before.blockers.len()
+        );
+        for (agent_id, report) in agent_ids.iter().zip(&reports) {
+            if let Some(report) = report {
+                println!(
+                    "- {}: candidates={} task_result_claims={} continuations={}",
+                    report.agent_id,
+                    report.candidates.len(),
+                    report.task_result_claim_recoveries.len(),
+                    report.continuation_reconciliations.len(),
+                );
+            } else {
+                println!(
+                    "- {agent_id}: exact recovery report unavailable; typed fallback required"
+                );
+            }
+        }
+        if apply {
+            println!(
+                "- applied recovery changes={} fallbacks={} backup={}",
+                changed,
+                fallback_results.len(),
+                backup_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "not-created".into())
+            );
+        }
+        println!("- remaining blockers={}", after.blockers.len());
+    }
+    if apply && !after.is_fixed_point() {
+        return Err(anyhow!(
+            "scheduler recovery did not reach the retired scheduler cleanup fixed point: \
+             remaining_blockers={} affected_agents={}",
+            after.blockers.len(),
+            after.affected_agents().join(",")
+        ));
+    }
+    Ok(())
+}
+
+fn filter_scheduler_recovery_report(
+    report: &mut holon::runtime::SchedulerRecoveryReport,
+    message_id: Option<&str>,
+    require_match: bool,
+) -> Result<()> {
+    let Some(message_id) = message_id else {
+        return Ok(());
+    };
+    let matching = report
+        .task_result_claim_recoveries
+        .iter()
+        .filter(|candidate| candidate.message_id == message_id)
+        .count();
+    if matching > 1 || (require_match && matching != 1) {
+        return Err(anyhow!(
+            "scheduler recovery selector `{message_id}` matched {matching} TaskResult claim candidates; expected exactly one"
+        ));
+    }
+    report.candidates.clear();
+    report.continuation_reconciliations.clear();
+    report
+        .task_result_claim_recoveries
+        .retain(|candidate| candidate.message_id == message_id);
+    Ok(())
+}
+
+async fn handle_models_dev_command(command: ModelsDevCommands) -> Result<()> {
+    use holon::model_catalog::models_dev::{
+        audit_mappings, generate_artifact, parse_snapshot, MappingAuditReport, ProviderMapping,
+    };
+    use sha2::Digest;
+
+    match command {
+        ModelsDevCommands::Refresh { url, output_dir } => {
+            println!("Fetching models.dev snapshot from {url} …");
+            let response = reqwest::get(&url)
+                .await
+                .map_err(|e| anyhow!("failed to fetch models.dev snapshot: {e}"))?;
+            if !response.status().is_success() {
+                anyhow::bail!("models.dev fetch returned status {}", response.status());
+            }
+            let raw_json = response
+                .text()
+                .await
+                .map_err(|e| anyhow!("failed to read models.dev response: {e}"))?;
+            let fetched_at = chrono::Utc::now().to_rfc3339();
+            let sha = sha2::Sha256::digest(raw_json.as_bytes());
+            let upstream_revision = sha.iter().map(|b| format!("{b:02x}")).collect::<String>();
+
+            std::fs::create_dir_all(&output_dir)
+                .map_err(|e| anyhow!("failed to create output dir: {e}"))?;
+            let snapshot_path = output_dir.join("snapshot.json");
+            std::fs::write(&snapshot_path, &raw_json)
+                .map_err(|e| anyhow!("failed to write snapshot: {e}"))?;
+
+            let generated = generate_artifact(
+                &raw_json,
+                &upstream_revision,
+                &fetched_at,
+                env!("HOLON_VERSION"),
+            )
+            .map_err(|e| anyhow!("artifact generation failed: {e}"))?;
+
+            let artifact_path = output_dir.join("artifact.json");
+            let artifact_json = generated
+                .artifact
+                .to_json()
+                .map_err(|e| anyhow!("failed to serialize artifact: {e}"))?;
+            std::fs::write(&artifact_path, &artifact_json)
+                .map_err(|e| anyhow!("failed to write artifact: {e}"))?;
+
+            let parsed_snapshot =
+                parse_snapshot(&raw_json).map_err(|e| anyhow!("parse error: {e}"))?;
+            let report = audit_mappings(&parsed_snapshot, &ProviderMapping::default_mappings());
+
+            // Draft the supplemental catalog for allowlisted providers.
+            let supplement_path = output_dir.join("supplemental_catalog.json");
+            let previous_supplement = match std::fs::read_to_string(&supplement_path) {
+                Ok(raw) => Some(
+                    holon::model_catalog::models_dev::ModelsDevSupplement::parse(&raw)
+                        .map_err(|e| anyhow!("previous supplement invalid: {e}"))?,
+                ),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => {
+                    return Err(anyhow!("failed to read previous supplement: {err}"));
+                }
+            };
+            let legacy = holon::model_catalog::legacy_builtin_catalog()
+                .map_err(|e| anyhow!("built-in catalog invalid: {e}"))?;
+            let cutoff = (chrono::Utc::now().date_naive()
+                - chrono::Duration::days(holon::model_catalog::models_dev::RECENCY_WINDOW_DAYS))
+            .format("%Y-%m-%d")
+            .to_string();
+            let update = holon::model_catalog::models_dev::supplement::generate(
+                &parsed_snapshot,
+                previous_supplement.as_ref(),
+                &legacy,
+                &cutoff,
+                &upstream_revision,
+                env!("HOLON_VERSION"),
+            )
+            .map_err(|e| anyhow!("supplement generation failed: {e}"))?;
+            let supplement_json = update
+                .supplement
+                .to_json()
+                .map_err(|e| anyhow!("failed to serialize supplement: {e}"))?;
+            std::fs::write(&supplement_path, format!("{supplement_json}\n"))
+                .map_err(|e| anyhow!("failed to write supplement: {e}"))?;
+            let summary = holon::model_catalog::models_dev::render_summary_markdown(&update);
+            let summary_path = output_dir.join("refresh-summary.md");
+            std::fs::write(&summary_path, &summary)
+                .map_err(|e| anyhow!("failed to write refresh summary: {e}"))?;
+
+            println!("Snapshot  → {}", snapshot_path.display());
+            println!(
+                "Artifact  → {} ({} models)",
+                artifact_path.display(),
+                generated.artifact.model_count()
+            );
+            println!("Mapped    → {} providers", report.mapped.len());
+            println!(
+                "Unmapped  → {} upstream providers",
+                report.unmapped_upstream.len()
+            );
+            println!("Stale     → {} Holon mappings", report.stale_holon.len());
+            println!(
+                "Supplement→ {} ({} models: {} drafted, {} retained, {} removed, {} deferred)",
+                supplement_path.display(),
+                update.supplement.models.len(),
+                update.drafted.len(),
+                update.retained.len(),
+                update.removed.len(),
+                update.deferred.len()
+            );
+            println!("Summary   → {}", summary_path.display());
+            if !report.stale_holon.is_empty() {
+                eprintln!("WARNING: stale mappings (models.dev ID not in snapshot):");
+                for entry in &report.stale_holon {
+                    eprintln!("  {} → {}", entry.models_dev_id, entry.holon_provider_id);
+                }
+            }
+            Ok(())
+        }
+        ModelsDevCommands::Validate { input_dir } => {
+            let snapshot_path = input_dir.join("snapshot.json");
+            let artifact_path = input_dir.join("artifact.json");
+            let raw_json = std::fs::read_to_string(&snapshot_path)
+                .map_err(|e| anyhow!("failed to read snapshot: {e}"))?;
+            let artifact_json = std::fs::read_to_string(&artifact_path)
+                .map_err(|e| anyhow!("failed to read artifact: {e}"))?;
+            let artifact: holon::model_catalog::models_dev::ModelsDevArtifact =
+                serde_json::from_str(&artifact_json)
+                    .map_err(|e| anyhow!("failed to parse artifact JSON: {e}"))?;
+            artifact
+                .validate()
+                .map_err(|e| anyhow!("artifact validation failed: {e}"))?;
+            let snapshot =
+                parse_snapshot(&raw_json).map_err(|e| anyhow!("failed to parse snapshot: {e}"))?;
+            let report = audit_mappings(&snapshot, &ProviderMapping::default_mappings());
+            println!("Artifact valid ({} models)", artifact.model_count());
+            println!(
+                "Audit: mapped={}, unmapped={}, stale={}",
+                report.mapped.len(),
+                report.unmapped_upstream.len(),
+                report.stale_holon.len()
+            );
+            if !report.stale_holon.is_empty() {
+                eprintln!(
+                    "WARNING: {} stale mapping(s) need attention",
+                    report.stale_holon.len()
+                );
+            }
+            let supplement_path = input_dir.join("supplemental_catalog.json");
+            if supplement_path.exists() {
+                let raw = std::fs::read_to_string(&supplement_path)
+                    .map_err(|e| anyhow!("failed to read supplement: {e}"))?;
+                let supplement = holon::model_catalog::models_dev::ModelsDevSupplement::parse(&raw)
+                    .map_err(|e| anyhow!("supplement validation failed: {e}"))?;
+                let legacy = holon::model_catalog::legacy_builtin_catalog()
+                    .map_err(|e| anyhow!("built-in catalog invalid: {e}"))?;
+                let mut catalog = legacy.clone();
+                supplement
+                    .apply_to(&mut catalog)
+                    .map_err(|e| anyhow!("supplement validation failed: {e}"))?;
+                println!("Supplement valid ({} models)", supplement.models.len());
+            }
+            Ok(())
+        }
+        ModelsDevCommands::Audit { snapshot, json } => {
+            let raw_json = std::fs::read_to_string(&snapshot)
+                .map_err(|e| anyhow!("failed to read snapshot: {e}"))?;
+            let parsed =
+                parse_snapshot(&raw_json).map_err(|e| anyhow!("failed to parse snapshot: {e}"))?;
+            let report: MappingAuditReport =
+                audit_mappings(&parsed, &ProviderMapping::default_mappings());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .map_err(|e| anyhow!("failed to serialize audit: {e}"))?
+                );
+            } else {
+                println!("Provider mapping audit");
+                println!("Mapped ({}):", report.mapped.len());
+                for entry in &report.mapped {
+                    println!("  {} → {}", entry.models_dev_id, entry.holon_provider_id);
+                }
+                println!("Unmapped upstream ({}):", report.unmapped_upstream.len());
+                for id in &report.unmapped_upstream {
+                    println!("  {id}");
+                }
+                println!("Stale Holon mappings ({}):", report.stale_holon.len());
+                for entry in &report.stale_holon {
+                    println!("  {} → {}", entry.models_dev_id, entry.holon_provider_id);
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 fn handle_runtime_db_debug_command(
@@ -2467,6 +3304,49 @@ fn handle_runtime_db_debug_command(
     command: holon::cli::RuntimeDbDebugCommands,
 ) -> Result<()> {
     match command {
+        holon::cli::RuntimeDbDebugCommands::Audit {
+            check,
+            baseline_through,
+            sample_limit,
+            json,
+        } => {
+            let check = match check {
+                holon::cli::RuntimeDbAuditCheckArg::ProjectionEffects => {
+                    RuntimeDbAuditCheck::ProjectionEffects
+                }
+                holon::cli::RuntimeDbAuditCheckArg::BriefIntegrity => {
+                    RuntimeDbAuditCheck::BriefIntegrity
+                }
+                holon::cli::RuntimeDbAuditCheckArg::All => RuntimeDbAuditCheck::All,
+            };
+            let baseline_through = baseline_through
+                .map(|value| {
+                    chrono::DateTime::parse_from_rfc3339(&value)
+                        .with_context(|| {
+                            format!("invalid --baseline-through RFC3339 timestamp `{value}`")
+                        })
+                        .map(|value| value.with_timezone(&chrono::Utc))
+                })
+                .transpose()?;
+            let db = RuntimeDb::open_and_migrate(
+                config.runtime_db_path(),
+                config.runtime_db_lock_path(),
+            )?;
+            let report = db.audit(RuntimeDbAuditOptions {
+                check,
+                baseline_through,
+                sample_limit,
+            })?;
+            if json {
+                print_json(&serde_json::to_value(&report)?)?;
+            } else {
+                print_runtime_db_audit_human(&report);
+            }
+            if report.has_new_violations() {
+                return Err(anyhow!("runtime database audit found new violations"));
+            }
+            Ok(())
+        }
         holon::cli::RuntimeDbDebugCommands::Retention { dry_run, json } => {
             let policy = config.runtime_db_retention_policy()?;
             let db = RuntimeDb::open_and_migrate(
@@ -2499,6 +3379,84 @@ fn handle_runtime_db_debug_command(
             } else {
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
+            }
+        }
+    }
+}
+
+fn print_runtime_db_audit_human(report: &RuntimeDbAuditReport) {
+    println!("runtime database audit");
+    println!("  path: {}", report.database.path);
+    println!("  schema version: {}", report.database.schema_version);
+    println!("  runtime id: {}", report.database.runtime_id);
+    println!("  event-log epoch: {}", report.database.event_log_epoch);
+    println!(
+        "  baseline through: {}",
+        report
+            .baseline
+            .baseline_through
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_else(|| "<none; findings count as new violations>".to_string())
+    );
+    if let Some(audit) = &report.projection_effects {
+        println!("projection effects");
+        println!(
+            "  unsupported: historical_baseline={} new_violation={}",
+            audit.totals.historical_baseline, audit.totals.new_violation
+        );
+        for group in &audit.groups {
+            println!(
+                "  agent={} kind={} contract={} schema={}@{} classification={} effect={} reason={} count={} historical_baseline={} new_violation={} samples={}",
+                group.agent_id,
+                group.kind,
+                group.contract_version,
+                if group.payload_schema.is_empty() {
+                    "<legacy>"
+                } else {
+                    &group.payload_schema
+                },
+                group.payload_schema_version,
+                group.classification,
+                group.projection_effect.unwrap_or("-"),
+                group.unsupported_reason.unwrap_or("-"),
+                group.count,
+                group.historical_baseline,
+                group.new_violation,
+                group.sample_event_ids.join(","),
+            );
+        }
+    }
+    if let Some(audit) = &report.brief_integrity {
+        println!("brief integrity");
+        for agent in &audit.agents {
+            println!(
+                "  agent={} retained_event_floor={} event_head={} operator_messages={} terminal_turns={} deliveries={} briefs={} brief_created_events={} valid_linked_briefs={}",
+                agent.agent_id,
+                agent
+                    .retained_event_floor
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                agent
+                    .event_head
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                agent.counts.operator_messages,
+                agent.counts.terminal_turns,
+                agent.counts.operator_visible_assistant_deliveries,
+                agent.counts.canonical_briefs,
+                agent.counts.brief_created_events,
+                agent.counts.valid_linked_briefs,
+            );
+            for category in &agent.categories {
+                println!(
+                    "    category={} observable_offline={} historical_baseline={} new_violation={} samples={} description={}",
+                    category.category,
+                    category.observable_offline,
+                    category.historical_baseline,
+                    category.new_violation,
+                    category.sample_ids.join(","),
+                    category.description,
+                );
             }
         }
     }
@@ -3053,31 +4011,42 @@ fn format_duration_ms(duration_ms: u64) -> String {
 
 async fn handle_daemon_command(config: AppConfig, command: DaemonCommands) -> Result<()> {
     let value = match command {
-        DaemonCommands::Start { options } => {
+        DaemonCommands::Start {
+            options,
+            start_timeout,
+        } => {
             let mut config = config;
             let serve_launch = serve_args_for_options(&options);
             apply_serve_options(&mut config, options)?;
             serde_json::to_value(
-                daemon_start(
+                daemon_start_with_timeout(
                     &config,
                     &serve_launch.args,
                     serve_launch.control_token_env.as_deref(),
+                    start_timeout,
                 )
                 .await?,
             )?
         }
         DaemonCommands::Stop => serde_json::to_value(daemon_stop(&config).await?)?,
+        DaemonCommands::PrepareUpdate => {
+            serde_json::to_value(daemon_prepare_update(&config).await?)?
+        }
         DaemonCommands::Status => serde_json::to_value(daemon_status(&config).await?)?,
-        DaemonCommands::Restart { options } => {
+        DaemonCommands::Restart {
+            options,
+            start_timeout,
+        } => {
             let mut config = config;
             let metadata = holon::daemon::load_daemon_metadata(&config)?;
             let serve_launch =
                 restart_serve_launch_options(&mut config, options, metadata.as_ref())?;
             serde_json::to_value(
-                daemon_restart(
+                daemon_restart_with_timeout(
                     &config,
                     &serve_launch.args,
                     serve_launch.control_token_env.as_deref(),
+                    start_timeout,
                 )
                 .await?,
             )?
@@ -3117,6 +4086,12 @@ async fn handle_workspace_command(config: &AppConfig, command: WorkspaceCommands
 async fn handle_task_command(config: &AppConfig, command: TaskCommands) -> Result<()> {
     let client = LocalClient::new(config.clone())?;
     match command {
+        TaskCommands::List { limit, agent } => {
+            let agent = cli_target_agent(config, agent)?;
+            print_json(&serde_json::to_value(
+                client.agent_tasks(&agent, limit).await?,
+            )?)
+        }
         TaskCommands::Run {
             summary,
             cmd,
@@ -3128,7 +4103,7 @@ async fn handle_task_command(config: &AppConfig, command: TaskCommands) -> Resul
             max_output_tokens,
             agent,
         } => {
-            let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
+            let agent = cli_target_agent(config, agent)?;
             post_control_json(
                 config,
                 &format!("/control/agents/{agent}/tasks"),
@@ -3142,13 +4117,14 @@ async fn handle_task_command(config: &AppConfig, command: TaskCommands) -> Resul
                     yield_time_ms,
                     max_output_tokens,
                     accepts_input: Some(false),
-                    authority_class: Some(AuthorityClass::OperatorInstruction),
+                    authority_class: Some(cli_authority_class()?),
+                    invocation_context: cli_invocation_context()?,
                 },
             )
             .await
         }
         TaskCommands::Status { task_id, agent } => {
-            let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
+            let agent = cli_target_agent(config, agent)?;
             print_json(&serde_json::to_value(
                 client.task_status(&agent, &task_id).await?,
             )?)
@@ -3159,7 +4135,7 @@ async fn handle_task_command(config: &AppConfig, command: TaskCommands) -> Resul
             timeout_ms,
             agent,
         } => {
-            let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
+            let agent = cli_target_agent(config, agent)?;
             print_json(&serde_json::to_value(
                 client
                     .task_output(&agent, &task_id, block, timeout_ms)
@@ -3171,15 +4147,54 @@ async fn handle_task_command(config: &AppConfig, command: TaskCommands) -> Resul
             text,
             agent,
         } => {
-            let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
-            print_json(&serde_json::to_value(
-                client.task_input(&agent, &task_id, text).await?,
-            )?)
+            let agent = cli_target_agent(config, agent)?;
+            post_control_json(
+                config,
+                &format!("/control/agents/{agent}/tasks/{task_id}/input"),
+                &TaskInputRequest {
+                    text,
+                    authority_class: Some(cli_authority_class()?),
+                    invocation_context: cli_invocation_context()?,
+                },
+            )
+            .await
         }
         TaskCommands::Stop { task_id, agent } => {
+            let agent = cli_target_agent(config, agent)?;
+            post_control_json(
+                config,
+                &format!("/control/agents/{agent}/tasks/{task_id}/stop"),
+                &TaskStopRequest {
+                    authority_class: Some(cli_authority_class()?),
+                    invocation_context: cli_invocation_context()?,
+                },
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_timer_command(config: &AppConfig, command: TimerCommands) -> Result<()> {
+    let client = LocalClient::new(config.clone())?;
+    match command {
+        TimerCommands::Create { options } => {
+            let agent = options
+                .agent
+                .unwrap_or_else(|| config.default_agent_id.clone());
+            print_json(&serde_json::to_value(
+                client
+                    .create_timer(&agent, options.after_ms, options.every_ms, options.summary)
+                    .await?,
+            )?)
+        }
+        TimerCommands::List { limit, agent } => {
+            let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
+            print_json(&serde_json::to_value(client.timers(&agent, limit).await?)?)
+        }
+        TimerCommands::Cancel { timer_id, agent } => {
             let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
             print_json(&serde_json::to_value(
-                client.task_stop(&agent, &task_id).await?,
+                client.cancel_timer(&agent, &timer_id).await?,
             )?)
         }
     }
@@ -3189,7 +4204,7 @@ async fn handle_work_item_command(config: &AppConfig, command: WorkItemCommands)
     let client = LocalClient::new(config.clone())?;
     match command {
         WorkItemCommands::List { limit, agent } => {
-            let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
+            let agent = cli_target_agent(config, agent)?;
             print_json(&serde_json::to_value(
                 client.agent_work_items(&agent, limit).await?,
             )?)
@@ -3198,12 +4213,160 @@ async fn handle_work_item_command(config: &AppConfig, command: WorkItemCommands)
             work_item_id,
             agent,
         } => {
-            let agent = agent.unwrap_or_else(|| config.default_agent_id.clone());
+            let agent = cli_target_agent(config, agent)?;
             print_json(&serde_json::to_value(
                 client.work_item(&agent, &work_item_id).await?,
             )?)
         }
+        WorkItemCommands::Create { objective, agent } => {
+            let agent = cli_target_agent(config, agent)?;
+            post_control_json(
+                config,
+                &format!("/control/agents/{agent}/work-items"),
+                &CreateWorkItemRequest {
+                    objective,
+                    authority_class: Some(cli_authority_class()?),
+                    invocation_context: cli_invocation_context()?,
+                },
+            )
+            .await
+        }
+        WorkItemCommands::Pick {
+            work_item_id,
+            reason,
+            clear_blocker,
+            agent,
+        } => {
+            let agent = cli_target_agent(config, agent)?;
+            post_control_json(
+                config,
+                &format!("/control/agents/{agent}/work-items/{work_item_id}/pick"),
+                &PickWorkItemRequest {
+                    reason,
+                    clear_blocker,
+                    authority_class: Some(cli_authority_class()?),
+                    invocation_context: cli_invocation_context()?,
+                },
+            )
+            .await
+        }
+        WorkItemCommands::Update {
+            work_item_id,
+            objective,
+            plan_status,
+            todo_json,
+            blocked_by_json,
+            recheck_after,
+            agent,
+        } => {
+            let agent = cli_target_agent(config, agent)?;
+            let plan_status = plan_status
+                .map(|value| parse_work_item_plan_status(&value))
+                .transpose()?;
+            let todo_list = todo_json
+                .map(|value| serde_json::from_str::<Vec<TodoItem>>(&value))
+                .transpose()
+                .context("--todo-json must contain a JSON array of todo items")?;
+            let blocked_by = blocked_by_json
+                .map(|value| serde_json::from_str::<serde_json::Value>(&value))
+                .transpose()
+                .context("--blocked-by-json must contain valid JSON")?;
+            post_control_json(
+                config,
+                &format!("/control/agents/{agent}/work-items/{work_item_id}"),
+                &UpdateWorkItemRequest {
+                    objective,
+                    plan_status,
+                    todo_list,
+                    blocked_by,
+                    recheck_after,
+                    authority_class: Some(cli_authority_class()?),
+                    invocation_context: cli_invocation_context()?,
+                },
+            )
+            .await
+        }
+        WorkItemCommands::Complete {
+            work_item_id,
+            report,
+            report_file,
+            agent,
+        } => {
+            let agent = cli_target_agent(config, agent)?;
+            let report_text = read_report_input(report, report_file)?;
+            post_control_json(
+                config,
+                &format!("/control/agents/{agent}/work-items/{work_item_id}/complete"),
+                &CompleteWorkItemRequest {
+                    report_text,
+                    authority_class: Some(cli_authority_class()?),
+                    invocation_context: cli_invocation_context()?,
+                },
+            )
+            .await
+        }
     }
+}
+
+fn cli_target_agent(config: &AppConfig, explicit: Option<String>) -> Result<String> {
+    let context = cli_invocation_context()?;
+    if let Some(agent) = explicit {
+        return Ok(agent);
+    }
+    Ok(context
+        .map(|context| context.caller_agent_id)
+        .unwrap_or_else(|| config.default_agent_id.clone()))
+}
+
+fn cli_invocation_context() -> Result<Option<AgentInvocationContext>> {
+    AgentInvocationContext::from_env().map_err(|error| anyhow!(error))
+}
+
+fn cli_authority_class() -> Result<AuthorityClass> {
+    authority_class_for_cli_context(cli_invocation_context()?)
+}
+
+fn authority_class_for_cli_context(
+    context: Option<AgentInvocationContext>,
+) -> Result<AuthorityClass> {
+    match context {
+        Some(context) => context.inherited_authority_class.ok_or_else(|| {
+            anyhow!(
+                "agent invocation context is missing {HOLON_CALLER_AUTHORITY_CLASS_ENV}; \
+                 refusing to fall back to operator authority"
+            )
+        }),
+        None => Ok(AuthorityClass::OperatorInstruction),
+    }
+}
+
+fn parse_work_item_plan_status(value: &str) -> Result<WorkItemPlanStatus> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "draft" => Ok(WorkItemPlanStatus::Draft),
+        "ready" => Ok(WorkItemPlanStatus::Ready),
+        "needs_input" | "needs-input" => Ok(WorkItemPlanStatus::NeedsInput),
+        _ => Err(anyhow!(
+            "invalid --plan-status {value:?}; expected draft, ready, or needs_input"
+        )),
+    }
+}
+
+fn read_report_input(report: Option<String>, report_file: Option<PathBuf>) -> Result<String> {
+    if let Some(report) = report {
+        return Ok(report);
+    }
+    let Some(path) = report_file else {
+        return Err(anyhow!(
+            "one of --report or --report-file <path|-> is required"
+        ));
+    };
+    if path == Path::new("-") {
+        let mut report = String::new();
+        std::io::stdin().read_to_string(&mut report)?;
+        return Ok(report);
+    }
+    fs::read_to_string(&path)
+        .with_context(|| format!("failed to read completion report {}", path.display()))
 }
 
 async fn handle_agent_command(config: &AppConfig, command: Option<AgentCommands>) -> Result<()> {

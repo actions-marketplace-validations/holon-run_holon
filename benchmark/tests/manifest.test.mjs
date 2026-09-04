@@ -4,13 +4,23 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import {
   ensureBaseShaExists,
+  loadBenchmarkSuite,
+  loadRealTaskManifest,
+  resolveRepoPath,
   validateBenchmarkSuite,
   validateRealTaskManifest
 } from "../lib/manifest.mjs";
 import {
+  assertHolonFixtureModel,
+  assertHolonProviderRoundTelemetry,
+  buildHolonFixtureConfig,
+  buildHolonFixtureEnv,
+  buildFixtureHolonRunArgs,
+  buildPairedSummary,
   buildHolonBenchmarkEnv,
   buildOperatorPrompt,
   classifyVerificationResult,
@@ -19,27 +29,277 @@ import {
   classifyHolonBenchmarkCompletion,
   collectChangedFilesFromGitOutputs,
   copyHolonProviderHttpTraceArtifacts,
+  canonicalHolonModelRef,
   captureHolonProviderRequests,
   codexBenchmarkConfigToml,
   detectScopeViolation,
   evaluateRealTaskSuccess,
+  orderPairedRunners,
+  normalizeHolonEventEnvelope,
+  normalizeProviderRoundUsage,
   parseClaudeCliJsonl,
   parseCodexJsonl,
+  resolveDriverHolonBinary,
+  resolveHolonFixtureProvider,
+  readHolonAuditEvents,
   selectHolonFinalMessage,
+  selectHolonToolExecutions,
+  shouldRunManifestVerifier,
   summarizeHolonTokenOptimization,
   tokenOptimizationEvents
 } from "../run.mjs";
 import {
+  artifactDirForTask,
   benchmarkLabelsForTask,
   branchNameForTask,
   prTitleForTask,
   worktreeNameForTask
 } from "../lib/naming.mjs";
 
+test("resolveDriverHolonBinary always selects the benchmark driver repository", () => {
+  const originalOverride = process.env.HOLON_BENCHMARK_BINARY;
+  const driverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+
+  try {
+    delete process.env.HOLON_BENCHMARK_BINARY;
+    assert.equal(
+      resolveDriverHolonBinary(),
+      path.join(driverRoot, "target", "release", "holon")
+    );
+
+    process.env.HOLON_BENCHMARK_BINARY = "target/benchmark/holon";
+    assert.equal(
+      resolveDriverHolonBinary(),
+      path.join(driverRoot, "target", "benchmark", "holon")
+    );
+  } finally {
+    if (originalOverride === undefined) {
+      delete process.env.HOLON_BENCHMARK_BINARY;
+    } else {
+      process.env.HOLON_BENCHMARK_BINARY = originalOverride;
+    }
+  }
+});
+
+test("resolveHolonFixtureProvider builds a local provider override", () => {
+  assert.deepEqual(
+    resolveHolonFixtureProvider({
+      holonModel: "ollama-responses/qwen3.8:27b-mlx",
+      holonProviderTransport: "openai_responses",
+      holonProviderBaseUrl: "http://127.0.0.1:11434/v1",
+      holonProviderApiKeyEnv: undefined,
+    }),
+    {
+      modelRef: "ollama-responses/qwen3.8:27b-mlx",
+      provider: "ollama-responses",
+      transport: "openai_responses",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      apiKeyEnv: undefined,
+    },
+  );
+});
+
+test("selectHolonToolExecutions falls back to durable runtime events", () => {
+  assert.deepEqual(
+    selectHolonToolExecutions(
+      [],
+      [
+        {
+          kind: "tool_executed",
+          data: {
+            tool_name: "ExecCommand",
+            duration_ms: 34,
+            input: { cmd: "pwd" },
+          },
+        },
+        {
+          kind: "provider_round_completed",
+          data: { round: 1 },
+        },
+      ],
+    ),
+    [
+      {
+        tool_name: "ExecCommand",
+        duration_ms: 34,
+        input: { cmd: "pwd" },
+      },
+    ],
+  );
+});
+
+test("selectHolonToolExecutions prefers the full artifact", () => {
+  const artifact = [{ tool_name: "Read", output: { content: "runtime.js" } }];
+  assert.equal(
+    selectHolonToolExecutions(artifact, [
+      { kind: "tool_executed", data: { tool_name: "ExecCommand" } },
+    ]),
+    artifact,
+  );
+});
+
+test("resolveHolonFixtureProvider rejects partial provider overrides", () => {
+  assert.throws(
+    () =>
+      resolveHolonFixtureProvider({
+        holonModel: "ollama-responses/qwen3.8:27b-mlx",
+        holonProviderTransport: "openai_responses",
+      }),
+    /requires --holon-model/,
+  );
+});
+
+test("canonicalHolonModelRef adds the default provider profile", () => {
+  assert.equal(
+    canonicalHolonModelRef("ollama-responses/qwen3.8:27b-mlx"),
+    "ollama-responses@default/qwen3.8:27b-mlx",
+  );
+  assert.equal(
+    canonicalHolonModelRef("ollama-responses@local/qwen3.8:27b-mlx"),
+    "ollama-responses@local/qwen3.8:27b-mlx",
+  );
+});
+
+test("assertHolonFixtureModel rejects a provider override that used the default model", () => {
+  assert.throws(
+    () =>
+      assertHolonFixtureModel(
+        [{ kind: "agent_created", data: { agent_id: "analysis-runtime" } }],
+        "ollama-anthropic/qwen3.8:27b-mlx",
+      ),
+    /emitted no provider round telemetry/,
+  );
+  assert.throws(
+    () =>
+      assertHolonFixtureModel(
+        [
+          {
+            kind: "provider_round_completed",
+            data: {
+              round: 1,
+              provider_attempt_timeline: {
+                winning_model_ref: "anthropic@default/claude-fable-5",
+              },
+            },
+          },
+        ],
+        "ollama-anthropic/qwen3.8:27b-mlx",
+      ),
+    /used anthropic@default\/claude-fable-5/,
+  );
+  assert.doesNotThrow(() =>
+    assertHolonFixtureModel(
+      [
+        {
+          kind: "provider_round_completed",
+          data: {
+            round: 1,
+            active_model: "ollama-anthropic@default/qwen3.8:27b-mlx",
+          },
+        },
+      ],
+      "ollama-anthropic/qwen3.8:27b-mlx",
+    ),
+  );
+});
+
+test("runtime fixture creates its public agent only on the first turn", () => {
+  const task = { mode: "runtime" };
+  assert.deepEqual(
+    buildFixtureHolonRunArgs(task, "inspect", "analysis-runtime", true),
+    [
+      "run",
+      "inspect",
+      "--agent",
+      "analysis-runtime",
+      "--create-agent",
+      "--json",
+      "--trust",
+      "trusted-operator",
+    ],
+  );
+  assert.equal(
+    buildFixtureHolonRunArgs(
+      task,
+      "continue",
+      "analysis-runtime",
+      false,
+    ).includes("--create-agent"),
+    false,
+  );
+});
+
+test("provider fixture config uses the requested model as the isolated runtime default", () => {
+  assert.deepEqual(
+    buildHolonFixtureConfig({
+      provider: "ollama-anthropic",
+      transport: "anthropic_messages",
+      baseUrl: "http://127.0.0.1:11434",
+      modelRef: "ollama-anthropic@default/qwen3.8:27b-mlx",
+    }),
+    {
+      model: {
+        default: "ollama-anthropic@default/qwen3.8:27b-mlx",
+        fallbacks: [],
+      },
+      providers: {
+        "ollama-anthropic": {
+          transport: "anthropic_messages",
+          base_url: "http://127.0.0.1:11434",
+          auth: {
+            source: "none",
+            kind: "none",
+          },
+        },
+      },
+    },
+  );
+});
+
+test("provider fixture config supports credentials supplied by environment", () => {
+  assert.deepEqual(
+    buildHolonFixtureConfig({
+      provider: "ollama-anthropic",
+      transport: "anthropic_messages",
+      baseUrl: "http://127.0.0.1:11434",
+      modelRef: "ollama-anthropic@default/qwen3.8:27b-mlx",
+      apiKeyEnv: "OLLAMA_API_KEY",
+    }).providers["ollama-anthropic"].auth,
+    {
+      source: "env",
+      kind: "api_key",
+      env: "OLLAMA_API_KEY",
+    },
+  );
+});
+
+test("provider fixture env overrides inherited model selection", () => {
+  assert.deepEqual(
+    buildHolonFixtureEnv(
+      {
+        HOLON_MODEL: "anthropic@default/claude-fable-5",
+        HOLON_DISABLE_PROVIDER_FALLBACK: "0",
+        HOLON_MODEL_FALLBACKS: "openai@default/gpt-5",
+      },
+      "/tmp/holon-home",
+      "/tmp/workspace",
+      {
+        modelRef: "ollama-anthropic/qwen3.8:27b-mlx",
+      },
+    ),
+    {
+      HOLON_MODEL: "ollama-anthropic/qwen3.8:27b-mlx",
+      HOLON_DISABLE_PROVIDER_FALLBACK: "1",
+      HOLON_HOME: "/tmp/holon-home",
+      HOLON_WORKSPACE_DIR: "/tmp/workspace",
+    },
+  );
+});
+
 test("validateRealTaskManifest accepts a phase-1 manifest", () => {
   const manifest = validateRealTaskManifest({
     schema_version: 1,
-    task_id: "holon-0015-tool-guidance-registry",
+    task_id: "holon-1611-tool-guidance-markdown",
     repo: { name: "holon-run/holon", local_path: "." },
     issue: { number: 15, title: "Dogfood task" },
     base: { branch: "main", sha: "abc123" },
@@ -63,13 +323,13 @@ test("validateRealTaskManifest accepts a phase-1 manifest", () => {
     metadata: { difficulty: "medium", benchmark_group: "prompt-system" }
   });
 
-  assert.equal(manifest.task_id, "holon-0015-tool-guidance-registry");
+  assert.equal(manifest.task_id, "holon-1611-tool-guidance-markdown");
 });
 
 test("validateRealTaskManifest allows issue-driven tasks without operator_prompt", () => {
   const manifest = validateRealTaskManifest({
     schema_version: 1,
-    task_id: "holon-0015-tool-guidance-registry",
+    task_id: "holon-1611-tool-guidance-markdown",
     repo: { name: "holon-run/holon", local_path: "." },
     issue: { number: 15, title: "Dogfood task" },
     base: { branch: "main", sha: "abc123" },
@@ -100,7 +360,7 @@ test("validateRealTaskManifest rejects unsupported keys and followups", () => {
     () =>
       validateRealTaskManifest({
         schema_version: 1,
-        task_id: "holon-0015-tool-guidance-registry",
+        task_id: "holon-1611-tool-guidance-markdown",
         repo: { name: "holon-run/holon", local_path: "." },
         issue: { number: 15, title: "Dogfood task" },
         base: { branch: "main", sha: "abc123" },
@@ -132,7 +392,7 @@ test("validateRealTaskManifest rejects empty verification commands and invalid p
     () =>
       validateRealTaskManifest({
         schema_version: 1,
-        task_id: "holon-0015-tool-guidance-registry",
+        task_id: "holon-1611-tool-guidance-markdown",
         repo: { name: "holon-run/holon", local_path: "." },
         issue: { number: 15, title: "Dogfood task" },
         base: { branch: "main", sha: "abc123" },
@@ -162,7 +422,7 @@ test("validateRealTaskManifest rejects empty verification commands and invalid p
 test("validateRealTaskManifest accepts structured verification commands", () => {
   const manifest = validateRealTaskManifest({
     schema_version: 1,
-    task_id: "holon-0015-tool-guidance-registry",
+    task_id: "holon-1611-tool-guidance-markdown",
     repo: { name: "holon-run/holon", local_path: "." },
     issue: { number: 15, title: "Dogfood task" },
     base: { branch: "main", sha: "abc123" },
@@ -197,7 +457,7 @@ test("validateRealTaskManifest accepts structured verification commands", () => 
 test("validateRealTaskManifest defaults absent verification for real PR benchmarks", () => {
   const manifest = validateRealTaskManifest({
     schema_version: 1,
-    task_id: "holon-0015-tool-guidance-registry",
+    task_id: "holon-1611-tool-guidance-markdown",
     repo: { name: "holon-run/holon", local_path: "." },
     issue: { number: 15, title: "Dogfood task" },
     base: { branch: "main", sha: "abc123" },
@@ -223,7 +483,7 @@ test("buildOperatorPrompt uses an issue-driven template with PR policy", () => {
   const prompt = buildOperatorPrompt(
     validateRealTaskManifest({
       schema_version: 1,
-      task_id: "holon-0015-tool-guidance-registry",
+      task_id: "holon-1611-tool-guidance-markdown",
       repo: { name: "holon-run/holon", local_path: "." },
       issue: { number: 15, title: "Dogfood task" },
       base: { branch: "main", sha: "abc123" },
@@ -427,7 +687,7 @@ test("buildOperatorPrompt preserves legacy push-only PR policy", () => {
   const prompt = buildOperatorPrompt(
     validateRealTaskManifest({
       schema_version: 1,
-      task_id: "holon-0015-tool-guidance-registry",
+      task_id: "holon-1611-tool-guidance-markdown",
       repo: { name: "holon-run/holon", local_path: "." },
       issue: { number: 15, title: "Dogfood task" },
       base: { branch: "main", sha: "abc123" },
@@ -752,18 +1012,161 @@ test("github ci summary classifies check buckets", () => {
   );
 });
 
-test("validateBenchmarkSuite rejects unknown runner ids", () => {
+test("validateBenchmarkSuite rejects invalid and duplicate runner ids", () => {
   assert.throws(
     () =>
       validateBenchmarkSuite({
         suite_id: "openai-phase1",
         label_prefix: "openai-phase1",
         tasks: ["benchmarks/tasks/task.yaml"],
-        runners: [{ runner_id: "not-a-runner", driver: "holon", model_ref: "openai-codex/gpt-5.3-codex-spark" }],
+        runners: [{ runner_id: "Not_A_Runner", driver: "holon", model_ref: "openai-codex/gpt-5.3-codex-spark" }],
         pr: { submit_pr: true, draft_pr: true, push_branch: true },
         timeouts: { ci_poll_minutes: 30 }
       }),
-    /runner_id must be one of/
+    /runner_id must be a stable lowercase slug/
+  );
+  assert.throws(
+    () =>
+      validateBenchmarkSuite({
+        suite_id: "deepseek-pilot",
+        label_prefix: "deepseek-pilot",
+        tasks: ["benchmarks/tasks/task.yaml"],
+        runners: [
+          { runner_id: "deepseek", driver: "holon", model_ref: "deepseek/model-a" },
+          { runner_id: "deepseek", driver: "holon", model_ref: "deepseek/model-b" }
+        ],
+        pr: { submit_pr: false },
+        timeouts: { ci_poll_minutes: 30 }
+      }),
+    /runner_id must be unique/
+  );
+});
+
+test("validateBenchmarkSuite accepts repeated paired execution metadata", () => {
+  const suite = validateBenchmarkSuite({
+    suite_id: "deepseek-pilot",
+    label_prefix: "deepseek-pilot",
+    tasks: ["benchmarks/tasks/task.yaml"],
+    repetitions: 5,
+    execution: {
+      runner_order: "paired_randomized",
+      random_seed: 20260814,
+      max_parallel_runners: 1,
+      cooldown_ms: 5000
+    },
+    runners: [
+      {
+        runner_id: "deepseek-anthropic-messages",
+        driver: "holon",
+        model_ref: "deepseek@default/deepseek-v4-flash",
+        transport: "anthropic_messages",
+        endpoint: "default"
+      },
+      {
+        runner_id: "deepseek-openai-responses",
+        driver: "holon",
+        model_ref: "deepseek@responses/deepseek-v4-flash",
+        transport: "openai_responses",
+        endpoint: "responses",
+        pricing: {
+          currency: "USD",
+          effective_at: "2026-08-16T16:00:00Z",
+          source: "provider pricing page",
+          cache_miss_input_per_million: 0.28,
+          cache_read_input_per_million: 0.028,
+          cache_creation_input_per_million: 0,
+          output_per_million: 0.42
+        }
+      }
+    ],
+    pr: { submit_pr: false },
+    timeouts: { ci_poll_minutes: 30 }
+  });
+
+  assert.equal(suite.repetitions, 5);
+  assert.equal(suite.execution.max_parallel_runners, 1);
+  assert.equal(suite.runners[1].endpoint, "responses");
+  assert.equal(suite.runners[1].pricing.currency, "USD");
+});
+
+test("validateBenchmarkSuite rejects incomplete or invalid pricing", () => {
+  assert.throws(
+    () =>
+      validateBenchmarkSuite({
+        suite_id: "deepseek-pilot",
+        label_prefix: "deepseek-pilot",
+        tasks: ["benchmarks/tasks/task.yaml"],
+        runners: [
+          {
+            runner_id: "deepseek",
+            driver: "holon",
+            model_ref: "deepseek/model",
+            pricing: {
+              currency: "USD",
+              effective_at: "not-a-date",
+              source: "provider pricing page",
+              cache_miss_input_per_million: 0.28,
+              cache_read_input_per_million: 0.028,
+              cache_creation_input_per_million: 0,
+              output_per_million: 0.42
+            }
+          }
+        ],
+        pr: { submit_pr: false },
+        timeouts: { ci_poll_minutes: 30 }
+      }),
+    /effective_at must be an ISO-8601 timestamp/
+  );
+  assert.throws(
+    () =>
+      validateBenchmarkSuite({
+        suite_id: "deepseek-pilot",
+        label_prefix: "deepseek-pilot",
+        tasks: ["benchmarks/tasks/task.yaml"],
+        runners: [
+          {
+            runner_id: "deepseek",
+            driver: "holon",
+            model_ref: "deepseek/model",
+            pricing: {
+              currency: "USD",
+              effective_at: "2026",
+              source: "provider pricing page",
+              cache_miss_input_per_million: 0.28,
+              cache_read_input_per_million: 0.028,
+              cache_creation_input_per_million: 0,
+              output_per_million: 0.42
+            }
+          }
+        ],
+        pr: { submit_pr: false },
+        timeouts: { ci_poll_minutes: 30 }
+      }),
+    /effective_at must be an ISO-8601 timestamp/
+  );
+});
+
+test("validateBenchmarkSuite requires serial execution for paired ordering", () => {
+  assert.throws(
+    () =>
+      validateBenchmarkSuite({
+        suite_id: "deepseek-pilot",
+        label_prefix: "deepseek-pilot",
+        tasks: ["benchmarks/tasks/task.yaml"],
+        execution: {
+          runner_order: "paired_randomized",
+          random_seed: 1,
+          max_parallel_runners: 2,
+          cooldown_ms: 0
+        },
+        runners: [
+          { runner_id: "one", driver: "holon", model_ref: "deepseek/model-a" },
+          { runner_id: "two", driver: "holon", model_ref: "deepseek/model-b" }
+        ],
+        pr: { submit_pr: false },
+        timeouts: { ci_poll_minutes: 30 }
+      }),
+    /max_parallel_runners must be 1/
   );
 });
 
@@ -828,10 +1231,22 @@ test("validateBenchmarkSuite accepts anthropic holon and claude-cli runners", ()
 
 test("naming helpers follow canonical conventions", () => {
   assert.equal(
-    branchNameForTask("holon-0015-tool-guidance-registry", "holon-openai"),
-    "bench/holon-0015-tool-guidance-registry/holon-openai"
+    branchNameForTask(
+      "holon-1611-tool-guidance-markdown",
+      "holon-openai",
+      1,
+      "OpenAI Phase 1"
+    ),
+    "bench/openai-phase-1/holon-1611-tool-guidance-markdown/holon-openai/run-01"
   );
-  assert.equal(worktreeNameForTask(15, "codex-openai"), "bench-0015-codex-openai");
+  assert.equal(
+    worktreeNameForTask(15, "codex-openai", 3),
+    "bench-0015-codex-openai-run-03"
+  );
+  assert.deepEqual(
+    artifactDirForTask("/results", "suite", "task", "runner", 3),
+    { runId: "run-03", path: "/results/suite/task/runner/run-03" }
+  );
   assert.equal(
     prTitleForTask(15, "Dogfood: tool guidance", "holon-openai"),
     "[bench][holon-openai][#15] Dogfood: tool guidance"
@@ -841,6 +1256,400 @@ test("naming helpers follow canonical conventions", () => {
     "bench:task-15",
     "runner:holon-openai"
   ]);
+});
+
+test("orderPairedRunners is deterministic and alternating reverses even repetitions", () => {
+  const runners = [
+    { runner_id: "one" },
+    { runner_id: "two" },
+    { runner_id: "three" }
+  ];
+  const first = orderPairedRunners({
+    runnerConfigs: runners,
+    runnerOrder: "paired_randomized",
+    randomSeed: 20260814,
+    taskId: "task-a",
+    repetition: 1
+  });
+  const second = orderPairedRunners({
+    runnerConfigs: runners,
+    runnerOrder: "paired_randomized",
+    randomSeed: 20260814,
+    taskId: "task-a",
+    repetition: 1
+  });
+  assert.deepEqual(first, second);
+  assert.deepEqual(
+    orderPairedRunners({
+      runnerConfigs: runners,
+      runnerOrder: "alternating",
+      taskId: "task-a",
+      repetition: 2
+    }).map((runner) => runner.runner_id),
+    ["three", "two", "one"]
+  );
+  assert.deepEqual(runners.map((runner) => runner.runner_id), ["one", "two", "three"]);
+});
+
+test("buildPairedSummary preserves execution order and emits metric deltas", () => {
+  const entries = buildPairedSummary(
+    [
+      {
+        task_id: "task-a",
+        repetition: 1,
+        runner: "responses",
+        pair_order: 1,
+        transport: "openai_responses",
+        success: true,
+        duration_ms: 80,
+        input_tokens: 90,
+        logical_input_tokens: 90,
+        output_tokens: 20,
+        provider_duration_ms: 50,
+        provider_retry_count: 0,
+        reasoning_tokens: 8,
+        cache_read_input_tokens: 4,
+        cache_miss_input_tokens: 86,
+        estimated_cost_usd: 0.00004
+      },
+      {
+        task_id: "task-a",
+        repetition: 1,
+        runner: "anthropic",
+        pair_order: 2,
+        transport: "anthropic_messages",
+        success: false,
+        duration_ms: 100,
+        input_tokens: 100,
+        logical_input_tokens: 120,
+        output_tokens: 30,
+        provider_duration_ms: 70,
+        provider_retry_count: 1,
+        reasoning_tokens: 5,
+        cache_read_input_tokens: 10,
+        cache_miss_input_tokens: 100,
+        estimated_cost_usd: 0.00006
+      }
+    ],
+    [{ runner_id: "anthropic" }, { runner_id: "responses" }]
+  );
+
+  assert.deepEqual(entries[0].scheduled_runner_order, ["responses", "anthropic"]);
+  assert.equal(entries[0].complete, true);
+  assert.equal(entries[0].comparisons[0].duration_ms_delta, -20);
+  assert.equal(entries[0].comparisons[0].provider_retry_count_delta, -1);
+  assert.equal(entries[0].comparisons[0].logical_input_tokens_delta, -30);
+  assert.equal(entries[0].comparisons[0].cache_miss_input_tokens_delta, -14);
+  assert.ok(Math.abs(entries[0].comparisons[0].estimated_cost_usd_delta + 0.00002) < 1e-12);
+});
+
+test("readHolonAuditEvents paginates stable DB event envelopes", async () => {
+  const calls = [];
+  const pages = [
+    {
+      event_log_epoch: "epoch-1",
+      newest_seq: 2,
+      has_newer: true,
+      events: [
+        {
+          id: "audit-1",
+          event_seq: 1,
+          event_log_epoch: "epoch-1",
+          contract_version: 1,
+          ts: "2026-08-15T00:00:00Z",
+          agent_id: "agent",
+          type: "provider_round_completed",
+          payload_schema: "holon.runtime_event.legacy",
+          payload_schema_version: 1,
+          payload: { round: 1 }
+        },
+        {
+          id: "audit-2",
+          event_seq: 2,
+          event_log_epoch: "epoch-1",
+          contract_version: 1,
+          ts: "2026-08-15T00:00:01Z",
+          agent_id: "agent",
+          type: "tool_executed",
+          payload_schema: "holon.runtime_event.legacy",
+          payload_schema_version: 1,
+          payload: { tool_name: "ExecCommand" }
+        }
+      ]
+    },
+    {
+      event_log_epoch: "epoch-1",
+      newest_seq: 3,
+      has_newer: false,
+      events: [
+        {
+          id: "audit-3",
+          event_seq: 3,
+          event_log_epoch: "epoch-1",
+          contract_version: 1,
+          ts: "2026-08-15T00:00:02Z",
+          agent_id: "agent",
+          type: "provider_round_completed",
+          payload_schema: "holon.runtime_event.legacy",
+          payload_schema_version: 1,
+          payload: { round: 2 }
+        }
+      ]
+    }
+  ];
+  const events = await readHolonAuditEvents({
+    holonBinary: "holon",
+    agentId: "agent",
+    homeDir: "/tmp/home",
+    cwd: "/tmp/repo",
+    env: {},
+    execute: async (_command, args) => {
+      calls.push(args);
+      return { stdout: JSON.stringify(pages[calls.length - 1]), stderr: "", exitCode: 0 };
+    }
+  });
+
+  assert.deepEqual(events.map((event) => event.event_seq), [1, 2, 3]);
+  assert.equal(events[0].kind, "provider_round_completed");
+  assert.equal(events[0].data.round, 1);
+  assert.deepEqual(calls[1].slice(-2), ["--after-seq", "2"]);
+});
+
+test("event envelope normalization rejects invalid events", () => {
+  assert.throws(
+    () => normalizeHolonEventEnvelope({ event_seq: 0, type: "x", payload: {} }),
+    /invalid event sequence/
+  );
+});
+
+test("DB event export failures are explicit", async () => {
+  await assert.rejects(
+    readHolonAuditEvents({
+      holonBinary: "holon",
+      agentId: "agent",
+      homeDir: "/tmp/home",
+      cwd: "/tmp/repo",
+      env: {},
+      execute: async () => ({
+        stdout: "{\"events\":[]}",
+        stderr: "runtime DB unavailable",
+        exitCode: 2
+      })
+    }),
+    /holon DB event export failed with exit code 2: runtime DB unavailable/
+  );
+
+  await assert.rejects(
+    readHolonAuditEvents({
+      holonBinary: "holon",
+      agentId: "agent",
+      homeDir: "/tmp/home",
+      cwd: "/tmp/repo",
+      env: {},
+      execute: async () => ({ stdout: "not-json", stderr: "", exitCode: 0 })
+    }),
+    /failed to parse holon DB event export/
+  );
+});
+
+test("provider usage normalization is transport-neutral and cost-aware", () => {
+  const pricing = {
+    currency: "USD",
+    effective_at: "2026-08-16T16:00:00Z",
+    source: "provider pricing page",
+    cache_miss_input_per_million: 1,
+    cache_read_input_per_million: 0.1,
+    cache_creation_input_per_million: 2,
+    output_per_million: 3
+  };
+  const responses = normalizeProviderRoundUsage({
+    provider: "deepseek",
+    modelRef: "deepseek@responses/deepseek-v4-flash",
+    transport: "openai_responses",
+    pricing,
+    data: {
+      input_tokens: 1000,
+      output_tokens: 100,
+      provider_cache_usage: { read_input_tokens: 800, creation_input_tokens: 0 }
+    }
+  });
+  assert.equal(responses.logical_input_tokens, 1000);
+  assert.equal(responses.cache_miss_input_tokens, 200);
+  assert.equal(responses.estimated_cost_usd, 0.00058);
+
+  const anthropic = normalizeProviderRoundUsage({
+    provider: "deepseek",
+    modelRef: "deepseek@default/deepseek-v4-flash",
+    transport: "anthropic_messages",
+    pricing,
+    data: {
+      input_tokens: 200,
+      output_tokens: 100,
+      provider_cache_usage: { read_input_tokens: 800, creation_input_tokens: 50 }
+    }
+  });
+  assert.equal(anthropic.logical_input_tokens, 1050);
+  assert.equal(anthropic.cache_miss_input_tokens, 200);
+  assert.equal(anthropic.estimated_cost_usd, 0.00068);
+
+  const fullHit = normalizeProviderRoundUsage({
+    provider: "deepseek",
+    modelRef: "deepseek@responses/deepseek-v4-flash",
+    transport: "openai_responses",
+    data: {
+      input_tokens: 1000,
+      output_tokens: 10,
+      provider_cache_usage: { read_input_tokens: 1000, creation_input_tokens: 0 }
+    }
+  });
+  assert.equal(fullHit.cache_miss_input_tokens, 0);
+
+  const noHit = normalizeProviderRoundUsage({
+    provider: "deepseek",
+    modelRef: "deepseek@responses/deepseek-v4-flash",
+    transport: "openai_responses",
+    data: {
+      input_tokens: 1000,
+      output_tokens: 10,
+      provider_cache_usage: { read_input_tokens: 0, creation_input_tokens: 0 }
+    }
+  });
+  assert.equal(noHit.cache_miss_input_tokens, 1000);
+
+  const explicitResponsesWins = normalizeProviderRoundUsage({
+    provider: "anthropic",
+    modelRef: "fallback/model",
+    transport: "openai_responses",
+    data: {
+      input_tokens: 1000,
+      output_tokens: 10,
+      provider_cache_usage: { read_input_tokens: 800, creation_input_tokens: 0 }
+    }
+  });
+  assert.equal(explicitResponsesWins.usage_semantics, "openai_responses");
+  assert.equal(explicitResponsesWins.logical_input_tokens, 1000);
+});
+
+test("provider usage normalization reports invalid or unavailable data explicitly", () => {
+  const usage = normalizeProviderRoundUsage({
+    provider: "openai",
+    modelRef: "openai/gpt",
+    data: {
+      input_tokens: -1,
+      output_tokens: null,
+      provider_cache_usage: { read_input_tokens: 5 }
+    }
+  });
+  assert.equal(usage.estimated_cost_usd, null);
+  assert.ok(usage.usage_validation_issues.includes("input_tokens_negative"));
+  assert.ok(usage.usage_validation_issues.includes("output_tokens_missing"));
+  assert.ok(usage.usage_validation_issues.includes("cache_read_exceeds_logical_input"));
+
+  const invalidPriced = normalizeProviderRoundUsage({
+    provider: "openai",
+    modelRef: "openai/gpt",
+    pricing: {
+      currency: "USD",
+      effective_at: "2026-08-16T16:00:00Z",
+      source: "provider pricing page",
+      cache_miss_input_per_million: 1,
+      cache_read_input_per_million: 0.1,
+      cache_creation_input_per_million: 2,
+      output_per_million: 3
+    },
+    data: { input_tokens: null, output_tokens: 10 }
+  });
+  assert.equal(invalidPriced.estimated_cost_usd, null);
+});
+
+test("provider round telemetry cannot silently disappear after model execution", () => {
+  assert.throws(
+    () =>
+      assertHolonProviderRoundTelemetry({
+        modelRounds: 2,
+        tokenOptimization: { summary: { rounds: 0 } }
+      }),
+    /contained no provider_round_completed telemetry/
+  );
+  assert.doesNotThrow(() =>
+    assertHolonProviderRoundTelemetry({
+      modelRounds: 2,
+      tokenOptimization: { summary: { rounds: 2 } }
+    })
+  );
+});
+
+test("summarizeHolonTokenOptimization reports local compaction and cache warm-up", () => {
+  const diagnostics = summarizeHolonTokenOptimization([
+    {
+      kind: "provider_round_completed",
+      data: {
+        round: 4,
+        input_tokens: 900,
+        output_tokens: 20,
+        provider_cache_usage: { read_input_tokens: 0, creation_input_tokens: 0 },
+        turn_local_compaction: {
+          trigger_reason: "estimated_tokens_exceeded_trigger",
+          pre_compaction_estimated_tokens: 1400,
+          projected_estimated_tokens: 850,
+          compacted_rounds: 2,
+          exact_tail_rounds: 1,
+          degraded_rounds: 0,
+          compacted_tool_results: 1,
+          preserved_artifact_refs: 3,
+          trigger_budget_fallback_applied: true,
+          strict_fallback_applied: false
+        }
+      }
+    },
+    {
+      kind: "provider_round_completed",
+      data: {
+        round: 5,
+        input_tokens: 950,
+        output_tokens: 20,
+        provider_cache_usage: { read_input_tokens: 700, creation_input_tokens: 0 },
+        turn_local_compaction: null
+      }
+    }
+  ]);
+
+  assert.equal(diagnostics.summary.turn_local_compaction_telemetry_status, "available");
+  assert.equal(diagnostics.summary.turn_local_compaction_applied_rounds, 1);
+  assert.equal(diagnostics.summary.turn_local_compaction_pre_estimated_tokens, 1400);
+  assert.equal(diagnostics.summary.turn_local_compaction_projected_estimated_tokens, 850);
+  assert.equal(diagnostics.summary.turn_local_compacted_rounds, 2);
+  assert.equal(diagnostics.summary.turn_local_compacted_tool_results, 1);
+  assert.equal(diagnostics.summary.turn_local_preserved_artifact_refs, 3);
+  assert.equal(diagnostics.summary.turn_local_compaction_cache_warmup_observed, 1);
+  assert.equal(diagnostics.summary.turn_local_compaction_cache_warmup_hits, 1);
+  assert.equal(diagnostics.rounds[0].turn_local_compaction.status, "applied");
+  assert.equal(
+    diagnostics.rounds[0].turn_local_compaction.trigger_budget_fallback_applied,
+    true
+  );
+  assert.equal(diagnostics.rounds[1].turn_local_compaction.status, "not_applied");
+});
+
+test("summarizeHolonTokenOptimization marks legacy local compaction telemetry unavailable", () => {
+  const diagnostics = summarizeHolonTokenOptimization([
+    {
+      kind: "provider_round_completed",
+      data: {
+        round: 1,
+        input_tokens: 100,
+        output_tokens: 10
+      }
+    }
+  ]);
+
+  assert.equal(diagnostics.rounds[0].turn_local_compaction.status, "unavailable");
+  assert.equal(diagnostics.summary.turn_local_compaction_telemetry_status, "unavailable");
+});
+
+test("manifest verifier runs only when GitHub CI is not the verification source", () => {
+  assert.equal(shouldRunManifestVerifier({ pr: { submit_pr: false } }), true);
+  assert.equal(shouldRunManifestVerifier({ pr: { submit_pr: true } }), false);
 });
 
 test("summarizeHolonTokenOptimization reports Anthropic cache miss rounds safely", () => {
@@ -856,6 +1665,7 @@ test("summarizeHolonTokenOptimization reports Anthropic cache miss rounds safely
         kind: "provider_round_completed",
         data: {
           round: 7,
+          reasoning_tokens: null,
           input_tokens: 35_000,
           output_tokens: 120,
           provider_cache_usage: {
@@ -870,9 +1680,21 @@ test("summarizeHolonTokenOptimization reports Anthropic cache miss rounds safely
               {
                 provider: "anthropic",
                 model_ref: "anthropic/claude-sonnet-4-6",
-                outcome: "succeeded"
+                outcome: "failed",
+                duration_ms: 25
+              },
+              {
+                provider: "anthropic",
+                model_ref: "anthropic/claude-sonnet-4-6",
+                outcome: "succeeded",
+                duration_ms: 75
               }
             ],
+            aggregated_token_usage: {
+              output_tokens_details: {
+                reasoning_tokens: 40
+              }
+            },
             winning_model_ref: "anthropic/claude-sonnet-4-6"
           }
         }
@@ -895,6 +1717,11 @@ test("summarizeHolonTokenOptimization reports Anthropic cache miss rounds safely
   assert.equal(diagnostics.secret_safe, true);
   assert.equal(diagnostics.summary.high_input_zero_cache_read_rounds, 1);
   assert.equal(diagnostics.summary.request_lowering_modes.prompt_cache_blocks, 1);
+  assert.equal(diagnostics.summary.provider_duration_ms, 100);
+  assert.equal(diagnostics.summary.provider_attempt_count, 2);
+  assert.equal(diagnostics.summary.provider_retry_count, 1);
+  assert.equal(diagnostics.summary.provider_error_count, 1);
+  assert.equal(diagnostics.summary.reasoning_tokens, 40);
   assert.equal(diagnostics.rounds[0].request_lowering_mode, "prompt_cache_blocks");
   assert.equal(diagnostics.rounds[0].previous_tool.name, "ExecCommand");
   assert.equal(typeof diagnostics.rounds[0].previous_tool.input_bytes, "number");
@@ -1389,6 +2216,30 @@ test("summarizeHolonTokenOptimization reports non-material zero cache reads accu
   );
 });
 
+test("summarizeHolonTokenOptimization classifies matching stable-prefix cache drops as server-side", () => {
+  const diagnostics = summarizeHolonTokenOptimization([
+    anthropicProviderRound({
+      round: 1,
+      cacheRead: 18_000,
+      createdAt: "2026-04-28T00:00:00Z",
+      stablePrefixFingerprint: "stable-x"
+    }),
+    anthropicProviderRound({
+      round: 2,
+      cacheRead: 0,
+      createdAt: "2026-04-28T00:00:20Z",
+      stablePrefixFingerprint: "stable-x"
+    })
+  ]);
+
+  assert.equal(diagnostics.rounds[1].cache_break_classification, "likely_server_side_drop");
+  assert.equal(diagnostics.rounds[1].stable_prefix_matches_cache_baseline, true);
+  assert.equal(
+    diagnostics.rounds[1].cache_break_reason,
+    "provider-visible stable prefix matched the positive cache-read baseline"
+  );
+});
+
 test("summarizeHolonTokenOptimization classifies stable-prefix cache drop as likely server-side", () => {
   const diagnostics = summarizeHolonTokenOptimization([
     anthropicProviderRound({
@@ -1429,6 +2280,48 @@ test("summarizeHolonTokenOptimization classifies client prefix cache drops", () 
   assert.equal(diagnostics.rounds[1].stable_shape_segment_id, 1);
   assert.equal(diagnostics.rounds[1].request_shape_changed, true);
   assert.deepEqual(diagnostics.rounds[1].shape_changed_fields, ["anthropic_cache.system_hash"]);
+});
+
+test("summarizeHolonTokenOptimization explains stable-prefix component changes", () => {
+  const diagnostics = summarizeHolonTokenOptimization([
+    anthropicProviderRound({
+      round: 1,
+      cacheRead: 18_000,
+      stablePrefixFingerprint: "stable-a"
+    }),
+    anthropicProviderRound({
+      round: 2,
+      cacheRead: 0,
+      stablePrefixFingerprint: "stable-b",
+      stablePrefixComponents: [
+        { name: "contract", fingerprint: "contract" },
+        { name: "request_controls", fingerprint: "controls" },
+        { name: "system", fingerprint: "system" },
+        { name: "tools", fingerprint: "tools-changed" },
+        { name: "history_prefix", fingerprint: "history" }
+      ]
+    })
+  ]);
+
+  assert.equal(diagnostics.rounds[0].stable_prefix.status, "available");
+  assert.deepEqual(diagnostics.rounds[1].stable_prefix_changed_components, ["tools"]);
+  assert.equal(diagnostics.rounds[1].cache_break_classification, "client_prefix_changed");
+  assert.equal(
+    diagnostics.rounds[1].shape_changed_fields.includes("stable_prefix.components.tools"),
+    true
+  );
+  assert.equal(diagnostics.summary.stable_prefix_available_rounds, 2);
+  assert.equal(diagnostics.summary.stable_prefix_changed_rounds, 1);
+});
+
+test("summarizeHolonTokenOptimization keeps missing stable-prefix diagnostics unavailable", () => {
+  const diagnostics = summarizeHolonTokenOptimization([
+    anthropicProviderRound({ round: 1, cacheRead: 18_000 })
+  ]);
+
+  assert.equal(diagnostics.rounds[0].stable_prefix.status, "unavailable");
+  assert.equal(diagnostics.rounds[0].stable_prefix_changed_components, null);
+  assert.equal(diagnostics.summary.stable_prefix_available_rounds, 0);
 });
 
 test("summarizeHolonTokenOptimization reports client prefix changes inside a segment", () => {
@@ -1568,7 +2461,9 @@ function anthropicProviderRound({
   breakpointStability = "conversation_tail",
   workingMemoryRevision = 4,
   compressionEpoch = 1,
-  appliedEdits = []
+  appliedEdits = [],
+  stablePrefixFingerprint = null,
+  stablePrefixComponents = null
 }) {
   return {
     kind: "provider_round_completed",
@@ -1585,6 +2480,26 @@ function anthropicProviderRound({
       compression_epoch: compressionEpoch,
       provider_request_diagnostics: {
         request_lowering_mode: "prompt_cache_blocks",
+        ...(stablePrefixFingerprint
+          ? {
+              stable_prefix: {
+                schema_version: 1,
+                algorithm: "sha256",
+                full_request_fingerprint: `full-${round}`,
+                stable_prefix_fingerprint: stablePrefixFingerprint,
+                history_prefix_items: 3,
+                dynamic_tail_items: 1,
+                components:
+                  stablePrefixComponents ?? [
+                    { name: "contract", fingerprint: "contract" },
+                    { name: "request_controls", fingerprint: "controls" },
+                    { name: "system", fingerprint: "system" },
+                    { name: "tools", fingerprint: "tools" },
+                    { name: "history_prefix", fingerprint: "history" }
+                  ]
+              }
+            }
+          : {}),
         anthropic_cache: {
           tools_count: 3,
           tools_hash: toolsHash,
@@ -1642,6 +2557,34 @@ test("ensureBaseShaExists verifies commits in a git repo", async () => {
   assert.equal(resolved, sha);
 
   await fs.rm(repoDir, { recursive: true, force: true });
+});
+
+test("checked-in suites reference valid tasks with reachable base commits", async () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  const suiteDir = path.join(repoRoot, "benchmarks", "suites");
+  const suiteFiles = (await fs.readdir(suiteDir))
+    .filter((entry) => entry.endsWith(".yaml"))
+    .sort();
+
+  assert.ok(suiteFiles.length > 0);
+
+  for (const suiteFile of suiteFiles) {
+    const suitePath = path.join(suiteDir, suiteFile);
+    const suite = await loadBenchmarkSuite(suitePath);
+
+    for (const taskEntry of suite.tasks) {
+      const taskPath = path.resolve(path.dirname(suitePath), taskEntry);
+      const manifest = await loadRealTaskManifest(taskPath);
+      const taskRepoPath = resolveRepoPath(manifest.repo.local_path, path.dirname(taskPath));
+      const resolved = await ensureBaseShaExists(
+        taskRepoPath,
+        manifest.base.sha,
+        execCommand
+      );
+
+      assert.equal(resolved, manifest.base.sha);
+    }
+  }
 });
 
 async function execCommand(command, args, cwd, env) {

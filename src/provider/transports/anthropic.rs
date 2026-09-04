@@ -12,7 +12,7 @@ use twox_hash::XxHash64;
 
 use crate::{
     config::{
-        AnthropicCacheStrategy, AnthropicContextManagementConfig, AppConfig,
+        AnthropicCacheStrategy, AnthropicContextManagementConfig, AppConfig, CredentialKind,
         ProviderBuiltinWebSearchConfig, ProviderId, ProviderRuntimeConfig,
     },
     prompt::PromptStability,
@@ -20,9 +20,10 @@ use crate::{
         builtin_web_search_probe_turn_request,
         http_trace::{ProviderHttpTrace, ProviderHttpTraceRequest},
         AgentProvider, AnthropicPromptCacheDiagnostics, CacheBreakpointInfo, ConversationMessage,
-        ModelBlock, ModelToolCallKind, PromptContentBlock, ProviderBuiltinWebSearchCapability,
-        ProviderCacheUsage, ProviderContextManagementPolicy, ProviderNativeWebSearchDiagnostics,
-        ProviderNativeWebSearchKind, ProviderNativeWebSearchRequest, ProviderPromptCapability,
+        ModelBlock, ModelToolCallKind, PromptContentBlock, ProviderBlockData,
+        ProviderBuiltinWebSearchCapability, ProviderCacheUsage, ProviderContextManagementPolicy,
+        ProviderNativeWebSearchDiagnostics, ProviderNativeWebSearchKind,
+        ProviderNativeWebSearchRequest, ProviderPromptCapability,
         ProviderResponseFormatDiagnostics, ProviderResponseFormatRequest, ProviderTurnRequest,
         ProviderTurnResponse,
     },
@@ -31,17 +32,20 @@ use crate::{
 use super::{build_http_client, request_send_timeout, response_body_timeout, stream_idle_timeout};
 use crate::provider::retry::{
     classify_reqwest_transport_error_with_trace, classify_status_error_with_trace,
-    invalid_response_error_with_trace, provider_transport_error,
-    timeout_transport_error_with_trace, ProviderFailureClassification, ProviderFailureKind,
-    RetryDisposition,
+    empty_response_error_with_trace, invalid_response_error_with_trace, parse_retry_after,
+    provider_transport_error, timeout_transport_error_with_trace, ProviderFailureClassification,
+    ProviderFailureKind, RetryDisposition,
 };
+
+const ANTHROPIC_PROVIDER_BLOCK_FORMAT: &str = "anthropic_messages/v1";
 
 #[derive(Clone)]
 pub struct AnthropicProvider {
     client: Client,
-    provider_id: String,
+    route_provider: String,
+    route_endpoint: String,
     base_url: String,
-    auth_token: String,
+    auth_token: Option<String>,
     model: String,
     max_output_tokens: u32,
     reasoning_effort: Option<String>,
@@ -59,6 +63,8 @@ struct MessagesRequest<'a> {
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<ThinkingRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<OutputConfigRequest<'a>>,
     stream: bool,
     system: Value,
     messages: Vec<ApiMessage>,
@@ -80,6 +86,11 @@ struct ThinkingRequest {
     #[serde(rename = "type")]
     kind: &'static str,
     budget_tokens: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct OutputConfigRequest<'a> {
+    effort: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,15 +135,30 @@ struct MessagesResponse {
 struct ApiResponseBlock {
     #[serde(rename = "type")]
     kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     input: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_use_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_error: Option<bool>,
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -173,20 +199,21 @@ impl AnthropicProvider {
         let auth_token = provider_config
             .credential
             .clone()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                let credential_name = provider_config
-                    .auth
-                    .env
-                    .as_deref()
-                    .or(provider_config.auth.profile.as_deref())
-                    .or(provider_config.auth.external.as_deref())
-                    .unwrap_or("configured credential");
-                anyhow!("missing {credential_name}")
-            })?;
+            .filter(|value| !value.trim().is_empty());
+        if auth_token.is_none() && provider_config.auth.kind != CredentialKind::None {
+            let credential_name = provider_config
+                .auth
+                .env
+                .as_deref()
+                .or(provider_config.auth.profile.as_deref())
+                .or(provider_config.auth.external.as_deref())
+                .unwrap_or("configured credential");
+            return Err(anyhow!("missing {credential_name}"));
+        }
         Ok(Self {
             client,
-            provider_id: provider_config.id.as_str().to_string(),
+            route_provider: provider_config.route_provider.as_str().to_string(),
+            route_endpoint: provider_config.route_endpoint.as_str().to_string(),
             base_url: provider_config.base_url.trim_end_matches('/').to_string(),
             auth_token,
             model: model.to_string(),
@@ -215,10 +242,10 @@ impl AnthropicProvider {
 /// The budget is computed as a percentage of `max_output_tokens`, clamped to
 /// the Anthropic minimum of 1024 and capped at `max_output_tokens - 1`.
 fn reasoning_effort_to_thinking(
-    reasoning_effort: &Option<String>,
+    reasoning_effort: Option<&str>,
     max_output_tokens: u32,
 ) -> Option<ThinkingRequest> {
-    let effort = reasoning_effort.as_ref()?;
+    let effort = reasoning_effort?;
     let ratio: f64 = match effort.to_ascii_lowercase().as_str() {
         "low" => 0.10,
         "medium" => 0.25,
@@ -240,6 +267,26 @@ fn reasoning_effort_to_thinking(
     })
 }
 
+fn anthropic_reasoning_controls<'a>(
+    route_provider: &str,
+    supports_reasoning: bool,
+    reasoning_effort: Option<&'a str>,
+    max_output_tokens: u32,
+) -> (Option<ThinkingRequest>, Option<OutputConfigRequest<'a>>) {
+    if route_provider == "deepseek" {
+        return (
+            None,
+            reasoning_effort.map(|effort| OutputConfigRequest { effort }),
+        );
+    }
+    (
+        supports_reasoning
+            .then(|| reasoning_effort_to_thinking(reasoning_effort, max_output_tokens))
+            .flatten(),
+        None,
+    )
+}
+
 #[async_trait]
 impl AgentProvider for AnthropicProvider {
     async fn complete_turn(&self, request: ProviderTurnRequest) -> Result<ProviderTurnResponse> {
@@ -249,14 +296,17 @@ impl AgentProvider for AnthropicProvider {
             rolling_conversation_cache_marker(&wire_conversation, cache_strategy);
         let messages = build_anthropic_messages(&wire_conversation, rolling_cache_marker);
         let response_format_tool_choice = anthropic_response_format_tool_choice(&request);
+        let (thinking, output_config) = anthropic_reasoning_controls(
+            &self.route_provider,
+            self.supports_reasoning,
+            self.reasoning_effort.as_deref(),
+            self.max_output_tokens,
+        );
         let request_body = MessagesRequest {
             model: &self.model,
             max_tokens: self.max_output_tokens,
-            thinking: if self.supports_reasoning {
-                reasoning_effort_to_thinking(&self.reasoning_effort, self.max_output_tokens)
-            } else {
-                None
-            },
+            thinking,
+            output_config,
             stream: true,
             system: build_anthropic_system(&request, cache_strategy),
             messages,
@@ -271,12 +321,17 @@ impl AgentProvider for AnthropicProvider {
         let request_payload = serde_json::to_value(&request_body)?;
 
         let url = format!("{}/v1/messages", self.base_url);
-        let model_ref = format!("anthropic/{}", self.model);
+        let model_ref = format!(
+            "{}@{}/{}",
+            self.route_provider, self.route_endpoint, self.model
+        );
         let mut headers = vec![
             ("content-type", "application/json".to_string()),
-            ("authorization", format!("Bearer {}", self.auth_token)),
             ("anthropic-version", "2023-06-01".to_string()),
         ];
+        if let Some(auth_token) = self.auth_token.as_deref() {
+            headers.push(("authorization", format!("Bearer {auth_token}")));
+        }
         if self.context_management.enabled {
             headers.push((
                 "anthropic-beta",
@@ -297,7 +352,7 @@ impl AgentProvider for AnthropicProvider {
                     .cache
                     .as_ref()
                     .map(|cache| cache.agent_id.as_str()),
-                "anthropic",
+                &self.route_provider,
                 Some(&model_ref),
                 url.as_str(),
                 "messages",
@@ -318,7 +373,7 @@ impl AgentProvider for AnthropicProvider {
                 classify_reqwest_transport_error_with_trace(
                     "Anthropic request failed",
                     "request_send",
-                    "anthropic",
+                    &self.route_provider,
                     Some(&model_ref),
                     Some(url.as_str()),
                     error,
@@ -332,6 +387,7 @@ impl AgentProvider for AnthropicProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = parse_retry_after(response.headers());
             let body = match tokio::time::timeout(response_body_timeout(), response.text()).await {
                 Ok(Ok(text)) => text,
                 _ => String::new(),
@@ -342,26 +398,34 @@ impl AgentProvider for AnthropicProvider {
             return Err(classify_status_error_with_trace(
                 "Anthropic request failed",
                 "response_status",
-                Some("anthropic"),
+                Some(&self.route_provider),
                 Some(&model_ref),
                 Some(url.as_str()),
                 status,
                 body,
                 request_trace.as_ref(),
+                retry_after,
             ));
         }
 
         let parsed = if anthropic_response_is_sse(&response) {
             read_anthropic_streaming_response(
                 response,
+                &self.route_provider,
                 &model_ref,
                 url.as_str(),
                 request_trace.as_ref(),
             )
             .await?
         } else {
-            read_anthropic_json_response(response, &model_ref, url.as_str(), request_trace.as_ref())
-                .await?
+            read_anthropic_json_response(
+                response,
+                &self.route_provider,
+                &model_ref,
+                url.as_str(),
+                request_trace.as_ref(),
+            )
+            .await?
         };
         anthropic_messages_response_to_turn_response(
             parsed,
@@ -370,7 +434,7 @@ impl AgentProvider for AnthropicProvider {
             &wire_conversation,
             rolling_cache_marker,
             &request_payload,
-            self.provider_id.as_str(),
+            self.route_provider.as_str(),
             self.model.as_str(),
             cache_strategy,
             &self.context_management.betas,
@@ -382,7 +446,10 @@ impl AgentProvider for AnthropicProvider {
 
     #[cfg(test)]
     fn configured_model_refs(&self) -> Vec<String> {
-        vec![format!("anthropic/{}", self.model)]
+        vec![format!(
+            "{}@{}/{}",
+            self.route_provider, self.route_endpoint, self.model
+        )]
     }
 
     fn prompt_capabilities(&self) -> Vec<ProviderPromptCapability> {
@@ -400,8 +467,11 @@ impl AgentProvider for AnthropicProvider {
         let config = self.builtin_web_search.as_ref()?;
         Some(ProviderBuiltinWebSearchCapability {
             kind: config.kind,
-            provider_id: self.provider_id.clone(),
-            provider_model_ref: format!("{}/{}", self.provider_id, self.model),
+            provider_id: self.route_provider.clone(),
+            provider_model_ref: format!(
+                "{}@{}/{}",
+                self.route_provider, self.route_endpoint, self.model
+            ),
             provider_transport: "anthropic_messages".into(),
             provider_base_url: self.base_url.clone(),
             advertised_tool_type: config.advertised_tool_type.clone(),
@@ -422,7 +492,7 @@ impl AgentProvider for AnthropicProvider {
         self.context_management
             .enabled
             .then(|| ProviderContextManagementPolicy {
-                provider: "anthropic".to_string(),
+                provider: self.route_provider.clone(),
                 strategy: "clear_tool_uses_20250919".to_string(),
                 keep_recent_tool_uses: self.context_management.keep_recent_tool_uses as usize,
                 trigger_input_tokens: self.context_management.trigger_input_tokens,
@@ -451,6 +521,7 @@ fn anthropic_response_is_sse(response: &Response) -> bool {
 
 async fn read_anthropic_json_response(
     response: Response,
+    provider: &str,
     model_ref: &str,
     url: &str,
     trace: Option<&ProviderHttpTraceRequest>,
@@ -461,7 +532,7 @@ async fn read_anthropic_json_response(
             return Err(classify_reqwest_transport_error_with_trace(
                 "Anthropic response body failed",
                 "response_body",
-                "anthropic",
+                provider,
                 Some(model_ref),
                 Some(url),
                 error,
@@ -472,7 +543,7 @@ async fn read_anthropic_json_response(
             return Err(timeout_transport_error_with_trace(
                 "Anthropic response body read timed out",
                 "response_body",
-                "anthropic",
+                provider,
                 Some(model_ref),
                 Some(url),
                 format!("timed out after {:?}", response_body_timeout()),
@@ -487,7 +558,7 @@ async fn read_anthropic_json_response(
         invalid_response_error_with_trace(
             "invalid Anthropic JSON",
             "response_parse",
-            "anthropic",
+            provider,
             Some(model_ref),
             Some(url),
             error.to_string(),
@@ -498,6 +569,7 @@ async fn read_anthropic_json_response(
 
 async fn read_anthropic_streaming_response(
     mut response: Response,
+    provider: &str,
     model_ref: &str,
     url: &str,
     trace: Option<&ProviderHttpTraceRequest>,
@@ -513,7 +585,7 @@ async fn read_anthropic_streaming_response(
                 timeout_transport_error_with_trace(
                     "Anthropic streaming response timed out",
                     "streaming_response_body",
-                    "anthropic",
+                    provider,
                     Some(model_ref),
                     Some(url),
                     format!(
@@ -533,7 +605,7 @@ async fn read_anthropic_streaming_response(
                     invalid_response_error_with_trace(
                         "invalid Anthropic stream event",
                         "streaming_response_parse",
-                        "anthropic",
+                        provider,
                         Some(model_ref),
                         Some(url),
                         error,
@@ -547,7 +619,7 @@ async fn read_anthropic_streaming_response(
                 return Err(classify_reqwest_transport_error_with_trace(
                     "Anthropic streaming response body failed",
                     "streaming_response_body",
-                    "anthropic",
+                    provider,
                     Some(model_ref),
                     Some(url),
                     error,
@@ -562,7 +634,7 @@ async fn read_anthropic_streaming_response(
         invalid_response_error_with_trace(
             "invalid Anthropic stream event",
             "streaming_response_parse",
-            "anthropic",
+            provider,
             Some(model_ref),
             Some(url),
             error,
@@ -571,7 +643,7 @@ async fn read_anthropic_streaming_response(
     })? {
         accumulator.apply(event, model_ref, url, trace)?;
     }
-    let response = accumulator.finish(model_ref, url, trace)?;
+    let response = accumulator.finish(provider, model_ref, url, trace)?;
     if let Some(trace) = trace {
         trace.write_stream_terminal(&serde_json::to_value(&response).unwrap_or_else(|_| json!({})));
     }
@@ -579,7 +651,7 @@ async fn read_anthropic_streaming_response(
 }
 
 fn anthropic_messages_response_to_turn_response(
-    parsed: MessagesResponse,
+    mut parsed: MessagesResponse,
     provider_request_id: Option<String>,
     request: &ProviderTurnRequest,
     wire_conversation: &[ConversationMessage],
@@ -607,6 +679,18 @@ fn anthropic_messages_response_to_turn_response(
         read_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
         creation_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
     });
+    if parsed.content.is_empty() {
+        return Err(empty_response_error_with_trace(
+            "empty Anthropic response",
+            "response_protocol",
+            provider_id,
+            Some(model_ref),
+            Some(url),
+            "Anthropic response contained no content blocks",
+            trace,
+            crate::types::TokenUsage::new(input_tokens, output_tokens),
+        ));
+    }
     let tools_available = !request.tools.is_empty();
     for (block_index, block) in parsed.content.iter().enumerate() {
         warn_unsupported_anthropic_response_block(
@@ -633,13 +717,14 @@ fn anthropic_messages_response_to_turn_response(
         return Err(invalid_response_error_with_trace(
             "invalid Anthropic tool response",
             "response_protocol",
-            "anthropic",
+            provider_id,
             Some(model_ref),
             Some(url),
             "stop_reason=tool_use without native tool_use block; text block contains tool-call-looking markup",
             trace,
         ));
     }
+    strip_zai_redundant_provider_tool_text(&mut parsed.content);
     let response_format_tool_name = anthropic_response_format_tool_name(request);
     let blocks = parsed
         .content
@@ -652,7 +737,7 @@ fn anthropic_messages_response_to_turn_response(
         return Err(invalid_response_error_with_trace(
             "invalid Anthropic response",
             "response_protocol",
-            "anthropic",
+            provider_id,
             Some(model_ref),
             Some(url),
             "Anthropic response contained no supported content blocks",
@@ -670,7 +755,20 @@ fn anthropic_messages_response_to_turn_response(
         betas,
     );
     let request_lowering_mode = anthropic_request_lowering_mode(request, cache_strategy);
-
+    let (stable_history_prefix, dynamic_tail_items) =
+        anthropic_stable_history_prefix(request_payload, rolling_cache_marker);
+    let stable_prefix = crate::provider::wire_fingerprint::stable_prefix_diagnostics(
+        request_payload,
+        request_payload,
+        &stable_history_prefix,
+        dynamic_tail_items,
+        &json!({
+            "provider_transport": "anthropic_messages",
+            "endpoint_dialect": "anthropic_messages",
+            "request_lowering_mode": request_lowering_mode,
+            "contract_version": 1,
+        }),
+    );
     Ok(ProviderTurnResponse {
         blocks,
         stop_reason: parsed.stop_reason,
@@ -681,6 +779,16 @@ fn anthropic_messages_response_to_turn_response(
         provider_request_id,
         request_diagnostics: Some(crate::provider::ProviderRequestDiagnostics {
             request_lowering_mode: request_lowering_mode.to_string(),
+            provider_id: Some(provider_id.to_string()),
+            provider_model_ref: Some(model_ref.to_string()),
+            provider_transport: Some("anthropic_messages".to_string()),
+            endpoint_dialect: Some("anthropic_messages".to_string()),
+            streaming: Some(true),
+            reasoning_effort: request_payload
+                .pointer("/output_config/effort")
+                .or_else(|| request_payload.pointer("/thinking/type"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
             anthropic_cache: Some(cache_diagnostics),
             anthropic_context_management: parsed.context_management,
             openai_request_controls: None,
@@ -688,8 +796,35 @@ fn anthropic_messages_response_to_turn_response(
             openai_remote_compaction: None,
             native_web_search: native_web_search_diagnostics(request),
             response_format: response_format_diagnostics(request),
+            stable_prefix: Some(stable_prefix),
         }),
     })
+}
+
+fn anthropic_stable_history_prefix(
+    request_payload: &Value,
+    rolling_cache_marker: Option<(usize, usize)>,
+) -> (Vec<Value>, usize) {
+    let messages = request_payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let Some((message_index, content_index)) = rolling_cache_marker else {
+        let prefix_items = messages.len().saturating_sub(1);
+        return (
+            messages[..prefix_items].to_vec(),
+            messages.len().saturating_sub(prefix_items),
+        );
+    };
+    let end = message_index.saturating_add(1).min(messages.len());
+    let mut prefix = messages[..end].to_vec();
+    if let Some(message) = prefix.get_mut(message_index) {
+        if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
+            content.truncate(content_index.saturating_add(1));
+        }
+    }
+    (prefix, messages.len().saturating_sub(end))
 }
 
 fn provider_request_id_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -930,6 +1065,7 @@ impl AnthropicStreamAccumulator {
 
     fn finish(
         mut self,
+        provider: &str,
         model_ref: &str,
         url: &str,
         trace: Option<&ProviderHttpTraceRequest>,
@@ -938,7 +1074,7 @@ impl AnthropicStreamAccumulator {
             return Err(invalid_response_error_with_trace(
                 "invalid Anthropic stream",
                 "streaming_response_protocol",
-                "anthropic",
+                provider,
                 Some(model_ref),
                 Some(url),
                 "stream completed without message_start",
@@ -949,7 +1085,7 @@ impl AnthropicStreamAccumulator {
             return Err(invalid_response_error_with_trace(
                 "invalid Anthropic stream",
                 "streaming_response_protocol",
-                "anthropic",
+                provider,
                 Some(model_ref),
                 Some(url),
                 "stream completed without message_stop",
@@ -1239,7 +1375,7 @@ fn build_anthropic_tools(request: &ProviderTurnRequest) -> Vec<Value> {
         .collect::<Vec<_>>();
     if matches!(
         request.native_web_search.as_ref().map(|native| native.kind),
-        Some(ProviderNativeWebSearchKind::Anthropic)
+        Some(ProviderNativeWebSearchKind::Anthropic | ProviderNativeWebSearchKind::DeepSeek)
     ) {
         tools.push(json!({
             "type": request
@@ -1289,7 +1425,10 @@ fn native_web_search_diagnostics(
     request: &ProviderTurnRequest,
 ) -> Option<ProviderNativeWebSearchDiagnostics> {
     let native = request.native_web_search.as_ref()?;
-    let lowered = native.kind == ProviderNativeWebSearchKind::Anthropic;
+    let lowered = matches!(
+        native.kind,
+        ProviderNativeWebSearchKind::Anthropic | ProviderNativeWebSearchKind::DeepSeek
+    );
     Some(ProviderNativeWebSearchDiagnostics {
         kind: native.kind,
         provider_id: native.provider_id.clone(),
@@ -1297,8 +1436,9 @@ fn native_web_search_diagnostics(
         advertised_tool_type: native.advertised_tool_type.clone(),
         backend_kind: native.backend_kind.clone(),
         lowered,
-        fallback_reason: (!lowered)
-            .then(|| "anthropic transport only supports Anthropic-native web search".into()),
+        fallback_reason: (!lowered).then(|| {
+            "anthropic transport only supports Anthropic/DeepSeek-native web search".into()
+        }),
     })
 }
 
@@ -1441,6 +1581,12 @@ fn conversation_message_to_api(
             content: Value::Array(
                 blocks
                     .iter()
+                    .filter(|block| {
+                        !matches!(
+                            block,
+                            ModelBlock::ReasoningText { .. } | ModelBlock::Citations { .. }
+                        )
+                    })
                     .enumerate()
                     .map(|(block_index, block)| {
                         maybe_mark_cache_control(
@@ -1457,6 +1603,48 @@ fn conversation_message_to_api(
                                     "name": name,
                                     "input": input,
                                 }),
+                                ModelBlock::ProviderToolUse {
+                                    id,
+                                    name,
+                                    input,
+                                    status,
+                                    provider_data,
+                                } => anthropic_provider_block_payload(provider_data)
+                                    .unwrap_or_else(|| {
+                                        let mut value = json!({
+                                            "type": "server_tool_use",
+                                            "id": id,
+                                            "name": name,
+                                            "input": input,
+                                        });
+                                        if let Some(status) = status {
+                                            value["status"] = json!(status);
+                                        }
+                                        value
+                                    }),
+                                ModelBlock::ProviderToolResult {
+                                    tool_use_id,
+                                    content,
+                                    is_error,
+                                    status,
+                                    provider_data,
+                                } => anthropic_provider_block_payload(provider_data)
+                                    .unwrap_or_else(|| {
+                                        let mut value = json!({
+                                            "type": "tool_result",
+                                            "content": content,
+                                        });
+                                        if let Some(tool_use_id) = tool_use_id {
+                                            value["tool_use_id"] = json!(tool_use_id);
+                                        }
+                                        if *is_error {
+                                            value["is_error"] = json!(true);
+                                        }
+                                        if let Some(status) = status {
+                                            value["status"] = json!(status);
+                                        }
+                                        value
+                                    }),
                                 ModelBlock::Thinking { text, signature } => {
                                     let mut v = json!({
                                         "type": "thinking",
@@ -1473,6 +1661,12 @@ fn conversation_message_to_api(
                                     "type": "redacted_thinking",
                                     "data": data,
                                 }),
+                                ModelBlock::ReasoningText { .. } => unreachable!(
+                                    "reasoning text blocks are filtered before Anthropic encoding"
+                                ),
+                                ModelBlock::Citations { .. } => unreachable!(
+                                    "citation blocks are filtered before Anthropic encoding"
+                                ),
                             },
                             rolling_cache_block_index == Some(block_index),
                         )
@@ -1501,6 +1695,13 @@ fn conversation_message_to_api(
             ),
         },
     }
+}
+
+fn anthropic_provider_block_payload(provider_data: &Option<ProviderBlockData>) -> Option<Value> {
+    provider_data
+        .as_ref()
+        .filter(|data| data.format == ANTHROPIC_PROVIDER_BLOCK_FORMAT)
+        .map(|data| data.payload.clone())
 }
 
 fn maybe_mark_cache_control(mut content: Value, should_mark: bool) -> Value {
@@ -1572,8 +1773,9 @@ fn warn_unsupported_anthropic_response_block(
 ) {
     if matches!(
         block.kind.as_str(),
-        "text" | "tool_use" | "thinking" | "redacted_thinking" | "server_tool_use" | "tool_result"
-    ) {
+        "text" | "tool_use" | "thinking" | "redacted_thinking" | "server_tool_use"
+    ) || is_provider_tool_result_kind(&block.kind)
+    {
         return;
     }
 
@@ -1629,6 +1831,12 @@ fn api_response_block_to_model(
     block: ApiResponseBlock,
     response_format_tool_name: Option<&str>,
 ) -> Option<ModelBlock> {
+    let provider_data = serde_json::to_value(&block)
+        .ok()
+        .map(|payload| ProviderBlockData {
+            format: ANTHROPIC_PROVIDER_BLOCK_FORMAT.to_string(),
+            payload,
+        });
     match block.kind.as_str() {
         "text" => Some(ModelBlock::Text {
             text: block.text.unwrap_or_default(),
@@ -1655,39 +1863,94 @@ fn api_response_block_to_model(
         "redacted_thinking" => Some(ModelBlock::RedactedThinking {
             data: block.data.unwrap_or_default(),
         }),
-        // Anthropic server-side tool use (e.g. web search). This is a server-
-        // internal block that doesn't need to be stored or replayed.
-        "server_tool_use" => None,
-        // Anthropic server-side tool result (e.g. web search results) returned
-        // in the assistant response `content` array. This is distinct from
-        // client-side tool_result blocks in user messages, handled separately.
-        // Convert to Text so the content is preserved in subsequent turns.
-        "tool_result" => {
-            let text = match block.content {
-                Some(Value::String(s)) => s,
-                Some(Value::Array(arr)) => {
-                    // Anthropic tool_result content is an array of content blocks.
-                    // Extract text blocks and concatenate.
-                    arr.iter()
-                        .filter_map(|v| {
-                            v.get("text")
-                                .and_then(|t| t.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }
-                Some(other) => other.to_string(),
-                None => String::new(),
-            };
-            if text.is_empty() {
-                None
-            } else {
-                Some(ModelBlock::Text { text })
-            }
-        }
+        "server_tool_use" => Some(ModelBlock::ProviderToolUse {
+            id: block.id?,
+            name: block.name?,
+            input: block.input.unwrap_or_else(|| json!({})),
+            status: block.status,
+            provider_data,
+        }),
+        kind if is_provider_tool_result_kind(kind) => Some(ModelBlock::ProviderToolResult {
+            tool_use_id: block.tool_use_id,
+            content: block.content.unwrap_or(Value::Null),
+            is_error: block.is_error.unwrap_or(false),
+            status: block.status,
+            provider_data,
+        }),
         _ => None,
     }
+}
+
+fn is_provider_tool_result_kind(kind: &str) -> bool {
+    kind == "tool_result" || kind.ends_with("_tool_result")
+}
+
+fn strip_zai_redundant_provider_tool_text(blocks: &mut Vec<ApiResponseBlock>) {
+    let mut remove = vec![false; blocks.len()];
+    for (index, window) in blocks.windows(4).enumerate() {
+        let [input_text, tool_use, output_text, tool_result] = window else {
+            continue;
+        };
+        if is_zai_provider_tool_display_sequence(input_text, tool_use, output_text, tool_result) {
+            remove[index] = true;
+            remove[index + 2] = true;
+        }
+    }
+
+    let mut index = 0;
+    blocks.retain(|_| {
+        let keep = !remove[index];
+        index += 1;
+        keep
+    });
+}
+
+fn is_zai_provider_tool_display_sequence(
+    input_text: &ApiResponseBlock,
+    tool_use: &ApiResponseBlock,
+    output_text: &ApiResponseBlock,
+    tool_result: &ApiResponseBlock,
+) -> bool {
+    if input_text.kind != "text"
+        || tool_use.kind != "server_tool_use"
+        || output_text.kind != "text"
+        || !is_provider_tool_result_kind(&tool_result.kind)
+        || tool_use.id.as_deref() != tool_result.tool_use_id.as_deref()
+    {
+        return false;
+    }
+
+    let Some(name) = tool_use.name.as_deref() else {
+        return false;
+    };
+    let Some(input) = tool_use.input.as_ref() else {
+        return false;
+    };
+    let Some(displayed_input) =
+        parse_zai_provider_tool_input_display(input_text.text.as_deref().unwrap_or_default(), name)
+    else {
+        return false;
+    };
+    if &displayed_input != input {
+        return false;
+    }
+
+    let output_prefix = format!("**Output:**\n**{name}_result_summary:** ");
+    output_text
+        .text
+        .as_deref()
+        .is_some_and(|text| text.starts_with(&output_prefix))
+}
+
+fn parse_zai_provider_tool_input_display(text: &str, expected_name: &str) -> Option<Value> {
+    let name = text
+        .strip_prefix("**🌐 Z.ai Built-in Tool: ")?
+        .split_once("**\n\n**Input:**\n```json\n")?;
+    if name.0 != expected_name {
+        return None;
+    }
+    let json = name.1.strip_suffix("\n```\n*Executing on server...*\n")?;
+    serde_json::from_str(json).ok()
 }
 
 fn collect_anthropic_cache_diagnostics(
@@ -2138,8 +2401,12 @@ fn model_block_kind(block: &ModelBlock) -> &'static str {
     match block {
         ModelBlock::Text { .. } => "assistant_text",
         ModelBlock::ToolUse { .. } => "tool_use",
+        ModelBlock::ProviderToolUse { .. } => "provider_tool_use",
+        ModelBlock::ProviderToolResult { .. } => "provider_tool_result",
         ModelBlock::Thinking { .. } => "thinking",
+        ModelBlock::ReasoningText { .. } => "reasoning_text",
         ModelBlock::RedactedThinking { .. } => "redacted_thinking",
+        ModelBlock::Citations { .. } => "citations",
     }
 }
 
@@ -2152,6 +2419,10 @@ fn hash_model_block(block: &ModelBlock) -> String {
         ModelBlock::Thinking { text, .. } => {
             // Include a stable prefix so thinking blocks hash differently from text blocks
             let value = json!({ "type": "thinking", "thinking": text });
+            sha256_hex(canonical_json(&value).as_bytes())
+        }
+        ModelBlock::ReasoningText { text } => {
+            let value = json!({ "type": "reasoning", "text": text });
             sha256_hex(canonical_json(&value).as_bytes())
         }
         ModelBlock::RedactedThinking { data } => {
@@ -2167,6 +2438,44 @@ fn hash_model_block(block: &ModelBlock) -> String {
                 "name": name,
                 "input": input,
             });
+            sha256_hex(canonical_json(&value).as_bytes())
+        }
+        ModelBlock::ProviderToolUse {
+            id,
+            name,
+            input,
+            status,
+            provider_data,
+        } => {
+            let value = json!({
+                "type": "provider_tool_use",
+                "id": id,
+                "name": name,
+                "input": input,
+                "status": status,
+                "provider_data": provider_data,
+            });
+            sha256_hex(canonical_json(&value).as_bytes())
+        }
+        ModelBlock::ProviderToolResult {
+            tool_use_id,
+            content,
+            is_error,
+            status,
+            provider_data,
+        } => {
+            let value = json!({
+                "type": "provider_tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content,
+                "is_error": is_error,
+                "status": status,
+                "provider_data": provider_data,
+            });
+            sha256_hex(canonical_json(&value).as_bytes())
+        }
+        ModelBlock::Citations { citations } => {
+            let value = json!({ "type": "citations", "citations": citations });
             sha256_hex(canonical_json(&value).as_bytes())
         }
     }
@@ -2186,8 +2495,38 @@ fn estimate_model_block_tokens(block: &ModelBlock) -> u64 {
     match block {
         ModelBlock::Text { text } => estimate_tokens_from_chars(text.len()),
         ModelBlock::ToolUse { .. } => 50,
+        ModelBlock::ProviderToolUse {
+            input,
+            provider_data,
+            ..
+        } => provider_data
+            .as_ref()
+            .and_then(|data| serde_json::to_string(&data.payload).ok())
+            .map_or_else(
+                || estimate_tokens_from_chars(input.to_string().len()),
+                |payload| estimate_tokens_from_chars(payload.len()),
+            ),
+        ModelBlock::ProviderToolResult {
+            content,
+            provider_data,
+            ..
+        } => provider_data
+            .as_ref()
+            .and_then(|data| serde_json::to_string(&data.payload).ok())
+            .map_or_else(
+                || estimate_tokens_from_chars(content.to_string().len()),
+                |payload| estimate_tokens_from_chars(payload.len()),
+            ),
         ModelBlock::Thinking { text, .. } => estimate_tokens_from_chars(text.len()),
+        ModelBlock::ReasoningText { text } => estimate_tokens_from_chars(text.len()),
         ModelBlock::RedactedThinking { data } => estimate_tokens_from_chars(data.len()),
+        ModelBlock::Citations { citations } => citations
+            .iter()
+            .map(|citation| {
+                citation.url.len() + citation.title.as_ref().map(String::len).unwrap_or_default()
+            })
+            .map(estimate_tokens_from_chars)
+            .sum(),
     }
 }
 
@@ -2788,6 +3127,7 @@ mod tests {
             model: "claude-sonnet-4-6",
             max_tokens: 4096,
             thinking: None,
+            output_config: None,
             stream: true,
             system: if request.prompt_frame.has_structured_system_blocks() {
                 Value::Array(
@@ -2825,6 +3165,31 @@ mod tests {
             provider_model_ref: "anthropic/claude-test".into(),
             advertised_tool_type: "web_search_20250305".into(),
             backend_kind: "anthropic_web_search".into(),
+            max_results: None,
+        });
+
+        let payload = anthropic_request_payload_for_test(&request);
+
+        assert!(payload["tools"]
+            .as_array()
+            .expect("tools should be an array")
+            .iter()
+            .any(|tool| tool == &json!({ "type": "web_search_20250305", "name": "web_search" })));
+    }
+
+    #[test]
+    fn deepseek_anthropic_request_payload_lowers_native_web_search_tool() {
+        let mut request = ProviderTurnRequest::plain(
+            "system",
+            vec![ConversationMessage::UserText("search the web".into())],
+            vec![],
+        );
+        request.native_web_search = Some(ProviderNativeWebSearchRequest {
+            kind: ProviderNativeWebSearchKind::DeepSeek,
+            provider_id: "deepseek".into(),
+            provider_model_ref: "deepseek@default/deepseek-v4-pro".into(),
+            advertised_tool_type: "web_search_20250305".into(),
+            backend_kind: "deepseek_web_search".into(),
             max_results: None,
         });
 
@@ -2887,7 +3252,12 @@ mod tests {
         }
 
         let response = accumulator
-            .finish("anthropic/claude-test", "https://example.test", None)
+            .finish(
+                "anthropic",
+                "anthropic/claude-test",
+                "https://example.test",
+                None,
+            )
             .expect("stream should finish");
 
         assert_eq!(response.stop_reason.as_deref(), Some("tool_use"));
@@ -2908,6 +3278,98 @@ mod tests {
             response.content[1].input.as_ref(),
             Some(&json!({ "cmd": "echo ok" }))
         );
+    }
+
+    #[test]
+    fn anthropic_empty_completed_stream_is_retryable_and_preserves_usage() {
+        let stream = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":3}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":893}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let events = SseParser::default()
+            .push(stream.as_bytes())
+            .expect("stream should parse");
+        let mut accumulator = AnthropicStreamAccumulator::default();
+        for event in events {
+            accumulator
+                .apply(event, "anthropic/claude-test", "https://example.test", None)
+                .expect("event should accumulate");
+        }
+        let parsed = accumulator
+            .finish(
+                "anthropic",
+                "anthropic/claude-test",
+                "https://example.test",
+                None,
+            )
+            .expect("stream should finish");
+        let request = ProviderTurnRequest::plain("system", Vec::new(), Vec::new());
+        let error = anthropic_messages_response_to_turn_response(
+            parsed,
+            None,
+            &request,
+            &[],
+            None,
+            &json!({}),
+            "anthropic",
+            "claude-test",
+            AnthropicCacheStrategy::MessagesNative,
+            &[],
+            "anthropic/claude-test",
+            "https://example.test",
+            None,
+        )
+        .expect_err("empty completed stream should fail");
+
+        let classification = crate::provider::retry::classify_provider_error(&error);
+        assert_eq!(classification.kind, ProviderFailureKind::EmptyResponse);
+        assert_eq!(classification.disposition, RetryDisposition::Retryable);
+        assert_eq!(
+            crate::provider::provider_error_token_usage(&error)
+                .map(|usage| (usage.input_tokens, usage.output_tokens)),
+            Some((3, 893))
+        );
+    }
+
+    #[test]
+    fn anthropic_nonempty_unsupported_block_remains_fail_fast() {
+        let parsed = MessagesResponse {
+            content: vec![ApiResponseBlock {
+                kind: "unsupported_provider_block".into(),
+                ..Default::default()
+            }],
+            usage: Some(ApiUsage {
+                input_tokens: Some(3),
+                output_tokens: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let request = ProviderTurnRequest::plain("system", Vec::new(), Vec::new());
+        let error = anthropic_messages_response_to_turn_response(
+            parsed,
+            None,
+            &request,
+            &[],
+            None,
+            &json!({}),
+            "anthropic",
+            "claude-test",
+            AnthropicCacheStrategy::MessagesNative,
+            &[],
+            "anthropic/claude-test",
+            "https://example.test",
+            None,
+        )
+        .expect_err("unsupported block should fail");
+
+        let classification = crate::provider::retry::classify_provider_error(&error);
+        assert_eq!(classification.kind, ProviderFailureKind::InvalidResponse);
+        assert_eq!(classification.disposition, RetryDisposition::FailFast);
     }
 
     #[test]
@@ -3232,52 +3694,52 @@ mod tests {
 
     #[test]
     fn reasoning_effort_to_thinking_none_when_absent() {
-        assert!(reasoning_effort_to_thinking(&None, 16384).is_none());
+        assert!(reasoning_effort_to_thinking(None, 16384).is_none());
     }
 
     #[test]
     fn reasoning_effort_to_thinking_maps_levels() {
         // low = 10% of 16384 = ~1638, clamped to min 1024
-        let low = reasoning_effort_to_thinking(&Some("low".into()), 16384).unwrap();
+        let low = reasoning_effort_to_thinking(Some("low"), 16384).unwrap();
         assert_eq!(low.kind, "enabled");
         assert_eq!(low.budget_tokens, 1638);
 
         // medium = 25% of 16384 = ~4096
-        let medium = reasoning_effort_to_thinking(&Some("medium".into()), 16384).unwrap();
+        let medium = reasoning_effort_to_thinking(Some("medium"), 16384).unwrap();
         assert_eq!(medium.budget_tokens, 4096);
 
         // high = 50% of 16384 = ~8192
-        let high = reasoning_effort_to_thinking(&Some("high".into()), 16384).unwrap();
+        let high = reasoning_effort_to_thinking(Some("high"), 16384).unwrap();
         assert_eq!(high.budget_tokens, 8192);
 
         // xhigh = 80% of 16384 = ~13107
-        let xhigh = reasoning_effort_to_thinking(&Some("xhigh".into()), 16384).unwrap();
+        let xhigh = reasoning_effort_to_thinking(Some("xhigh"), 16384).unwrap();
         assert_eq!(xhigh.budget_tokens, 13107);
     }
 
     #[test]
     fn reasoning_effort_to_thinking_case_insensitive() {
-        let result = reasoning_effort_to_thinking(&Some("HIGH".into()), 16384).unwrap();
+        let result = reasoning_effort_to_thinking(Some("HIGH"), 16384).unwrap();
         assert_eq!(result.budget_tokens, 8192);
     }
 
     #[test]
     fn reasoning_effort_to_thinking_unknown_defaults_medium() {
-        let result = reasoning_effort_to_thinking(&Some("bogus".into()), 16384).unwrap();
+        let result = reasoning_effort_to_thinking(Some("bogus"), 16384).unwrap();
         assert_eq!(result.budget_tokens, 4096); // 25% = medium
     }
 
     #[test]
     fn reasoning_effort_to_thinking_clamps_to_min_1024() {
         // 10% of 4096 = ~410, should be clamped to 1024
-        let result = reasoning_effort_to_thinking(&Some("low".into()), 4096).unwrap();
+        let result = reasoning_effort_to_thinking(Some("low"), 4096).unwrap();
         assert_eq!(result.budget_tokens, 1024);
     }
 
     #[test]
     fn reasoning_effort_to_thinking_capped_below_max_tokens() {
         // budget must be <= max_output_tokens - 1
-        let result = reasoning_effort_to_thinking(&Some("xhigh".into()), 2048).unwrap();
+        let result = reasoning_effort_to_thinking(Some("xhigh"), 2048).unwrap();
         assert!(result.budget_tokens <= 2047);
         assert_eq!(result.budget_tokens, 1638); // 80% of 2048
     }
@@ -3285,41 +3747,235 @@ mod tests {
     #[test]
     fn reasoning_effort_to_thinking_skips_when_too_small() {
         // max_output_tokens = 1024 → max_tokens - 1 = 1023 < 1024 min → skip
-        assert!(reasoning_effort_to_thinking(&Some("high".into()), 1024).is_none());
+        assert!(reasoning_effort_to_thinking(Some("high"), 1024).is_none());
     }
 
     #[test]
-    fn api_response_block_tool_result_converts_to_text() {
+    fn deepseek_anthropic_reasoning_uses_output_config_effort_only() {
+        let (thinking, output_config) =
+            anthropic_reasoning_controls("deepseek", true, Some("high"), 16384);
+        assert!(thinking.is_none());
+        assert_eq!(
+            serde_json::to_value(output_config).unwrap(),
+            json!({ "effort": "high" })
+        );
+
+        let (thinking, output_config) = anthropic_reasoning_controls("deepseek", true, None, 16384);
+        assert!(thinking.is_none());
+        assert!(output_config.is_none());
+
+        let (thinking, output_config) =
+            anthropic_reasoning_controls("anthropic", true, Some("high"), 16384);
+        assert_eq!(thinking.unwrap().budget_tokens, 8192);
+        assert!(output_config.is_none());
+    }
+
+    #[test]
+    fn api_response_block_provider_tool_result_preserves_structured_content() {
         let block = ApiResponseBlock {
-            kind: "tool_result".to_string(),
+            kind: "web_search_tool_result".to_string(),
             tool_use_id: Some("srv_001".to_string()),
             content: Some(json!([{
-                "type": "text",
-                "text": "Search results: Rust is awesome."
+                "type": "web_search_result",
+                "url": "https://example.com/rust",
+                "title": "Rust"
             }])),
+            extra: [("provider_extension".to_string(), json!("kept"))]
+                .into_iter()
+                .collect(),
             ..Default::default()
         };
         let model = api_response_block_to_model(block, None);
-        assert!(
-            matches!(&model, Some(ModelBlock::Text { text }) if text.contains("Search results: Rust is awesome.")),
-            "tool_result should convert to Text preserving content, got: {model:?}"
-        );
+        match model {
+            Some(ModelBlock::ProviderToolResult {
+                tool_use_id,
+                content,
+                provider_data,
+                ..
+            }) => {
+                assert_eq!(tool_use_id.as_deref(), Some("srv_001"));
+                assert_eq!(content[0]["type"], json!("web_search_result"));
+                let provider_data = provider_data.expect("raw provider block should be preserved");
+                assert_eq!(provider_data.format, ANTHROPIC_PROVIDER_BLOCK_FORMAT);
+                assert_eq!(
+                    provider_data.payload["type"],
+                    json!("web_search_tool_result")
+                );
+                assert_eq!(provider_data.payload["provider_extension"], json!("kept"));
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
     }
 
     #[test]
-    fn api_response_block_server_tool_use_returns_none() {
+    fn api_response_block_server_tool_use_preserves_structured_input() {
         let block = ApiResponseBlock {
             kind: "server_tool_use".to_string(),
             id: Some("srv_search_1".to_string()),
             name: Some("web_search".to_string()),
             input: Some(json!({"query": "rust async"})),
+            extra: [("provider_extension".to_string(), json!({"version": 2}))]
+                .into_iter()
+                .collect(),
             ..Default::default()
         };
         let model = api_response_block_to_model(block, None);
-        assert!(
-            model.is_none(),
-            "server_tool_use should return None (server-side only), got: {model:?}"
-        );
+        match model {
+            Some(ModelBlock::ProviderToolUse {
+                id,
+                name,
+                input,
+                provider_data,
+                ..
+            }) => {
+                assert_eq!(id, "srv_search_1");
+                assert_eq!(name, "web_search");
+                assert_eq!(input, json!({"query": "rust async"}));
+                assert_eq!(
+                    provider_data
+                        .expect("raw provider block should be preserved")
+                        .payload["provider_extension"]["version"],
+                    json!(2)
+                );
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_tool_blocks_round_trip_through_anthropic_assistant_history() {
+        let raw_use = json!({
+            "type": "server_tool_use",
+            "id": "srv_search_1",
+            "name": "web_search",
+            "input": {"query": "rust async"},
+            "provider_extension": {"version": 2}
+        });
+        let raw_result = json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": "srv_search_1",
+            "content": [{
+                "type": "web_search_result",
+                "url": "https://example.com/rust",
+                "title": "Rust"
+            }]
+        });
+        let message = ConversationMessage::AssistantBlocks(vec![
+            ModelBlock::ProviderToolUse {
+                id: "srv_search_1".to_string(),
+                name: "web_search".to_string(),
+                input: json!({"query": "rust async"}),
+                status: None,
+                provider_data: Some(ProviderBlockData {
+                    format: ANTHROPIC_PROVIDER_BLOCK_FORMAT.to_string(),
+                    payload: raw_use.clone(),
+                }),
+            },
+            ModelBlock::ProviderToolResult {
+                tool_use_id: Some("srv_search_1".to_string()),
+                content: raw_result["content"].clone(),
+                is_error: false,
+                status: None,
+                provider_data: Some(ProviderBlockData {
+                    format: ANTHROPIC_PROVIDER_BLOCK_FORMAT.to_string(),
+                    payload: raw_result.clone(),
+                }),
+            },
+        ]);
+
+        let encoded = conversation_message_to_api(&message, None);
+        assert_eq!(encoded.content, json!([raw_use, raw_result]));
+    }
+
+    #[test]
+    fn strips_zai_redundant_provider_tool_display_text() {
+        let mut blocks = vec![
+            ApiResponseBlock {
+                kind: "text".to_string(),
+                text: Some(
+                    "**🌐 Z.ai Built-in Tool: web_search_prime**\n\n\
+                     **Input:**\n```json\n\
+                     {\"content_size\":\"medium\",\"search_query\":\"rust async\"}\n\
+                     ```\n*Executing on server...*\n"
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+            ApiResponseBlock {
+                kind: "server_tool_use".to_string(),
+                id: Some("call_1".to_string()),
+                name: Some("web_search_prime".to_string()),
+                input: Some(json!({
+                    "content_size": "medium",
+                    "search_query": "rust async"
+                })),
+                ..Default::default()
+            },
+            ApiResponseBlock {
+                kind: "text".to_string(),
+                text: Some(
+                    "**Output:**\n**web_search_prime_result_summary:** [{\"title\":\"Rust\"}]"
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+            ApiResponseBlock {
+                kind: "tool_result".to_string(),
+                tool_use_id: Some("call_1".to_string()),
+                content: Some(json!([[{"title": "Rust"}]])),
+                ..Default::default()
+            },
+            ApiResponseBlock {
+                kind: "text".to_string(),
+                text: Some("Rust uses async/await.".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        strip_zai_redundant_provider_tool_text(&mut blocks);
+
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].kind, "server_tool_use");
+        assert_eq!(blocks[1].kind, "tool_result");
+        assert_eq!(blocks[2].text.as_deref(), Some("Rust uses async/await."));
+    }
+
+    #[test]
+    fn preserves_zai_like_text_without_matching_structured_sequence() {
+        let mut blocks = vec![
+            ApiResponseBlock {
+                kind: "text".to_string(),
+                text: Some(
+                    "**🌐 Z.ai Built-in Tool: web_search_prime**\n\n\
+                     **Input:**\n```json\n{\"search_query\":\"displayed\"}\n```\n\
+                     *Executing on server...*\n"
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+            ApiResponseBlock {
+                kind: "server_tool_use".to_string(),
+                id: Some("call_1".to_string()),
+                name: Some("web_search_prime".to_string()),
+                input: Some(json!({"search_query": "actual"})),
+                ..Default::default()
+            },
+            ApiResponseBlock {
+                kind: "text".to_string(),
+                text: Some("**Output:**\n**web_search_prime_result_summary:** []".to_string()),
+                ..Default::default()
+            },
+            ApiResponseBlock {
+                kind: "tool_result".to_string(),
+                tool_use_id: Some("call_1".to_string()),
+                content: Some(json!([])),
+                ..Default::default()
+            },
+        ];
+
+        strip_zai_redundant_provider_tool_text(&mut blocks);
+
+        assert_eq!(blocks.len(), 4);
     }
 
     #[test]

@@ -8,11 +8,12 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
+use chrono::Utc;
 use serde_json::{json, Value};
 use tokio::{
-    sync::{Notify, RwLock},
-    task::{spawn_blocking, JoinHandle},
+    sync::{mpsc, watch, Notify, RwLock},
+    task::{spawn_blocking, JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -38,6 +39,7 @@ use crate::{
         SchedulerRepairInspection,
     },
     runtime_db::RuntimeDb,
+    runtime_error::describe_runtime_error,
     skills::{
         effective_skill_root_registrations, skills_runtime_view_from_catalog, SkillVisibility,
         SkillsRegistry,
@@ -49,12 +51,12 @@ use crate::{
     },
     tool::{apply_patch::ApplyPatchSurface, ToolRegistry},
     types::{
-        AdmissionContext, AgentDeletionJob, AgentIdentityRecord, AgentIdentityView, AgentKind,
-        AgentLifecycleHint, AgentListEntry, AgentOwnership, AgentProfilePreset,
-        AgentRegistryStatus, AgentState, AgentStatus, AgentSummary, AgentTokenUsageSummary,
-        AgentVisibility, AuthorityClass, ChildAgentSummary, ClosureOutcome, ExternalTriggerRecord,
-        ExternalTriggerStatus, ExternalTriggerSummary, LoadedAgentsMdView, MessageBody,
-        MessageDeliverySurface, MessageEnvelope, MessageKind, MessageOrigin,
+        AdmissionContext, AgentDeletionJob, AgentDurability, AgentIdentityRecord,
+        AgentIdentityView, AgentKind, AgentLifecycleHint, AgentListEntry, AgentOwnership,
+        AgentProfilePreset, AgentRegistryStatus, AgentState, AgentStatus, AgentSummary,
+        AgentTokenUsageSummary, AgentVisibility, AuthorityClass, ChildAgentSummary, ClosureOutcome,
+        ExternalTriggerRecord, ExternalTriggerStatus, ExternalTriggerSummary, LoadedAgentsMdView,
+        MessageBody, MessageDeliverySurface, MessageEnvelope, MessageKind, MessageOrigin,
         OperatorNotificationRecord, Priority, QueueEntryStatus, RuntimeFailureSummary,
         SpawnAgentModelResolution, SpawnAgentModelResolutionStatus, TaskKind, TaskRecord,
         TaskStatus, TimerRecord, TokenUsage, TranscriptEntry, TranscriptEntryKind,
@@ -68,6 +70,101 @@ pub struct PublicAgentActivitySnapshot {
     pub status: AgentStatus,
     pub active_task_count: usize,
     pub last_runtime_failure: Option<RuntimeFailureSummary>,
+}
+
+/// Host-level roster snapshot data assembled from one committed read view.
+/// The HTTP layer maps this onto the wire `AgentRosterSnapshot` contract.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AgentRosterSnapshotData {
+    pub runtime_id: String,
+    pub event_log_epoch: String,
+    pub visibility_policy_generation: u64,
+    pub agents: Vec<AgentRosterEntryData>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AgentRosterEntryData {
+    pub agent: AgentListEntry,
+    pub event_head_seq: u64,
+    pub oldest_retained_seq: u64,
+    pub latest_brief: Option<AgentRosterLatestBriefData>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AgentRosterLatestBriefData {
+    pub brief_id: String,
+    pub created_event_seq: Option<u64>,
+    pub created_at: chrono::DateTime<Utc>,
+    pub preview: String,
+}
+
+/// Host-level per-Agent projection snapshot data assembled from one
+/// committed read view. The HTTP layer maps this onto the wire
+/// `AgentProjectionSnapshot` contract.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AgentProjectionSnapshotData {
+    pub runtime_id: String,
+    pub event_log_epoch: String,
+    pub visibility_policy_generation: u64,
+    pub agent_id: String,
+    /// Consistency boundary: equals the per-Agent committed event head of
+    /// the same read view, because every display-affecting event family
+    /// commits its canonical record no later than its event.
+    pub snapshot_through_seq: u64,
+    pub event_head_seq: u64,
+    pub oldest_retained_seq: u64,
+    pub agent: AgentListEntry,
+    pub current_work_item: Option<AgentWorkItemAnchorData>,
+    pub conversation: ConversationRevisionAnchorsData,
+    pub latest_brief: Option<AgentRosterLatestBriefData>,
+    /// Records referenced by the projection and resolvable through the
+    /// per-family batch record APIs. Tombstones stay empty in v1: no
+    /// durable per-record deletion ledger exists for these families yet,
+    /// and absence is represented by the null anchors above.
+    pub hydration_references: Vec<AgentHydrationReferenceData>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AgentWorkItemAnchorData {
+    pub work_item_id: String,
+    pub state: crate::types::WorkItemState,
+    pub plan_status: crate::types::WorkItemPlanStatus,
+    pub revision: u64,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ConversationRevisionAnchorsData {
+    pub latest_message_id: Option<String>,
+    pub latest_transcript_entry_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AgentHydrationReferenceData {
+    pub record_kind: ObserverSyncRecordKindData,
+    pub record_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObserverSyncRecordKindData {
+    Message,
+    Brief,
+    TranscriptEntry,
+}
+
+/// Bounds a stored Brief preview to the roster contract's UTF-8 byte limit,
+/// cutting on a char boundary so the value stays valid UTF-8.
+fn brief_preview(preview: &Option<String>) -> String {
+    const MAX_UTF8_BYTES: usize = crate::http::observer_sync::LATEST_BRIEF_PREVIEW_MAX_UTF8_BYTES;
+    let text = preview.as_deref().unwrap_or("");
+    if text.len() <= MAX_UTF8_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_UTF8_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +203,21 @@ const TEMP_CHILD_AGENT_PREFIX: &str = "tmp_child_";
 const HOST_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 #[cfg(test)]
 const HOST_SHUTDOWN_GRACE: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const RUNTIME_RECOVERY_BACKOFF: &[Duration] = &[
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+#[cfg(test)]
+const RUNTIME_RECOVERY_BACKOFF: &[Duration] = &[
+    Duration::from_millis(10),
+    Duration::from_millis(20),
+    Duration::from_millis(50),
+];
 
 #[derive(Debug)]
 pub enum PublicAgentError {
@@ -157,11 +269,35 @@ pub(crate) struct HostInner {
     skills_registry: Arc<RwLock<SkillsRegistry>>,
     static_provider: Option<Arc<dyn AgentProvider>>,
     runtimes: RwLock<HostRuntimeRegistry>,
+    runtime_recovery_tx: mpsc::UnboundedSender<RuntimeRecoveryNotice>,
+    runtime_recovery_rx: Mutex<Option<mpsc::UnboundedReceiver<RuntimeRecoveryNotice>>>,
+    runtime_recovery_token: CancellationToken,
+    runtime_recovery_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 struct AgentEntry {
     runtime: RuntimeHandle,
     task: JoinHandle<()>,
+    phase: watch::Receiver<AgentRuntimePhase>,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentRuntimePhase {
+    Bootstrapping,
+    Running,
+    FailedCleaning,
+    Terminated,
+}
+
+impl AgentEntry {
+    fn accepts_host_access(&self) -> bool {
+        !self.task.is_finished()
+            && matches!(
+                *self.phase.borrow(),
+                AgentRuntimePhase::Bootstrapping | AgentRuntimePhase::Running
+            )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +310,22 @@ enum HostRuntimePhase {
 struct HostRuntimeRegistry {
     phase: HostRuntimePhase,
     agents: HashMap<String, AgentEntry>,
+    next_generation: u64,
+    recovering: HashMap<String, RuntimeRecoveryClaim>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeRecoveryClaim {
+    generation: u64,
+    retryable: bool,
+    notify: Arc<Notify>,
+}
+
+#[derive(Debug)]
+struct RuntimeRecoveryNotice {
+    agent_id: String,
+    generation: u64,
+    retryable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,6 +466,7 @@ impl RuntimeHost {
         let runtime_db =
             RuntimeDb::open_and_migrate(config.runtime_db_path(), config.runtime_db_lock_path())?;
         let registry = RuntimeRegistry::new(config, runtime_db.clone())?;
+        let (runtime_recovery_tx, runtime_recovery_rx) = mpsc::unbounded_channel();
         let host = Self {
             inner: Arc::new(HostInner {
                 registry,
@@ -331,7 +484,13 @@ impl RuntimeHost {
                 runtimes: RwLock::new(HostRuntimeRegistry {
                     phase: HostRuntimePhase::Open,
                     agents: HashMap::new(),
+                    next_generation: 1,
+                    recovering: HashMap::new(),
                 }),
+                runtime_recovery_tx,
+                runtime_recovery_rx: Mutex::new(Some(runtime_recovery_rx)),
+                runtime_recovery_token: CancellationToken::new(),
+                runtime_recovery_handle: Mutex::new(None),
             }),
         };
         host.ensure_default_agent_identity()?;
@@ -464,6 +623,323 @@ impl RuntimeHost {
             .take();
     }
 
+    fn ensure_runtime_recovery_coordinator(&self) {
+        if self.inner.runtime_recovery_handle.lock().unwrap().is_some() {
+            return;
+        }
+        let Some(receiver) = self.inner.runtime_recovery_rx.lock().unwrap().take() else {
+            return;
+        };
+        let host = self.clone();
+        let handle = tokio::spawn(async move {
+            host.run_runtime_recovery_coordinator(receiver).await;
+        });
+        *self.inner.runtime_recovery_handle.lock().unwrap() = Some(handle);
+    }
+
+    async fn shutdown_runtime_recovery_coordinator(&self) {
+        self.inner.runtime_recovery_token.cancel();
+        let handle = self.inner.runtime_recovery_handle.lock().unwrap().take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+    }
+
+    async fn run_runtime_recovery_coordinator(
+        self,
+        mut receiver: mpsc::UnboundedReceiver<RuntimeRecoveryNotice>,
+    ) {
+        let mut recoveries = JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = self.inner.runtime_recovery_token.cancelled() => break,
+                Some(notice) = receiver.recv() => {
+                    if self.claim_runtime_recovery(&notice).await {
+                        let host = self.clone();
+                        recoveries.spawn(async move {
+                            host.recover_runtime_after_failure(notice).await;
+                        });
+                    }
+                }
+                Some(result) = recoveries.join_next(), if !recoveries.is_empty() => {
+                    if let Err(error) = result {
+                        tracing::warn!(error = %error, "runtime recovery task failed");
+                    }
+                }
+            }
+        }
+        recoveries.abort_all();
+        while recoveries.join_next().await.is_some() {}
+    }
+
+    async fn claim_runtime_recovery(&self, notice: &RuntimeRecoveryNotice) -> bool {
+        let mut registry = self.inner.runtimes.write().await;
+        if registry.phase != HostRuntimePhase::Open
+            || !registry.agents.get(&notice.agent_id).is_some_and(|entry| {
+                entry.generation == notice.generation
+                    && *entry.phase.borrow() == AgentRuntimePhase::Terminated
+            })
+        {
+            return false;
+        }
+        if let Some(claim) = registry.recovering.get_mut(&notice.agent_id) {
+            if notice.generation >= claim.generation {
+                claim.generation = notice.generation;
+                claim.retryable = notice.retryable;
+                if !notice.retryable {
+                    claim.notify.notify_one();
+                }
+            }
+            return false;
+        }
+        if !notice.retryable {
+            tracing::warn!(
+                agent_id = notice.agent_id,
+                generation = notice.generation,
+                "runtime failure is not retryable; automatic recovery disabled"
+            );
+            return false;
+        }
+        registry.recovering.insert(
+            notice.agent_id.clone(),
+            RuntimeRecoveryClaim {
+                generation: notice.generation,
+                retryable: true,
+                notify: Arc::new(Notify::new()),
+            },
+        );
+        true
+    }
+
+    async fn clear_runtime_recovery(&self, agent_id: &str, generation: u64) {
+        let mut registry = self.inner.runtimes.write().await;
+        if registry
+            .recovering
+            .get(agent_id)
+            .is_some_and(|claim| claim.generation == generation)
+        {
+            registry.recovering.remove(agent_id);
+        }
+    }
+
+    async fn notify_runtime_recovery(&self, agent_id: &str) {
+        let notify = self
+            .inner
+            .runtimes
+            .read()
+            .await
+            .recovering
+            .get(agent_id)
+            .map(|claim| claim.notify.clone());
+        if let Some(notify) = notify {
+            notify.notify_one();
+        }
+    }
+
+    async fn recover_runtime_after_failure(&self, notice: RuntimeRecoveryNotice) {
+        let mut generation: u64;
+        let mut attempt = 0usize;
+        loop {
+            let claim = {
+                self.inner
+                    .runtimes
+                    .read()
+                    .await
+                    .recovering
+                    .get(&notice.agent_id)
+                    .cloned()
+            };
+            let Some(claim) = claim else {
+                return;
+            };
+            generation = claim.generation;
+            if !claim.retryable {
+                tracing::warn!(
+                    agent_id = notice.agent_id,
+                    generation,
+                    "runtime failure is not retryable; automatic recovery disabled"
+                );
+                self.clear_runtime_recovery(&notice.agent_id, generation)
+                    .await;
+                return;
+            }
+            let delay = RUNTIME_RECOVERY_BACKOFF
+                [attempt.min(RUNTIME_RECOVERY_BACKOFF.len().saturating_sub(1))];
+            tokio::select! {
+                _ = self.inner.runtime_recovery_token.cancelled() => {
+                    self.clear_runtime_recovery(&notice.agent_id, generation).await;
+                    return;
+                }
+                _ = tokio::time::sleep(delay) => {}
+                _ = claim.notify.notified() => {}
+            }
+            attempt = attempt.saturating_add(1);
+
+            match self.active_agent_identity(&notice.agent_id) {
+                Ok(_) => {}
+                Err(PublicAgentError::Runtime(error)) => {
+                    tracing::warn!(
+                        agent_id = notice.agent_id,
+                        error = %error,
+                        "runtime recovery identity check failed"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    self.clear_runtime_recovery(&notice.agent_id, generation)
+                        .await;
+                    return;
+                }
+            }
+            let state = match self
+                .agent_storage_read_only(&notice.agent_id)
+                .and_then(|storage| storage.read_agent())
+            {
+                Ok(state) => state.unwrap_or_else(|| AgentState::new(&notice.agent_id)),
+                Err(error) => {
+                    tracing::warn!(
+                        agent_id = notice.agent_id,
+                        error = %error,
+                        "runtime recovery state check failed"
+                    );
+                    continue;
+                }
+            };
+            if state.status == AgentStatus::Stopped {
+                self.clear_runtime_recovery(&notice.agent_id, generation)
+                    .await;
+                return;
+            }
+
+            let existing_runtime = {
+                let mut registry = self.inner.runtimes.write().await;
+                if registry.phase != HostRuntimePhase::Open {
+                    registry.recovering.remove(&notice.agent_id);
+                    return;
+                }
+                let Some(claim) = registry.recovering.get(&notice.agent_id) else {
+                    return;
+                };
+                if !claim.retryable {
+                    continue;
+                }
+                generation = claim.generation;
+                let Some(entry) = registry.agents.get(&notice.agent_id) else {
+                    registry.recovering.remove(&notice.agent_id);
+                    return;
+                };
+                let entry_generation = entry.generation;
+                let entry_terminated = entry.task.is_finished()
+                    || *entry.phase.borrow() == AgentRuntimePhase::Terminated;
+                let accessible_runtime = entry.accepts_host_access().then(|| entry.runtime.clone());
+                if entry_generation != generation {
+                    if accessible_runtime.is_some() {
+                        registry.recovering.remove(&notice.agent_id);
+                        return;
+                    }
+                    continue;
+                } else if entry_terminated {
+                    registry.agents.remove(&notice.agent_id);
+                    None
+                } else {
+                    accessible_runtime
+                }
+            };
+
+            let runtime = match existing_runtime {
+                Some(runtime) => runtime,
+                None => match self
+                    .activate_agent(&notice.agent_id, RuntimeActivationReason::StartupRecovery)
+                    .await
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        tracing::warn!(
+                            agent_id = notice.agent_id,
+                            attempt,
+                            error = %error,
+                            "runtime automatic recovery activation failed"
+                        );
+                        continue;
+                    }
+                },
+            };
+            {
+                let mut registry = self.inner.runtimes.write().await;
+                if let Some(entry) = registry.agents.get(&notice.agent_id) {
+                    let previous_generation = generation;
+                    generation = entry.generation;
+                    if registry
+                        .recovering
+                        .get(&notice.agent_id)
+                        .is_some_and(|claim| claim.generation == previous_generation)
+                    {
+                        if let Some(claim) = registry.recovering.get_mut(&notice.agent_id) {
+                            claim.generation = generation;
+                        }
+                    }
+                }
+            }
+
+            match runtime.wait_for_bootstrap().await {
+                Ok(()) => {
+                    let recovered = {
+                        let mut registry = self.inner.runtimes.write().await;
+                        let claim_matches = registry
+                            .recovering
+                            .get(&notice.agent_id)
+                            .is_some_and(|claim| claim.generation == generation && claim.retryable);
+                        let runtime_is_healthy =
+                            registry.agents.get(&notice.agent_id).is_some_and(|entry| {
+                                entry.generation == generation && entry.accepts_host_access()
+                            });
+                        if claim_matches && runtime_is_healthy {
+                            registry.recovering.remove(&notice.agent_id);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if !recovered {
+                        continue;
+                    }
+                    let _ = runtime
+                        .storage()
+                        .append_event(&crate::types::AuditEvent::legacy(
+                            "runtime_loop_recovered",
+                            json!({
+                                "agent_id": notice.agent_id,
+                                "failed_generation": notice.generation,
+                                "recovered_generation": generation,
+                                "attempt": attempt,
+                            }),
+                        ));
+                    tracing::info!(
+                        agent_id = notice.agent_id,
+                        attempt,
+                        "agent runtime loop recovered automatically"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    let descriptor = describe_runtime_error(&error);
+                    tracing::warn!(
+                        agent_id = notice.agent_id,
+                        attempt,
+                        retryable = descriptor.retryable,
+                        error = %error,
+                        "runtime automatic recovery bootstrap failed"
+                    );
+                    if !descriptor.retryable {
+                        self.clear_runtime_recovery(&notice.agent_id, generation)
+                            .await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// Signal the deletion coordinator to stop.
     pub async fn shutdown_daemon_deletion_coordinator(&self) {
         self.inner.daemon_deletion_token.cancel();
@@ -548,12 +1024,12 @@ impl RuntimeHost {
     const DAEMON_INDEXER_FALLBACK_POLL: Duration = Duration::from_secs(60);
 
     async fn run_daemon_memory_indexer(self) {
-        use crate::memory::refresh_memory_index_bounded;
+        use crate::memory::{memory_index_agent_ids_with_pending, refresh_memory_index_bounded};
         loop {
             if self.inner.daemon_indexer_token.is_cancelled() {
                 break;
             }
-            let agent_ids = match self
+            let runtime_agent_ids = match self
                 .inner
                 .runtime_db
                 .runtime_index_outbox()
@@ -566,6 +1042,28 @@ impl RuntimeHost {
                     continue;
                 }
             };
+            let default_storage = match self.agent_storage(&self.config().default_agent_id) {
+                Ok(storage) => storage,
+                Err(error) => {
+                    tracing::warn!(error = %error, "daemon memory indexer: failed to open shared index");
+                    self.wait_daemon_indexer_round().await;
+                    continue;
+                }
+            };
+            let pending_source_agent_ids = match memory_index_agent_ids_with_pending(
+                &default_storage,
+            ) {
+                Ok(ids) => ids.into_iter().collect::<std::collections::BTreeSet<_>>(),
+                Err(error) => {
+                    tracing::warn!(error = %error, "daemon memory indexer: failed to query pending source agents");
+                    self.wait_daemon_indexer_round().await;
+                    continue;
+                }
+            };
+            let agent_ids = runtime_agent_ids
+                .into_iter()
+                .chain(pending_source_agent_ids.iter().cloned())
+                .collect::<std::collections::BTreeSet<_>>();
 
             let mut did_work = false;
             for agent_id in &agent_ids {
@@ -586,9 +1084,12 @@ impl RuntimeHost {
                 .await;
                 match result {
                     Ok(Ok(status)) => {
-                        if status.lag > 0 || status.consumption_was_limited {
-                            did_work = true;
-                        }
+                        did_work |= status.lag > 0
+                            || status.consumption_was_limited
+                            // A successful rebuild consumes every pending source
+                            // for the agent, so another immediate round is useful.
+                            || (pending_source_agent_ids.contains(agent_id)
+                                && status.skipped_error_count == 0);
                         tracing::debug!(
                             agent_id = %agent_id,
                             freshness = %status.freshness,
@@ -663,6 +1164,7 @@ impl RuntimeHost {
                 HostRuntimePhase::Closing | HostRuntimePhase::Closed => return Ok(()),
             }
         };
+        self.shutdown_runtime_recovery_coordinator().await;
         self.shutdown_daemon_runtime_db_retention().await;
         self.shutdown_daemon_memory_indexer().await;
         self.shutdown_daemon_deletion_coordinator().await;
@@ -692,6 +1194,7 @@ impl RuntimeHost {
 
     pub(crate) async fn unload_runtime(&self, agent_id: &str) {
         let entry = self.inner.runtimes.write().await.agents.remove(agent_id);
+        self.notify_runtime_recovery(agent_id).await;
         if let Some(entry) = entry {
             entry.task.abort();
             let _ = entry.task.await;
@@ -707,21 +1210,44 @@ impl RuntimeHost {
     }
 
     pub async fn recover_orphaned_queue_claims_at_startup(&self) -> Result<Vec<String>> {
-        let recovered_agent_ids = self
+        let recovered_queue_agent_ids = self
             .runtime_db()
             .recover_orphaned_dequeued_claims_at_startup()?;
-        for agent_id in &recovered_agent_ids {
+        let queue_recovery_candidate_ids = self
+            .runtime_db()
+            .queue_entries()
+            .recovery_candidate_agent_ids()?
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let active_task_owner_ids = self
+            .runtime_db()
+            .tasks()
+            .active_owner_agent_ids()?
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut recovery_agent_ids = recovered_queue_agent_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        recovery_agent_ids.extend(queue_recovery_candidate_ids.iter().cloned());
+        recovery_agent_ids.extend(active_task_owner_ids.iter().cloned());
+        for agent_id in recovery_agent_ids {
             let state = self
-                .agent_storage_read_only(agent_id)?
+                .agent_storage_read_only(&agent_id)?
                 .read_agent()?
-                .unwrap_or_else(|| AgentState::new(agent_id));
-            if state.status == AgentStatus::Stopped {
+                .unwrap_or_else(|| AgentState::new(&agent_id));
+            if state.status == AgentStatus::Stopped
+                && !active_task_owner_ids.contains(&agent_id)
+                && !queue_recovery_candidate_ids.contains(&agent_id)
+            {
                 continue;
             }
-            self.activate_agent(agent_id, RuntimeActivationReason::StartupRecovery)
+            let runtime = self
+                .activate_agent(&agent_id, RuntimeActivationReason::StartupRecovery)
                 .await?;
+            runtime.wait_for_bootstrap().await?;
         }
-        Ok(recovered_agent_ids)
+        Ok(recovered_queue_agent_ids)
     }
 
     fn active_agent_identity(
@@ -780,7 +1306,7 @@ impl RuntimeHost {
         registry
             .agents
             .get(agent_id)
-            .filter(|entry| !entry.task.is_finished())
+            .filter(|entry| entry.accepts_host_access())
             .map(|entry| entry.runtime.clone())
     }
 
@@ -838,6 +1364,7 @@ impl RuntimeHost {
         limit: usize,
         include_all_workspaces: bool,
         agent_ids: &[String],
+        source_kinds: &[String],
     ) -> Result<crate::memory::MemorySearchQueryResult> {
         let default_agent_id = self.config().default_agent_id.clone();
         let storage = self.agent_storage_read_only(&default_agent_id)?;
@@ -853,6 +1380,7 @@ impl RuntimeHost {
         }
         let query = query.to_string();
         let agent_ids = agent_ids.to_vec();
+        let source_kinds = source_kinds.to_vec();
         tokio::task::spawn_blocking(move || {
             let _ = crate::memory::ensure_memory_indexes_fresh(
                 &storage,
@@ -866,6 +1394,7 @@ impl RuntimeHost {
                 active_workspace_id.as_deref(),
                 include_all_workspaces,
                 &agent_ids,
+                &source_kinds,
                 &agent_storages,
             )
         })
@@ -1094,9 +1623,15 @@ impl RuntimeHost {
         agent_id: &str,
     ) -> std::result::Result<RuntimeHandle, PublicAgentError> {
         self.public_agent_identity(agent_id)?;
-        self.activate_agent(agent_id, RuntimeActivationReason::OperatorControl)
+        let runtime = self
+            .activate_agent(agent_id, RuntimeActivationReason::OperatorControl)
             .await
-            .map_err(Self::public_activation_error)
+            .map_err(Self::public_activation_error)?;
+        runtime
+            .wait_for_bootstrap()
+            .await
+            .map_err(PublicAgentError::Runtime)?;
+        Ok(runtime)
     }
 
     pub async fn begin_public_agent_deletion(
@@ -1190,7 +1725,7 @@ impl RuntimeHost {
             registry
                 .agents
                 .get(agent_id)
-                .filter(|entry| !entry.task.is_finished())
+                .filter(|entry| entry.accepts_host_access())
                 .map(|entry| entry.runtime.clone())
         };
 
@@ -1344,9 +1879,15 @@ impl RuntimeHost {
                 agent_id: agent_id.to_string(),
             });
         }
-        self.activate_agent(agent_id, RuntimeActivationReason::ExternalIngress)
+        let runtime = self
+            .activate_agent(agent_id, RuntimeActivationReason::ExternalIngress)
             .await
-            .map_err(Self::public_activation_error)
+            .map_err(Self::public_activation_error)?;
+        runtime
+            .wait_for_bootstrap()
+            .await
+            .map_err(PublicAgentError::Runtime)?;
+        Ok(runtime)
     }
 
     pub async fn control_public_agent(
@@ -1370,6 +1911,7 @@ impl RuntimeHost {
             .control(action.clone())
             .await
             .map_err(PublicAgentError::Runtime)?;
+        self.notify_runtime_recovery(agent_id).await;
         if action.is_start() && was_stopped {
             return self.get_public_agent(agent_id).await;
         }
@@ -1514,6 +2056,7 @@ impl RuntimeHost {
         reason: RuntimeActivationReason,
     ) -> Pin<Box<dyn Future<Output = Result<RuntimeHandle>> + Send + 'a>> {
         Box::pin(async move {
+            self.ensure_runtime_recovery_coordinator();
             self.validate_agent_id(agent_id)?;
             if agent_id == self.config().default_agent_id {
                 self.ensure_default_agent_identity()?;
@@ -1523,38 +2066,61 @@ impl RuntimeHost {
             if agent_id == self.config().default_agent_id {
                 self.ensure_default_agent_home_initialized().await?;
             }
-            let mut stale_entry = None;
-            let mut registry = self.inner.runtimes.write().await;
-            if registry.phase != HostRuntimePhase::Open {
-                return Err(anyhow::Error::new(RuntimeAdmissionClosed));
-            }
-            if let Err(error) = self.active_agent_identity(agent_id) {
-                return Err(anyhow::Error::new(error));
-            }
-            if let Some(entry) = registry.agents.get(agent_id) {
-                if !entry.task.is_finished() {
-                    return Ok(entry.runtime.clone());
+            loop {
+                let mut stale_entry = None;
+                let mut failed_runtime_phase = None;
+                let mut registry = self.inner.runtimes.write().await;
+                if registry.phase != HostRuntimePhase::Open {
+                    return Err(anyhow::Error::new(RuntimeAdmissionClosed));
                 }
-                stale_entry = registry.agents.remove(agent_id);
+                if let Err(error) = self.active_agent_identity(agent_id) {
+                    return Err(anyhow::Error::new(error));
+                }
+                if let Some(entry) = registry.agents.get(agent_id) {
+                    if entry.accepts_host_access() {
+                        return Ok(entry.runtime.clone());
+                    }
+                    if !entry.task.is_finished()
+                        && *entry.phase.borrow() == AgentRuntimePhase::FailedCleaning
+                    {
+                        failed_runtime_phase = Some(entry.phase.clone());
+                    } else {
+                        stale_entry = registry.agents.remove(agent_id);
+                    }
+                }
+                if let Some(mut phase) = failed_runtime_phase {
+                    drop(registry);
+                    while *phase.borrow_and_update() != AgentRuntimePhase::Terminated {
+                        if phase.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                let generation = registry.next_generation;
+                registry.next_generation = registry.next_generation.saturating_add(1);
+                let (runtime, runtime_task, phase) =
+                    self.spawn_runtime(agent_id, Some(generation))?;
+                tracing::debug!(
+                    agent_id,
+                    activation_reason = reason.as_str(),
+                    "activating agent runtime"
+                );
+                registry.agents.insert(
+                    agent_id.to_string(),
+                    AgentEntry {
+                        runtime: runtime.clone(),
+                        task: runtime_task,
+                        phase,
+                        generation,
+                    },
+                );
+                drop(registry);
+                if let Some(entry) = stale_entry {
+                    let _ = entry.task.await;
+                }
+                return Ok(runtime);
             }
-            let (runtime, runtime_task) = self.spawn_runtime(agent_id)?;
-            tracing::debug!(
-                agent_id,
-                activation_reason = reason.as_str(),
-                "activating agent runtime"
-            );
-            registry.agents.insert(
-                agent_id.to_string(),
-                AgentEntry {
-                    runtime: runtime.clone(),
-                    task: runtime_task,
-                },
-            );
-            drop(registry);
-            if let Some(entry) = stale_entry {
-                let _ = entry.task.await;
-            }
-            Ok(runtime)
         })
     }
 
@@ -1567,8 +2133,42 @@ impl RuntimeHost {
             other => ids::runtime_id(&format!("{TEMP_AGENT_PREFIX}{other}")),
         };
         self.validate_agent_id(&agent_id)?;
-        let (runtime, runtime_task) = self.spawn_runtime(&agent_id)?;
+        let mut identity = AgentIdentityRecord::new(
+            agent_id.clone(),
+            AgentKind::Named,
+            AgentVisibility::Private,
+            AgentOwnership::SelfOwned,
+            AgentProfilePreset::PublicNamed,
+            None,
+            None,
+        );
+        identity.durability = Some(AgentDurability::Ephemeral);
+        self.append_agent_identity(&identity)?;
+        let (runtime, runtime_task, _phase) = match self.spawn_runtime(&agent_id, None) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                let _ = self.archive_temporary_runtime_identity(&agent_id);
+                return Err(error);
+            }
+        };
         Ok((agent_id, runtime, runtime_task))
+    }
+
+    pub(crate) fn archive_temporary_runtime_identity(&self, agent_id: &str) -> Result<()> {
+        if !Self::is_temporary_agent_id(agent_id) {
+            bail!("agent {agent_id} is not a temporary runtime");
+        }
+        let Some(mut identity) = self.agent_identity_record(agent_id)? else {
+            bail!("temporary runtime {agent_id} is missing its host identity");
+        };
+        if identity.status != AgentRegistryStatus::Deleted {
+            identity.status = AgentRegistryStatus::Deleted;
+            identity.revision = identity.revision.saturating_add(1);
+            identity.deleted_at = Some(Utc::now());
+            identity.updated_at = Utc::now();
+            self.append_agent_identity(&identity)?;
+        }
+        Ok(())
     }
 
     pub fn workspace_entries(&self) -> Result<Vec<WorkspaceEntry>> {
@@ -1748,6 +2348,245 @@ impl RuntimeHost {
         })
     }
 
+    /// Authoritative roster snapshot data (S4): membership, per-Agent
+    /// committed event windows, and latest canonical Brief anchors from one
+    /// committed database read view. All-or-nothing: any per-Agent assembly
+    /// failure fails the whole snapshot, and entries reflect committed
+    /// canonical state instead of in-memory runtime watchers.
+    pub(crate) fn agent_roster_snapshot(&self) -> Result<AgentRosterSnapshotData> {
+        let rows = self.runtime_db().agent_roster_snapshot_rows()?;
+        let catalog = RuntimeModelCatalog::from_config(&self.config());
+        let mut agents = Vec::with_capacity(rows.rows.len());
+        for row in rows.rows {
+            let identity: AgentIdentityRecord =
+                serde_json::from_str(&row.identity_json).map_err(|error| {
+                    anyhow!(
+                        "unreadable roster identity payload for {}: {error}",
+                        row.agent_id
+                    )
+                })?;
+            let agent_state = row
+                .agent_state_json
+                .as_deref()
+                .map(|payload| {
+                    serde_json::from_str::<AgentState>(payload).map_err(|error| {
+                        anyhow!(
+                            "unreadable roster agent state payload for {}: {error}",
+                            row.agent_id
+                        )
+                    })
+                })
+                .transpose()?;
+            let latest_brief = row
+                .latest_brief
+                .map(|brief| -> Result<AgentRosterLatestBriefData> {
+                    Ok(AgentRosterLatestBriefData {
+                        brief_id: brief.brief_id,
+                        created_event_seq: brief
+                            .created_event_seq
+                            .map(|seq| {
+                                u64::try_from(seq).map_err(|_| {
+                                    anyhow!("negative latest brief linkage for {}", row.agent_id)
+                                })
+                            })
+                            .transpose()?,
+                        created_at: chrono::DateTime::parse_from_rfc3339(&brief.created_at)
+                            .map(|parsed| parsed.with_timezone(&Utc))
+                            .map_err(|error| {
+                                anyhow!(
+                                    "unreadable latest brief timestamp for {}: {error}",
+                                    row.agent_id
+                                )
+                            })?,
+                        preview: brief_preview(&brief.preview),
+                    })
+                })
+                .transpose()?;
+            let agent =
+                self.agent_list_entry_from_committed_state(&identity, agent_state, &catalog)?;
+            agents.push(AgentRosterEntryData {
+                agent,
+                event_head_seq: row.event_head_seq,
+                oldest_retained_seq: row.oldest_retained_seq,
+                latest_brief,
+            });
+        }
+        Ok(AgentRosterSnapshotData {
+            runtime_id: rows.runtime_id,
+            event_log_epoch: rows.event_log_epoch,
+            visibility_policy_generation: rows.visibility_policy_generation,
+            agents,
+        })
+    }
+
+    /// Per-Agent canonical projection snapshot data (S5) assembled from one
+    /// committed read view. Returns `None` when the Agent is not an active
+    /// public member, so unknown, private, and deleted identities stay
+    /// indistinguishable. Assembly is all-or-nothing: an unreadable anchor
+    /// fails the whole request instead of substituting placeholder facts.
+    pub(crate) fn agent_projection_snapshot(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<AgentProjectionSnapshotData>> {
+        let rows = self.runtime_db().agent_projection_snapshot_rows(agent_id)?;
+        let row = match rows.row {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+        let identity: AgentIdentityRecord =
+            serde_json::from_str(&row.identity_json).map_err(|error| {
+                anyhow!(
+                    "unreadable projection identity payload for {}: {error}",
+                    row.agent_id
+                )
+            })?;
+        let agent_state = row
+            .agent_state_json
+            .as_deref()
+            .map(|payload| {
+                serde_json::from_str::<AgentState>(payload).map_err(|error| {
+                    anyhow!(
+                        "unreadable projection agent state payload for {}: {error}",
+                        row.agent_id
+                    )
+                })
+            })
+            .transpose()?;
+        let catalog = RuntimeModelCatalog::from_config(&self.config());
+        let agent = self.agent_list_entry_from_committed_state(&identity, agent_state, &catalog)?;
+        let current_work_item = row
+            .current_work_item
+            .map(|work_item| -> Result<AgentWorkItemAnchorData> {
+                Ok(AgentWorkItemAnchorData {
+                    work_item_id: work_item.work_item_id,
+                    state: crate::runtime_db::observer_sync::parse_work_item_state(
+                        &work_item.state,
+                    )?,
+                    // A stored NULL is the pre-plan state; the wire anchor
+                    // is non-optional and maps it to the draft baseline.
+                    plan_status: work_item
+                        .plan_status
+                        .as_deref()
+                        .map(crate::runtime_db::observer_sync::parse_work_item_plan_status)
+                        .transpose()?
+                        .unwrap_or(crate::types::WorkItemPlanStatus::Draft),
+                    revision: u64::try_from(work_item.revision)
+                        .map_err(|_| anyhow!("negative work item revision for {}", row.agent_id))?,
+                    updated_at: chrono::DateTime::parse_from_rfc3339(&work_item.updated_at)
+                        .map(|parsed| parsed.with_timezone(&Utc))
+                        .map_err(|error| {
+                            anyhow!(
+                                "unreadable work item timestamp for {}: {error}",
+                                row.agent_id
+                            )
+                        })?,
+                })
+            })
+            .transpose()?;
+        let latest_brief = row
+            .latest_brief
+            .map(|brief| -> Result<AgentRosterLatestBriefData> {
+                Ok(AgentRosterLatestBriefData {
+                    brief_id: brief.brief_id,
+                    created_event_seq: brief
+                        .created_event_seq
+                        .map(|seq| {
+                            u64::try_from(seq).map_err(|_| {
+                                anyhow!("negative latest brief linkage for {}", row.agent_id)
+                            })
+                        })
+                        .transpose()?,
+                    created_at: chrono::DateTime::parse_from_rfc3339(&brief.created_at)
+                        .map(|parsed| parsed.with_timezone(&Utc))
+                        .map_err(|error| {
+                            anyhow!(
+                                "unreadable latest brief timestamp for {}: {error}",
+                                row.agent_id
+                            )
+                        })?,
+                    preview: brief_preview(&brief.preview),
+                })
+            })
+            .transpose()?;
+        // Hydration references mirror the anchors the projection itself
+        // names; each id resolves through the per-family batch record API.
+        let mut hydration_references = Vec::new();
+        if let Some(message_id) = row.latest_message_id.clone() {
+            hydration_references.push(AgentHydrationReferenceData {
+                record_kind: ObserverSyncRecordKindData::Message,
+                record_id: message_id,
+            });
+        }
+        if let Some(transcript_entry_id) = row.latest_transcript_entry_id.clone() {
+            hydration_references.push(AgentHydrationReferenceData {
+                record_kind: ObserverSyncRecordKindData::TranscriptEntry,
+                record_id: transcript_entry_id,
+            });
+        }
+        if let Some(brief) = latest_brief.as_ref() {
+            hydration_references.push(AgentHydrationReferenceData {
+                record_kind: ObserverSyncRecordKindData::Brief,
+                record_id: brief.brief_id.clone(),
+            });
+        }
+        Ok(Some(AgentProjectionSnapshotData {
+            runtime_id: rows.runtime_id,
+            event_log_epoch: rows.event_log_epoch,
+            visibility_policy_generation: rows.visibility_policy_generation,
+            agent_id: row.agent_id,
+            snapshot_through_seq: row.event_head_seq,
+            event_head_seq: row.event_head_seq,
+            oldest_retained_seq: row.oldest_retained_seq,
+            agent,
+            current_work_item,
+            conversation: ConversationRevisionAnchorsData {
+                latest_message_id: row.latest_message_id,
+                latest_transcript_entry_id: row.latest_transcript_entry_id,
+            },
+            latest_brief,
+            hydration_references,
+        }))
+    }
+
+    /// Builds one roster `AgentListEntry` from the committed identity and
+    /// AgentState captured by the snapshot read view. Unlike
+    /// `agent_list_entry_from_storage`, read failures propagate: the roster
+    /// is all-or-nothing and never substitutes placeholder facts. A member
+    /// with no committed state yet keeps the stopped placeholder semantics
+    /// it would also get from `/agents/list`.
+    fn agent_list_entry_from_committed_state(
+        &self,
+        identity: &AgentIdentityRecord,
+        agent_state: Option<AgentState>,
+        catalog: &RuntimeModelCatalog,
+    ) -> Result<AgentListEntry> {
+        let storage = self.agent_storage_read_only(&identity.agent_id)?;
+        let agent = match agent_state {
+            Some(agent) => agent,
+            None => stopped_unloaded_agent(&identity.agent_id),
+        };
+        let model = crate::runtime::agent_model_state_for_catalog(
+            catalog,
+            &self.runtime_context_config(),
+            &agent,
+        );
+        let scheduling_posture = storage.agent_posture_projection(&agent)?;
+        let waiting_reason = crate::runtime::lightweight_agent_list_waiting_reason(&agent);
+        Ok(AgentListEntry {
+            identity: AgentIdentityView::from_record(identity, &self.config().default_agent_id),
+            lifecycle: AgentLifecycleHint::from_status(&agent.id, agent.status.clone()),
+            status: agent.status,
+            scheduling_posture,
+            pending: agent.pending,
+            current_run_id: agent.current_run_id,
+            waiting_reason,
+            model: (&model).into(),
+            active_workspace_entry: agent
+                .active_workspace_entry
+                .map(crate::types::ActiveWorkspaceEntry::without_projection_metadata),
+        })
+    }
+
     pub async fn public_agent_activity_snapshots(
         &self,
     ) -> Result<Vec<PublicAgentActivitySnapshot>> {
@@ -1789,9 +2628,10 @@ impl RuntimeHost {
         agent_id: &str,
         text: String,
         authority_class: AuthorityClass,
+        budget_override: Option<usize>,
     ) -> std::result::Result<EffectivePrompt, PublicAgentError> {
         let identity = self.public_agent_identity(agent_id)?;
-        self.preview_agent_prompt_from_storage(&identity, text, authority_class)
+        self.preview_agent_prompt_from_storage(&identity, text, authority_class, budget_override)
             .await
             .map_err(PublicAgentError::Runtime)
     }
@@ -1822,7 +2662,26 @@ impl RuntimeHost {
         };
         self.active_agent_identity(agent_id)
             .map_err(anyhow::Error::new)?;
-        self.preview_agent_prompt_from_storage(&identity, text, authority_class)
+        self.preview_agent_prompt_from_storage(&identity, text, authority_class, None)
+            .await
+    }
+
+    pub async fn preview_agent_prompt_with_budget(
+        &self,
+        agent_id: &str,
+        text: String,
+        authority_class: AuthorityClass,
+        budget: usize,
+    ) -> Result<EffectivePrompt> {
+        self.validate_agent_id(agent_id)?;
+        let identity = self.agent_identity_record(agent_id)?.ok_or_else(|| {
+            anyhow!(
+                "agent {agent_id} not found; create it first with 'holon agent create {agent_id}'"
+            )
+        })?;
+        self.active_agent_identity(agent_id)
+            .map_err(anyhow::Error::new)?;
+        self.preview_agent_prompt_from_storage(&identity, text, authority_class, Some(budget))
             .await
     }
 
@@ -1840,6 +2699,7 @@ impl RuntimeHost {
         identity: &AgentIdentityRecord,
         text: String,
         authority_class: AuthorityClass,
+        budget_override: Option<usize>,
     ) -> Result<EffectivePrompt> {
         let storage = self.agent_storage_read_only(&identity.agent_id)?;
         let state = storage
@@ -1907,10 +2767,7 @@ impl RuntimeHost {
         let config = self.config();
         let model_catalog = RuntimeModelCatalog::from_config(&config);
         let model_ref = model_catalog
-            .provider_chain_for_turn(
-                state.model_override.as_ref(),
-                state.pending_fallback_model.as_ref(),
-            )
+            .provider_chain(state.model_override.as_ref())
             .into_iter()
             .next()
             .unwrap_or_else(|| {
@@ -1927,8 +2784,7 @@ impl RuntimeHost {
             .clone()
             .map(Ok)
             .unwrap_or_else(|| build_provider_from_config(&config))?;
-        let apply_patch_surface =
-            ApplyPatchSurface::for_model_ref(&model_ref.model_ref().as_string());
+        let apply_patch_surface = ApplyPatchSurface::for_model_route_ref(&model_ref.as_string());
         let registry = ToolRegistry::new(execution.execution_root.clone());
         let available_tools = registry
             .tool_specs_with_families_for_apply_patch_surface(apply_patch_surface)?
@@ -1941,12 +2797,16 @@ impl RuntimeHost {
             .map(|(_, tool)| tool)
             .collect::<Vec<_>>();
         let prompt_tools = provider.prompt_tool_specs(&available_tools);
+        let mut context_config = self.runtime_context_config();
+        if let Some(budget) = budget_override {
+            context_config.prompt_budget_estimated_tokens = budget;
+        }
         build_effective_prompt_with_apply_patch_surface(
             &storage,
             &state,
             &execution,
             &message,
-            &self.runtime_context_config(),
+            &context_config,
             &execution.execution_root,
             agent_home.as_path(),
             &identity_view,
@@ -2152,6 +3012,26 @@ impl RuntimeHost {
                 }
             }
         }
+        // Abort pending queue entries to prevent orphaned queued messages
+        // that would never be consumed after the agent is removed.
+        if let Ok(aborted_count) = self
+            .runtime_db()
+            .queue_entries()
+            .abort_pending_for_agent(agent_id)
+        {
+            if aborted_count > 0 {
+                if let Ok(storage) = self.agent_storage(agent_id) {
+                    let _ = storage.append_event(&crate::types::AuditEvent::legacy(
+                        "queue_entries_aborted",
+                        serde_json::json!({
+                            "agent_id": agent_id,
+                            "reason": "agent_archived",
+                            "count": aborted_count,
+                        }),
+                    ));
+                }
+            }
+        }
 
         let data_dir = self.agent_data_dir(agent_id);
         if data_dir.exists() {
@@ -2223,6 +3103,12 @@ impl RuntimeHost {
                 self.append_agent_identity(&identity)?;
             }
         }
+        // Abort pending queue entries as a safety net for agents that were
+        // stopped through a different path (e.g. data dir already removed).
+        let _ = self
+            .runtime_db()
+            .queue_entries()
+            .abort_pending_for_agent(agent_id)?;
 
         let data_dir = self.agent_data_dir(agent_id);
         if data_dir.exists() {
@@ -2312,7 +3198,7 @@ impl RuntimeHost {
             crate::types::MessageOrigin::Task {
                 task_id: task.id.clone(),
             },
-            authority_class,
+            authority_class.clone(),
             crate::types::Priority::Normal,
             crate::types::MessageBody::Text { text: prompt },
         )
@@ -2327,6 +3213,7 @@ impl RuntimeHost {
             "parent_agent_id": parent_state.id,
             "child_agent_id": child_identity.agent_id,
             "parent_supervised": true,
+            "delegated_authority_class": authority_class,
         }));
         child_runtime.enqueue(message).await?;
 
@@ -2628,7 +3515,15 @@ impl RuntimeHost {
         RuntimeModelCatalog::from_config(&config).resolved_context_config(&base, None)
     }
 
-    fn spawn_runtime(&self, agent_id: &str) -> Result<(RuntimeHandle, JoinHandle<()>)> {
+    fn spawn_runtime(
+        &self,
+        agent_id: &str,
+        recovery_generation: Option<u64>,
+    ) -> Result<(
+        RuntimeHandle,
+        JoinHandle<()>,
+        watch::Receiver<AgentRuntimePhase>,
+    )> {
         let config = self.config();
         let runtime = if let Some(provider) = self.inner.static_provider.as_ref() {
             RuntimeHandle::new_static_with_host_bridge(
@@ -2643,7 +3538,6 @@ impl RuntimeHost {
                 self.bridge(),
                 RuntimeModelCatalog::from_config(&config),
                 self.inner.event_bus.clone(),
-                config.scheduler_engine,
             )?
         } else {
             RuntimeHandle::new_reconfigurable_with_host_bridge(
@@ -2660,20 +3554,53 @@ impl RuntimeHost {
             )?
         };
         runtime.enable_memory_index_notify(self.inner.memory_index_notify.clone());
+        let (phase_tx, phase_rx) = watch::channel(AgentRuntimePhase::Bootstrapping);
+        let runtime_recovery_tx = self.inner.runtime_recovery_tx.clone();
         let runtime_task = tokio::spawn({
             let runtime = runtime.clone();
             let agent_id = agent_id.to_string();
             async move {
-                if let Err(error) = runtime.clone().run().await {
+                let run = runtime.clone().run();
+                tokio::pin!(run);
+                let result = tokio::select! {
+                    result = &mut run => result,
+                    bootstrap = runtime.wait_for_bootstrap() => {
+                        match bootstrap {
+                            Ok(()) => {
+                                phase_tx.send_replace(AgentRuntimePhase::Running);
+                            }
+                            Err(_) => {
+                                phase_tx.send_replace(AgentRuntimePhase::FailedCleaning);
+                            }
+                        }
+                        run.await
+                    }
+                };
+                let retryable_failure = result
+                    .as_ref()
+                    .err()
+                    .map(|error| describe_runtime_error(error).retryable);
+                if let Err(error) = result {
+                    phase_tx.send_replace(AgentRuntimePhase::FailedCleaning);
                     runtime.record_runtime_loop_failure(&error).await;
                     tracing::warn!(
                         agent_id,
-                        "agent runtime loop stopped; the next host access will rebuild it"
+                        "agent runtime loop stopped; host recovery will rebuild it when safe"
                     );
+                }
+                phase_tx.send_replace(AgentRuntimePhase::Terminated);
+                if let (Some(generation), Some(retryable)) =
+                    (recovery_generation, retryable_failure)
+                {
+                    let _ = runtime_recovery_tx.send(RuntimeRecoveryNotice {
+                        agent_id,
+                        generation,
+                        retryable,
+                    });
                 }
             }
         });
-        Ok((runtime, runtime_task))
+        Ok((runtime, runtime_task, phase_rx))
     }
 
     async fn detect_changed_files_for_worktree(
@@ -2896,7 +3823,7 @@ impl RuntimeHostBridge {
             crate::types::MessageOrigin::Task {
                 task_id: task_id.to_string(),
             },
-            authority_class,
+            authority_class.clone(),
             crate::types::Priority::Normal,
             crate::types::MessageBody::Text {
                 text: input.to_string(),
@@ -2911,6 +3838,7 @@ impl RuntimeHostBridge {
             "parent_agent_id": parent_agent_id,
             "child_agent_id": child_agent_id,
             "followup_via": "task_input",
+            "delegated_authority_class": authority_class,
         }));
         runtime.enqueue(message).await.map(|_| true)
     }
@@ -3021,6 +3949,11 @@ mod tests {
 
     use crate::{
         config::{provider_registry_for_tests, ControlAuthMode, ModelRouteRef},
+        domain::execution_protocol::{
+            AdmittedFences, ExecutionAttempt, ExecutionAttemptState, ExecutionBinding,
+            ExecutionOrigin, ExecutionPriority, ExecutionProvenance, ExecutionSource,
+            ExecutionSourceIdentity, ExecutionTrust,
+        },
         provider::{AgentProvider, ProviderTurnRequest, ProviderTurnResponse, StubProvider},
         runtime::RuntimeHandle,
         runtime_db::RuntimeDb,
@@ -3028,10 +3961,11 @@ mod tests {
         system::WorkspaceProjectionKind,
         types::{
             AgentDeletionPhase, AgentDeletionStatus, AgentKind, AgentOwnership, AgentProfilePreset,
-            AgentRegistryStatus, AgentStatus, AgentVisibility, AuthorityClass, ControlAction,
-            MessageBody, MessageEnvelope, MessageKind, MessageOrigin, Priority, QueueEntryRecord,
-            QueueEntryStatus, TaskRecord, TaskRecoverySpec, TaskStatus, TurnTerminalKind,
-            WorkItemRecord, WorkItemState,
+            AgentRegistryStatus, AgentStatus, AgentVisibility, AuthorityClass, BriefKind,
+            BriefRecord, ControlAction, DeliverySummaryRecord, MessageBody, MessageEnvelope,
+            MessageKind, MessageOrigin, Priority, QueueEntryRecord, QueueEntryStatus, TaskRecord,
+            TaskRecoverySpec, TaskStatus, TurnTerminalKind, WaitConditionKind, WaitConditionRecord,
+            WaitConditionStatus, WakeSource, WorkItemRecord, WorkItemState,
         },
     };
 
@@ -3052,6 +3986,15 @@ mod tests {
     }
 
     fn test_host() -> (tempfile::TempDir, RuntimeHost) {
+        let home = tempdir().unwrap();
+        write_test_model_config(home.path());
+        let config = AppConfig::load_with_home(Some(home.path().to_path_buf())).unwrap();
+        let host =
+            RuntimeHost::new_with_provider(config, Arc::new(StubProvider::new("done"))).unwrap();
+        (home, host)
+    }
+
+    fn canonical_test_host() -> (tempfile::TempDir, RuntimeHost) {
         let home = tempdir().unwrap();
         write_test_model_config(home.path());
         let config = AppConfig::load_with_home(Some(home.path().to_path_buf())).unwrap();
@@ -3197,6 +4140,7 @@ mod tests {
             max_relevant_episodes: 3,
             control_token: Some("secret".into()),
             control_auth_mode: ControlAuthMode::Auto,
+            auth: Default::default(),
             api_cors: Default::default(),
             config_file_path: home_path.join("config.json"),
             stored_config: Default::default(),
@@ -3209,7 +4153,6 @@ mod tests {
             default_tool_output_tokens: crate::tool::helpers::DEFAULT_TOOL_OUTPUT_TOKENS as u32,
             max_tool_output_tokens: crate::tool::helpers::MAX_TOOL_OUTPUT_TOKENS as u32,
             disable_provider_fallback: false,
-            scheduler_engine: crate::config::SchedulerEngineMode::Canonical,
             tui_alternate_screen: crate::config::AltScreenMode::Auto,
             validated_model_overrides: std::collections::HashMap::new(),
             validated_unknown_model_fallback: None,
@@ -3603,12 +4546,13 @@ mod tests {
     async fn private_child_initial_message_sets_task_label_and_supervision_provenance() {
         let (_home, host) = test_host();
         let parent = host.default_runtime().await.unwrap();
+        let parent_agent_id = parent.agent_state().await.unwrap().id;
         let initial_message = "  investigate   remote\nTUI  access ".to_string();
 
         let spawned = parent
             .spawn_agent(
                 Some(initial_message.clone()),
-                AuthorityClass::OperatorInstruction,
+                AuthorityClass::ExternalEvidence,
                 AgentProfilePreset::PrivateChild,
                 None,
                 false,
@@ -3650,6 +4594,7 @@ mod tests {
                 task_id: task_id.clone()
             }
         );
+        assert_eq!(delegated.authority_class, AuthorityClass::ExternalEvidence);
         assert_eq!(
             delegated.metadata.as_ref().unwrap()["parent_supervised"],
             true
@@ -3663,6 +4608,35 @@ mod tests {
             MessageBody::Text {
                 text: initial_message
             }
+        );
+
+        assert!(host
+            .bridge()
+            .deliver_child_followup(
+                &parent_agent_id,
+                &task_id,
+                &spawned.agent_id,
+                "additional untrusted evidence",
+                AuthorityClass::ExternalEvidence,
+            )
+            .await
+            .unwrap());
+        let messages = child.storage().read_recent_messages(10).unwrap();
+        let followup = messages
+            .iter()
+            .find(|message| {
+                message
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("followup_via"))
+                    .and_then(|value| value.as_str())
+                    == Some("task_input")
+            })
+            .expect("child should receive the task input follow-up");
+        assert_eq!(followup.authority_class, AuthorityClass::ExternalEvidence);
+        assert_eq!(
+            followup.metadata.as_ref().unwrap()["delegated_authority_class"],
+            serde_json::json!("external_evidence")
         );
     }
 
@@ -4466,6 +5440,7 @@ mod tests {
             kind: crate::types::TurnTerminalKind::Completed,
             reason: None,
             last_assistant_message: Some("child finished after restart".into()),
+            no_brief_reason: None,
             checkpoint: None,
             completed_at: chrono::Utc::now(),
             duration_ms: 1,
@@ -4587,6 +5562,7 @@ mod tests {
             kind: crate::types::TurnTerminalKind::Completed,
             reason: None,
             last_assistant_message: Some("child says done before command finished".into()),
+            no_brief_reason: None,
             checkpoint: None,
             completed_at: chrono::Utc::now(),
             duration_ms: 1,
@@ -4634,6 +5610,8 @@ mod tests {
                 resolved_at: None,
                 cancelled_at: None,
                 turn_id: None,
+                trigger_message_id: None,
+                triggered_at: None,
             })
             .unwrap();
 
@@ -4714,6 +5692,7 @@ mod tests {
             kind: crate::types::TurnTerminalKind::Completed,
             reason: None,
             last_assistant_message: Some("child says done before wait resolved".into()),
+            no_brief_reason: None,
             checkpoint: None,
             completed_at: chrono::Utc::now(),
             duration_ms: 1,
@@ -4740,6 +5719,8 @@ mod tests {
                 resolved_at: None,
                 cancelled_at: None,
                 turn_id: None,
+                trigger_message_id: None,
+                triggered_at: None,
             })
             .unwrap();
 
@@ -5304,8 +6285,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_loop_failure_preserves_canonical_claim_and_reconciles_on_next_host_access() {
-        let (_home, host) = test_host();
+    async fn runtime_loop_failure_recovers_and_replays_canonical_claim_without_host_access() {
+        let (_home, host) = canonical_test_host();
         let agent_id = host.config().default_agent_id.clone();
         let runtime = host.default_runtime().await.unwrap();
         runtime.inject_runtime_loop_failure_after_next_claim();
@@ -5373,43 +6354,61 @@ mod tests {
                     || event.data["message_id"] != message.id
             }));
 
-        let rebuilt = host.get_or_create_agent(&agent_id).await.unwrap();
-        assert_eq!(rebuilt.agent_state().await.unwrap().id, agent_id);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let queue_reconciled = rebuilt
+            let queue_replayed = runtime
                 .storage()
                 .latest_queue_entries()
                 .unwrap()
                 .iter()
                 .any(|entry| {
-                    entry.message_id == message.id && entry.status == QueueEntryStatus::Aborted
+                    entry.message_id == message.id && entry.status == QueueEntryStatus::Processed
                 });
-            let recovery_recorded = rebuilt
+            let events = runtime.storage().read_recent_events(64).unwrap();
+            let recovery_recorded = events.iter().any(|event| {
+                event.kind == "scheduler_bootstrap_claim_recovered"
+                    && event.data["message_id"].as_str() == Some(message.id.as_str())
+                    && event.data["recovery_outcome"].as_str()
+                        == Some("attempt_interrupted_for_reentry")
+            });
+            let replay_started = events.iter().any(|event| {
+                event.kind == "turn_replay_started"
+                    && event.data["message_id"].as_str() == Some(message.id.as_str())
+            });
+            let recovered = events.iter().any(|event| {
+                event.kind == "runtime_loop_recovered"
+                    && event.data["failed_generation"].as_u64() == Some(1)
+                    && event.data["recovered_generation"].as_u64() == Some(2)
+            });
+            let brief_delivered = runtime
                 .storage()
-                .read_recent_events(32)
+                .read_recent_briefs(10)
                 .unwrap()
                 .iter()
-                .any(|event| {
-                    event.kind == "scheduler_bootstrap_claim_recovered"
-                        && event.data["message_id"].as_str() == Some(message.id.as_str())
-                        && event.data["recovery_outcome"].as_str() == Some("settlement_missing")
-                });
-            if queue_reconciled && recovery_recorded {
+                .any(|brief| brief.related_message_id.as_deref() == Some(message.id.as_str()));
+            if queue_replayed && recovery_recorded && replay_started && recovered && brief_delivered
+            {
                 break;
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for canonical claim reconciliation"
-            );
+            if tokio::time::Instant::now() >= deadline {
+                let queue = runtime.storage().latest_queue_entries().unwrap();
+                let briefs = runtime.storage().read_recent_briefs(10).unwrap();
+                let task_finished = host
+                    .inner
+                    .runtimes
+                    .read()
+                    .await
+                    .agents
+                    .get(&agent_id)
+                    .is_none_or(|entry| entry.task.is_finished());
+                panic!(
+                    "timed out waiting for automatic canonical claim reconciliation and replay: \
+                     queue={queue:?}, events={events:?}, briefs={briefs:?}, \
+                     task_finished={task_finished}"
+                );
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(rebuilt
-            .storage()
-            .read_recent_briefs(10)
-            .unwrap()
-            .iter()
-            .all(|brief| brief.related_message_id.as_deref() != Some(message.id.as_str())));
         let registry = host.inner.runtimes.read().await;
         let entry = registry
             .agents
@@ -5417,8 +6416,69 @@ mod tests {
             .expect("rebuilt runtime should be registered");
         assert!(
             !entry.task.is_finished(),
-            "next host access should start a fresh runtime loop"
+            "automatic recovery should start a fresh runtime loop"
         );
+    }
+
+    #[tokio::test]
+    async fn non_retryable_runtime_loop_failure_does_not_trigger_automatic_recovery() {
+        let (_home, host) = canonical_test_host();
+        let agent_id = host.config().default_agent_id.clone();
+        let runtime = host.default_runtime().await.unwrap();
+        runtime.inject_non_retryable_runtime_loop_failure_after_next_claim();
+        runtime
+            .enqueue(MessageEnvelope::new(
+                &agent_id,
+                MessageKind::OperatorPrompt,
+                MessageOrigin::Operator { actor_id: None },
+                AuthorityClass::OperatorInstruction,
+                Priority::Normal,
+                MessageBody::Text {
+                    text: "do not automatically recover".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let finished = host
+                .inner
+                .runtimes
+                .read()
+                .await
+                .agents
+                .get(&agent_id)
+                .is_some_and(|entry| entry.task.is_finished());
+            if finished {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for non-retryable runtime failure"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let registry = host.inner.runtimes.read().await;
+        let entry = registry
+            .agents
+            .get(&agent_id)
+            .expect("failed runtime entry should remain registered");
+        assert_eq!(entry.generation, 1);
+        assert!(
+            entry.task.is_finished(),
+            "non-retryable failures should not spawn a fresh runtime"
+        );
+        assert!(!registry.recovering.contains_key(&agent_id));
+        drop(registry);
+        assert!(runtime
+            .storage()
+            .read_recent_events(64)
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "runtime_loop_recovered"));
     }
 
     #[test]
@@ -5657,12 +6717,6 @@ mod tests {
             completed.result_summary.as_deref(),
             Some("Agent deleted before work completed")
         );
-        assert!(host
-            .runtime_db()
-            .transitions()
-            .legacy_scheduler_adoption_candidates("delete-work")
-            .unwrap()
-            .is_empty());
     }
 
     #[tokio::test]
@@ -5781,6 +6835,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn archive_private_agent_aborts_pending_queue_entries() {
+        let (_home, host) = test_host();
+        let parent_id = "archive-queue-parent";
+
+        // Create parent agent.
+        let parent = AgentIdentityRecord::new(
+            parent_id,
+            AgentKind::Default,
+            AgentVisibility::Public,
+            AgentOwnership::SelfOwned,
+            AgentProfilePreset::PublicNamed,
+            None,
+            None,
+        );
+        host.append_agent_identity(&parent).unwrap();
+        host.runtime_db()
+            .agent_identities()
+            .upsert(&parent)
+            .unwrap();
+
+        // Create a private child with queued entries.
+        let child_id = "archive-queue-child";
+        let child = AgentIdentityRecord::new(
+            child_id,
+            AgentKind::Child,
+            AgentVisibility::Private,
+            AgentOwnership::ParentSupervised,
+            AgentProfilePreset::PrivateChild,
+            Some(parent_id.to_string()),
+            Some("task-queue-1".to_string()),
+        );
+        host.append_agent_identity(&child).unwrap();
+        host.runtime_db().agent_identities().upsert(&child).unwrap();
+
+        let now = Utc::now();
+        host.runtime_db()
+            .queue_entries()
+            .upsert(&QueueEntryRecord {
+                message_id: "msg-queued-orphan-1".into(),
+                agent_id: child_id.into(),
+                priority: Priority::Normal,
+                status: QueueEntryStatus::Queued,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        host.runtime_db()
+            .queue_entries()
+            .upsert(&QueueEntryRecord {
+                message_id: "msg-interrupted-orphan-1".into(),
+                agent_id: child_id.into(),
+                priority: Priority::Normal,
+                status: QueueEntryStatus::Interrupted,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+
+        // Archive the private child agent.
+        host.archive_private_agent(child_id).await.unwrap();
+
+        // Verify queued entries were aborted.
+        assert_eq!(
+            host.runtime_db()
+                .queue_entries()
+                .latest("msg-queued-orphan-1")
+                .unwrap()
+                .unwrap()
+                .status,
+            QueueEntryStatus::Aborted
+        );
+        assert_eq!(
+            host.runtime_db()
+                .queue_entries()
+                .latest("msg-interrupted-orphan-1")
+                .unwrap()
+                .unwrap()
+                .status,
+            QueueEntryStatus::Aborted
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_pipeline_aborts_pending_queue_entries() {
+        let (_home, host) = test_host();
+
+        // Create a public self-owned agent with queued entries.
+        let agent = AgentIdentityRecord::new(
+            "delete-queue-me",
+            AgentKind::Default,
+            AgentVisibility::Public,
+            AgentOwnership::SelfOwned,
+            AgentProfilePreset::PublicNamed,
+            None,
+            None,
+        );
+        host.append_agent_identity(&agent).unwrap();
+        host.runtime_db().agent_identities().upsert(&agent).unwrap();
+
+        let now = Utc::now();
+        host.runtime_db()
+            .queue_entries()
+            .upsert(&QueueEntryRecord {
+                message_id: "msg-queued-delete-1".into(),
+                agent_id: "delete-queue-me".into(),
+                priority: Priority::Normal,
+                status: QueueEntryStatus::Queued,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+
+        // Begin deletion and execute the full pipeline.
+        let (_, job, _) = host
+            .begin_public_agent_deletion("delete-queue-me", false, "operator")
+            .await
+            .unwrap();
+        host.execute_deletion_job(job).await.unwrap();
+
+        // Verify the queued entry was aborted.
+        assert_eq!(
+            host.runtime_db()
+                .queue_entries()
+                .latest("msg-queued-delete-1")
+                .unwrap()
+                .unwrap()
+                .status,
+            QueueEntryStatus::Aborted
+        );
+    }
+
+    #[tokio::test]
     async fn read_only_host_methods_do_not_activate_runtime() {
         let (_home, host) = test_host();
         let agent_id = host.config().default_agent_id.clone();
@@ -5810,6 +6996,252 @@ mod tests {
             .public_agent_scheduler_repair_inspection(&agent_id)
             .expect("scheduler repair inspection");
         assert!(host.inner.runtimes.read().await.agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_activates_active_task_owners_and_waits_for_bootstrap() {
+        let (_home, host) = canonical_test_host();
+        let agent_id = "startup-task-owner";
+        host.create_named_agent(agent_id, None).await.unwrap();
+        host.unload_runtime(agent_id).await;
+        let storage = host.agent_storage(agent_id).unwrap();
+        storage
+            .append_task(&TaskRecord {
+                id: "task-startup-owner".into(),
+                agent_id: agent_id.into(),
+                kind: crate::types::TaskKind::CommandTask,
+                status: TaskStatus::Running,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                parent_message_id: None,
+                work_item_id: None,
+                summary: Some("startup owner task".into()),
+                detail: None,
+                recovery: None,
+            })
+            .unwrap();
+
+        assert!(host.try_get_loaded_runtime(agent_id).await.is_none());
+        host.recover_orphaned_queue_claims_at_startup()
+            .await
+            .unwrap();
+
+        let task = storage
+            .latest_task_record("task-startup-owner")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Interrupted);
+        let message_id = format!("message:task-restart:{}", task.id);
+        assert!(storage.read_message_by_id(&message_id).unwrap().is_some());
+        assert!(host.try_get_loaded_runtime(agent_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_replays_interrupted_operator_prompt_while_work_item_waits_external() {
+        let (_home, host) = canonical_test_host();
+        let config = host.config().as_ref().clone();
+        let agent_id = "startup-interrupted-prompt";
+        host.create_named_agent(agent_id, None).await.unwrap();
+        host.unload_runtime(agent_id).await;
+        let storage = host.agent_storage(agent_id).unwrap();
+        let mut work_item = WorkItemRecord::new(agent_id, "wait for review", WorkItemState::Open);
+        work_item.id = "work-startup-external".into();
+        storage.append_work_item(&work_item).unwrap();
+        let now = Utc::now();
+        storage
+            .append_wait_condition(&WaitConditionRecord {
+                id: "wait-startup-external".into(),
+                agent_id: agent_id.into(),
+                work_item_id: Some(work_item.id.clone()),
+                status: WaitConditionStatus::Active,
+                kind: WaitConditionKind::External,
+                source: Some("github".into()),
+                subject_ref: Some("github:holon-run/holon#2528".into()),
+                waiting_for: "review".into(),
+                wake_sources: vec![WakeSource::ExternalIngress {
+                    external_trigger_id: Some("trigger-startup-external".into()),
+                }],
+                continuation: None,
+                created_at: now,
+                updated_at: now,
+                expires_at: None,
+                resolved_at: None,
+                cancelled_at: None,
+                turn_id: None,
+                trigger_message_id: None,
+                triggered_at: None,
+            })
+            .unwrap();
+        let mut state = storage.read_agent().unwrap().unwrap();
+        state.current_work_item_id = Some(work_item.id.clone());
+        storage.write_agent(&state).unwrap();
+        let mut message = MessageEnvelope::new(
+            agent_id,
+            MessageKind::OperatorPrompt,
+            MessageOrigin::Operator { actor_id: None },
+            AuthorityClass::OperatorInstruction,
+            Priority::Normal,
+            MessageBody::Text {
+                text: "resume after restart".into(),
+            },
+        );
+        message.id = "msg-startup-interrupted-prompt".into();
+        message.turn_id = Some("turn-startup-interrupted-prompt".into());
+        storage.append_message(&message).unwrap();
+        storage
+            .append_queue_entry(&QueueEntryRecord {
+                message_id: message.id.clone(),
+                agent_id: agent_id.into(),
+                priority: message.priority,
+                status: QueueEntryStatus::Interrupted,
+                created_at: message.created_at,
+                updated_at: now,
+            })
+            .unwrap();
+
+        assert!(storage.latest_active_task_records(10).unwrap().is_empty());
+        assert!(host.try_get_loaded_runtime(agent_id).await.is_none());
+        drop(storage);
+        drop(host);
+
+        let started = Arc::new(Notify::new());
+        let started_wait = started.notified();
+        tokio::pin!(started_wait);
+        started_wait.as_mut().enable();
+        let restarted = RuntimeHost::new_with_provider(
+            config,
+            Arc::new(BlockingProvider {
+                started: started.clone(),
+            }),
+        )
+        .unwrap();
+        assert!(restarted
+            .recover_orphaned_queue_claims_at_startup()
+            .await
+            .unwrap()
+            .is_empty());
+        tokio::time::timeout(Duration::from_secs(5), &mut started_wait)
+            .await
+            .expect("startup recovery should replay the interrupted prompt");
+
+        let runtime = restarted
+            .try_get_loaded_runtime(agent_id)
+            .await
+            .expect("startup recovery should keep the interrupted prompt owner active");
+        assert!(runtime
+            .storage()
+            .read_recent_events(100)
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event.kind == "turn_replay_started"
+                    && event.data["source_turn_id"] == "turn-startup-interrupted-prompt"
+            }));
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_converges_stopped_task_owner_without_reentry() {
+        let (_home, host) = canonical_test_host();
+        let agent_id = "stopped-task-owner";
+        host.create_named_agent(agent_id, None).await.unwrap();
+        host.unload_runtime(agent_id).await;
+        let storage = host.agent_storage(agent_id).unwrap();
+        let mut state = storage.read_agent().unwrap().unwrap();
+        state.status = AgentStatus::Stopped;
+        storage.write_agent(&state).unwrap();
+        storage
+            .append_task(&TaskRecord {
+                id: "task-stopped-owner".into(),
+                agent_id: agent_id.into(),
+                kind: crate::types::TaskKind::CommandTask,
+                status: TaskStatus::Running,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                parent_message_id: None,
+                work_item_id: None,
+                summary: Some("stopped owner task".into()),
+                detail: None,
+                recovery: None,
+            })
+            .unwrap();
+
+        host.recover_orphaned_queue_claims_at_startup()
+            .await
+            .unwrap();
+
+        let task = storage
+            .latest_task_record("task-stopped-owner")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Interrupted);
+        assert_eq!(
+            task.detail
+                .as_ref()
+                .and_then(|detail| detail["interrupted_reason"].as_str()),
+            Some("agent_stopped")
+        );
+        let result_message_id = task
+            .parent_message_id
+            .as_deref()
+            .expect("agent stop should atomically persist a TaskResult");
+        assert_eq!(
+            storage
+                .read_message_by_id(result_message_id)
+                .unwrap()
+                .expect("agent stop TaskResult")
+                .kind,
+            MessageKind::TaskResult
+        );
+        assert!(storage
+            .read_message_by_id("message:task-restart:task-stopped-owner")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_ignores_interrupted_queue_for_deleted_private_child() {
+        let (_home, host) = canonical_test_host();
+        let agent_id = "tmp_child_deleted_recovery";
+        let now = Utc::now();
+        let mut identity = AgentIdentityRecord::new(
+            agent_id,
+            AgentKind::Child,
+            AgentVisibility::Private,
+            AgentOwnership::ParentSupervised,
+            AgentProfilePreset::PrivateChild,
+            Some(host.config().default_agent_id.clone()),
+            Some("task-deleted-child".into()),
+        );
+        identity.status = AgentRegistryStatus::Deleted;
+        identity.deleted_at = Some(now);
+        host.append_agent_identity(&identity).unwrap();
+        host.runtime_db()
+            .queue_entries()
+            .upsert(&QueueEntryRecord {
+                message_id: "msg-deleted-child".into(),
+                agent_id: agent_id.into(),
+                priority: Priority::Normal,
+                status: QueueEntryStatus::Interrupted,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+
+        assert!(host
+            .recover_orphaned_queue_claims_at_startup()
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(host.try_get_loaded_runtime(agent_id).await.is_none());
+        assert_eq!(
+            host.runtime_db()
+                .queue_entries()
+                .latest("msg-deleted-child")
+                .unwrap()
+                .unwrap()
+                .status,
+            QueueEntryStatus::Interrupted
+        );
     }
 
     #[tokio::test]
@@ -5868,11 +7300,73 @@ mod tests {
             .append_queue_entry(&make_queue_entry(&msg_a, QueueEntryStatus::Dequeued))
             .unwrap();
 
-        // Has scheduler activation: should NOT be recovered
+        // Has unified execution attempt: should NOT be recovered.
         let msg_b = make_message("msg-activated");
         storage.append_message(&msg_b).unwrap();
         storage
             .append_queue_entry(&make_queue_entry(&msg_b, QueueEntryStatus::Dequeued))
+            .unwrap();
+        let attempt = ExecutionAttempt {
+            attempt_id: format!("activation:message:{}", msg_b.id),
+            agent_id: agent_id.clone(),
+            source_message_id: Some(msg_b.id.clone()),
+            source: ExecutionSource {
+                identity: ExecutionSourceIdentity::QueueMessage {
+                    message_id: msg_b.id.clone(),
+                },
+                generation: 1,
+            },
+            binding: ExecutionBinding::AgentLifecycle {
+                agent_id: agent_id.clone(),
+            },
+            provenance: ExecutionProvenance {
+                origin: ExecutionOrigin::Operator,
+                trust: ExecutionTrust::OperatorInstruction,
+                priority: ExecutionPriority::Normal,
+                correlation_id: None,
+                causation_id: None,
+            },
+            admitted_fences: AdmittedFences {
+                source_revision: 1,
+                work_item_source_revision: None,
+                work_item_generation: None,
+                rejoin: None,
+                agent_control_revision: 1,
+                host_registry_revision: 1,
+            },
+            state: ExecutionAttemptState::Open,
+            run_id: None,
+            turn_id: None,
+            recovery_of_attempt_id: None,
+            terminal_outcome_id: None,
+            admitted_at: Utc::now().to_rfc3339(),
+            terminal_at: None,
+        };
+        runtime_db
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO execution_protocol_attempts (
+                       agent_id, attempt_id, lifecycle_state,
+                       source_identity_json, source_generation,
+                       recovery_of_attempt_id, terminal_outcome_id, payload_json
+                     ) VALUES (?1, ?2, 'open', ?3, ?4, NULL, NULL, ?5)",
+                    rusqlite::params![
+                        &agent_id,
+                        &attempt.attempt_id,
+                        serde_json::to_string(&attempt.source.identity)?,
+                        attempt.source.generation as i64,
+                        serde_json::to_string(&attempt)?,
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("insert execution attempt");
+
+        // A legacy activation without a unified attempt no longer protects a claim.
+        let msg_legacy = make_message("msg-legacy-activation");
+        storage.append_message(&msg_legacy).unwrap();
+        storage
+            .append_queue_entry(&make_queue_entry(&msg_legacy, QueueEntryStatus::Dequeued))
             .unwrap();
         runtime_db
             .transaction(|tx| {
@@ -5885,16 +7379,16 @@ mod tests {
                      VALUES (?, ?, '', 'work_item', 'test-work', 'test-work', 0, 'scheduling', NULL, NULL, NULL, 'running', '', '{}', ?, ?)",
                     rusqlite::params![
                         &agent_id,
-                        format!("activation:message:{}", msg_b.id),
+                        format!("activation:message:{}", msg_legacy.id),
                         Utc::now().timestamp_millis(),
                         Utc::now().timestamp_millis(),
                     ],
                 )?;
                 Ok(())
             })
-            .expect("insert activation");
+            .expect("insert legacy activation");
 
-        // Has terminal turn: should NOT be recovered
+        // Has terminal turn: completion evidence settles the stale claim.
         let msg_c = make_message("msg-terminal");
         storage.append_message(&msg_c).unwrap();
         storage
@@ -5905,6 +7399,7 @@ mod tests {
         turn.terminal = Some(crate::types::TurnTerminalSummary {
             kind: crate::types::TurnTerminalKind::Completed,
             reason: None,
+            no_brief_reason: None,
             completed_at: Utc::now(),
             duration_ms: 100,
         });
@@ -5912,6 +7407,57 @@ mod tests {
             .turn_records()
             .upsert(&turn)
             .expect("upsert turn");
+
+        // Has a result brief without a terminal turn: should also settle, not replay.
+        let msg_result = make_message("msg-result-brief");
+        storage.append_message(&msg_result).unwrap();
+        storage
+            .append_queue_entry(&make_queue_entry(&msg_result, QueueEntryStatus::Dequeued))
+            .unwrap();
+        let result_brief = BriefRecord::new(
+            &agent_id,
+            BriefKind::Result,
+            "completed before restart",
+            Some(msg_result.id.clone()),
+            None,
+        );
+        storage.append_brief(&result_brief).unwrap();
+
+        // Has failure evidence: should settle as aborted, not replay.
+        let msg_failure = make_message("msg-failure-brief");
+        storage.append_message(&msg_failure).unwrap();
+        storage
+            .append_queue_entry(&make_queue_entry(&msg_failure, QueueEntryStatus::Dequeued))
+            .unwrap();
+        let failure_brief = BriefRecord::new(
+            &agent_id,
+            BriefKind::Failure,
+            "failed before restart",
+            Some(msg_failure.id.clone()),
+            None,
+        );
+        storage.append_brief(&failure_brief).unwrap();
+
+        // Has delivery evidence attached to its trigger turn: should settle, not replay.
+        let msg_delivery = make_message("msg-delivery");
+        storage.append_message(&msg_delivery).unwrap();
+        storage
+            .append_queue_entry(&make_queue_entry(&msg_delivery, QueueEntryStatus::Dequeued))
+            .unwrap();
+        let mut delivery_turn = crate::types::TurnRecord::new(&agent_id, "turn-delivery", 1);
+        delivery_turn.trigger = Some(crate::types::TurnTriggerSummary::from_message(
+            &msg_delivery,
+        ));
+        storage.append_turn(&delivery_turn).unwrap();
+        let mut delivery = DeliverySummaryRecord::new(
+            &agent_id,
+            "work-delivery",
+            "delivered before restart",
+            Some(1),
+            None,
+        );
+        delivery.turn_id = Some(delivery_turn.turn_id);
+        storage.append_delivery_summary(&delivery).unwrap();
 
         let recovered = host
             .recover_orphaned_queue_claims_at_startup()
@@ -5922,23 +7468,42 @@ mod tests {
         let entries = storage.latest_queue_entries().unwrap();
         for entry in &entries {
             match entry.message_id.as_str() {
-                "msg-orphaned" => assert_eq!(
+                "msg-orphaned" | "msg-legacy-activation" => assert_eq!(
                     entry.status,
                     QueueEntryStatus::Interrupted,
                     "orphaned should be recovered"
                 ),
-                "msg-activated" | "msg-terminal" => assert_eq!(
+                "msg-activated" => assert_eq!(
                     entry.status,
                     QueueEntryStatus::Dequeued,
-                    "non-orphaned should not be recovered"
+                    "active execution should retain its claim"
+                ),
+                "msg-terminal" | "msg-result-brief" | "msg-delivery" => assert_eq!(
+                    entry.status,
+                    QueueEntryStatus::Processed,
+                    "successful completion evidence should prevent replay"
+                ),
+                "msg-failure-brief" => assert_eq!(
+                    entry.status,
+                    QueueEntryStatus::Aborted,
+                    "failure completion evidence should prevent replay"
                 ),
                 _ => {}
             }
         }
 
         let events = storage.read_recent_events(32).unwrap();
-        assert!(events
-            .iter()
-            .any(|e| e.kind == "orphaned_queue_claim_recovered"));
+        assert!(events.iter().any(|event| {
+            event.kind == "orphaned_queue_claim_recovered"
+                && event.data["message_id"] == "msg-result-brief"
+                && event.data["next_status"] == "processed"
+                && event.data["reason"] == "terminal_or_result_completion_evidence"
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == "orphaned_queue_claim_recovered"
+                && event.data["message_id"] == "msg-failure-brief"
+                && event.data["next_status"] == "aborted"
+                && event.data["reason"] == "terminal_failure_completion_evidence"
+        }));
     }
 }

@@ -4,7 +4,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{prompt::PromptStability, tool::ToolError, tool::ToolSpec, types::TokenUsage};
+use crate::{
+    config::ModelRouteRef,
+    prompt::PromptStability,
+    tool::ToolError,
+    tool::ToolSpec,
+    types::{Citation, TokenUsage},
+};
 
 mod catalog;
 mod diagnostics;
@@ -15,8 +21,12 @@ mod retry;
 pub mod test_support;
 mod tool_schema;
 mod transports;
+mod wire_fingerprint;
 
-pub(crate) use catalog::build_candidate_from_model_route;
+pub(crate) use catalog::{
+    build_candidate_from_model_route, build_provider_from_model_chain_with_override,
+    ModelRouteReasoningEffortOverride,
+};
 pub use catalog::{build_provider_from_config, build_provider_from_model_chain};
 pub use diagnostics::{
     provider_doctor, resolved_model_availability, resolved_model_providers,
@@ -27,13 +37,14 @@ pub(crate) use diagnostics::{
     resolved_model_providers_from_availability_for_runtime,
 };
 pub use http_trace::ProviderHttpTraceDiagnostics;
+#[cfg(test)]
+pub(crate) use registry::ProviderCatalogRegistration;
 pub(crate) use registry::{
     build_provider_for_route, provider_definition, provider_definitions,
     provider_transport_definition, provider_transport_definition_by_wire_name,
     provider_transport_definitions, ModelDiscoveryAuth, ModelDiscoveryDecoder,
     ModelDiscoveryDefinition, ModelDiscoveryRoute, ProviderCatalogPolicy,
-    ProviderCatalogRegistration, ProviderContextManagement, ProviderDefinition,
-    ProviderMaterializer, ProviderWebSearch,
+    ProviderContextManagement, ProviderDefinition, ProviderMaterializer, ProviderWebSearch,
 };
 pub(crate) use retry::sanitize_transport_url;
 pub(crate) use transports::OpenAiBearerAuth;
@@ -181,6 +192,18 @@ pub struct ProviderCacheUsage {
 pub struct ProviderRequestDiagnostics {
     pub request_lowering_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_model_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_transport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_dialect: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anthropic_cache: Option<AnthropicPromptCacheDiagnostics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anthropic_context_management: Option<serde_json::Value>,
@@ -194,6 +217,27 @@ pub struct ProviderRequestDiagnostics {
     pub native_web_search: Option<ProviderNativeWebSearchDiagnostics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ProviderResponseFormatDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_prefix: Option<ProviderStablePrefixDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderStablePrefixDiagnostics {
+    pub schema_version: u32,
+    pub algorithm: String,
+    pub full_request_fingerprint: String,
+    pub stable_prefix_fingerprint: String,
+    pub history_prefix_items: usize,
+    pub dynamic_tail_items: usize,
+    pub components: Vec<ProviderStablePrefixComponentDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderStablePrefixComponentDiagnostics {
+    pub name: String,
+    pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -201,6 +245,7 @@ pub struct ProviderRequestDiagnostics {
 pub enum ProviderNativeWebSearchKind {
     OpenAi,
     Anthropic,
+    DeepSeek,
     Gemini,
     Xai,
 }
@@ -419,6 +464,9 @@ pub enum ModelBlock {
     Text {
         text: String,
     },
+    Citations {
+        citations: Vec<Citation>,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -426,17 +474,54 @@ pub enum ModelBlock {
         #[serde(default)]
         kind: ModelToolCallKind,
     },
+    /// A tool call executed by the model provider rather than by Holon.
+    ///
+    /// Provider-owned tool blocks are retained for audit and compatible
+    /// conversation replay, but must never be dispatched as managed tools or
+    /// rendered as assistant prose.
+    ProviderToolUse {
+        id: String,
+        name: String,
+        input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_data: Option<ProviderBlockData>,
+    },
+    /// A result produced by a provider-owned tool.
+    ProviderToolResult {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<String>,
+        content: Value,
+        #[serde(default)]
+        is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_data: Option<ProviderBlockData>,
+    },
     Thinking {
         text: String,
         /// Opaque signature returned by the provider (e.g. DeepSeek V4 Pro).
         /// Must be passed back verbatim in subsequent requests.
         signature: String,
     },
+    ReasoningText {
+        /// Plain provider reasoning that must be replayed as reasoning, never
+        /// rendered as user-visible assistant text.
+        text: String,
+    },
     RedactedThinking {
         /// Opaque encrypted/redacted thinking payload returned by the provider.
         /// Must be passed back verbatim in subsequent requests.
         data: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderBlockData {
+    pub format: String,
+    pub payload: Value,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,6 +544,13 @@ pub struct ToolResultBlock {
 #[async_trait]
 pub trait AgentProvider: Send + Sync {
     async fn complete_turn(&self, request: ProviderTurnRequest) -> Result<ProviderTurnResponse>;
+
+    fn select_model_lineage(
+        &self,
+        _model_ref: &ModelRouteRef,
+    ) -> Option<std::sync::Arc<dyn AgentProvider>> {
+        None
+    }
 
     async fn generate_image(
         &self,
@@ -611,6 +703,8 @@ pub struct ProviderAttemptRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_diagnostics: Option<ProviderTransportDiagnostics>,
@@ -700,6 +794,13 @@ pub fn provider_error_code(error: &anyhow::Error) -> Option<&str> {
         .chain()
         .find_map(|source| source.downcast_ref::<retry::ProviderTransportError>())
         .and_then(|error| error.code.as_deref())
+}
+
+pub(crate) fn provider_error_token_usage(error: &anyhow::Error) -> Option<&TokenUsage> {
+    error
+        .chain()
+        .find_map(|source| source.downcast_ref::<retry::ProviderTransportError>())
+        .and_then(|error| error.token_usage.as_ref())
 }
 
 pub fn provider_error_is_context_length_exceeded(error: &anyhow::Error) -> bool {

@@ -165,6 +165,7 @@ pub struct OperatorIngressRequest {
     pub text: String,
     pub actor_id: String,
     pub binding_id: String,
+    pub conversation_ref: Option<String>,
     pub reply_route_id: Option<String>,
     pub provider: Option<String>,
     pub upstream_provider: Option<String>,
@@ -178,6 +179,8 @@ pub struct OperatorIngressRequest {
 pub struct DebugPromptRequest {
     pub text: String,
     pub authority_class: Option<AuthorityClass>,
+    pub manifest: Option<bool>,
+    pub budget: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,12 +202,16 @@ pub(crate) const TASK_OUTPUT_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 pub struct TaskInputRequest {
     pub text: String,
     pub authority_class: Option<AuthorityClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_context: Option<crate::types::AgentInvocationContext>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskStopRequest {
     pub authority_class: Option<AuthorityClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_context: Option<crate::types::AgentInvocationContext>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,6 +341,10 @@ pub(crate) struct StreamEventEnvelope {
     pub(crate) payload_schema_version: u32,
     pub(crate) provenance: EventReplayProvenance,
     pub(crate) payload: Value,
+    /// Additive classification derived from the runtime event registry.
+    /// Present only while `events.projection-effect.v1` is advertised.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) projection_effect: Option<crate::runtime_event::ProjectionEffect>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -349,12 +360,16 @@ pub struct CreateCommandTaskRequest {
     pub max_output_tokens: Option<u64>,
     pub accepts_input: Option<bool>,
     pub authority_class: Option<AuthorityClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_context: Option<crate::types::AgentInvocationContext>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct CreateWorkItemRequest {
     pub objective: String,
     pub authority_class: Option<AuthorityClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_context: Option<crate::types::AgentInvocationContext>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -364,6 +379,8 @@ pub struct PickWorkItemRequest {
     #[serde(default)]
     pub clear_blocker: bool,
     pub authority_class: Option<AuthorityClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_context: Option<crate::types::AgentInvocationContext>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -376,12 +393,17 @@ pub struct UpdateWorkItemRequest {
     #[schemars(range(min = 1))]
     pub recheck_after: Option<u64>,
     pub authority_class: Option<AuthorityClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_context: Option<crate::types::AgentInvocationContext>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CompleteWorkItemRequest {
+    pub report_text: String,
     pub authority_class: Option<AuthorityClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_context: Option<crate::types::AgentInvocationContext>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

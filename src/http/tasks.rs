@@ -221,6 +221,7 @@ pub async fn task_input(
     let authority_class = request
         .authority_class
         .unwrap_or(AuthorityClass::OperatorInstruction);
+    validate_invocation_context(request.invocation_context.as_ref(), Some(authority_class))?;
     let result = runtime
         .managed_tasks()
         .task_input_with_trust(&task_id, &request.text, &authority_class)
@@ -252,6 +253,7 @@ pub async fn task_stop(
     let authority_class = request
         .authority_class
         .unwrap_or(AuthorityClass::OperatorInstruction);
+    validate_invocation_context(request.invocation_context.as_ref(), Some(authority_class))?;
     let task = runtime
         .managed_tasks()
         .stop_task(&task_id, &authority_class)
@@ -286,6 +288,7 @@ pub async fn create_command_task(
     authorize_control(&headers, &state).map_err(|err| auth_required(err.to_string()))?;
     let admission_context = control_admission_context(&state);
     let provided_trust = request.authority_class;
+    validate_invocation_context(request.invocation_context.as_ref(), provided_trust)?;
     let effective_trust = provided_trust
         .clone()
         .unwrap_or(AuthorityClass::OperatorInstruction);
@@ -341,6 +344,7 @@ pub async fn create_work_item(
     authorize_control(&headers, &state).map_err(|err| auth_required(err.to_string()))?;
     let admission_context = control_admission_context(&state);
     let provided_trust = request.authority_class;
+    validate_invocation_context(request.invocation_context.as_ref(), provided_trust)?;
     let objective = request.objective.trim().to_string();
     if objective.is_empty() {
         return Err(bad_request("objective must not be empty"));
@@ -377,6 +381,7 @@ pub async fn pick_work_item(
     authorize_control(&headers, &state).map_err(|err| auth_required(err.to_string()))?;
     let admission_context = control_admission_context(&state);
     let provided_trust = request.authority_class;
+    validate_invocation_context(request.invocation_context.as_ref(), provided_trust)?;
     let runtime = state
         .host
         .get_public_agent(&agent_id)
@@ -425,6 +430,7 @@ pub async fn update_work_item(
     authorize_control(&headers, &state).map_err(|err| auth_required(err.to_string()))?;
     let admission_context = control_admission_context(&state);
     let provided_trust = request.authority_class;
+    validate_invocation_context(request.invocation_context.as_ref(), provided_trust)?;
     let objective = request
         .objective
         .map(|value| {
@@ -499,8 +505,13 @@ pub async fn complete_work_item(
     Json(request): Json<CompleteWorkItemRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
     authorize_control(&headers, &state).map_err(|err| auth_required(err.to_string()))?;
+    let report_text = request.report_text.trim();
+    if report_text.is_empty() {
+        return Err(bad_request("report_text must not be empty"));
+    }
     let admission_context = control_admission_context(&state);
     let provided_trust = request.authority_class;
+    validate_invocation_context(request.invocation_context.as_ref(), provided_trust)?;
     let runtime = state
         .host
         .get_public_agent(&agent_id)
@@ -509,10 +520,49 @@ pub async fn complete_work_item(
     let boundary = current_boundary_metadata(&runtime)
         .await
         .map_err(error_response)?;
-    let record = runtime
-        .complete_work_item(work_item_id, Vec::new())
+    let existing = runtime
+        .latest_work_item(&work_item_id)
         .await
-        .map_err(work_item_lifecycle_error)?;
+        .map_err(work_item_lifecycle_error)?
+        .ok_or_else(|| {
+            work_item_lifecycle_error(
+                RuntimeError::not_found(
+                    "work_item_not_found",
+                    format!("work item {work_item_id} not found"),
+                )
+                .with_safe_context("work_item_id", work_item_id.clone())
+                .into(),
+            )
+        })?;
+    let record = match existing.state {
+        crate::types::WorkItemState::Open | crate::types::WorkItemState::Completed => runtime
+            .complete_work_item_with_report(
+                work_item_id,
+                crate::runtime::WorkItemCompletionAuthority::Control,
+                report_text.to_string(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+            )
+            .await
+            .map_err(work_item_lifecycle_error)?
+            .into_record(),
+        crate::types::WorkItemState::Completing => runtime
+            .promote_work_item_completion_report(
+                work_item_id,
+                report_text.to_string(),
+                None,
+                None,
+                Vec::new(),
+            )
+            .await
+            .map_err(work_item_lifecycle_error)?,
+    };
     runtime
         .append_audit_event(
             "work_item_complete_requested",

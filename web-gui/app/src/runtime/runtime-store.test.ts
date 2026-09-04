@@ -4,31 +4,44 @@ import {
   agentBriefPatchFromEvents,
   agentDetailErrorKind,
   applyStreamEvents,
+  backfillRetryDelayMs,
   buildResumeRefreshes,
   canUseRemoteRuntimeConnections,
-  hasEventIdentityConflict,
   isSessionCacheContextCurrent,
   isLoopbackWebHostname,
   materializeProjectionDetail,
   mergeBootstrapAgentState,
-  mergeCachedSessionIntoCurrent,
   mergeTimelineEventPage,
+  modelCatalogCacheKey,
   missingBriefIdsForHydration,
+  observerSyncDiagnostics,
   readStoredRemoteConnectionProfiles,
+  retryPendingReadMarker,
   resetSessionsForResume,
   resetTransientRuntimeStateForResume,
   readStoredRuntimeConnectionConfig,
   runWithConcurrencyLimit,
-  sessionForEventLogEpoch,
   skillDetailCacheKey,
   streamEventFromBackfill,
   useRuntimeStore,
   writeStoredRuntimeConnectionConfig,
 } from "./runtime-store";
 import type { StreamEventEnvelopeDto } from "./client";
+import { AgentSessionRepository } from "./agent-session-repository";
+import {
+  getRuntimeTraceRecords,
+  setRuntimeTraceEnabled,
+} from "./runtime-trace";
 import type { AgentSessionState } from "./runtime-store";
 import { createSessionProjectionState, reduceSessionProjection } from "./session-projection";
 import type { AgentSummary } from "./types";
+
+const OBSERVER_SYNC_CAPABILITIES = [
+  "agents.roster-snapshot.v1",
+  "agents.projection-snapshot.v1",
+  "events.projection-effect.v1",
+  "briefs.atomic-created-event.v1",
+];
 
 class MemoryStorage implements Storage {
   private readonly items = new Map<string, string>();
@@ -62,7 +75,8 @@ function sessionState(overrides: Partial<AgentSessionState> = {}): AgentSessionS
   return {
     ...createSessionProjectionState(),
     loading: false,
-    loadingOlder: false,
+    semanticHistoryByDisplayLevel: {},
+    targetEventLoading: false,
     liveStatus: "idle",
     cacheStatus: "unchecked",
     contentStatus: "unknown",
@@ -76,12 +90,75 @@ function sessionState(overrides: Partial<AgentSessionState> = {}): AgentSessionS
   };
 }
 
+describe("sendOperatorPrompt", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("reports UUID generation failures instead of silently ignoring the send", async () => {
+    const previous = useRuntimeStore.getState();
+    useRuntimeStore.setState({
+      ...previous,
+      sessionsByAgentId: {
+        "agent-a": sessionState(),
+      },
+    }, true);
+    vi.stubGlobal("crypto", {});
+
+    try {
+      await expect(
+        useRuntimeStore.getState().sendOperatorPrompt("agent-a", "hello", "info"),
+      ).rejects.toThrow("Secure random number generation is unavailable");
+
+      expect(useRuntimeStore.getState().sessionsByAgentId["agent-a"]).toMatchObject({
+        sendingPrompt: false,
+        promptError: "Secure random number generation is unavailable",
+      });
+    } finally {
+      useRuntimeStore.setState(previous, true);
+    }
+  });
+});
+
 describe("skillDetailCacheKey", () => {
   it("keeps global and agent-scoped versions separate", () => {
     expect(skillDetailCacheKey("workspace:root:demo")).toBe("workspace:root:demo");
     expect(skillDetailCacheKey("workspace:root:demo", "agent-a")).toBe(
       "agent-a\u0000workspace:root:demo",
     );
+  });
+});
+
+describe("modelCatalogCacheKey", () => {
+  it("isolates model catalogs by runtime and credential without storing the token", () => {
+    const first = modelCatalogCacheKey({
+      mode: "remote",
+      baseUrl: "https://runtime.example/",
+      token: "secret-a",
+    });
+    const second = modelCatalogCacheKey({
+      mode: "remote",
+      baseUrl: "https://runtime.example",
+      token: "secret-b",
+    });
+
+    expect(first).not.toBe(second);
+    expect(first).toContain("https://runtime.example#auth-");
+    expect(first).not.toContain("secret-a");
+    expect(modelCatalogCacheKey({ mode: "local" })).toBe("local#anonymous");
+  });
+});
+
+describe("backfillRetryDelayMs", () => {
+  it("uses deterministic capped exponential backoff", () => {
+    expect([1, 2, 3, 4, 5, 6].map(backfillRetryDelayMs)).toEqual([
+      1_000,
+      2_000,
+      4_000,
+      8_000,
+      15_000,
+      15_000,
+    ]);
   });
 });
 
@@ -107,6 +184,46 @@ function agentSummary(overrides: Partial<AgentSummary> = {}): AgentSummary {
     ...overrides,
   };
 }
+
+describe("observerSyncDiagnostics", () => {
+  it("reports only synchronization metadata for Agents in the authorized roster", () => {
+    const previous = useRuntimeStore.getState();
+    useRuntimeStore.setState({
+      bootstrap: {
+        ...previous.bootstrap,
+        agents: [agentSummary({ id: "visible-agent", lastBrief: "private brief text" })],
+      },
+      discovery: {
+        mode: "authoritative",
+        freshness: "fresh",
+        identity: {
+          runtimeId: "runtime-1",
+          visibilityScopeId: "scope-1",
+          eventLogEpoch: "epoch-1",
+        },
+        retryAttempt: 0,
+      },
+      sessionsByAgentId: {
+        "hidden-agent": sessionState(),
+      },
+      ledgerUnreadByAgentId: {},
+    });
+
+    const diagnostics = observerSyncDiagnostics();
+    expect(diagnostics.agents.map((agent) => agent.agentId)).toEqual(["visible-agent"]);
+    expect(diagnostics.discovery).toEqual({
+      mode: "authoritative",
+      freshness: "fresh",
+      runtimeId: "runtime-1",
+      visibilityScopeId: "scope-1",
+      eventLogEpoch: "epoch-1",
+    });
+    expect(JSON.stringify(diagnostics)).not.toContain("private brief text");
+    expect(JSON.stringify(diagnostics)).not.toContain("hidden-agent");
+
+    useRuntimeStore.setState(previous, true);
+  });
+});
 
 describe("agent snapshot merging", () => {
   it("lets a fresh bootstrap snapshot clear cached running state and counts", () => {
@@ -159,7 +276,10 @@ describe("resume session reset", () => {
     const reset = resetSessionsForResume({
       "agent-a": sessionState({
         loading: true,
-        loadingOlder: true,
+        semanticHistoryByDisplayLevel: {
+          info: { cursorSeq: 10, hasOlder: true, loading: true },
+        },
+        targetEventLoading: true,
         sendingPrompt: true,
         liveStatus: "recovering",
         reconnectAttempt: 4,
@@ -175,7 +295,10 @@ describe("resume session reset", () => {
 
     expect(reset["agent-a"]).toMatchObject({
       loading: false,
-      loadingOlder: false,
+      semanticHistoryByDisplayLevel: {
+        info: { cursorSeq: 10, hasOlder: true, loading: false },
+      },
+      targetEventLoading: false,
       sendingPrompt: false,
       liveStatus: "stale",
       reconnectAttempt: 0,
@@ -358,66 +481,6 @@ describe("timeline events state", () => {
 });
 
 describe("runtime event epoch", () => {
-  it("drops seq-indexed history and hydration caches when the epoch changes", () => {
-    const current = sessionState({
-      eventLogEpoch: "epoch-old",
-      eventsBySeq: { 7: { id: "evt-old" } },
-      eventSeqs: [7],
-      messagesById: { msg: { id: "msg" } },
-      newestSeq: 7,
-      oldestSeq: 7,
-      hasOlder: true,
-      detail: {
-        agent: { id: "agent-1" } as NonNullable<AgentSessionState["detail"]>["agent"],
-        source: "http",
-        timeline: [],
-        events: [],
-        eventCursorSeq: 7,
-        hasOlderEvents: true,
-      },
-    });
-
-    const reset = sessionForEventLogEpoch(current, "epoch-new");
-
-    expect(reset.eventLogEpoch).toBe("epoch-new");
-    expect(reset.eventsBySeq).toEqual({});
-    expect(reset.eventSeqs).toEqual([]);
-    expect(reset.messagesById).toEqual({});
-    expect(reset.newestSeq).toBeUndefined();
-    expect(reset.oldestSeq).toBeUndefined();
-    expect(reset.hasOlder).toBeUndefined();
-    expect(reset.detail?.eventCursorSeq).toBeUndefined();
-    expect(reset.detail?.hasOlderEvents).toBeUndefined();
-  });
-
-  it("detects conflicting immutable content for the same epoch and sequence", () => {
-    const existing: StreamEventEnvelopeDto = {
-      id: "evt-1",
-      event_seq: 7,
-      event_log_epoch: "epoch-1",
-      contract_version: 1,
-      ts: "2026-07-16T00:00:00Z",
-      agent_id: "agent-1",
-      type: "legacy_event",
-      payload_schema: "holon.runtime_event.legacy",
-      payload_schema_version: 1,
-      provenance: {},
-      payload: { value: 1 },
-    };
-    const current = sessionState({
-      eventLogEpoch: "epoch-1",
-      eventsBySeq: { 7: existing },
-      eventSeqs: [7],
-    });
-
-    expect(hasEventIdentityConflict(current, [{ ...existing }])).toBe(false);
-    expect(
-      hasEventIdentityConflict(current, [
-        { ...existing, id: "evt-conflict", payload: { value: 2 } },
-      ]),
-    ).toBe(true);
-  });
-
   it("preserves typed contract metadata when rebuilding gap backfill events", () => {
     const provenance = {
       source: "runtime",
@@ -461,42 +524,6 @@ describe("session cache restoration", () => {
     expect(isSessionCacheContextCurrent(captured, "https://old.example", 8)).toBe(false);
   });
 
-  it("does not overwrite HTTP or SSE state that arrived while cache was loading", () => {
-    const current = sessionState({
-      eventLogEpoch: "epoch-live",
-      eventsBySeq: { 9: { id: "live-event", event_seq: 9 } },
-      eventSeqs: [9],
-      newestSeq: 9,
-      oldestSeq: 9,
-      liveStatus: "streaming",
-    });
-    const cached = {
-      ...createSessionProjectionState("epoch-cache"),
-      eventsBySeq: { 1: { id: "cached-event", event_seq: 1 } },
-      eventSeqs: [1],
-      newestSeq: 1,
-      oldestSeq: 1,
-    };
-
-    expect(mergeCachedSessionIntoCurrent(current, cached)).toBe(current);
-  });
-
-  it("restores cached projection into an empty session without changing UI state", () => {
-    const current = sessionState({ loading: true, liveStatus: "connecting" });
-    const cached = {
-      ...createSessionProjectionState("epoch-cache"),
-      eventsBySeq: { 1: { id: "cached-event", event_seq: 1 } },
-      eventSeqs: [1],
-      newestSeq: 1,
-      oldestSeq: 1,
-    };
-
-    const restored = mergeCachedSessionIntoCurrent(current, cached);
-
-    expect(restored.eventSeqs).toEqual([1]);
-    expect(restored.loading).toBe(true);
-    expect(restored.liveStatus).toBe("connecting");
-  });
 });
 
 function installWindow(localStorage: Storage, sessionStorage: Storage, hostname = "localhost") {
@@ -604,89 +631,374 @@ describe("runtime connection storage", () => {
   });
 });
 
-describe("roster activity unread state", () => {
+describe("agent deletion cache cleanup", () => {
   afterEach(() => {
+    useRuntimeStore.setState({
+      selectedAgentId: "",
+      route: "dashboard",
+      sessionsByAgentId: {},
+      rosterActivityByAgentId: {},
+    });
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
-  it("hydrates persisted roster activity per remote key", async () => {
-    const sharedLocalStorage = new MemoryStorage();
-    installWindow(sharedLocalStorage, new MemoryStorage());
-    sharedLocalStorage.setItem(
-      "holon.webGui.rosterActivityByRemote.v1",
-      JSON.stringify({
-        local: {
-          localAgent: { unreadCount: 2, lastUnreadSeq: 12, lastReadSeq: 7, briefAt: "2026-01-01T00:00:00.000Z" },
-        },
-        "http://remote.example:7878": {
-          remoteAgent: { unreadCount: 4, lastUnreadSeq: 20 },
-        },
-      }),
-    );
-
-    const { readStoredRosterActivity } = await import("./runtime-store");
-
-    expect(readStoredRosterActivity("local")).toEqual({
-      localAgent: { unreadCount: 2, lastUnreadSeq: 12, lastReadSeq: 7, briefAt: "2026-01-01T00:00:00.000Z" },
+  it("removes persisted session and read state after server deletion succeeds", async () => {
+    const localStorage = new MemoryStorage();
+    const sessionStorage = new MemoryStorage();
+    vi.stubGlobal("window", {
+      localStorage,
+      sessionStorage,
+      setTimeout,
+      clearTimeout,
+      location: { hostname: "localhost", protocol: "http:" },
     });
-    expect(readStoredRosterActivity("http://remote.example:7878")).toEqual({
-      remoteAgent: { unreadCount: 4, lastUnreadSeq: 20 },
+    const fetchMock = vi.fn((input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/handshake")) return Promise.resolve(jsonResponse({ capabilities: OBSERVER_SYNC_CAPABILITIES }));
+      if (url.endsWith("/agents/list")) return Promise.resolve(jsonResponse([]));
+      if (
+        url.endsWith("/control/agents/agent-a") &&
+        init?.method === "DELETE"
+      ) {
+        return Promise.resolve(jsonResponse({
+          created: true,
+          ok: true,
+          identity: { agent_id: "agent-a", status: "deleting" },
+          job: {
+            deletion_id: "delete-1",
+            status: "completed",
+            phase: "completed",
+            attempts: 1,
+            created_at: "2026-08-10T00:00:00Z",
+            updated_at: "2026-08-10T00:00:01Z",
+            completed_at: "2026-08-10T00:00:01Z",
+          },
+        }));
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const idbModule = await import("./idb-cache");
+    const deleteSpy = vi.spyOn(idbModule, "cacheDeleteSession").mockResolvedValue(undefined);
+
+    await useRuntimeStore.getState().setRuntimeConnection({ mode: "local" });
+    useRuntimeStore.setState({
+      selectedAgentId: "agent-a",
+      route: "agent",
+      sessionsByAgentId: {
+        "agent-a": sessionState({
+          eventSeqs: [1],
+          eventsBySeq: { 1: { id: "event-1", event_seq: 1 } },
+        }),
+      },
+      rosterActivityByAgentId: {
+        "agent-a": {
+          unreadCount: 2,
+          lastUnreadDeliverySeq: 3,
+          lastReadDeliverySeq: 1,
+        },
+      },
+    });
+
+    await useRuntimeStore.getState().deleteAgent("agent-a");
+
+    expect(deleteSpy).toHaveBeenCalledWith("local", "agent-a");
+    expect(useRuntimeStore.getState().sessionsByAgentId["agent-a"]).toBeUndefined();
+    expect(useRuntimeStore.getState().rosterActivityByAgentId["agent-a"]).toBeUndefined();
+    expect(useRuntimeStore.getState()).toMatchObject({
+      selectedAgentId: "",
+      route: "dashboard",
+    });
+  });
+});
+
+describe("roster activity unread state", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    setRuntimeTraceEnabled(false, { clear: true });
+    useRuntimeStore.setState({
+      route: "dashboard",
+      selectedAgentId: "",
+      sessionsByAgentId: {},
+      ledgerUnreadByAgentId: {},
     });
   });
 
-  it("counts unread brief and non-operator message events once by seq", async () => {
-    const { touchRosterActivityFromEvent } = await import("./runtime-store");
-    const afterBrief = touchRosterActivityFromEvent(
-      {},
-      "agent-a",
-      { agent_id: "agent-a", event_seq: 10, ts: "2026-01-01T00:00:00.000Z", type: "brief_created", payload: {} },
-      "agent-b",
-    );
-    const afterDuplicate = touchRosterActivityFromEvent(
-      afterBrief,
-      "agent-a",
-      { agent_id: "agent-a", event_seq: 10, ts: "2026-01-01T00:00:01.000Z", type: "brief_created", payload: {} },
-      "agent-b",
-    );
-    const afterAgentMessage = touchRosterActivityFromEvent(
-      afterDuplicate,
-      "agent-a",
-      {
-        agent_id: "agent-a",
-        event_seq: 11,
-        ts: "2026-01-01T00:00:02.000Z",
-        type: "message_enqueued",
-        payload: { origin: { kind: "agent" } },
+  it("retries a pending read marker after ledger readiness becomes available", async () => {
+    vi.stubGlobal("document", { visibilityState: "visible" });
+    let ready = false;
+    vi.spyOn(AgentSessionRepository.prototype, "sessionLedgerReadiness")
+      .mockImplementation(() => ready
+        ? { readyThroughSeq: 12, ingestedThroughSeq: 12, observedHeadSeq: 12 }
+        : null);
+    const advanceReadMarker = vi
+      .spyOn(AgentSessionRepository.prototype, "advanceReadMarker")
+      .mockResolvedValue({
+        advanced: true,
+        record: {
+          remoteKey: "local",
+          runtimeId: "runtime-1",
+          visibilityScopeId: "scope-1",
+          eventLogEpoch: "epoch-1",
+          agentId: "agent-retry",
+          readThroughEventSeq: 12,
+          updatedAt: 1,
+        },
+      });
+    const acknowledgeReadTruncation = vi
+      .spyOn(AgentSessionRepository.prototype, "acknowledgeReadTruncation")
+      .mockResolvedValue(null);
+    vi.spyOn(AgentSessionRepository.prototype, "unreadSnapshot").mockResolvedValue({
+      scopeAgentId: "agent-retry",
+      boundarySeq: 12,
+      countedThroughSeq: 12,
+      certainty: "exact",
+      count: 0,
+      historyTruncatedBeforeSeq: null,
+      acknowledgedTruncationBeforeSeq: null,
+    });
+    useRuntimeStore.setState({
+      route: "agent",
+      selectedAgentId: "agent-retry",
+      discovery: {
+        mode: "authoritative",
+        freshness: "fresh",
+        retryAttempt: 0,
       },
-      "agent-b",
-    );
+      sessionsByAgentId: {
+        "agent-retry": sessionState(),
+      },
+      ledgerUnreadByAgentId: {
+        "agent-retry": { mode: "exact", count: 2 },
+      },
+    });
 
-    expect(afterAgentMessage["agent-a"]).toMatchObject({ unreadCount: 2, lastUnreadSeq: 11 });
+    useRuntimeStore.getState().markAgentConversationRead("agent-retry");
+    await Promise.resolve();
+    expect(advanceReadMarker).not.toHaveBeenCalled();
+
+    ready = true;
+    await retryPendingReadMarker("agent-retry");
+
+    expect(advanceReadMarker).toHaveBeenCalledWith("agent-retry", 12);
+    // An exact record never triggers the auto-restore acknowledgement.
+    expect(acknowledgeReadTruncation).not.toHaveBeenCalled();
+    expect(useRuntimeStore.getState().ledgerUnreadByAgentId["agent-retry"]).toEqual({
+      mode: "exact",
+      count: 0,
+    });
   });
 
-  it("does not count unread for the currently open agent or operator messages", async () => {
-    const { touchRosterActivityFromEvent } = await import("./runtime-store");
-    const afterSelectedBrief = touchRosterActivityFromEvent(
-      {},
-      "agent-a",
-      { agent_id: "agent-a", event_seq: 10, ts: "2026-01-01T00:00:00.000Z", type: "brief_created", payload: {} },
-      "agent-a",
-    );
-    const afterOperatorMessage = touchRosterActivityFromEvent(
-      afterSelectedBrief,
-      "agent-a",
-      {
-        agent_id: "agent-a",
-        event_seq: 11,
-        ts: "2026-01-01T00:00:01.000Z",
-        type: "message_enqueued",
-        payload: { origin: { kind: "operator" }, created_at: "2026-01-01T00:00:01.000Z" },
+  it("auto-restores exact certainty when a sticky truncated marker already covers the head", async () => {
+    vi.stubGlobal("document", { visibilityState: "visible" });
+    let ready = false;
+    vi.spyOn(AgentSessionRepository.prototype, "sessionLedgerReadiness")
+      .mockImplementation(() => ready
+        ? { readyThroughSeq: 12, ingestedThroughSeq: 12, observedHeadSeq: 12 }
+        : null);
+    // Pre-fix durable state: the marker already reached the head, so the
+    // monotonic advance is a no-op while certainty stays truncated.
+    const advanceReadMarker = vi
+      .spyOn(AgentSessionRepository.prototype, "advanceReadMarker")
+      .mockResolvedValue({
+      advanced: false,
+      record: {
+        remoteKey: "local",
+        runtimeId: "runtime-1",
+        visibilityScopeId: "scope-1",
+        eventLogEpoch: "epoch-1",
+        agentId: "agent-auto",
+        readThroughEventSeq: 12,
+        certainty: "truncated",
+        updatedAt: 1,
       },
+    });
+    const acknowledgeReadTruncation = vi
+      .spyOn(AgentSessionRepository.prototype, "acknowledgeReadTruncation")
+      .mockResolvedValue({
+        remoteKey: "local",
+        runtimeId: "runtime-1",
+        visibilityScopeId: "scope-1",
+        eventLogEpoch: "epoch-1",
+        agentId: "agent-auto",
+        readThroughEventSeq: 12,
+        unreadBaselineSeq: 12,
+        acknowledgedTruncationBeforeSeq: 12,
+        certainty: "exact",
+        updatedAt: 2,
+      });
+    vi.spyOn(AgentSessionRepository.prototype, "unreadSnapshot").mockResolvedValue({
+      scopeAgentId: "agent-auto",
+      boundarySeq: 12,
+      countedThroughSeq: 12,
+      certainty: "exact",
+      count: 0,
+      historyTruncatedBeforeSeq: 5,
+      acknowledgedTruncationBeforeSeq: 12,
+    });
+    useRuntimeStore.setState({
+      route: "agent",
+      selectedAgentId: "agent-auto",
+      discovery: {
+        mode: "authoritative",
+        freshness: "fresh",
+        retryAttempt: 0,
+      },
+      sessionsByAgentId: {
+        "agent-auto": sessionState(),
+      },
+      ledgerUnreadByAgentId: {
+        "agent-auto": { mode: "truncated", count: 2 },
+      },
+    });
+
+    useRuntimeStore.getState().markAgentConversationRead("agent-auto");
+    await Promise.resolve();
+    expect(advanceReadMarker).not.toHaveBeenCalled();
+
+    ready = true;
+    await retryPendingReadMarker("agent-auto");
+
+    // Auto-restore retires the truncated generation at the gated head the
+    // marker already covers, flipping the badge back to exact.
+    expect(acknowledgeReadTruncation).toHaveBeenCalledWith("agent-auto", 12);
+    expect(useRuntimeStore.getState().ledgerUnreadByAgentId["agent-auto"]).toEqual({
+      mode: "exact",
+      count: 0,
+    });
+  });
+
+  it("refreshes a stale unread view after a monotonic read-marker no-op", async () => {
+    vi.stubGlobal("document", { visibilityState: "visible" });
+    setRuntimeTraceEnabled(true, { clear: true });
+    vi.spyOn(AgentSessionRepository.prototype, "sessionLedgerReadiness").mockReturnValue({
+      readyThroughSeq: 12,
+      ingestedThroughSeq: 12,
+      observedHeadSeq: 12,
+    });
+    vi.spyOn(AgentSessionRepository.prototype, "advanceReadMarker").mockResolvedValue({
+      advanced: false,
+      record: {
+        remoteKey: "local",
+        runtimeId: "runtime-1",
+        visibilityScopeId: "scope-1",
+        eventLogEpoch: "epoch-1",
+        agentId: "agent-noop",
+        readThroughEventSeq: 12,
+        updatedAt: 1,
+      },
+    });
+    vi.spyOn(AgentSessionRepository.prototype, "unreadSnapshot").mockResolvedValue({
+      scopeAgentId: "agent-noop",
+      boundarySeq: 12,
+      countedThroughSeq: 12,
+      certainty: "exact",
+      count: 0,
+      historyTruncatedBeforeSeq: null,
+      acknowledgedTruncationBeforeSeq: null,
+    });
+    useRuntimeStore.setState({
+      route: "agent",
+      selectedAgentId: "agent-noop",
+      discovery: {
+        mode: "authoritative",
+        freshness: "fresh",
+        retryAttempt: 0,
+      },
+      sessionsByAgentId: {
+        "agent-noop": sessionState(),
+      },
+      ledgerUnreadByAgentId: {
+        "agent-noop": { mode: "exact", count: 2 },
+      },
+    });
+
+    useRuntimeStore.getState().markAgentConversationRead("agent-noop");
+    await vi.waitFor(() => {
+      expect(useRuntimeStore.getState().ledgerUnreadByAgentId["agent-noop"]?.count).toBe(0);
+    });
+    expect(getRuntimeTraceRecords({ agentId: "agent-noop" }).at(-1)).toMatchObject({
+      name: "read_marker.advance",
+      outcome: "ok",
+      attributes: { advanced: false, candidateSeq: 12 },
+    });
+  });
+
+  it("does not mutate legacy roster activity when marking a conversation read", async () => {
+    const { touchRosterActivityFromEvent } = await import("./runtime-store");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let activity: Record<string, any> = {
+      "agent-a": { unreadCount: 0, lastUnreadDeliverySeq: 7, lastReadDeliverySeq: 7 },
+    };
+    for (const seq of [8, 9, 10]) {
+      activity = touchRosterActivityFromEvent(
+        activity,
+        "agent-a",
+        { agent_id: "agent-a", event_seq: seq, ts: `2026-01-01T00:00:0${seq}.000Z`, type: "brief_created", payload: {} },
+        "agent-a",
+      );
+    }
+    expect(activity["agent-a"]?.unreadCount).toBe(3);
+
+    vi.stubGlobal("document", { visibilityState: "visible" });
+    useRuntimeStore.setState({
+      route: "agent",
+      selectedAgentId: "agent-a",
+      rosterActivityByAgentId: activity,
+      sessionsByAgentId: {
+        "agent-a": sessionState({
+          cacheStatus: "hit",
+          contentStatus: "available",
+          syncStatus: "streaming",
+          liveStatus: "recovering",
+          eventsBySeq: {
+            8: { agent_id: "agent-a", event_seq: 8, type: "brief_created", payload: {} },
+            9: { agent_id: "agent-a", event_seq: 9, type: "brief_created", payload: {} },
+            10: { agent_id: "agent-a", event_seq: 10, type: "brief_created", payload: {} },
+          },
+          eventSeqs: [8, 9, 10],
+        }),
+      },
+    });
+    useRuntimeStore.getState().markAgentConversationRead("agent-a");
+    expect(useRuntimeStore.getState().rosterActivityByAgentId["agent-a"]?.unreadCount).toBe(3);
+    useRuntimeStore.setState((state) => ({
+      sessionsByAgentId: {
+        ...state.sessionsByAgentId,
+        "agent-a": {
+          ...state.sessionsByAgentId["agent-a"],
+          liveStatus: "streaming",
+        },
+      },
+    }));
+    useRuntimeStore.getState().markAgentConversationRead("agent-a");
+    activity = useRuntimeStore.getState().rosterActivityByAgentId;
+    expect(activity["agent-a"]?.unreadCount).toBe(3);
+    expect(activity["agent-a"]?.lastReadDeliverySeq).toBe(7);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let replayed: Record<string, any> = activity;
+    for (const seq of [8, 9, 10]) {
+      replayed = touchRosterActivityFromEvent(
+        replayed,
+        "agent-a",
+        { agent_id: "agent-a", event_seq: seq, ts: `2026-01-01T00:00:0${seq}.000Z`, type: "brief_created", payload: {} },
+        "agent-b",
+      );
+    }
+    expect(replayed["agent-a"]?.unreadCount).toBe(3);
+
+    // A genuinely new event (seq 11) should still be counted.
+    replayed = touchRosterActivityFromEvent(
+      replayed,
+      "agent-a",
+      { agent_id: "agent-a", event_seq: 11, ts: "2026-01-01T00:00:11.000Z", type: "brief_created", payload: {} },
       "agent-b",
     );
-
-    expect(afterOperatorMessage["agent-a"]?.unreadCount).toBeUndefined();
-    expect(afterOperatorMessage["agent-a"]?.operatorAt).toBe("2026-01-01T00:00:01.000Z");
+    expect(replayed["agent-a"]?.unreadCount).toBe(4);
+    expect(replayed["agent-a"]?.lastUnreadDeliverySeq).toBe(11);
   });
 });
 
@@ -718,7 +1030,7 @@ describe("brief projection and hydration", () => {
           missing_brief_ids: [],
         }));
       }
-      if (url.endsWith("/handshake")) return Promise.resolve(jsonResponse({}));
+      if (url.endsWith("/handshake")) return Promise.resolve(jsonResponse({ capabilities: OBSERVER_SYNC_CAPABILITIES }));
       if (url.endsWith("/agents/list")) return Promise.resolve(jsonResponse([]));
       throw new Error(`Unexpected request: ${url}`);
     });
@@ -746,9 +1058,13 @@ describe("brief projection and hydration", () => {
       provenance: {},
       payload: { brief_id: "brief-b" },
     };
+    const ingestSessionEvents = vi
+      .spyOn(AgentSessionRepository.prototype, "ingestSessionEvents")
+      .mockResolvedValue(null);
 
     applyStreamEvents(useRuntimeStore.setState, "agent-b", [briefEvent]);
 
+    expect(ingestSessionEvents).toHaveBeenCalledWith("agent-b", [briefEvent]);
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/agents/agent-b/briefs:batchGet");
     await vi.waitFor(() => {
@@ -794,7 +1110,8 @@ describe("brief projection and hydration", () => {
     const session: AgentSessionState = {
       ...createSessionProjectionState(),
       loading: false,
-      loadingOlder: false,
+      semanticHistoryByDisplayLevel: {},
+      targetEventLoading: false,
       liveStatus: "idle",
       cacheStatus: "unchecked",
       contentStatus: "unknown",
@@ -963,7 +1280,7 @@ describe("runtime client generation", () => {
     const fetchMock = vi.fn((input: string | URL | Request) => {
       const url = String(input);
       if (url.includes("/agents/agent-a/work-items")) return oldWorkItems;
-      if (url.endsWith("/handshake")) return Promise.resolve(jsonResponse({}));
+      if (url.endsWith("/handshake")) return Promise.resolve(jsonResponse({ capabilities: OBSERVER_SYNC_CAPABILITIES }));
       if (url.endsWith("/agents/list")) {
         return Promise.resolve(jsonResponse([{ id: "agent-a", lifecycle: "asleep" }]));
       }
@@ -1027,7 +1344,7 @@ describe("agent event catch-up", () => {
     });
     const fetchMock = vi.fn((input: string | URL | Request) => {
       const url = new URL(String(input), "http://localhost");
-      if (url.pathname.endsWith("/handshake")) return Promise.resolve(jsonResponse({}));
+      if (url.pathname.endsWith("/handshake")) return Promise.resolve(jsonResponse({ capabilities: OBSERVER_SYNC_CAPABILITIES }));
       if (url.pathname.endsWith("/agents/list")) return Promise.resolve(jsonResponse([]));
       if (url.pathname.endsWith("/agents/agent-a/events")) {
         const afterSeq = Number(url.searchParams.get("after_seq"));
@@ -1109,9 +1426,11 @@ describe("agent event catch-up", () => {
     const eventRequests = fetchMock.mock.calls
       .map(([input]) => new URL(String(input), "http://localhost"))
       .filter((url) => url.pathname.endsWith("/agents/agent-a/events"));
-    // Phase 1: descending tail fetch, Phase 2: ascending backfill from cached cursor
-    expect(eventRequests.map((url) => url.searchParams.get("order"))).toEqual(["desc", "asc"]);
-    expect(eventRequests.map((url) => url.searchParams.get("after_seq"))).toEqual([null, "1"]);
+    // Phase 1: descending tail fetch, Phase 1.5: display-level filtered tail, Phase 2: ascending backfill from cached cursor
+    expect(eventRequests.map((url) => url.searchParams.get("order"))).toEqual(["desc", "desc", "asc"]);
+    expect(eventRequests.map((url) => url.searchParams.get("after_seq"))).toEqual([null, null, "1"]);
+    // Phase 1.5 request carries the display-level filter
+    expect(eventRequests[1].searchParams.get("max_level")).toBe("info");
     expect(useRuntimeStore.getState().sessionsByAgentId["agent-a"]).toMatchObject({
       eventSeqs: Array.from({ length: 150 }, (_, index) => index + 1),
       newestSeq: 150,
@@ -1144,7 +1463,7 @@ describe("agent event catch-up", () => {
     };
     const fetchMock = vi.fn((input: string | URL | Request) => {
       const url = new URL(String(input), "http://localhost");
-      if (url.pathname.endsWith("/handshake")) return Promise.resolve(jsonResponse({}));
+      if (url.pathname.endsWith("/handshake")) return Promise.resolve(jsonResponse({ capabilities: OBSERVER_SYNC_CAPABILITIES }));
       if (url.pathname.endsWith("/agents/list")) return Promise.resolve(jsonResponse([]));
       if (url.pathname.endsWith("/agents/agent-a/events")) {
         const order = url.searchParams.get("order");
@@ -1245,7 +1564,7 @@ describe("agent event catch-up", () => {
     });
     const fetchMock = vi.fn((input: string | URL | Request) => {
       const url = new URL(String(input), "http://localhost");
-      if (url.pathname.endsWith("/handshake")) return Promise.resolve(jsonResponse({}));
+      if (url.pathname.endsWith("/handshake")) return Promise.resolve(jsonResponse({ capabilities: OBSERVER_SYNC_CAPABILITIES }));
       if (url.pathname.endsWith("/agents/list")) return Promise.resolve(jsonResponse([]));
       if (url.pathname.endsWith("/agents/agent-a/events")) {
         const order = url.searchParams.get("order");
@@ -1350,7 +1669,7 @@ describe("brief hydration retry limits", () => {
           missing_brief_ids: [],
         }));
       }
-      if (url.endsWith("/handshake")) return Promise.resolve(jsonResponse({}));
+      if (url.endsWith("/handshake")) return Promise.resolve(jsonResponse({ capabilities: OBSERVER_SYNC_CAPABILITIES }));
       if (url.endsWith("/agents/list")) return Promise.resolve(jsonResponse([]));
       throw new Error(`Unexpected request: ${url}`);
     });
@@ -1406,6 +1725,255 @@ describe("brief hydration retry limits", () => {
         .toBe("Hydrated after manual retry.");
     });
   });
+
+  it("hydrates selected message references on the fresh streaming fast path", async () => {
+    const localStorage = new MemoryStorage();
+    const sessionStorage = new MemoryStorage();
+    vi.stubGlobal("window", {
+      localStorage,
+      sessionStorage,
+      setTimeout,
+      clearTimeout,
+      location: { hostname: "localhost", protocol: "http:" },
+    });
+    const fetchMock = vi.fn((input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/agents/agent-a/messages:batchGet")) {
+        return Promise.resolve(jsonResponse({
+          messages: [{
+            id: "message-123",
+            origin: { kind: "operator" },
+            body: { text: "Hydrated selected message." },
+          }],
+          missing_message_ids: [],
+        }));
+      }
+      if (url.endsWith("/handshake")) return Promise.resolve(jsonResponse({ capabilities: OBSERVER_SYNC_CAPABILITIES }));
+      if (url.endsWith("/agents/list")) return Promise.resolve(jsonResponse([]));
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await useRuntimeStore.getState().setRuntimeConnection({ mode: "local" });
+    fetchMock.mockClear();
+
+    const now = Date.now();
+    useRuntimeStore.setState({
+      route: "agent",
+      selectedAgentId: "agent-a",
+      globalStreamStatus: "streaming",
+      sessionsByAgentId: {
+        "agent-a": sessionState({
+          cacheStatus: "hit",
+          contentStatus: "available",
+          syncStatus: "streaming",
+          detailValidatedAt: now,
+          eventsValidatedAt: now,
+          detail: {
+            agent: agentSummary({ id: "agent-a" }),
+            source: "http",
+            timeline: [],
+          },
+          eventsBySeq: {
+            1: {
+              agent_id: "agent-a",
+              event_seq: 1,
+              type: "message_enqueued",
+              payload: {
+                message_id: "message-123",
+                origin: { kind: "operator" },
+              },
+            },
+          },
+          eventSeqs: [1],
+          referencedMessageIds: { "message-123": true },
+        }),
+      },
+    });
+
+    await useRuntimeStore.getState().ensureAgentSession("agent-a", "info");
+
+    await vi.waitFor(() => {
+      expect(useRuntimeStore.getState().sessionsByAgentId["agent-a"]?.messagesById["message-123"])
+        .toMatchObject({ id: "message-123" });
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("semantic history pagination", () => {
+  afterEach(() => {
+    useRuntimeStore.setState({
+      sessionsByAgentId: {},
+      selectedAgentId: "",
+    });
+    vi.unstubAllGlobals();
+  });
+
+  it("continues across raw pages until the selected display level gains a timeline item", async () => {
+    const localStorage = new MemoryStorage();
+    const sessionStorage = new MemoryStorage();
+    vi.stubGlobal("window", {
+      localStorage,
+      sessionStorage,
+      setTimeout,
+      clearTimeout,
+      location: { hostname: "localhost", protocol: "http:" },
+    });
+    const event = (
+      eventSeq: number,
+      type: string,
+      payload: Record<string, unknown> = {},
+    ): StreamEventEnvelopeDto => ({
+      id: `event-${eventSeq}`,
+      event_seq: eventSeq,
+      event_log_epoch: "epoch-1",
+      ts: `2026-08-09T00:00:${String(eventSeq % 60).padStart(2, "0")}Z`,
+      agent_id: "agent-a",
+      type,
+      payload,
+    });
+    const fetchMock = vi.fn((input: string | URL | Request) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname.endsWith("/handshake")) return Promise.resolve(jsonResponse({ capabilities: OBSERVER_SYNC_CAPABILITIES }));
+      if (url.pathname.endsWith("/agents/list")) return Promise.resolve(jsonResponse([]));
+      if (url.pathname.endsWith("/agents/agent-a/messages:batchGet")) {
+        return Promise.resolve(jsonResponse({ messages: [], missing_message_ids: ["message-80"] }));
+      }
+      if (url.pathname.endsWith("/agents/agent-a/events")) {
+        const beforeSeq = Number(url.searchParams.get("before_seq"));
+        if (beforeSeq === 90) {
+          return Promise.resolve(jsonResponse({
+            events: [event(89, "legacy_event"), event(88, "legacy_event")],
+            event_log_epoch: "epoch-1",
+            oldest_seq: 88,
+            newest_seq: 89,
+            has_older: true,
+            has_newer: false,
+            order: "desc",
+            limit: 80,
+          }));
+        }
+        if (beforeSeq === 88) {
+          return Promise.resolve(jsonResponse({
+            events: [event(80, "message_enqueued", {
+              message_id: "message-80",
+              origin: { kind: "operator" },
+              body: "Older operator message",
+            })],
+            event_log_epoch: "epoch-1",
+            oldest_seq: 80,
+            newest_seq: 80,
+            has_older: false,
+            has_newer: false,
+            order: "desc",
+            limit: 80,
+          }));
+        }
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await useRuntimeStore.getState().setRuntimeConnection({ mode: "local" });
+    fetchMock.mockClear();
+
+    useRuntimeStore.setState({
+      sessionsByAgentId: {
+        "agent-a": sessionState({
+          eventLogEpoch: "epoch-1",
+          detail: {
+            agent: agentSummary({ id: "agent-a" }),
+            source: "http",
+            timeline: [],
+          },
+          semanticHistoryByDisplayLevel: {
+            info: { eventLogEpoch: "epoch-1", cursorSeq: 90, hasOlder: true, loading: false },
+            verbose: { eventLogEpoch: "epoch-1", cursorSeq: 70, hasOlder: true, loading: false },
+          },
+        }),
+      },
+    });
+
+    await useRuntimeStore.getState().loadOlderAgentEvents("agent-a", "info");
+
+    const eventRequests = fetchMock.mock.calls
+      .map(([input]) => new URL(String(input), "http://localhost"))
+      .filter((url) => url.pathname.endsWith("/agents/agent-a/events"));
+    expect(eventRequests.map((url) => url.searchParams.get("before_seq"))).toEqual(["90", "88"]);
+    expect(eventRequests.every((url) => !url.searchParams.has("max_level"))).toBe(true);
+    expect(useRuntimeStore.getState().sessionsByAgentId["agent-a"]).toMatchObject({
+      oldestSeq: 80,
+      semanticHistoryByDisplayLevel: {
+        info: { cursorSeq: 80, hasOlder: false, loading: false },
+        verbose: { cursorSeq: 70, hasOlder: true, loading: false },
+      },
+    });
+  });
+
+  it("bounds a load when raw pages keep producing no semantic timeline items", async () => {
+    const localStorage = new MemoryStorage();
+    const sessionStorage = new MemoryStorage();
+    vi.stubGlobal("window", {
+      localStorage,
+      sessionStorage,
+      setTimeout,
+      clearTimeout,
+      location: { hostname: "localhost", protocol: "http:" },
+    });
+    const fetchMock = vi.fn((input: string | URL | Request) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname.endsWith("/handshake")) return Promise.resolve(jsonResponse({ capabilities: OBSERVER_SYNC_CAPABILITIES }));
+      if (url.pathname.endsWith("/agents/list")) return Promise.resolve(jsonResponse([]));
+      if (url.pathname.endsWith("/agents/agent-a/events")) {
+        const beforeSeq = Number(url.searchParams.get("before_seq"));
+        const nextSeq = beforeSeq - 1;
+        return Promise.resolve(jsonResponse({
+          events: [{
+            id: `event-${nextSeq}`,
+            event_seq: nextSeq,
+            event_log_epoch: "epoch-1",
+            agent_id: "agent-a",
+            type: "legacy_event",
+            payload: {},
+          }],
+          event_log_epoch: "epoch-1",
+          oldest_seq: nextSeq,
+          newest_seq: nextSeq,
+          has_older: true,
+          has_newer: false,
+          order: "desc",
+          limit: 80,
+        }));
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await useRuntimeStore.getState().setRuntimeConnection({ mode: "local" });
+    fetchMock.mockClear();
+    useRuntimeStore.setState({
+      sessionsByAgentId: {
+        "agent-a": sessionState({
+          eventLogEpoch: "epoch-1",
+          detail: {
+            agent: agentSummary({ id: "agent-a" }),
+            source: "http",
+            timeline: [],
+          },
+          semanticHistoryByDisplayLevel: {
+            info: { eventLogEpoch: "epoch-1", cursorSeq: 90, hasOlder: true, loading: false },
+          },
+        }),
+      },
+    });
+
+    await useRuntimeStore.getState().loadOlderAgentEvents("agent-a", "info");
+
+    const eventRequests = fetchMock.mock.calls
+      .map(([input]) => new URL(String(input), "http://localhost"))
+      .filter((url) => url.pathname.endsWith("/agents/agent-a/events"));
+    expect(eventRequests).toHaveLength(5);
+    expect(useRuntimeStore.getState().sessionsByAgentId["agent-a"]?.semanticHistoryByDisplayLevel.info)
+      .toMatchObject({ cursorSeq: 85, hasOlder: true, loading: false });
+  });
 });
 
 describe("projection saturation refresh handling", () => {
@@ -1427,7 +1995,7 @@ describe("projection saturation refresh handling", () => {
     let saturated = false;
     vi.stubGlobal("fetch", vi.fn((input: string | URL | Request) => {
       const url = String(input);
-      if (url.endsWith("/handshake")) return Promise.resolve(jsonResponse({}));
+      if (url.endsWith("/handshake")) return Promise.resolve(jsonResponse({ capabilities: OBSERVER_SYNC_CAPABILITIES }));
       if (url.endsWith("/agents/list")) {
         return Promise.resolve(
           saturated
@@ -1549,6 +2117,53 @@ describe("agentDetailErrorKind", () => {
   it("returns unknown for unclassified errors", () => {
     expect(agentDetailErrorKind(new Error("something broke"))).toBe("unknown");
     expect(agentDetailErrorKind("string error")).toBe("unknown");
+  });
+});
+
+describe("right panel expanded mode", () => {
+  afterEach(() => {
+    useRuntimeStore.setState({
+      rightPanelOpen: true,
+      rightPanelMode: "normal",
+      rightPanelExpandedNavWasCollapsed: undefined,
+      navCollapsed: false,
+    });
+  });
+
+  it("collapses the nav rail while expanded and restores the pre-expansion nav state", () => {
+    useRuntimeStore.setState({ navCollapsed: true, rightPanelMode: "normal" });
+
+    useRuntimeStore.getState().toggleRightPanelExpanded();
+    expect(useRuntimeStore.getState()).toMatchObject({
+      rightPanelMode: "expanded",
+      rightPanelOpen: true,
+      navCollapsed: true,
+      rightPanelExpandedNavWasCollapsed: true,
+    });
+
+    // Nav toggles issued while expanded must not leak into the restore value.
+    useRuntimeStore.getState().toggleNavCollapsed();
+    expect(useRuntimeStore.getState().navCollapsed).toBe(false);
+
+    useRuntimeStore.getState().toggleRightPanelExpanded();
+    expect(useRuntimeStore.getState()).toMatchObject({
+      rightPanelMode: "normal",
+      navCollapsed: true,
+      rightPanelExpandedNavWasCollapsed: undefined,
+    });
+  });
+
+  it("resets expansion when the panel is closed", () => {
+    useRuntimeStore.setState({ navCollapsed: false, rightPanelMode: "normal" });
+
+    useRuntimeStore.getState().toggleRightPanelExpanded();
+    useRuntimeStore.getState().setRightPanelOpen(false);
+    expect(useRuntimeStore.getState()).toMatchObject({
+      rightPanelOpen: false,
+      rightPanelMode: "normal",
+      navCollapsed: false,
+      rightPanelExpandedNavWasCollapsed: undefined,
+    });
   });
 });
 

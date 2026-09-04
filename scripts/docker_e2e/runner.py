@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -27,12 +28,16 @@ from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = ROOT / "tests/e2e/docker/manifest.json"
+OPENAI_STUB_ROOT = ROOT / "tests/e2e/docker/openai_stub"
+OPENAI_STUB_IMAGE = "holon-openai-responses-stub:local"
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 OFFLINE_MODEL_CREDENTIAL_ENV = "DEEPSEEK_API_KEY"
 OFFLINE_MODEL_CREDENTIAL = "docker-e2e-offline-provider-unused"
 EVIDENCE_SCHEMA_VERSION = 1
 SCHEDULER_ACCEPTANCE_REPORT_SCHEMA_VERSION = 1
-SCHEDULER_ENGINES = ("legacy", "canonical")
+SCHEDULER_COVERAGE_REPORT_SCHEMA_VERSION = 1
+SCHEDULER_LIVE_CANARY_REPORT_SCHEMA_VERSION = 1
+SCHEDULER_ENGINES = ("canonical",)
 TERMINAL_STATUSES = {"awake_idle", "asleep", "awaiting_task"}
 RUNTIME_DB_COPY_TIMEOUT_SECONDS = 120
 DOCKER_CONTROL_TIMEOUT_SECONDS = 30
@@ -111,6 +116,25 @@ def first_env(*names: str, default: str = "") -> str:
     return default
 
 
+def provider_file_paths(
+    env_file: Path | None,
+    config_file: Path | None,
+) -> tuple[Path | None, Path | None]:
+    env_file_value = env_file or first_env(
+        "HOLON_E2E_PROVIDER_ENV_FILE",
+        "HOLON_E2E_DOCKER_ENV_FILE",
+        "HOLON_LIVE_DOCKER_ENV_FILE",
+    )
+    config_file_value = config_file or first_env(
+        "HOLON_E2E_PROVIDER_CONFIG_FILE",
+        "HOLON_E2E_CONFIG_FILE",
+    )
+    return (
+        Path(env_file_value).resolve() if env_file_value else None,
+        Path(config_file_value).resolve() if config_file_value else None,
+    )
+
+
 def env_flag(*names: str) -> bool:
     return first_env(*names).lower() in {"1", "true", "yes", "on"}
 
@@ -135,6 +159,96 @@ def normalize_model_route(model: str) -> str:
     return f"{provider}/{name}"
 
 
+def model_route_provider(model: str) -> str:
+    return model.split("/", 1)[0]
+
+
+def canonical_model_route_entry(entry: dict[str, Any]) -> str | None:
+    family = str(entry.get("provider_family") or "")
+    endpoint = str(entry.get("endpoint") or "")
+    model_ref = str((entry.get("policy") or {}).get("model_ref") or "")
+    model = model_ref.split("/", 1)[-1] if "/" in model_ref else ""
+    if not (family and endpoint and model):
+        return None
+    return f"{family}@{endpoint}/{model}"
+
+
+def require_runtime_model_route(
+    harness: "CaseHarness",
+    label: str,
+    runtime_route: str,
+    models_payload: dict[str, Any],
+) -> None:
+    """Require the runtime route to serve the requested model route.
+
+    The runtime canonicalizes provider and model aliases while loading the
+    configured route (``dashscope-token-plan/qwen-3.7`` becomes
+    ``dashscope@token-plan/qwen3.7-max``), so literal equality only holds for
+    requests that already use canonical routes. When the strings differ, the
+    runtime route is accepted only when the runtime's own model catalog
+    confirms the resolution: an availability entry for the requested provider
+    that reconstructs to the served route and reports it as available.
+    """
+    requested = normalize_model_route(harness.model)
+    served = normalize_model_route(str(runtime_route))
+    if served == requested:
+        return
+    requested_provider = model_route_provider(harness.model)
+    confirmations = []
+    for entry in models_payload.get("model_availability") or []:
+        canonical = canonical_model_route_entry(entry)
+        if canonical is None or normalize_model_route(canonical) != served:
+            continue
+        entry_providers = {
+            str(entry.get("route_provider") or ""),
+            model_route_provider(canonical),
+        }
+        if requested_provider not in entry_providers:
+            continue
+        confirmations.append(entry)
+    require(
+        confirmations,
+        f"{label} model route mismatch: runtime served {runtime_route!r} for "
+        f"requested {harness.model!r}; the runtime model catalog did not "
+        "confirm the canonical resolution",
+    )
+    unavailable = [
+        str(entry.get("unavailable_reason"))
+        for entry in confirmations
+        if entry.get("available") is not True
+    ]
+    require(
+        not unavailable,
+        f"{label} model route is not available: {unavailable}",
+    )
+
+
+def load_runtime_config(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {}
+    require(path.is_file(), f"config file does not exist: {path}")
+    value = json.loads(path.read_text())
+    require(isinstance(value, dict), "config file must contain a JSON object")
+    return value
+
+
+def merged_runtime_config(
+    config: dict[str, Any],
+    model: str,
+    model_runtime_override: dict[str, int] | None,
+) -> dict[str, Any]:
+    merged = copy.deepcopy(config)
+    if model_runtime_override:
+        models = merged.setdefault("models", {})
+        require(isinstance(models, dict), "config models must be a JSON object")
+        catalog = models.setdefault("catalog", {})
+        require(
+            isinstance(catalog, dict), "config models.catalog must be a JSON object"
+        )
+        catalog[model] = dict(model_runtime_override)
+    return merged
+
+
 def provider_base_url_env(model: str) -> str:
     route = model.split("/", 1)[0]
     provider, separator, endpoint = route.partition("@")
@@ -151,8 +265,7 @@ def provider_base_url_env(model: str) -> str:
         )
         return override
     fragment = "".join(
-        character.upper() if character.isalnum() else "_"
-        for character in provider
+        character.upper() if character.isalnum() else "_" for character in provider
     )
     return f"HOLON_{fragment}_BASE_URL"
 
@@ -173,8 +286,14 @@ class CaseHarness:
         evidence_root: Path,
         timeout_seconds: int,
         keep: bool,
+        runtime_config: dict[str, Any] | None = None,
+        provider_mode: str = "live",
+        stub_scenario: str | None = None,
+        model_runtime_override: dict[str, int] | None = None,
+        tool_assertion_mode: str = "strict",
         resource_names: dict[str, str] | None = None,
         control_token: str | None = None,
+        previous_image: str | None = None,
     ) -> None:
         suffix = secrets.token_hex(4)
         self.case_id = case_id
@@ -186,6 +305,7 @@ class CaseHarness:
         )
         self.credential_envs = credential_envs if requires_model else []
         self.env_file = env_file if requires_model else None
+        self.runtime_config = copy.deepcopy(runtime_config or {})
         self.runtime_env = dict(runtime_env)
         if not requires_model:
             self.runtime_env.setdefault(
@@ -195,10 +315,20 @@ class CaseHarness:
         self.evidence = evidence_root / case_id
         self.timeout_seconds = timeout_seconds
         self.keep = keep
+        self.provider_mode = provider_mode
+        self.stub_scenario = stub_scenario
+        self.stub_provider_base_url: str | None = None
+        self.model_runtime_override = dict(model_runtime_override or {})
+        self._model_runtime_override_seeded = False
+        self.tool_assertion_mode = tool_assertion_mode
+        self.previous_image = previous_image
         names = resource_names or {}
         self.volume = names.get("volume", f"holon-live-{case_id}-{suffix}")
         self.network = names.get("network", f"holon-live-{case_id}-{suffix}")
         self.container = names.get("container", f"holon-live-{case_id}-{suffix}")
+        self.stub_container = names.get(
+            "stub_container", f"holon-openai-stub-{case_id}-{suffix}"
+        )
         self.token = control_token or secrets.token_urlsafe(24)
         self.base_url = ""
         self.agent_id = ""
@@ -217,15 +347,8 @@ class CaseHarness:
             "lock": threading.Lock(),
             "claimed": set(),
         }
+        self._prompt_scopes: dict[str, dict[str, Any]] = {}
         self.evidence.mkdir(parents=True, exist_ok=True)
-
-    @property
-    def scheduler_engine(self) -> str | None:
-        return self.runtime_env.get("HOLON_SCHEDULER")
-
-    @property
-    def canonical_scheduler_enabled(self) -> bool:
-        return self.scheduler_engine == "canonical"
 
     def docker(self, *args: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         with self._docker_health["lock"]:
@@ -342,14 +465,14 @@ class CaseHarness:
             "set -euo pipefail; "
             "rss_kb=$(awk '/^VmRSS:/{print $2}' /proc/1/status); "
             "fd_count=$(find /proc/1/fd -maxdepth 1 -type l | wc -l); "
-            "printf '{\"rss_kb\":%s,\"fd_count\":%s,\"state_files\":[' "
-            "\"${rss_kb:-0}\" \"$fd_count\"; "
+            'printf \'{"rss_kb":%s,"fd_count":%s,"state_files":[\' '
+            '"${rss_kb:-0}" "$fd_count"; '
             "first=1; for path in /var/lib/holon/state/runtime.sqlite*; do "
-            "[ -e \"$path\" ] || continue; "
-            "size=$(stat -c %s \"$path\"); "
-            "name=$(basename \"$path\"); "
+            '[ -e "$path" ] || continue; '
+            'size=$(stat -c %s "$path"); '
+            'name=$(basename "$path"); '
             "[ $first -eq 1 ] || printf ','; first=0; "
-            "printf '{\"name\":\"%s\",\"bytes\":%s}' \"$name\" \"$size\"; "
+            'printf \'{"name":"%s","bytes":%s}\' "$name" "$size"; '
             "done; printf ']}'",
             check=False,
             timeout=15,
@@ -420,6 +543,22 @@ class CaseHarness:
             objective,
         )
 
+    def seed_scheduler_recovery_fixture(
+        self,
+        label: str,
+        *,
+        agent: str,
+        objective: str,
+    ) -> dict[str, Any]:
+        return self.offline_debug(
+            label,
+            "scheduler-recovery-fixture",
+            "--agent",
+            agent,
+            "--objective",
+            objective,
+        )
+
     def initialize_workspace(self) -> None:
         self.workspace_parent.mkdir(parents=True, exist_ok=True)
         self.workspace_parent.chmod(0o777)
@@ -445,6 +584,82 @@ class CaseHarness:
         self.docker("volume", "create", self.volume)
         if self.docker("network", "inspect", self.network, check=False).returncode != 0:
             self.docker("network", "create", self.network)
+        if self.provider_mode == "stub":
+            require(
+                bool(self.stub_scenario), "stub provider mode requires stub_scenario"
+            )
+            stub_state = self.docker(
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                self.stub_container,
+                check=False,
+            )
+            if stub_state.returncode != 0:
+                self.docker(
+                    "run",
+                    "--detach",
+                    "--name",
+                    self.stub_container,
+                    "--network",
+                    self.network,
+                    "--network-alias",
+                    "provider-stub",
+                    "--volume",
+                    f"{self.evidence}:/data",
+                    OPENAI_STUB_IMAGE,
+                    "--scenario",
+                    self.stub_scenario,
+                )
+            else:
+                require(
+                    stub_state.stdout.strip() == "true",
+                    "deterministic provider stub stopped during case restart",
+                )
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                ready = self.docker(
+                    "exec",
+                    self.stub_container,
+                    "python",
+                    "-c",
+                    "import urllib.request;"
+                    "urllib.request.urlopen('http://127.0.0.1:8080/healthz')",
+                    check=False,
+                )
+                if ready.returncode == 0:
+                    break
+                time.sleep(0.2)
+            else:
+                raise TimeoutError("deterministic provider stub did not become ready")
+            self.model = "openai/gpt-5.4"
+            self.runtime_env["HOLON_OPENAI_BASE_URL"] = (
+                self.stub_provider_base_url or "http://provider-stub:8080/v1"
+            )
+            self.runtime_env["OPENAI_API_KEY"] = "deterministic-test-key"
+        if (
+            self.runtime_config or self.model_runtime_override
+        ) and not self._model_runtime_override_seeded:
+            config = merged_runtime_config(
+                self.runtime_config,
+                self.model,
+                self.model_runtime_override,
+            )
+            self.docker(
+                "run",
+                "--rm",
+                "--volume",
+                f"{self.volume}:/var/lib/holon",
+                "--entrypoint",
+                "bash",
+                self.image,
+                "-lc",
+                "set -euo pipefail; umask 077; "
+                "printf '%s' \"$1\" > /var/lib/holon/config.json",
+                "bash",
+                json.dumps(config, separators=(",", ":")),
+            )
+            self._model_runtime_override_seeded = True
         args = [
             "run",
             "--detach",
@@ -554,6 +769,64 @@ class CaseHarness:
         self.stop()
         self.start(wait_idle=wait_idle)
 
+    def crash(self) -> None:
+        # Kill the container directly with SIGKILL.  This avoids the
+        # SIGSTOP/SIGKILL race where the daemon could detect child-process
+        # death and record a terminal TaskResult before being stopped.
+        crash = self.docker(
+            "kill",
+            "--signal",
+            "KILL",
+            self.container,
+            check=False,
+            timeout=DOCKER_CONTROL_TIMEOUT_SECONDS,
+        )
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            state = self.docker(
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                self.container,
+                check=False,
+            )
+            if state.returncode != 0 or state.stdout.strip() == "false":
+                break
+            time.sleep(0.25)
+        require(
+            state.returncode != 0 or state.stdout.strip() == "false",
+            "Holon container did not stop after Docker SIGKILL: "
+            + (crash.stderr or crash.stdout).strip(),
+        )
+        self.capture_logs()
+        self.docker("rm", "-f", self.container, check=False)
+        # Clean up stale daemon state files (socket, pid, metadata) left
+        # behind by SIGKILL.  Without this, the replacement container's
+        # PID 1 matches the dead daemon's recorded PID, causing probe_runtime
+        # to falsely report "runtime is already running".
+        self.docker(
+            "run",
+            "--rm",
+            "--volume",
+            f"{self.volume}:/var/lib/holon",
+            "--entrypoint",
+            "bash",
+            self.image,
+            "-c",
+            "rm -rf /var/lib/holon/run",
+            check=False,
+        )
+        self.base_url = ""
+
+    def crash_restart(self, *, wait_idle: bool = True) -> None:
+        self.crash()
+        self.start(wait_idle=wait_idle)
+
+    def restart_with_image(self, image: str, *, wait_idle: bool = True) -> None:
+        self.stop()
+        self.image = image
+        self.start(wait_idle=wait_idle)
+
     def reset_callback(self, label: str) -> dict[str, Any]:
         value = self.request(
             "POST",
@@ -586,6 +859,8 @@ class CaseHarness:
             return {"status": "retained", "errors": []}
         errors: list[str] = []
         self.docker("rm", "-f", self.container, check=False)
+        if self.provider_mode == "stub":
+            self.docker("rm", "-f", self.stub_container, check=False)
         self.docker("volume", "rm", self.volume, check=False)
         self.docker("network", "rm", self.network, check=False)
         residuals = [
@@ -605,10 +880,40 @@ class CaseHarness:
                 self.docker("network", "inspect", self.network, check=False),
             ),
         ]
+        if self.provider_mode == "stub":
+            residuals.append(
+                (
+                    "container",
+                    self.stub_container,
+                    self.docker("inspect", self.stub_container, check=False),
+                )
+            )
         for kind, name, result in residuals:
             if result.returncode == 0:
                 errors.append(f"{kind} still exists after cleanup: {name}")
         return {"status": "fail" if errors else "completed", "errors": errors}
+
+    def assert_stub_complete(self) -> None:
+        if self.provider_mode != "stub":
+            return
+        result = self.docker(
+            "exec",
+            self.stub_container,
+            "python",
+            "-c",
+            "import json,urllib.request;"
+            "print(json.dumps(json.load(urllib.request.urlopen('http://127.0.0.1:8080/status'))))",
+        )
+        status = json.loads(result.stdout)
+        write_json(self.evidence / "stub-status.json", status)
+        require(
+            status.get("complete") is True,
+            f"stub transcript was not fully consumed: {status}",
+        )
+        require(
+            status.get("extra_requests") == 0,
+            f"stub received requests after transcript exhaustion: {status}",
+        )
 
     def capture_logs(self) -> None:
         result = self.docker("logs", self.container, check=False)
@@ -794,7 +1099,9 @@ class CaseHarness:
                 item for item in items if objective_marker in item.get("objective", "")
             ]
             if len(matches) > 1:
-                write_json(self.evidence / f"{label}-duplicate-work-items.json", matches)
+                write_json(
+                    self.evidence / f"{label}-duplicate-work-items.json", matches
+                )
                 self.capture_context(f"{label}-duplicate")
                 raise AssertionError(
                     f"multiple WorkItems matched {objective_marker}: "
@@ -802,15 +1109,6 @@ class CaseHarness:
                 )
             if len(matches) == 1 and matches[0].get("state") == expected_state:
                 write_json(self.evidence / f"{label}-work-items.json", items)
-                self.wait_agent_idle()
-                # Re-fetch after idle so result_brief_id and completion_intent
-                # reflect the final post-promotion state.
-                final_items = self.request("GET", self.agent_path("work-items?limit=50"))
-                final_matches = [
-                    item for item in final_items if objective_marker in item.get("objective", "")
-                ]
-                if len(final_matches) == 1:
-                    return final_matches[0]
                 return matches[0]
             time.sleep(1)
         write_json(self.evidence / f"{label}-timeout-work-items.json", matches)
@@ -834,7 +1132,9 @@ class CaseHarness:
                 item for item in items if objective_marker in item.get("objective", "")
             ]
             if len(matches) > 1:
-                write_json(self.evidence / f"{label}-duplicate-work-items.json", matches)
+                write_json(
+                    self.evidence / f"{label}-duplicate-work-items.json", matches
+                )
                 self.capture_context(f"{label}-duplicate")
                 raise AssertionError(
                     f"multiple WorkItems matched {objective_marker}: "
@@ -849,11 +1149,9 @@ class CaseHarness:
                 )
             if (
                 len(matches) == 1
-                and matches[0].get("scheduling_state")
-                == expected_scheduling_state
+                and matches[0].get("scheduling_state") == expected_scheduling_state
             ):
                 write_json(self.evidence / f"{label}-work-items.json", items)
-                self.wait_agent_idle()
                 return matches[0]
             time.sleep(1)
         write_json(self.evidence / f"{label}-timeout-work-items.json", matches)
@@ -868,6 +1166,40 @@ class CaseHarness:
         value = self.request("GET", self.agent_path(f"briefs/{encoded_id}"))
         write_json(self.evidence / f"{label}-brief.json", value)
         return value
+
+    def wait_result_brief_terminal_turn(
+        self,
+        *,
+        brief: dict[str, Any],
+        label: str,
+    ) -> str:
+        source_turn_id = brief.get("turn_id")
+        require(
+            isinstance(source_turn_id, str) and source_turn_id,
+            f"{label} result brief omitted its source turn: {brief}",
+        )
+        deadline = time.monotonic() + self.timeout_seconds
+        while time.monotonic() < deadline:
+            terminal_events = [
+                event
+                for event in self.events(f"{label}-terminal-poll")
+                if event.get("type") == "turn_terminal"
+                and event.get("payload", {}).get("turn_id") == source_turn_id
+            ]
+            if terminal_events:
+                terminal_kind = terminal_events[-1].get("payload", {}).get("kind")
+                require(
+                    terminal_kind == "completed",
+                    f"{label} source turn ended with {terminal_kind}: "
+                    f"{terminal_events[-1].get('payload', {})}",
+                )
+                return source_turn_id
+            time.sleep(1)
+        self.capture_context(f"{label}-terminal-timeout")
+        raise TimeoutError(
+            f"timed out waiting for {label} source turn {source_turn_id} "
+            "to reach terminal"
+        )
 
     def events(
         self,
@@ -886,6 +1218,40 @@ class CaseHarness:
     def event_cursor(self) -> int:
         page = self.request("GET", self.agent_path("events?limit=1&order=desc"))
         return int(page.get("cursor_seq") or 0)
+
+    def event_batch(
+        self,
+        label: str,
+        *,
+        after_seq: int,
+        limit: int = CONTEXT_EVENT_LIMIT,
+    ) -> dict[str, Any]:
+        events: list[dict[str, Any]] = []
+        cursor = after_seq
+        final_cursor = after_seq
+        while True:
+            page = self.request(
+                "GET",
+                self.agent_path(f"events?limit={limit}&order=asc&after_seq={cursor}"),
+            )
+            events.extend(page["events"])
+            newest_seq = page.get("newest_seq")
+            if isinstance(newest_seq, int):
+                final_cursor = newest_seq
+            if not page.get("has_newer"):
+                break
+            require(
+                isinstance(newest_seq, int) and newest_seq > cursor,
+                f"event pagination did not advance after {cursor}: {page}",
+            )
+            cursor = newest_seq
+        batch = {
+            "events": events,
+            "after_seq": after_seq,
+            "newest_seq": final_cursor,
+        }
+        write_json(self.evidence / f"{label}-events.json", batch)
+        return batch
 
     def capture_context(
         self,
@@ -931,20 +1297,95 @@ class CaseHarness:
             self.agent_path("prompt", control=True),
             body,
         )
+        message_id = response.get("message_id")
+        require(
+            isinstance(message_id, str) and message_id,
+            f"prompt response omitted message_id: {response}",
+        )
         write_json(self.evidence / f"{label}-prompt-response.json", response)
         (self.evidence / f"{label}-prompt.txt").write_text(text + "\n")
 
         deadline = time.monotonic() + self.timeout_seconds
         last_state = before
+        baseline_failure_at = (
+            before["agent"]["agent"].get("last_runtime_failure") or {}
+        ).get("occurred_at")
+        target_turn_id: str | None = None
+        target_turn_index: int | None = None
+        event_poll_cursor = baseline_event_seq
         while time.monotonic() < deadline:
             last_state = self.request("GET", self.agent_path("state"))
-            agent = last_state["agent"]["agent"]
-            if (
-                int(agent["turn_index"]) > baseline
-                and agent["status"] in TERMINAL_STATUSES
-                and agent.get("current_run_id") is None
-                and int(last_state["session"]["pending_count"]) == 0
-            ):
+            failure = last_state["agent"]["agent"].get("last_runtime_failure")
+            if failure and failure.get("occurred_at") != baseline_failure_at:
+                write_json(
+                    self.evidence / f"{label}-runtime-failure-state.json",
+                    last_state,
+                )
+                raise AssertionError(
+                    f"runtime failure occurred while waiting for {label}: "
+                    f"{failure.get('summary', 'unknown runtime failure')}"
+                )
+            page = self.event_batch(
+                f"{label}-terminal-poll",
+                after_seq=event_poll_cursor,
+            )
+            phase_events = page["events"]
+            event_poll_cursor = int(page["newest_seq"])
+            for event in phase_events:
+                payload = event.get("payload", {})
+                if (
+                    event.get("type") == "turn_started"
+                    and payload.get("message_id") == message_id
+                ):
+                    target_turn_id = payload.get("turn_id")
+                    target_turn_index = int(payload.get("turn_index", 0))
+            runtime_failures = [
+                event
+                for event in phase_events
+                if event.get("type") == "runtime_error"
+                and (
+                    event.get("payload", {}).get("message_id") == message_id
+                    or (
+                        target_turn_id is not None
+                        and event.get("payload", {}).get("turn_id") == target_turn_id
+                    )
+                )
+            ]
+            if runtime_failures:
+                failure = runtime_failures[-1]["payload"]
+                source_chain = failure.get("source_chain") or []
+                detail = (
+                    source_chain[0]
+                    if source_chain
+                    else failure.get("error", "unknown runtime failure")
+                )
+                raise AssertionError(
+                    f"runtime failure occurred while waiting for {label}: "
+                    f"{failure.get('domain', 'unknown')}: {detail}"
+                )
+            terminal = next(
+                (
+                    event
+                    for event in phase_events
+                    if event.get("type") == "turn_terminal"
+                    and target_turn_id is not None
+                    and event.get("payload", {}).get("turn_id") == target_turn_id
+                ),
+                None,
+            )
+            if terminal is not None:
+                terminal_kind = terminal.get("payload", {}).get("kind")
+                require(
+                    terminal_kind == "completed",
+                    f"target turn for {label} ended with {terminal_kind}: "
+                    f"{terminal.get('payload', {})}",
+                )
+                self._prompt_scopes[label] = {
+                    "message_id": message_id,
+                    "turn_id": target_turn_id,
+                    "turn_index": target_turn_index,
+                    "terminal_kind": terminal_kind,
+                }
                 write_json(self.evidence / f"{label}-after-state.json", last_state)
                 self.capture_context(
                     label,
@@ -955,32 +1396,82 @@ class CaseHarness:
             time.sleep(1)
         write_json(self.evidence / f"{label}-timeout-state.json", last_state)
         self.capture_logs()
+        target_state = (
+            "target turn was not observed"
+            if target_turn_id is None
+            else (
+                f"target turn {target_turn_id} started at index "
+                f"{target_turn_index} but did not reach terminal"
+            )
+        )
         raise TimeoutError(
-            f"timed out after {self.timeout_seconds}s waiting for phase {label}"
+            f"timed out after {self.timeout_seconds}s waiting for phase {label}: "
+            f"{target_state}"
         )
 
+    def prompt_scope(self, label: str) -> dict[str, Any]:
+        scope = self._prompt_scopes.get(label)
+        require(scope is not None, f"prompt scope is unavailable for {label}")
+        return scope
+
     def successful_tool_events(
-        self, label: str, baseline_turn: int
+        self,
+        label: str,
+        baseline_turn: int,
+        *,
+        end_turn: int | None = None,
+        message_id: str | None = None,
+        turn_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         events = self.events(f"{label}-tool-check")
         turn_indexes = {
-            event["payload"].get("turn_id"): int(
-                event["payload"].get("turn_index", 0)
-            )
+            event["payload"].get("turn_id"): int(event["payload"].get("turn_index", 0))
             for event in events
             if event["type"] == "turn_started"
         }
+        message_turn_ids = {
+            event["payload"].get("turn_id")
+            for event in events
+            if event["type"] == "turn_started"
+            and event["payload"].get("message_id") == message_id
+        }
+        if message_id is not None:
+            require(
+                message_turn_ids,
+                f"no turn was recorded for message {message_id} in {label}",
+            )
+        require(
+            message_id is None or turn_ids is None,
+            "tool assertion accepts message_id or turn_ids, not both",
+        )
+
+        def in_scope(event: dict[str, Any]) -> bool:
+            payload = event["payload"]
+            if message_id is not None:
+                return payload.get("turn_id") in message_turn_ids
+            if turn_ids is not None:
+                return payload.get("turn_id") in turn_ids
+            turn_index = int(
+                turn_indexes.get(
+                    payload.get("turn_id"),
+                    payload.get("turn_index", 0),
+                )
+            )
+            return turn_index > baseline_turn and (
+                end_turn is None or turn_index <= end_turn
+            )
+
         runtime_failures = [
             event
             for event in events
-            if event["type"] == "runtime_error"
-            and turn_indexes.get(event["payload"].get("turn_id"), 0)
-            > baseline_turn
+            if event["type"] == "runtime_error" and in_scope(event)
         ]
         if runtime_failures:
             failure = runtime_failures[-1]["payload"]
             source_chain = failure.get("source_chain") or []
-            detail = source_chain[0] if source_chain else failure.get("error", "unknown")
+            detail = (
+                source_chain[0] if source_chain else failure.get("error", "unknown")
+            )
             raise AssertionError(
                 f"runtime failure occurred in {label}: "
                 f"{failure.get('domain', 'unknown')}: {detail}"
@@ -988,8 +1479,7 @@ class CaseHarness:
         failures = [
             event
             for event in events
-            if event["type"] == "tool_execution_failed"
-            and int(event["payload"].get("turn_index", 0)) > baseline_turn
+            if event["type"] == "tool_execution_failed" and in_scope(event)
         ]
         require(not failures, f"tool failures occurred in {label}: {failures}")
         return [
@@ -997,7 +1487,7 @@ class CaseHarness:
             for event in events
             if event["type"] == "tool_executed"
             and event["payload"].get("status") == "success"
-            and int(event["payload"].get("turn_index", 0)) > baseline_turn
+            and in_scope(event)
         ]
 
     def assert_tools(
@@ -1006,12 +1496,37 @@ class CaseHarness:
         baseline_turn: int,
         expected: list[str],
         forbidden: list[str] | None = None,
+        *,
+        end_turn: int | None = None,
+        message_id: str | None = None,
+        turn_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
-        events = self.successful_tool_events(label, baseline_turn)
+        events = self.successful_tool_events(
+            label,
+            baseline_turn,
+            end_turn=end_turn,
+            message_id=message_id,
+            turn_ids=turn_ids,
+        )
         actual = [event["payload"].get("tool_name") for event in events]
         missing = [name for name in expected if name not in actual]
-        require(not missing, f"{label} missing successful tools {missing}; got {actual}")
         forbidden_actual = [name for name in (forbidden or []) if name in actual]
+        if self.tool_assertion_mode == "observe":
+            write_json(
+                self.evidence / f"{label}-tool-observation.json",
+                {
+                    "mode": "observe",
+                    "expected": expected,
+                    "forbidden": forbidden or [],
+                    "actual": actual,
+                    "missing": missing,
+                    "forbidden_actual": forbidden_actual,
+                },
+            )
+            return events
+        require(
+            not missing, f"{label} missing successful tools {missing}; got {actual}"
+        )
         require(
             not forbidden_actual,
             f"{label} used forbidden tools {forbidden_actual}; got {actual}",
@@ -1100,7 +1615,8 @@ class CaseHarness:
                 "turn_records": sqlite_rows(
                     connection,
                     "SELECT turn_id, turn_index, agent_id, run_id, "
-                    "current_work_item_id, trigger_message_id, terminal_kind, "
+                    f"current_work_item_id, {turn_record_owner_columns(connection)}"
+                    "trigger_message_id, terminal_kind, "
                     "created_at, completed_at, payload_json "
                     "FROM turn_records ORDER BY turn_index, created_at",
                 ),
@@ -1118,53 +1634,173 @@ class CaseHarness:
                 "wait_conditions": sqlite_rows(
                     connection,
                     "SELECT wait_condition_id, agent_id, work_item_id, status, kind, "
-                    "subject_ref, waiting_for, last_turn_id, payload_json "
+                    "subject_ref, waiting_for, last_turn_id, trigger_message_id, "
+                    "payload_json "
                     "FROM wait_conditions ORDER BY created_at",
                 ),
-                "scheduler_work_demands": sqlite_rows(
+                "execution_protocol_attempts": sqlite_rows(
                     connection,
-                    "SELECT agent_id, work_item_id, scheduling_generation, status, "
-                    "status_reference_id, payload_json FROM scheduler_work_demands",
+                    "SELECT agent_id, attempt_id, lifecycle_state, terminal_outcome_id, "
+                    "payload_json FROM execution_protocol_attempts "
+                    "ORDER BY agent_id, attempt_id",
                 ),
-                "scheduler_agent_slots": sqlite_rows(
+                "execution_protocol_work_items": sqlite_rows(
                     connection,
-                    "SELECT agent_id, slot_kind, activation_id, work_item_id, "
-                    "admitted_generation FROM scheduler_agent_slots",
+                    "SELECT agent_id, work_item_id, source_revision, generation, "
+                    "lifecycle_state, payload_json "
+                    "FROM execution_protocol_work_items "
+                    "ORDER BY agent_id, work_item_id",
                 ),
-                "scheduler_activations": sqlite_rows(
+                "execution_protocol_outcomes": sqlite_rows(
                     connection,
-                    "SELECT agent_id, activation_id, authority_id, work_item_id, "
-                    "admitted_generation, admission_kind, lifecycle_state, "
-                    "idempotency_key, payload_json FROM scheduler_activations",
-                ),
-                "scheduler_activation_settlements": sqlite_rows(
-                    connection,
-                    "SELECT agent_id, settlement_id, activation_id, payload_json "
-                    "FROM scheduler_activation_settlements",
-                ),
-                "scheduler_wait_generations": sqlite_rows(
-                    connection,
-                    "SELECT agent_id, wait_id, generation, owner_work_item_id, "
-                    "lifecycle_state, trigger_id, trigger_generation, "
-                    "consuming_activation_id, payload_json "
-                    "FROM scheduler_wait_generations ORDER BY wait_id, generation",
-                ),
-                "scheduler_missing_settlements": sqlite_rows(
-                    connection,
-                    "SELECT agent_id, missing_settlement_id, activation_id, payload_json "
-                    "FROM scheduler_missing_settlements",
-                ),
-                "scheduler_protocol_command_results": sqlite_rows(
-                    connection,
-                    "SELECT agent_id, command_kind, command_identity, decision, "
-                    "conflict_kind, conflict_code, result_references_json, "
-                    "pre_state_fence_json, post_state_fence_json "
-                    "FROM scheduler_protocol_command_results ORDER BY created_at",
+                    "SELECT agent_id, outcome_id, attempt_id, payload_json "
+                    "FROM execution_protocol_outcomes "
+                    "ORDER BY agent_id, outcome_id",
                 ),
             }
         finally:
             connection.close()
         write_json(self.evidence / f"{label}-runtime-db.json", snapshot)
+        return snapshot
+
+    def offline_runtime_db_snapshot(self, label: str) -> dict[str, Any]:
+        snapshot_dir = self.evidence / f"{label}-runtime-state"
+        if snapshot_dir.exists():
+            shutil.rmtree(snapshot_dir)
+        snapshot_dir.mkdir(parents=True)
+        self.docker(
+            "run",
+            "--rm",
+            "--user",
+            "0:0",
+            "--volume",
+            f"{self.volume}:/var/lib/holon:ro",
+            "--volume",
+            f"{snapshot_dir}:/snapshot",
+            "--entrypoint",
+            "bash",
+            self.image,
+            "-lc",
+            "set -euo pipefail; cp /var/lib/holon/state/runtime.sqlite* /snapshot/",
+        )
+        database = snapshot_dir / "runtime.sqlite"
+        require(database.is_file(), "offline runtime database snapshot is missing")
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            snapshot = {
+                "integrity_check": connection.execute(
+                    "PRAGMA integrity_check"
+                ).fetchone()[0],
+                "schema_revision": connection.execute(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+                ).fetchone()[0],
+                "tables": sorted(tables),
+                "messages": sqlite_rows(
+                    connection,
+                    "SELECT message_id, agent_id, work_item_id, kind, payload_json "
+                    "FROM messages ORDER BY created_at",
+                ),
+                "queue_entries": sqlite_rows(
+                    connection,
+                    "SELECT message_id, agent_id, status, payload_json "
+                    "FROM queue_entries ORDER BY created_at, updated_at",
+                ),
+                "execution_protocol_attempts": sqlite_rows(
+                    connection,
+                    "SELECT agent_id, attempt_id, lifecycle_state, terminal_outcome_id, "
+                    "payload_json FROM execution_protocol_attempts "
+                    "ORDER BY agent_id, attempt_id",
+                ),
+                "execution_protocol_work_items": sqlite_rows(
+                    connection,
+                    "SELECT agent_id, work_item_id, generation, lifecycle_state, "
+                    "payload_json FROM execution_protocol_work_items "
+                    "ORDER BY agent_id, work_item_id",
+                ),
+                "migration_baselines": (
+                    sqlite_rows(
+                        connection,
+                        "SELECT baseline_id, source_version, target_version, "
+                        "covered_versions_json, schema_fingerprint "
+                        "FROM schema_migration_baselines",
+                    )
+                    if "schema_migration_baselines" in tables
+                    else []
+                ),
+            }
+        finally:
+            connection.close()
+        write_json(self.evidence / f"{label}-runtime-db.json", snapshot)
+        return snapshot
+
+    def upgrade_db_snapshot(self, label: str, marker: str) -> dict[str, Any]:
+        snapshot_dir = self.evidence / f"{label}-runtime-state"
+        if snapshot_dir.exists():
+            shutil.rmtree(snapshot_dir)
+        snapshot_dir.mkdir(parents=True)
+        for name in ("runtime.sqlite", "runtime.sqlite-wal", "runtime.sqlite-shm"):
+            self.docker(
+                "cp",
+                f"{self.container}:/var/lib/holon/state/{name}",
+                str(snapshot_dir / name),
+                check=name == "runtime.sqlite",
+                timeout=RUNTIME_DB_COPY_TIMEOUT_SECONDS,
+            )
+        connection = sqlite3.connect(
+            f"file:{snapshot_dir / 'runtime.sqlite'}?mode=ro", uri=True
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            has_baseline = connection.execute(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'schema_migration_baselines')"
+            ).fetchone()[0]
+            snapshot = {
+                "integrity_check": connection.execute(
+                    "PRAGMA integrity_check"
+                ).fetchone()[0],
+                "schema_revision": connection.execute(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+                ).fetchone()[0],
+                "agent_ids": [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT agent_id FROM agent_states ORDER BY agent_id"
+                    )
+                ],
+                "messages": sqlite_rows(
+                    connection,
+                    "SELECT evidence_id, message_id, turn_id, payload_json "
+                    "FROM messages WHERE payload_json LIKE ? ORDER BY created_at",
+                    (f"%{marker}%",),
+                ),
+                "briefs": sqlite_rows(
+                    connection,
+                    "SELECT evidence_id, message_id, turn_id, payload_json "
+                    "FROM briefs WHERE payload_json LIKE ? ORDER BY created_at",
+                    (f"%{marker}%",),
+                ),
+                "baseline": (
+                    sqlite_rows(
+                        connection,
+                        "SELECT baseline_id, source_version, target_version, "
+                        "covered_versions_json, schema_fingerprint "
+                        "FROM schema_migration_baselines",
+                    )
+                    if has_baseline
+                    else []
+                ),
+            }
+        finally:
+            connection.close()
+        write_json(self.evidence / f"{label}-upgrade-db.json", snapshot)
         return snapshot
 
 
@@ -1173,16 +1809,36 @@ def result_value(detail: dict[str, Any]) -> dict[str, Any]:
     return output.get("envelope", {}).get("result", output.get("result", output))
 
 
-def sqlite_rows(connection: sqlite3.Connection, query: str) -> list[dict[str, Any]]:
-    return [dict(row) for row in connection.execute(query).fetchall()]
+def sqlite_rows(
+    connection: sqlite3.Connection,
+    query: str,
+    parameters: tuple[Any, ...] = (),
+) -> list[dict[str, Any]]:
+    return [dict(row) for row in connection.execute(query, parameters).fetchall()]
+
+
+def turn_record_owner_columns(connection: sqlite3.Connection) -> str:
+    """Return the owner identity columns present in ``turn_records``.
+
+    Turn owner columns only exist from migration 52 onward, and the
+    interrupted-upgrade case snapshots the previous release's live database,
+    whose ``turn_records`` table predates those columns.
+    """
+    columns = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM pragma_table_info('turn_records')"
+        )
+    }
+    if {"owner_kind", "owner_id"}.issubset(columns):
+        return "owner_kind, owner_id, "
+    return ""
 
 
 def require_processed_queue_entries(
     queue_entries: list[dict[str, Any]], message_ids: set[str]
 ) -> None:
-    matching = [
-        row for row in queue_entries if row.get("message_id") in message_ids
-    ]
+    matching = [row for row in queue_entries if row.get("message_id") in message_ids]
     require(
         len(matching) == len(message_ids)
         and all(row.get("status") == "processed" for row in matching),
@@ -1190,35 +1846,42 @@ def require_processed_queue_entries(
     )
 
 
+def require_turn_local_compaction(
+    snapshot: dict[str, Any],
+    *,
+    label: str,
+) -> list[dict[str, Any]]:
+    events = [
+        json.loads(row["data_json"])["data"]
+        for row in snapshot["audit_events"]
+        if row["kind"] == "turn_local_compaction_applied"
+    ]
+    require(
+        events
+        and any(
+            int(event.get("compacted_rounds") or 0) > 0
+            or int(event.get("compacted_tool_results") or 0) > 0
+            for event in events
+        ),
+        f"{label} compaction stimulus did not compact rounds or tool results: {events}",
+    )
+    return events
+
+
 def require_scheduler_engine_activation_chain(
     harness: CaseHarness,
     snapshot: dict[str, Any],
     *,
     work_item_id: str,
-    expected_activation_count: int,
+    expected_source_kinds: tuple[str, ...],
+    conversation_message_ids: set[str] | None = None,
 ) -> None:
-    if harness.canonical_scheduler_enabled:
-        require_scheduler_activation_chain(
-            snapshot,
-            agent_id=harness.agent_id,
-            work_item_id=work_item_id,
-            expected_activation_count=expected_activation_count,
-        )
-        return
-    activations = [
-        row
-        for row in snapshot["scheduler_activations"]
-        if row["work_item_id"] == work_item_id
-    ]
-    demands = [
-        row
-        for row in snapshot["scheduler_work_demands"]
-        if row["work_item_id"] == work_item_id
-    ]
-    require(
-        not activations and not demands,
-        f"legacy scheduler wrote canonical execution state: "
-        f"activations={activations}, demands={demands}",
+    require_execution_attempt_chain(
+        snapshot,
+        agent_id=harness.agent_id,
+        work_item_id=work_item_id,
+        expected_source_kinds=expected_source_kinds,
+        conversation_message_ids=conversation_message_ids or set(),
     )
 
 
@@ -1229,69 +1892,250 @@ def require_scheduler_engine_wait_resolution(
     work_item_id: str,
     wait_ids: set[str],
 ) -> None:
-    canonical_waits = [
+    waits = [
         row
-        for row in snapshot["scheduler_wait_generations"]
-        if row["wait_id"] in wait_ids or row["owner_work_item_id"] == work_item_id
+        for row in snapshot["wait_conditions"]
+        if row["wait_condition_id"] in wait_ids
     ]
-    if harness.canonical_scheduler_enabled:
-        require(
-            len(canonical_waits) == len(wait_ids)
-            and all(row["lifecycle_state"] == "resolved" for row in canonical_waits)
-            and all(row["consuming_activation_id"] is None for row in canonical_waits),
-            f"canonical waits did not resolve exactly once: {canonical_waits}",
-        )
-        return
     require(
-        not canonical_waits,
-        f"legacy scheduler wrote canonical wait generations: {canonical_waits}",
+        len(waits) == len(wait_ids)
+        and all(
+            row["agent_id"] == harness.agent_id
+            and row["work_item_id"] == work_item_id
+            and row["status"] == "resolved"
+            for row in waits
+        ),
+        f"canonical waits did not resolve exactly once: {waits}",
     )
 
-def require_scheduler_activation_chain(
+
+def require_scheduler_wait_terminal(
+    harness: CaseHarness,
+    snapshot: dict[str, Any],
+    *,
+    work_item_id: str,
+    wait_kind: str,
+    require_callback_trigger: bool = False,
+    callback_external_trigger_id: str | None = None,
+) -> list[dict[str, Any]]:
+    waits = [
+        row
+        for row in snapshot["wait_conditions"]
+        if row["work_item_id"] == work_item_id and row["kind"] == wait_kind
+    ]
+    require(
+        len(waits) == 1,
+        f"expected one {wait_kind} wait for {work_item_id}: {waits}",
+    )
+    wait = waits[0]
+    require(
+        wait["status"] == "resolved",
+        f"canonical {wait_kind} wait did not resolve: {wait}",
+    )
+    if require_callback_trigger:
+        require(
+            callback_external_trigger_id is not None,
+            "callback trigger evidence requires an external trigger id",
+        )
+        callback_events = [
+            json.loads(row["data_json"])["data"]
+            for row in snapshot["audit_events"]
+            if row["kind"] == "callback_delivered"
+        ]
+        require(
+            any(
+                event.get("disposition") == "triggered"
+                and event.get("external_trigger_id") == callback_external_trigger_id
+                for event in callback_events
+            ),
+            f"canonical {wait_kind} wait lacked callback trigger evidence: "
+            f"external_trigger_id={callback_external_trigger_id}, "
+            f"callbacks={callback_events}",
+        )
+    return waits
+
+
+def execution_attempt(row: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(row["payload_json"])
+
+
+def execution_outcome(row: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(row["payload_json"])
+
+
+def execution_binding_work_item(attempt: dict[str, Any]) -> str | None:
+    binding = attempt.get("binding", {})
+    if binding.get("kind") == "work_item":
+        return binding.get("work_item_id")
+    return None
+
+
+def require_execution_work_items_terminal(
+    snapshot: dict[str, Any],
+    *,
+    agent_id: str,
+    work_item_ids: set[str],
+    label: str,
+) -> None:
+    records = [
+        row
+        for row in snapshot["execution_protocol_work_items"]
+        if row["agent_id"] == agent_id and row["work_item_id"] in work_item_ids
+    ]
+    require(
+        len(records) == len(work_item_ids)
+        and all(row["lifecycle_state"] == "terminal" for row in records),
+        f"{label} execution WorkItems did not converge: {records}",
+    )
+
+
+def require_execution_attempt_chain(
     snapshot: dict[str, Any],
     *,
     agent_id: str,
     work_item_id: str,
-    expected_activation_count: int,
+    expected_source_kinds: tuple[str, ...],
+    conversation_message_ids: set[str],
 ) -> list[dict[str, Any]]:
-    activations = [
-        row
-        for row in snapshot["scheduler_activations"]
-        if row["work_item_id"] == work_item_id
+    attempts = [
+        (row, execution_attempt(row))
+        for row in snapshot["execution_protocol_attempts"]
+        if row["agent_id"] == agent_id
+    ]
+    work_item_attempts = [
+        (row, attempt)
+        for row, attempt in attempts
+        if execution_binding_work_item(attempt) == work_item_id
+    ]
+    conversation_attempts = [
+        (row, attempt)
+        for row, attempt in attempts
+        if attempt.get("source_message_id") in conversation_message_ids
+        and attempt.get("binding", {}).get("kind") == "conversation"
+        and isinstance(attempt.get("binding", {}).get("interaction_id"), str)
+        and attempt["binding"]["interaction_id"]
     ]
     require(
-        len(activations) == expected_activation_count
-        and all(row["lifecycle_state"] == "settled" for row in activations),
-        f"canonical activations did not settle exactly once: {activations}",
+        len(conversation_attempts) == len(conversation_message_ids)
+        and all(
+            row["lifecycle_state"] == "settled"
+            and row["terminal_outcome_id"] is not None
+            for row, _ in conversation_attempts
+        ),
+        "canonical Conversation attempts did not settle without claiming a "
+        f"WorkItem: {[attempt for _, attempt in conversation_attempts]}",
     )
-    activation_ids = {row["activation_id"] for row in activations}
-    settlements = [
-        row
-        for row in snapshot["scheduler_activation_settlements"]
-        if row["activation_id"] in activation_ids
-    ]
     require(
-        len(settlements) == expected_activation_count,
-        f"canonical settlements are missing or duplicated: {settlements}",
+        sorted(
+            attempt.get("source", {}).get("identity", {}).get("kind")
+            for _, attempt in work_item_attempts
+        )
+        == sorted(expected_source_kinds)
+        and all(
+            row["lifecycle_state"] == "settled"
+            and row["terminal_outcome_id"] is not None
+            for row, _ in work_item_attempts
+        ),
+        "canonical WorkItem attempt lineage did not match the expected "
+        f"source kinds {expected_source_kinds}: "
+        f"{[attempt for _, attempt in work_item_attempts]}",
+    )
+    terminal_attempts = work_item_attempts + conversation_attempts
+    outcome_by_id = {
+        row["outcome_id"]: execution_outcome(row)
+        for row in snapshot["execution_protocol_outcomes"]
+        if row["agent_id"] == agent_id
+    }
+    require(
+        all(
+            row["terminal_outcome_id"] in outcome_by_id
+            and outcome_by_id[row["terminal_outcome_id"]]["attempt_id"]
+            == row["attempt_id"]
+            for row, _ in terminal_attempts
+        ),
+        "canonical execution outcomes are missing or mismatched: "
+        f"attempts={[attempt for _, attempt in terminal_attempts]}, "
+        f"outcomes={outcome_by_id}",
     )
     require(
         not [
             row
-            for row in snapshot["scheduler_missing_settlements"]
-            if row["activation_id"] in activation_ids
+            for row in snapshot["execution_protocol_attempts"]
+            if row["agent_id"] == agent_id and row["lifecycle_state"] == "open"
         ],
-        "canonical activation chain retained missing settlement evidence",
+        "canonical execution lane retained an open attempt",
     )
-    slots = [
-        row for row in snapshot["scheduler_agent_slots"] if row["agent_id"] == agent_id
+    return [attempt for _, attempt in terminal_attempts]
+
+
+def require_checkpoint_restart_activation_lineage(
+    before_restart_snapshot: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    work_item_id: str,
+    wait_id: str,
+) -> None:
+    before_restart_attempts = [
+        execution_attempt(row)
+        for row in before_restart_snapshot["execution_protocol_attempts"]
+        if execution_binding_work_item(execution_attempt(row)) == work_item_id
     ]
     require(
-        len(slots) == 1
-        and slots[0]["slot_kind"] == "idle"
-        and slots[0]["activation_id"] is None,
-        f"canonical activation slot was not released: {slots}",
+        len(before_restart_attempts) == 1
+        and before_restart_attempts[0]["source"]["identity"]["kind"]
+        == "work_item_continuation"
+        and before_restart_attempts[0]["admitted_fences"]["work_item_generation"] == 1,
+        "checkpoint replay restart boundary did not preserve exactly the initial "
+        f"scheduling attempt: {before_restart_attempts}",
     )
-    return activations
+    attempts = sorted(
+        (
+            execution_attempt(row)
+            for row in snapshot["execution_protocol_attempts"]
+            if execution_binding_work_item(execution_attempt(row)) == work_item_id
+        ),
+        key=lambda attempt: attempt["admitted_fences"]["work_item_generation"],
+    )
+    require(
+        len(attempts) == 3,
+        f"checkpoint replay expected exactly three WorkItem attempts: {attempts}",
+    )
+    scheduling, wait_resume, completion = attempts
+    require(
+        scheduling["admitted_fences"]["work_item_generation"] == 1
+        and scheduling["source"]["identity"]["kind"] == "work_item_continuation",
+        f"checkpoint replay initial scheduling attempt mismatch: {scheduling}",
+    )
+    require(
+        wait_resume["admitted_fences"]["work_item_generation"] == 2
+        and wait_resume["source"]["identity"]
+        == {
+            "kind": "triggered_wait",
+            "wait_id": wait_id,
+            "trigger_message_id": wait_resume["source_message_id"],
+        },
+        f"checkpoint replay wait-resume attempt mismatch: {wait_resume}",
+    )
+    require(
+        completion["admitted_fences"]["work_item_generation"] == 3
+        and completion["source"]["identity"]
+        == {
+            "kind": "work_item_continuation",
+            "work_item_id": work_item_id,
+        },
+        f"checkpoint replay completion attempt mismatch: {completion}",
+    )
+    waits = [
+        row
+        for row in snapshot["wait_conditions"]
+        if row["wait_condition_id"] == wait_id
+    ]
+    require(
+        len(waits) == 1
+        and waits[0]["work_item_id"] == work_item_id
+        and waits[0]["status"] == "resolved",
+        f"checkpoint replay wait identity mismatch: {waits}",
+    )
 
 
 def require_lifecycle_wait_adoption(
@@ -1315,65 +2159,51 @@ def require_lifecycle_wait_adoption(
         len(source_turns) == 1,
         f"adopted wait source turn is missing or duplicated: {source_turns}",
     )
-    source_message_id = source_turns[0]["trigger_message_id"]
-    activation_id = f"activation:message:{source_message_id}"
-    activations = [
-        row
-        for row in snapshot["scheduler_activations"]
-        if row["agent_id"] == agent_id and row["activation_id"] == activation_id
-    ]
-    require(
-        len(activations) == 1
-        and activations[0]["work_item_id"] is None
-        and activations[0]["lifecycle_state"] == "settled"
-        and activations[0]["admitted_generation"] > 0,
-        f"lifecycle adoption source activation is invalid: {activations}",
-    )
-    settlements = [
-        row
-        for row in snapshot["scheduler_activation_settlements"]
-        if row["agent_id"] == agent_id and row["activation_id"] == activation_id
-    ]
-    settlement = json.loads(settlements[0]["payload_json"]) if len(settlements) == 1 else {}
-    require(
-        len(settlements) == 1
-        and settlement.get("turn_terminal") == source_turn_id
-        and settlement.get("disposition") == {"kind": "work_continues"}
-        and settlement.get("agent_dispatch") == {"kind": "open"}
-        and settlement.get("operator_delivery") is None,
-        f"lifecycle adoption source did not settle WorkContinues: {settlements}",
-    )
-    adoption_rows = [
-        row
-        for row in snapshot["scheduler_protocol_command_results"]
+    source_turn = source_turns[0]
+    source_message_id = source_turn["trigger_message_id"]
+    owner_kind = source_turn.get("owner_kind")
+    owner_id = source_turn.get("owner_id")
+    if owner_kind == "conversation":
+        expected_binding = {"kind": "conversation", "interaction_id": owner_id}
+    else:
+        require(
+            owner_kind in {None, "agent_lifecycle"}
+            and owner_id in {None, agent_id},
+            f"adopted wait source turn has an invalid owner: {source_turn}",
+        )
+        expected_binding = {"kind": "agent_lifecycle", "agent_id": agent_id}
+    attempts = [
+        (row, execution_attempt(row))
+        for row in snapshot["execution_protocol_attempts"]
         if row["agent_id"] == agent_id
-        and row["command_kind"] == "adopt_activation_work_state"
-        and row["command_identity"] == f"{activation_id}:{work_item_id}"
+        and execution_attempt(row).get("source_message_id") == source_message_id
     ]
     require(
-        len(adoption_rows) == 1
-        and adoption_rows[0]["decision"] == "legacy_work_state_adopted"
-        and adoption_rows[0]["conflict_kind"] is None
-        and adoption_rows[0]["conflict_code"] is None,
-        f"lifecycle wait adoption command is missing or conflicted: {adoption_rows}",
+        len(attempts) == 1
+        and attempts[0][0]["lifecycle_state"] == "settled"
+        and attempts[0][1].get("binding") == expected_binding,
+        f"lifecycle handoff source attempt is invalid: {attempts}",
     )
-    post_state = json.loads(adoption_rows[0]["post_state_fence_json"])
-    adopted_work = post_state.get("work", {}).get(work_item_id, {})
-    adopted_generation = adopted_work.get("scheduling_generation")
-    references = json.loads(adoption_rows[0]["result_references_json"])
+    terminal_outcome_id = attempts[0][0]["terminal_outcome_id"]
+    outcomes = [
+        row
+        for row in snapshot["execution_protocol_outcomes"]
+        if row["agent_id"] == agent_id and row["outcome_id"] == terminal_outcome_id
+    ]
+    outcome = execution_outcome(outcomes[0]) if len(outcomes) == 1 else {}
     require(
-        isinstance(adopted_generation, int)
-        and adopted_generation > 0
-        and adopted_work.get("metadata_revision") == adopted_generation
-        and adopted_work.get("status")
-        == {"kind": "waiting", "wait_id": wait["wait_condition_id"]}
-        and set(references)
+        len(outcomes) == 1
+        and outcome.get("attempt_id") == attempts[0][0]["attempt_id"]
+        and outcome.get("outcome")
         == {
-            f"activation:{activation_id}",
-            f"work:{work_item_id}",
-            f"wait:{wait['wait_condition_id']}:generation:{adopted_generation}",
+            "owner": "conversation",
+            "outcome": {
+                "kind": "handoff_to_work_item_wait",
+                "work_item_id": work_item_id,
+                "wait": {"wait_id": wait["wait_condition_id"]},
+            },
         },
-        f"lifecycle adoption did not preserve wait ownership/generation: {adoption_rows}",
+        f"lifecycle wait handoff outcome is missing or mismatched: {outcomes}",
     )
 
 
@@ -1395,7 +2225,7 @@ def run_runtime_case(harness: CaseHarness, case: dict[str, Any]) -> None:
     unauthorized = harness.request(
         "GET",
         "/api/control/runtime/readiness",
-        expected_status=403,
+        expected_status=401,
         authenticated=False,
     )
     write_json(harness.evidence / "unauthorized-readiness.json", unauthorized)
@@ -1403,14 +2233,17 @@ def run_runtime_case(harness: CaseHarness, case: dict[str, Any]) -> None:
     readiness = harness.request("GET", "/api/control/runtime/readiness")
     write_json(harness.evidence / "readiness.json", readiness)
     runtime_surface = readiness["runtime_surface"]
-    require(
-        normalize_model_route(runtime_surface["model_default"])
-        == normalize_model_route(harness.model),
-        f"runtime model route mismatch: {runtime_surface['model_default']}",
-    )
+    models_payload = harness.request("GET", "/api/models")
+    write_json(harness.evidence / "models.json", models_payload)
     require(
         runtime_surface["disable_provider_fallback"] is True,
         "provider fallback must be disabled for release E2E",
+    )
+    require_runtime_model_route(
+        harness,
+        "runtime default",
+        runtime_surface["model_default"],
+        models_payload,
     )
 
     phase = case["phases"][0]
@@ -1424,7 +2257,13 @@ def run_runtime_case(harness: CaseHarness, case: dict[str, Any]) -> None:
         ),
     )
     required, forbidden = phase_tools(phase)
-    harness.assert_tools("runtime-delivery", baseline, required, forbidden)
+    harness.assert_tools(
+        "runtime-delivery",
+        baseline,
+        required,
+        forbidden,
+        message_id=harness.prompt_scope("runtime-delivery")["message_id"],
+    )
 
     events = harness.events("runtime-delivery-assert")
     provider_events = [
@@ -1447,9 +2286,11 @@ def run_runtime_case(harness: CaseHarness, case: dict[str, Any]) -> None:
         f"provider token usage is missing: {provider}",
     )
     winning = timeline.get("winning_model_ref")
-    require(
-        normalize_model_route(str(winning)) == normalize_model_route(harness.model),
-        f"winning model {winning!r} did not match {harness.model!r}",
+    require_runtime_model_route(
+        harness,
+        "winning",
+        str(winning),
+        models_payload,
     )
 
     briefs = harness.request("GET", harness.agent_path("briefs?limit=20"))
@@ -1463,11 +2304,11 @@ def run_runtime_case(harness: CaseHarness, case: dict[str, Any]) -> None:
     ]
     require(len(matching) == 1, f"expected one marker brief: {matching}")
 
-    transcript = harness.request(
-        "GET", harness.agent_path("transcript?limit=200")
-    )
+    transcript = harness.request("GET", harness.agent_path("transcript?limit=200"))
     write_json(harness.evidence / "runtime-delivery-transcript.json", transcript)
-    entries = transcript if isinstance(transcript, list) else transcript.get("entries", [])
+    entries = (
+        transcript if isinstance(transcript, list) else transcript.get("entries", [])
+    )
     assistant_rounds = [
         entry
         for entry in entries
@@ -1475,6 +2316,318 @@ def run_runtime_case(harness: CaseHarness, case: dict[str, Any]) -> None:
         and marker in json.dumps(entry, ensure_ascii=False)
     ]
     require(assistant_rounds, "marker assistant round is missing from transcript")
+
+
+def require_previous_schema_revision(snapshot: dict[str, Any]) -> int:
+    revision = snapshot.get("schema_revision")
+    require(
+        isinstance(revision, int) and revision > 0,
+        f"previous release produced an invalid schema revision: {snapshot}",
+    )
+    return revision
+
+
+def run_runtime_upgrade_previous_release_case(
+    harness: CaseHarness, case: dict[str, Any]
+) -> None:
+    require(
+        bool(harness.previous_image),
+        f"{case['id']} requires --previous-image",
+    )
+    candidate_image = harness.image
+    old_marker = f"UPGRADE-V030-OLD-{secrets.token_hex(6)}"
+    new_marker = f"UPGRADE-V030-NEW-{secrets.token_hex(6)}"
+
+    harness.image = str(harness.previous_image)
+    harness.initialize_workspace()
+    harness.start()
+    harness.prompt(
+        "upgrade-v030-old",
+        case["phases"][0]["prompt"].format(marker=old_marker),
+    )
+    old_snapshot = harness.upgrade_db_snapshot("upgrade-v030-old", old_marker)
+    require(
+        old_snapshot["integrity_check"] == "ok",
+        f"old database is invalid: {old_snapshot}",
+    )
+    old_schema_revision = require_previous_schema_revision(old_snapshot)
+    require(
+        old_snapshot["messages"] and old_snapshot["briefs"],
+        f"previous release did not persist the marker: {old_snapshot}",
+    )
+    old_agent_ids = set(old_snapshot["agent_ids"])
+    old_message_ids = {row["message_id"] for row in old_snapshot["messages"]}
+    old_brief_ids = {row["evidence_id"] for row in old_snapshot["briefs"]}
+
+    harness.restart_with_image(candidate_image)
+    migrated = harness.upgrade_db_snapshot("upgrade-v030-migrated", old_marker)
+    require(
+        migrated["integrity_check"] == "ok",
+        f"migrated database is invalid: {migrated}",
+    )
+    require(
+        migrated["schema_revision"] > old_schema_revision,
+        f"candidate did not advance the schema: {migrated}",
+    )
+    require(
+        len(migrated["baseline"]) == 1,
+        f"baseline provenance is missing: {migrated}",
+    )
+    require(
+        old_agent_ids.issubset(set(migrated["agent_ids"]))
+        and old_message_ids.issubset(
+            {row["message_id"] for row in migrated["messages"]}
+        )
+        and old_brief_ids.issubset({row["evidence_id"] for row in migrated["briefs"]}),
+        f"release data was not preserved: old={old_snapshot}, migrated={migrated}",
+    )
+
+    before_turn = int(
+        harness.state("upgrade-v030-before-new")["agent"]["agent"]["turn_index"]
+    )
+    harness.prompt(
+        "upgrade-v030-new",
+        case["phases"][1]["prompt"].format(marker=new_marker),
+    )
+    after_turn = int(
+        harness.state("upgrade-v030-after-new")["agent"]["agent"]["turn_index"]
+    )
+    require(after_turn > before_turn, "upgraded agent did not complete a new turn")
+    final_snapshot = harness.upgrade_db_snapshot("upgrade-v030-final", new_marker)
+    require(
+        final_snapshot["messages"] and final_snapshot["briefs"],
+        f"upgraded agent did not persist the new marker: {final_snapshot}",
+    )
+
+
+def run_runtime_upgrade_interrupted_schema47_case(
+    harness: CaseHarness, case: dict[str, Any]
+) -> None:
+    require(bool(harness.previous_image), f"{case['id']} requires --previous-image")
+    harness.runtime_env["HOLON_SCHEDULER_ACCEPTANCE_FIXTURES"] = "true"
+    candidate_image = harness.image
+    lifecycle_marker = f"UPGRADE-SCHEMA47-LIFECYCLE-{secrets.token_hex(6)}"
+    candidate_marker = f"UPGRADE-SCHEMA47-CANDIDATE-{secrets.token_hex(6)}"
+    work_item_agent = f"upgrade-worker-{secrets.token_hex(4)}"
+    work_item_bootstrap_marker = f"UPGRADE-SCHEMA47-BOOTSTRAP-{secrets.token_hex(6)}"
+    work_item_objective = f"UPGRADE-SCHEMA47-WORKITEM-{secrets.token_hex(6)}"
+    prompt_error: list[str] = []
+    work_item_error: list[str] = []
+
+    harness.image = str(harness.previous_image)
+    harness.initialize_workspace()
+    harness.start()
+    lifecycle_agent = harness.agent_id
+    created_work_item_agent = harness.request(
+        "POST",
+        f"/api/control/agents/{urllib.parse.quote(work_item_agent, safe='')}/create",
+        {
+            "authority_class": "operator_instruction",
+            "template": None,
+        },
+    )
+    write_json(
+        harness.evidence / "upgrade-schema47-workitem-agent.json",
+        created_work_item_agent,
+    )
+    harness.agent_id = work_item_agent
+    try:
+        harness.prompt(
+            "upgrade-schema47-workitem-bootstrap",
+            f"Reply with exactly {work_item_bootstrap_marker}.",
+        )
+    finally:
+        harness.agent_id = lifecycle_agent
+    work_item_path = (
+        "/api/control/agents/"
+        f"{urllib.parse.quote(work_item_agent, safe='')}/work-items"
+    )
+
+    def block_work_item_turn() -> None:
+        try:
+            created = harness.request(
+                "POST",
+                work_item_path,
+                {"objective": work_item_objective},
+            )
+            write_json(
+                harness.evidence / "upgrade-schema47-workitem-created.json",
+                created,
+            )
+        except Exception as error:
+            work_item_error.append(str(error))
+
+    work_item_thread = threading.Thread(target=block_work_item_turn, daemon=True)
+    work_item_thread.start()
+
+    def block_lifecycle_turn() -> None:
+        try:
+            harness.prompt(
+                "upgrade-schema47-lifecycle",
+                case["phases"][0]["prompt"].format(marker=lifecycle_marker),
+            )
+        except Exception as error:
+            prompt_error.append(str(error))
+
+    prompt_thread = threading.Thread(target=block_lifecycle_turn, daemon=True)
+    prompt_thread.start()
+    deadline = time.monotonic() + harness.timeout_seconds
+    old_live: dict[str, Any] | None = None
+    matching: list[dict[str, Any]] = []
+    prompt_binding: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        old_live = harness.runtime_db_snapshot("upgrade-schema47-open-attempt")
+        matching = [
+            row
+            for row in old_live["execution_protocol_attempts"]
+            if row["lifecycle_state"] == "open"
+        ]
+        prompt_binding = {
+            row["agent_id"]: json.loads(row["payload_json"]).get("binding")
+            for row in matching
+        }
+        binding_kinds = {
+            json.loads(row["payload_json"]).get("binding", {}).get("kind")
+            for row in matching
+        }
+        matching_agents = {row["agent_id"] for row in matching}
+        # Previous releases since v0.35.0 bind HTTP-control operator prompts
+        # to their conversation interaction instead of the bare agent
+        # lifecycle, so accept either binding for the interrupted prompt.
+        if (
+            "work_item" in binding_kinds
+            and binding_kinds & {"agent_lifecycle", "conversation"}
+            and {lifecycle_agent, work_item_agent}.issubset(matching_agents)
+        ):
+            break
+        matching = []
+        time.sleep(0.5)
+    require(
+        matching,
+        "previous image did not retain open agent-lifecycle/conversation and "
+        f"WorkItem attempts: {prompt_binding}",
+    )
+    harness.crash()
+    prompt_thread.join(timeout=35)
+    work_item_thread.join(timeout=35)
+    require(
+        not prompt_thread.is_alive() and not work_item_thread.is_alive(),
+        "interrupted previous-image requests did not terminate after SIGKILL",
+    )
+    old_snapshot = harness.offline_runtime_db_snapshot("upgrade-schema47-old")
+    require(
+        old_snapshot["integrity_check"] == "ok", f"old database invalid: {old_snapshot}"
+    )
+    previous_schema_revision = require_previous_schema_revision(old_snapshot)
+    open_attempt_agents = {
+        row["agent_id"]
+        for row in old_snapshot["execution_protocol_attempts"]
+        if row["lifecycle_state"] == "open"
+    }
+    require(
+        {lifecycle_agent, work_item_agent}.issubset(open_attempt_agents),
+        f"multi-agent blockers were not retained: {old_snapshot}",
+    )
+
+    harness.image = candidate_image
+    report = harness.offline_debug(
+        "upgrade-schema47-report-before",
+        "scheduler-recovery",
+        "--all-affected",
+    )
+    apply = harness.offline_debug(
+        "upgrade-schema47-apply",
+        "scheduler-recovery",
+        "--all-affected",
+        "--apply",
+    )
+    fixed_point = harness.offline_debug(
+        "upgrade-schema47-report-after",
+        "scheduler-recovery",
+        "--all-affected",
+    )
+    harness.start()
+    before_turn = int(
+        harness.state("upgrade-schema47-before-candidate")["agent"]["agent"][
+            "turn_index"
+        ]
+    )
+    harness.prompt(
+        "upgrade-schema47-candidate",
+        case["phases"][1]["prompt"].format(marker=candidate_marker),
+    )
+    after_turn = int(
+        harness.state("upgrade-schema47-after-candidate")["agent"]["agent"][
+            "turn_index"
+        ]
+    )
+    require(
+        after_turn > before_turn,
+        "schema 47 candidate did not complete a new canonical turn",
+    )
+    candidate_snapshot = harness.upgrade_db_snapshot(
+        "upgrade-schema47-candidate", candidate_marker
+    )
+    require(
+        candidate_snapshot["messages"] and candidate_snapshot["briefs"],
+        f"schema 47 candidate did not persist the new marker: {candidate_snapshot}",
+    )
+    harness.stop()
+    migrated = harness.offline_runtime_db_snapshot("upgrade-schema47-migrated")
+    candidate_schema_revision = migrated.get("schema_revision")
+    require(
+        migrated["integrity_check"] == "ok"
+        and isinstance(candidate_schema_revision, int)
+        and candidate_schema_revision >= 47
+        and candidate_schema_revision > previous_schema_revision,
+        "candidate did not migrate beyond the previous release at schema 47 or "
+        f"newer: previous={previous_schema_revision}, candidate={migrated}",
+    )
+    retired_tables = {
+        "scheduler_agent_slots",
+        "scheduler_waits",
+        "scheduler_work_demands",
+    }
+    require(
+        retired_tables.isdisjoint(migrated["tables"]),
+        f"retired scheduler tables remain after migration: {migrated['tables']}",
+    )
+    require(
+        len(migrated["migration_baselines"]) == 1,
+        f"schema migration baseline is missing: {migrated}",
+    )
+    require(
+        not [
+            row
+            for row in migrated["execution_protocol_attempts"]
+            if row["lifecycle_state"] == "open"
+        ],
+        f"recovery did not reach the execution fixed point: {migrated}",
+    )
+    old_evidence = harness.evidence / "upgrade-schema47-old-runtime-db.json"
+    migrated_evidence = harness.evidence / "upgrade-schema47-migrated-runtime-db.json"
+    write_json(
+        harness.evidence / "upgrade-schema47-recovery-attestation.json",
+        {
+            "schema_version": 1,
+            "previous_schema_revision": previous_schema_revision,
+            "candidate_schema_revision": candidate_schema_revision,
+            "affected_agents": sorted(open_attempt_agents),
+            "report_before": report,
+            "apply": apply,
+            "report_after": fixed_point,
+            "old_snapshot_sha256": hashlib.sha256(
+                old_evidence.read_bytes()
+            ).hexdigest(),
+            "migrated_snapshot_sha256": hashlib.sha256(
+                migrated_evidence.read_bytes()
+            ).hexdigest(),
+            "prompt_error_after_sigkill": prompt_error,
+            "work_item_error_after_sigkill": work_item_error,
+        },
+    )
+    # Leave the candidate running for the runner's common final context capture.
+    harness.start()
 
 
 def run_memory_case(harness: CaseHarness, case: dict[str, Any]) -> None:
@@ -1497,11 +2650,15 @@ def run_memory_case(harness: CaseHarness, case: dict[str, Any]) -> None:
         first_phase["prompt"].format(case_id=case["id"], marker=marker),
     )
     required, forbidden = phase_tools(first_phase)
-    events = harness.assert_tools("memory-search", baseline, required, forbidden)
+    events = harness.assert_tools(
+        "memory-search",
+        baseline,
+        required,
+        forbidden,
+        message_id=harness.prompt_scope("memory-search")["message_id"],
+    )
     search_event = next(
-        event
-        for event in events
-        if event["payload"].get("tool_name") == "MemorySearch"
+        event for event in events if event["payload"].get("tool_name") == "MemorySearch"
     )
     search_result = result_value(harness.tool_detail(search_event, "memory-search"))
     matches = [
@@ -1516,9 +2673,7 @@ def run_memory_case(harness: CaseHarness, case: dict[str, Any]) -> None:
         f"MemorySearch result omitted source_ref: {matches[0]}",
     )
     get_event = next(
-        event
-        for event in events
-        if event["payload"].get("tool_name") == "MemoryGet"
+        event for event in events if event["payload"].get("tool_name") == "MemoryGet"
     )
     get_result = memory_value(
         result_value(harness.tool_detail(get_event, "memory-get"))
@@ -1543,11 +2698,15 @@ def run_memory_case(harness: CaseHarness, case: dict[str, Any]) -> None:
         ),
     )
     required, forbidden = phase_tools(second_phase)
-    events = harness.assert_tools("memory-recover", baseline, required, forbidden)
+    events = harness.assert_tools(
+        "memory-recover",
+        baseline,
+        required,
+        forbidden,
+        message_id=harness.prompt_scope("memory-recover")["message_id"],
+    )
     recovered_get = next(
-        event
-        for event in events
-        if event["payload"].get("tool_name") == "MemoryGet"
+        event for event in events if event["payload"].get("tool_name") == "MemoryGet"
     )
     recovered = memory_value(
         result_value(harness.tool_detail(recovered_get, "memory-recover-get"))
@@ -1582,7 +2741,11 @@ def run_workspace_case(harness: CaseHarness, case: dict[str, Any]) -> None:
     )
     required, forbidden = phase_tools(create_phase)
     create_events = harness.assert_tools(
-        "workspace-create", baseline, required, forbidden
+        "workspace-create",
+        baseline,
+        required,
+        forbidden,
+        message_id=harness.prompt_scope("workspace-create")["message_id"],
     )
     create_event = next(
         event
@@ -1615,7 +2778,13 @@ def run_workspace_case(harness: CaseHarness, case: dict[str, Any]) -> None:
         ),
     )
     required, forbidden = phase_tools(recover_phase)
-    harness.assert_tools("workspace-recover", baseline, required, forbidden)
+    harness.assert_tools(
+        "workspace-recover",
+        baseline,
+        required,
+        forbidden,
+        message_id=harness.prompt_scope("workspace-recover")["message_id"],
+    )
     git_state = harness.docker(
         "exec",
         harness.container,
@@ -1662,7 +2831,13 @@ def run_workitem_case(harness: CaseHarness, case: dict[str, Any]) -> None:
         ),
     )
     required, forbidden = phase_tools(wait_phase)
-    harness.assert_tools("workitem-wait", baseline, required, forbidden)
+    harness.assert_tools(
+        "workitem-wait",
+        baseline,
+        required,
+        forbidden,
+        message_id=harness.prompt_scope("workitem-wait")["message_id"],
+    )
     items = harness.work_items("workitem-wait-assert")
     matches = [item for item in items if item["objective"] == objective]
     require(len(matches) == 1, f"expected exactly one matching WorkItem: {matches}")
@@ -1731,15 +2906,20 @@ def run_workitem_case(harness: CaseHarness, case: dict[str, Any]) -> None:
         ),
     )
     required, forbidden = phase_tools(complete_phase)
-    harness.assert_tools("workitem-complete", baseline, required, forbidden)
+    harness.assert_tools(
+        "workitem-complete",
+        baseline,
+        required,
+        forbidden,
+        message_id=harness.prompt_scope("workitem-complete")["message_id"],
+    )
     final_items = harness.work_items("workitem-final")
     completed = next(item for item in final_items if item["id"] == work_item_id)
     require(completed["state"] == "completed", f"WorkItem not completed: {completed}")
     require(
         len(completed.get("todo_list", [])) == 3
         and all(
-            todo["state"] == "completed"
-            for todo in completed.get("todo_list", [])
+            todo["state"] == "completed" for todo in completed.get("todo_list", [])
         ),
         f"WorkItem todos were not all completed: {completed}",
     )
@@ -1789,6 +2969,22 @@ def work_queue_message_evidence(
     return evidence
 
 
+def recovered_retry_ticks(
+    failed_ticks: list[dict[str, Any]],
+    recovered_ticks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    failed_keys = {
+        tick["idempotency_key"]
+        for tick in failed_ticks
+        if tick["status"] in {"aborted", "interrupted"}
+    }
+    return [
+        tick
+        for tick in recovered_ticks
+        if tick["status"] == "processed" and tick["idempotency_key"] in failed_keys
+    ]
+
+
 def run_scheduler_task_wait_resume_case(
     harness: CaseHarness, case: dict[str, Any]
 ) -> None:
@@ -1811,6 +3007,7 @@ def run_scheduler_task_wait_resume_case(
         f"{completion_marker} immediately followed by CompleteWorkItem for the "
         "exact current item. Do not create another WorkItem."
     )
+    callback = harness.reset_callback("scheduler-task-wait-callback")
     phase = case["phases"][0]
     baseline, _ = harness.prompt(
         "scheduler-task-wait-seed",
@@ -1825,6 +3022,7 @@ def run_scheduler_task_wait_resume_case(
         expected_scheduling_state="waiting_task",
         label="scheduler-task-wait-task",
     )
+    harness.crash_restart(wait_idle=False)
     external_waiting = harness.wait_work_item_scheduling_state(
         objective_marker=objective_marker,
         expected_scheduling_state="waiting_external",
@@ -1834,7 +3032,7 @@ def run_scheduler_task_wait_resume_case(
         external_waiting["id"] == task_waiting["id"],
         "task-result rejoin changed WorkItem identity",
     )
-    callback = harness.reset_callback("scheduler-task-wait-callback")
+    harness.wait_agent_asleep()
     harness.fire_callback(
         "scheduler-task-wait-wake",
         callback["trigger_url"],
@@ -1846,7 +3044,20 @@ def run_scheduler_task_wait_resume_case(
         label="scheduler-task-wait-completed",
     )
     required, forbidden = phase_tools(phase)
-    harness.assert_tools("scheduler-task-wait-seed", baseline, required, forbidden)
+    harness.assert_tools(
+        "scheduler-task-wait-seed",
+        baseline,
+        ["CreateWorkItem"],
+        forbidden
+        + [
+            "ExecCommand",
+            "WaitFor",
+            "GetWorkItem",
+            "UpdateWorkItem",
+            "CompleteWorkItem",
+        ],
+        message_id=harness.prompt_scope("scheduler-task-wait-seed")["message_id"],
+    )
     work_item_id = item["id"]
     result_brief_id = item.get("result_brief_id")
     require(
@@ -1871,6 +3082,13 @@ def run_scheduler_task_wait_resume_case(
     require(
         len(turns) == 3 and None not in message_ids,
         f"expected autonomous, task-result, and external-wake turns: {turns}",
+    )
+    harness.assert_tools(
+        "scheduler-task-wait-continuations",
+        baseline,
+        [name for name in required if name != "CreateWorkItem"],
+        forbidden + ["CreateWorkItem"],
+        turn_ids={row["turn_id"] for row in turns},
     )
     require_processed_queue_entries(snapshot["queue_entries"], message_ids)
     final_turn_id = result_brief.get("turn_id")
@@ -1897,33 +3115,74 @@ def run_scheduler_task_wait_resume_case(
         harness,
         snapshot,
         work_item_id=work_item_id,
-        expected_activation_count=3,
+        expected_source_kinds=(
+            "work_item_continuation",
+            "task_result",
+            "triggered_wait",
+        ),
+        conversation_message_ids={
+            harness.prompt_scope("scheduler-task-wait-seed")["message_id"]
+        },
     )
-    waits = [
-        row
-        for row in snapshot["wait_conditions"]
-        if row["work_item_id"] == work_item_id
+    activation_causes = [
+        execution_attempt(row)["source"]["identity"]["kind"]
+        for row in snapshot["execution_protocol_attempts"]
+        if execution_binding_work_item(execution_attempt(row)) == work_item_id
     ]
     require(
-        len(waits) == 2
-        and {row["kind"] for row in waits} == {"task", "external"}
-        and {row["kind"]: row["status"] for row in waits}
-        == {"task": "resolved", "external": "cancelled"},
-        f"task/external waits did not reach terminal states: {waits}",
+        sorted(activation_causes)
+        == ["task_result", "triggered_wait", "work_item_continuation"],
+        "canonical task/wait execution sources did not preserve scheduling, "
+        f"task-result, and external-resume provenance: {activation_causes}",
     )
+    task_waits = require_scheduler_wait_terminal(
+        harness,
+        snapshot,
+        work_item_id=work_item_id,
+        wait_kind="task",
+    )
+    external_waits = require_scheduler_wait_terminal(
+        harness,
+        snapshot,
+        work_item_id=work_item_id,
+        wait_kind="external",
+        require_callback_trigger=True,
+        callback_external_trigger_id=callback["external_trigger_id"],
+    )
+    waits = task_waits + external_waits
     require_scheduler_engine_wait_resolution(
         harness,
         snapshot,
         work_item_id=work_item_id,
         wait_ids={wait["wait_condition_id"] for wait in waits},
     )
-    harness.restart()
-    restarted_items = harness.work_items("scheduler-task-wait-after-restart")
-    restarted = next(item for item in restarted_items if item["id"] == work_item_id)
+    restart_messages = [
+        row
+        for row in snapshot["messages"]
+        if row["kind"] == "task_result"
+        and row["message_id"].startswith("message:task-restart:")
+    ]
     require(
-        restarted["state"] == "completed"
-        and restarted.get("result_brief_id") == result_brief_id,
-        f"task/wait WorkItem did not survive restart: {restarted}",
+        len(restart_messages) == 1,
+        f"canonical rejoin did not use the deterministic restart TaskResult: {restart_messages}",
+    )
+    restart_message_id = restart_messages[0]["message_id"]
+    task_result_turns = [
+        row for row in turns if row["trigger_message_id"] == restart_message_id
+    ]
+    require(
+        len(task_result_turns) == 1,
+        f"restart task result did not create exactly one model rejoin: {task_result_turns}",
+    )
+    restart_task_waits = [
+        wait
+        for wait in task_waits
+        if wait.get("trigger_message_id") == restart_message_id
+    ]
+    require(
+        len(restart_task_waits) == 1,
+        "restart TaskResult did not resolve the exact task wait with message provenance: "
+        f"{task_waits}",
     )
 
 
@@ -1932,9 +3191,9 @@ def run_scheduler_provider_failure_retry_case(
 ) -> None:
     harness.initialize_workspace()
     base_url_env = provider_base_url_env(harness.model)
-    original_base_url = harness.runtime_env.get(base_url_env)
-    harness.runtime_env[base_url_env] = "http://127.0.0.1:9"
     harness.start()
+    original_base_url = harness.runtime_env.get(base_url_env)
+    original_stub_provider_base_url = harness.stub_provider_base_url
 
     harness.request(
         "POST",
@@ -1964,6 +3223,13 @@ def run_scheduler_provider_failure_retry_case(
         {"reason": "prepare deterministic provider failure retry"},
     )
     write_json(harness.evidence / "provider-retry-picked.json", picked)
+    failure_event_cursor = harness.event_cursor()
+    harness.stop()
+    if harness.provider_mode == "stub":
+        harness.stub_provider_base_url = "http://127.0.0.1:9"
+    else:
+        harness.runtime_env[base_url_env] = "http://127.0.0.1:9"
+    harness.start(wait_idle=False)
     harness.request(
         "POST",
         harness.agent_path("control", control=True),
@@ -1972,16 +3238,34 @@ def run_scheduler_provider_failure_retry_case(
 
     deadline = time.monotonic() + harness.timeout_seconds
     runtime_errors: list[dict[str, Any]] = []
+    target_message_ids: set[str] = set()
     while time.monotonic() < deadline:
+        events = harness.events(
+            "provider-retry-failure-poll",
+            after_seq=failure_event_cursor,
+        )
+        target_message_ids.update(
+            event["payload"]["message_id"]
+            for event in events
+            if event["type"] == "message_admitted"
+            and event["payload"].get("work_item_id") == work_item_id
+            and isinstance(event["payload"].get("message_id"), str)
+        )
         runtime_errors = [
             event
-            for event in harness.events("provider-retry-failure-poll")
+            for event in events
             if event["type"] == "runtime_error"
+            and event["payload"].get("message_id") in target_message_ids
         ]
         if runtime_errors:
             break
         time.sleep(0.5)
-    require(runtime_errors, "invalid provider endpoint did not produce runtime_error")
+    require(
+        runtime_errors,
+        "invalid provider endpoint did not produce a runtime_error for the "
+        f"target WorkItem; admitted messages={sorted(target_message_ids)}",
+    )
+    failed_message_id = runtime_errors[-1]["payload"]["message_id"]
     harness.request(
         "POST",
         harness.agent_path("control", control=True),
@@ -2006,6 +3290,11 @@ def run_scheduler_provider_failure_retry_case(
         and not any(tick["status"] == "processed" for tick in failed_ticks),
         f"provider failure did not abort continue-active ticks: {failed_ticks}",
     )
+    require(
+        failed_message_id in {tick["message_id"] for tick in failed_ticks},
+        "runtime_error did not belong to the target continue-active message: "
+        f"error_message={failed_message_id}, ticks={failed_ticks}",
+    )
     failed_keys = {tick["idempotency_key"] for tick in failed_ticks}
     require(
         len(failed_keys) == 1 and None not in failed_keys,
@@ -2013,7 +3302,9 @@ def run_scheduler_provider_failure_retry_case(
     )
 
     harness.stop()
-    if original_base_url is None:
+    if harness.provider_mode == "stub":
+        harness.stub_provider_base_url = original_stub_provider_base_url
+    elif original_base_url is None:
         harness.runtime_env.pop(base_url_env, None)
     else:
         harness.runtime_env[base_url_env] = original_base_url
@@ -2044,29 +3335,24 @@ def run_scheduler_provider_failure_retry_case(
         work_item_id=work_item_id,
         reason="continue_active",
     )
+    processed_ticks = recovered_retry_ticks(failed_ticks, recovered_ticks)
     require(
-        len(recovered_ticks) > len(failed_ticks)
-        and any(tick["status"] == "processed" for tick in recovered_ticks),
-        f"provider recovery did not process a retry tick: {recovered_ticks}",
+        processed_ticks,
+        "provider recovery did not process a stable-idempotency retry after "
+        f"an aborted/interrupted attempt: failed={failed_ticks}, "
+        f"recovered={recovered_ticks}",
     )
     require(
         {tick["idempotency_key"] for tick in recovered_ticks} == failed_keys,
         f"provider recovery changed continue-active idempotency: {recovered_ticks}",
     )
-    tool_names = [
-        event["payload"].get("tool_name")
-        for event in harness.events("provider-retry-tools")
-        if event["type"] == "tool_executed"
-        and event["payload"].get("status") == "success"
-    ]
     required, forbidden = phase_tools(case["phases"][0])
-    require(
-        all(name in tool_names for name in required),
-        f"provider retry omitted required tools {required}: {tool_names}",
-    )
-    require(
-        not set(tool_names).intersection(forbidden),
-        f"provider retry used forbidden tools {forbidden}: {tool_names}",
+    harness.assert_tools(
+        "provider-retry-tools",
+        0,
+        required,
+        forbidden,
+        message_id=processed_ticks[-1]["message_id"],
     )
 
 
@@ -2123,12 +3409,26 @@ def run_scheduler_multi_workitem_case(
         label="scheduler-multi-b-completed",
     )
     required, forbidden = phase_tools(phase)
-    harness.assert_tools("scheduler-multi-create", baseline, required, forbidden)
+    harness.assert_tools(
+        "scheduler-multi-create",
+        baseline,
+        ["CreateWorkItem"],
+        forbidden
+        + [
+            "AgentGet",
+            "GetWorkspaceState",
+            "ListWorkItems",
+            "UpdateWorkItem",
+            "CompleteWorkItem",
+        ],
+        message_id=harness.prompt_scope("scheduler-multi-create")["message_id"],
+    )
     work_item_a_id = item_a["id"]
     work_item_b_id = item_b["id"]
     require(item_a["state"] == "completed", f"WorkItem A not completed: {item_a}")
     require(item_b["state"] == "completed", f"WorkItem B not completed: {item_b}")
     require(work_item_a_id != work_item_b_id, "WorkItem A and B share the same id")
+    terminal_turn_ids_by_work_item: dict[str, str] = {}
     for item, label_letter, completion, brief_label in (
         (item_a, "A", completion_a, "scheduler-multi-result-a"),
         (item_b, "B", completion_b, "scheduler-multi-result-b"),
@@ -2144,25 +3444,59 @@ def run_scheduler_multi_workitem_case(
             and completion in (brief.get("text") or ""),
             f"WorkItem {label_letter} brief mismatch: {brief}",
         )
+        terminal_turn_ids_by_work_item[item["id"]] = (
+            harness.wait_result_brief_terminal_turn(
+                brief=brief,
+                label=brief_label,
+            )
+        )
     snapshot = harness.runtime_db_snapshot("scheduler-multi")
+    for work_item_id, terminal_turn_id in terminal_turn_ids_by_work_item.items():
+        require(
+            any(
+                row["turn_id"] == terminal_turn_id
+                and row["current_work_item_id"] == work_item_id
+                and row["terminal_kind"] == "completed"
+                for row in snapshot["turn_records"]
+            ),
+            "multi-WorkItem source turn was not persisted as completed: "
+            f"work_item_id={work_item_id}, turn_id={terminal_turn_id}",
+        )
+    harness.assert_tools(
+        "scheduler-multi-a",
+        baseline,
+        ["AgentGet", "ListWorkItems", "UpdateWorkItem", "CompleteWorkItem"],
+        forbidden + ["CreateWorkItem", "GetWorkspaceState"],
+        turn_ids={terminal_turn_ids_by_work_item[work_item_a_id]},
+    )
+    harness.assert_tools(
+        "scheduler-multi-b",
+        baseline,
+        [
+            "GetWorkspaceState",
+            "ListWorkItems",
+            "UpdateWorkItem",
+            "CompleteWorkItem",
+        ],
+        forbidden + ["CreateWorkItem", "AgentGet"],
+        turn_ids={terminal_turn_ids_by_work_item[work_item_b_id]},
+    )
     for wid in (work_item_a_id, work_item_b_id):
         require_scheduler_engine_activation_chain(
             harness,
             snapshot,
             work_item_id=wid,
-            expected_activation_count=1,
+            expected_source_kinds=("work_item_continuation",),
+            conversation_message_ids={
+                harness.prompt_scope("scheduler-multi-create")["message_id"]
+            },
         )
-    if harness.canonical_scheduler_enabled:
-        demands = [
-            row
-            for row in snapshot["scheduler_work_demands"]
-            if row["work_item_id"] in (work_item_a_id, work_item_b_id)
-        ]
-        require(
-            len(demands) == 2
-            and all(d["status"] == "terminal" for d in demands),
-            f"multi-WorkItem demands did not converge: {demands}",
-        )
+    require_execution_work_items_terminal(
+        snapshot,
+        agent_id=harness.agent_id,
+        work_item_ids={work_item_a_id, work_item_b_id},
+        label="multi-WorkItem",
+    )
     harness.restart()
     restarted_items = harness.work_items("scheduler-multi-after-restart")
     for wid, brief_id in (
@@ -2221,10 +3555,18 @@ def run_scheduler_external_wait_resume_case(
         label="scheduler-external-completed",
     )
     required, forbidden = phase_tools(phase)
-    harness.assert_tools("scheduler-external-wait", baseline, required, forbidden)
+    harness.assert_tools(
+        "scheduler-external-wait",
+        baseline,
+        ["CreateWorkItem", "PickWorkItem", "WaitFor"],
+        forbidden + ["GetWorkItem", "UpdateWorkItem", "CompleteWorkItem"],
+        message_id=harness.prompt_scope("scheduler-external-wait")["message_id"],
+    )
     work_item_id = item["id"]
     require(item["state"] == "completed", f"WorkItem not completed: {item}")
-    require(item["id"] == waiting["id"], "external wait-resume changed WorkItem identity")
+    require(
+        item["id"] == waiting["id"], "external wait-resume changed WorkItem identity"
+    )
     result_brief_id = item.get("result_brief_id")
     require(
         isinstance(result_brief_id, str) and result_brief_id,
@@ -2236,31 +3578,50 @@ def run_scheduler_external_wait_resume_case(
         and completion_marker in (result_brief.get("text") or ""),
         f"external wait completion brief mismatch: {result_brief}",
     )
+    # CompleteWorkItem persists the completed WorkItem before the canonical
+    # scheduler records the enclosing activation settlement. Wait for the
+    # resume turn to fully drain before inspecting activation lineage.
+    harness.wait_queue_drained()
     snapshot = harness.runtime_db_snapshot("scheduler-external")
+    resume_turn_ids = {
+        row["turn_id"]
+        for row in snapshot["turn_records"]
+        if row["current_work_item_id"] == work_item_id
+    }
+    harness.assert_tools(
+        "scheduler-external-resume",
+        baseline,
+        [
+            name
+            for name in required
+            if name not in {"CreateWorkItem", "PickWorkItem", "WaitFor"}
+        ],
+        forbidden + ["CreateWorkItem", "PickWorkItem", "WaitFor"],
+        turn_ids=resume_turn_ids,
+    )
     require_scheduler_engine_activation_chain(
         harness,
         snapshot,
         work_item_id=work_item_id,
-        expected_activation_count=1,
+        expected_source_kinds=("triggered_wait",),
+        conversation_message_ids={
+            harness.prompt_scope("scheduler-external-wait")["message_id"]
+        },
     )
-    waits = [
-        row
-        for row in snapshot["wait_conditions"]
-        if row["work_item_id"] == work_item_id
-    ]
-    require(
-        len(waits) == 1
-        and waits[0]["kind"] == "external"
-        and waits[0]["status"] == "resolved",
-        f"external wait condition did not resolve: {waits}",
+    waits = require_scheduler_wait_terminal(
+        harness,
+        snapshot,
+        work_item_id=work_item_id,
+        wait_kind="external",
+        require_callback_trigger=True,
+        callback_external_trigger_id=callback["external_trigger_id"],
     )
-    if harness.canonical_scheduler_enabled:
-        require_lifecycle_wait_adoption(
-            snapshot,
-            agent_id=harness.agent_id,
-            work_item_id=work_item_id,
-            wait=waits[0],
-        )
+    require_lifecycle_wait_adoption(
+        snapshot,
+        agent_id=harness.agent_id,
+        work_item_id=work_item_id,
+        wait=waits[0],
+    )
     require_scheduler_engine_wait_resolution(
         harness,
         snapshot,
@@ -2312,10 +3673,18 @@ def run_scheduler_operator_wait_resume_case(
         label="scheduler-operator-completed",
     )
     required, forbidden = phase_tools(phase)
-    harness.assert_tools("scheduler-operator-wait", baseline, required, forbidden)
+    harness.assert_tools(
+        "scheduler-operator-wait",
+        baseline,
+        ["CreateWorkItem", "PickWorkItem", "WaitFor"],
+        forbidden + ["GetWorkItem", "UpdateWorkItem", "CompleteWorkItem"],
+        message_id=harness.prompt_scope("scheduler-operator-wait")["message_id"],
+    )
     work_item_id = item["id"]
     require(item["state"] == "completed", f"WorkItem not completed: {item}")
-    require(item["id"] == waiting["id"], "operator wait-resume changed WorkItem identity")
+    require(
+        item["id"] == waiting["id"], "operator wait-resume changed WorkItem identity"
+    )
     result_brief_id = item.get("result_brief_id")
     require(
         isinstance(result_brief_id, str) and result_brief_id,
@@ -2328,30 +3697,43 @@ def run_scheduler_operator_wait_resume_case(
         f"operator wait completion brief mismatch: {result_brief}",
     )
     snapshot = harness.runtime_db_snapshot("scheduler-operator")
+    resume_turn_ids = {
+        row["turn_id"]
+        for row in snapshot["turn_records"]
+        if row["current_work_item_id"] == work_item_id
+    }
+    harness.assert_tools(
+        "scheduler-operator-resume",
+        baseline,
+        [
+            name
+            for name in required
+            if name not in {"CreateWorkItem", "PickWorkItem", "WaitFor"}
+        ],
+        forbidden + ["CreateWorkItem", "PickWorkItem", "WaitFor"],
+        turn_ids=resume_turn_ids,
+    )
     require_scheduler_engine_activation_chain(
         harness,
         snapshot,
         work_item_id=work_item_id,
-        expected_activation_count=1,
+        expected_source_kinds=("triggered_wait",),
+        conversation_message_ids={
+            harness.prompt_scope("scheduler-operator-wait")["message_id"]
+        },
     )
-    waits = [
-        row
-        for row in snapshot["wait_conditions"]
-        if row["work_item_id"] == work_item_id
-    ]
-    require(
-        len(waits) == 1
-        and waits[0]["kind"] == "operator"
-        and waits[0]["status"] == "resolved",
-        f"operator wait condition did not resolve: {waits}",
+    waits = require_scheduler_wait_terminal(
+        harness,
+        snapshot,
+        work_item_id=work_item_id,
+        wait_kind="operator",
     )
-    if harness.canonical_scheduler_enabled:
-        require_lifecycle_wait_adoption(
-            snapshot,
-            agent_id=harness.agent_id,
-            work_item_id=work_item_id,
-            wait=waits[0],
-        )
+    require_lifecycle_wait_adoption(
+        snapshot,
+        agent_id=harness.agent_id,
+        work_item_id=work_item_id,
+        wait=waits[0],
+    )
     require_scheduler_engine_wait_resolution(
         harness,
         snapshot,
@@ -2405,17 +3787,12 @@ def run_scheduler_concurrent_claim_fencing_case(
         label="scheduler-concurrent-waiting",
     )
     harness.wait_agent_asleep()
-    interject_text = (
-        f"Scheduler Docker E2E case {case['id']} interject. Create exactly one "
-        f"WorkItem whose objective is "
-        f"{json.dumps(objective_b, ensure_ascii=False)}, "
-        f"with plan_status ready and exactly these todos: concurrent-b-seed "
-        f"completed, concurrent-b-complete pending. The expected completion "
-        f"marker is {completion_b}. Do not PickWorkItem, WaitFor, or "
-        "CompleteWorkItem in this turn. After CreateWorkItem succeeds, end "
-        "with a concise acknowledgement."
+    created_b = harness.request(
+        "POST",
+        harness.agent_path("work-items", control=True),
+        {"objective": objective_b},
     )
-    harness.prompt("scheduler-concurrent-interject", interject_text)
+    write_json(harness.evidence / "scheduler-concurrent-created-b.json", created_b)
     item_b = harness.wait_work_item(
         objective_marker=objective_b_marker,
         expected_state="completed",
@@ -2432,9 +3809,19 @@ def run_scheduler_concurrent_claim_fencing_case(
         label="scheduler-concurrent-a-completed",
     )
     required, forbidden = phase_tools(phase)
-    harness.assert_tools("scheduler-concurrent-create", baseline, required, forbidden)
+    harness.assert_tools(
+        "scheduler-concurrent-create",
+        baseline,
+        ["CreateWorkItem", "PickWorkItem", "WaitFor"],
+        forbidden + ["GetWorkItem", "UpdateWorkItem", "CompleteWorkItem"],
+        message_id=harness.prompt_scope("scheduler-concurrent-create")["message_id"],
+    )
     work_item_a_id = item_a["id"]
     work_item_b_id = item_b["id"]
+    require(
+        created_b.get("id") == work_item_b_id,
+        f"concurrent control-plane WorkItem identity mismatch: {created_b}",
+    )
     require(item_a["state"] == "completed", f"WorkItem A not completed: {item_a}")
     require(item_b["state"] == "completed", f"WorkItem B not completed: {item_b}")
     require(work_item_a_id != work_item_b_id, "WorkItem A and B share the same id")
@@ -2454,28 +3841,60 @@ def run_scheduler_concurrent_claim_fencing_case(
             f"WorkItem {letter} brief mismatch: {brief}",
         )
     snapshot = harness.runtime_db_snapshot("scheduler-concurrent")
+    messages_by_id = {row["message_id"]: row for row in snapshot["messages"]}
+    a_turn_ids = {
+        row["turn_id"]
+        for row in snapshot["turn_records"]
+        if row["current_work_item_id"] == work_item_a_id
+        and messages_by_id.get(row["trigger_message_id"], {}).get("work_item_id")
+        == work_item_a_id
+    }
+    b_turn_ids = {
+        row["turn_id"]
+        for row in snapshot["turn_records"]
+        if row["current_work_item_id"] == work_item_b_id
+        and messages_by_id.get(row["trigger_message_id"], {}).get("work_item_id")
+        == work_item_b_id
+    }
+    harness.assert_tools(
+        "scheduler-concurrent-a-resume",
+        baseline,
+        ["GetWorkItem", "UpdateWorkItem", "CompleteWorkItem"],
+        forbidden + ["CreateWorkItem", "PickWorkItem", "WaitFor"],
+        turn_ids=a_turn_ids,
+    )
+    harness.assert_tools(
+        "scheduler-concurrent-b-autonomous",
+        baseline,
+        ["ListWorkItems", "UpdateWorkItem", "CompleteWorkItem"],
+        forbidden + ["CreateWorkItem", "PickWorkItem", "WaitFor"],
+        turn_ids=b_turn_ids,
+    )
+    # The autonomous continuation claims the WorkItem before the wait wake is
+    # delivered, so it completes the item while the triggered wait still settles.
     require_scheduler_engine_activation_chain(
         harness,
         snapshot,
         work_item_id=work_item_a_id,
-        expected_activation_count=2,
+        expected_source_kinds=("work_item_continuation", "triggered_wait"),
+        conversation_message_ids={
+            harness.prompt_scope("scheduler-concurrent-create")["message_id"]
+        },
     )
     require_scheduler_engine_activation_chain(
         harness,
         snapshot,
         work_item_id=work_item_b_id,
-        expected_activation_count=1,
+        expected_source_kinds=("work_item_continuation",),
+        conversation_message_ids=set(),
     )
-    waits = [
-        row
-        for row in snapshot["wait_conditions"]
-        if row["work_item_id"] == work_item_a_id
-    ]
-    require(
-        len(waits) == 1
-        and waits[0]["kind"] == "external"
-        and waits[0]["status"] == "resolved",
-        f"concurrent external wait did not resolve: {waits}",
+    waits = require_scheduler_wait_terminal(
+        harness,
+        snapshot,
+        work_item_id=work_item_a_id,
+        wait_kind="external",
+        require_callback_trigger=True,
+        callback_external_trigger_id=callback["external_trigger_id"],
     )
     require_scheduler_engine_wait_resolution(
         harness,
@@ -2483,17 +3902,12 @@ def run_scheduler_concurrent_claim_fencing_case(
         work_item_id=work_item_a_id,
         wait_ids={wait["wait_condition_id"] for wait in waits},
     )
-    if harness.canonical_scheduler_enabled:
-        demands = [
-            row
-            for row in snapshot["scheduler_work_demands"]
-            if row["work_item_id"] in (work_item_a_id, work_item_b_id)
-        ]
-        require(
-            len(demands) == 2
-            and all(d["status"] == "terminal" for d in demands),
-            f"concurrent demands did not converge: {demands}",
-        )
+    require_execution_work_items_terminal(
+        snapshot,
+        agent_id=harness.agent_id,
+        work_item_ids={work_item_a_id, work_item_b_id},
+        label="concurrent",
+    )
     harness.restart()
     restarted_items = harness.work_items("scheduler-concurrent-after-restart")
     for wid, brief_id in (
@@ -2571,6 +3985,7 @@ def run_scheduler_operator_interject_during_wait_case(
         "scheduler-interject-resume",
         f"The operator is resuming WorkItem {marker}. Proceed with the "
         "completion steps described in the objective.",
+        work_item_id=waiting["id"],
     )
     item_a = harness.wait_work_item(
         objective_marker=objective_a_marker,
@@ -2578,7 +3993,20 @@ def run_scheduler_operator_interject_during_wait_case(
         label="scheduler-interject-a-completed",
     )
     required, forbidden = phase_tools(phase)
-    harness.assert_tools("scheduler-interject-create", baseline, required, forbidden)
+    harness.assert_tools(
+        "scheduler-interject-create",
+        baseline,
+        ["CreateWorkItem", "PickWorkItem", "WaitFor"],
+        forbidden + ["GetWorkItem", "UpdateWorkItem", "CompleteWorkItem"],
+        message_id=harness.prompt_scope("scheduler-interject-create")["message_id"],
+    )
+    harness.assert_tools(
+        "scheduler-interject-b-create",
+        baseline,
+        ["CreateWorkItem"],
+        forbidden + ["PickWorkItem", "WaitFor", "CompleteWorkItem"],
+        message_id=harness.prompt_scope("scheduler-interject-b-create")["message_id"],
+    )
     work_item_a_id = item_a["id"]
     work_item_b_id = item_b["id"]
     require(item_a["state"] == "completed", f"WorkItem A not completed: {item_a}")
@@ -2600,28 +4028,55 @@ def run_scheduler_operator_interject_during_wait_case(
             f"WorkItem {letter} brief mismatch: {brief}",
         )
     snapshot = harness.runtime_db_snapshot("scheduler-interject")
+    a_turn_ids = {
+        row["turn_id"]
+        for row in snapshot["turn_records"]
+        if row["current_work_item_id"] == work_item_a_id
+    }
+    b_turn_ids = {
+        row["turn_id"]
+        for row in snapshot["turn_records"]
+        if row["current_work_item_id"] == work_item_b_id
+    }
+    harness.assert_tools(
+        "scheduler-interject-a-resume",
+        baseline,
+        ["GetWorkItem", "UpdateWorkItem", "CompleteWorkItem"],
+        forbidden + ["CreateWorkItem", "PickWorkItem", "WaitFor"],
+        turn_ids=a_turn_ids,
+    )
+    harness.assert_tools(
+        "scheduler-interject-b-autonomous",
+        baseline,
+        ["ListWorkItems", "UpdateWorkItem", "CompleteWorkItem"],
+        forbidden + ["CreateWorkItem", "PickWorkItem", "WaitFor"],
+        turn_ids=b_turn_ids,
+    )
+    # The autonomous continuation claims the WorkItem before the interjection is
+    # delivered, so it completes the item while the triggered wait still settles.
     require_scheduler_engine_activation_chain(
         harness,
         snapshot,
         work_item_id=work_item_a_id,
-        expected_activation_count=2,
+        expected_source_kinds=("work_item_continuation", "triggered_wait"),
+        conversation_message_ids={
+            harness.prompt_scope("scheduler-interject-create")["message_id"]
+        },
     )
     require_scheduler_engine_activation_chain(
         harness,
         snapshot,
         work_item_id=work_item_b_id,
-        expected_activation_count=1,
+        expected_source_kinds=("work_item_continuation",),
+        conversation_message_ids={
+            harness.prompt_scope("scheduler-interject-b-create")["message_id"]
+        },
     )
-    waits = [
-        row
-        for row in snapshot["wait_conditions"]
-        if row["work_item_id"] == work_item_a_id
-    ]
-    require(
-        len(waits) == 1
-        and waits[0]["kind"] == "operator"
-        and waits[0]["status"] == "resolved",
-        f"interject operator wait did not resolve: {waits}",
+    waits = require_scheduler_wait_terminal(
+        harness,
+        snapshot,
+        work_item_id=work_item_a_id,
+        wait_kind="operator",
     )
     require_scheduler_engine_wait_resolution(
         harness,
@@ -2629,17 +4084,12 @@ def run_scheduler_operator_interject_during_wait_case(
         work_item_id=work_item_a_id,
         wait_ids={wait["wait_condition_id"] for wait in waits},
     )
-    if harness.canonical_scheduler_enabled:
-        demands = [
-            row
-            for row in snapshot["scheduler_work_demands"]
-            if row["work_item_id"] in (work_item_a_id, work_item_b_id)
-        ]
-        require(
-            len(demands) == 2
-            and all(d["status"] == "terminal" for d in demands),
-            f"interject demands did not converge: {demands}",
-        )
+    require_execution_work_items_terminal(
+        snapshot,
+        agent_id=harness.agent_id,
+        work_item_ids={work_item_a_id, work_item_b_id},
+        label="interject",
+    )
     harness.restart()
     restarted_items = harness.work_items("scheduler-interject-after-restart")
     for wid, brief_id in (
@@ -2685,11 +4135,17 @@ def run_scheduler_compaction_continuity_case(
         expected_scheduling_state="waiting_operator",
         label="scheduler-compaction-waiting",
     )
+    stimulus_snapshot = harness.runtime_db_snapshot("scheduler-compaction-stimulus")
+    require_turn_local_compaction(
+        stimulus_snapshot,
+        label="scheduler-compaction",
+    )
     harness.wait_agent_asleep()
     harness.prompt(
         "scheduler-compaction-resume",
         f"The operator is resuming WorkItem {marker}. Proceed with the "
         "completion steps described in the objective.",
+        work_item_id=waiting["id"],
     )
     item = harness.wait_work_item(
         objective_marker=objective_marker,
@@ -2697,10 +4153,18 @@ def run_scheduler_compaction_continuity_case(
         label="scheduler-compaction-completed",
     )
     required, forbidden = phase_tools(phase)
-    harness.assert_tools("scheduler-compaction-create", baseline, required, forbidden)
+    harness.assert_tools(
+        "scheduler-compaction-create",
+        baseline,
+        ["CreateWorkItem", "PickWorkItem", "WaitFor"],
+        forbidden + ["GetWorkItem", "UpdateWorkItem", "CompleteWorkItem"],
+        message_id=harness.prompt_scope("scheduler-compaction-create")["message_id"],
+    )
     work_item_id = item["id"]
     require(item["state"] == "completed", f"WorkItem not completed: {item}")
-    require(item["id"] == waiting["id"], "compaction wait-resume changed WorkItem identity")
+    require(
+        item["id"] == waiting["id"], "compaction wait-resume changed WorkItem identity"
+    )
     result_brief_id = item.get("result_brief_id")
     require(
         isinstance(result_brief_id, str) and result_brief_id,
@@ -2713,32 +4177,52 @@ def run_scheduler_compaction_continuity_case(
         f"compaction completion brief mismatch: {result_brief}",
     )
     snapshot = harness.runtime_db_snapshot("scheduler-compaction")
+    resume_turn_ids = {
+        row["turn_id"]
+        for row in snapshot["turn_records"]
+        if row["current_work_item_id"] == work_item_id
+    }
+    stimulus_turn_ids = {
+        row["turn_id"]
+        for row in snapshot["turn_records"]
+        if row["turn_id"] not in resume_turn_ids
+    }
+    harness.assert_tools(
+        "scheduler-compaction-stimulus",
+        baseline,
+        ["ExecCommand"],
+        forbidden,
+        turn_ids=stimulus_turn_ids,
+    )
+    harness.assert_tools(
+        "scheduler-compaction-resume",
+        baseline,
+        [
+            name
+            for name in required
+            if name in {"GetWorkItem", "UpdateWorkItem", "CompleteWorkItem"}
+        ],
+        forbidden + ["CreateWorkItem", "PickWorkItem", "WaitFor"],
+        turn_ids=resume_turn_ids,
+    )
     require_scheduler_engine_activation_chain(
         harness,
         snapshot,
         work_item_id=work_item_id,
-        expected_activation_count=2,
+        expected_source_kinds=("triggered_wait",),
+        conversation_message_ids={
+            harness.prompt_scope("scheduler-compaction-create")["message_id"]
+        },
     )
-    compaction_events = [
-        row
-        for row in snapshot["audit_events"]
-        if row["kind"] == "turn_local_compaction_applied"
-    ]
-    require(
-        len(compaction_events) >= 1,
-        f"compaction was not triggered; audit events: "
-        f"{[r['kind'] for r in snapshot['audit_events']]}",
+    require_turn_local_compaction(
+        snapshot,
+        label="scheduler-compaction",
     )
-    waits = [
-        row
-        for row in snapshot["wait_conditions"]
-        if row["work_item_id"] == work_item_id
-    ]
-    require(
-        len(waits) == 1
-        and waits[0]["kind"] == "operator"
-        and waits[0]["status"] == "resolved",
-        f"compaction operator wait did not resolve: {waits}",
+    waits = require_scheduler_wait_terminal(
+        harness,
+        snapshot,
+        work_item_id=work_item_id,
+        wait_kind="operator",
     )
     require_scheduler_engine_wait_resolution(
         harness,
@@ -2797,7 +4281,11 @@ def run_scheduler_worktree_isolation_case(
     )
     required, forbidden = phase_tools(phase)
     harness.assert_tools(
-        "scheduler-worktree-lifecycle", baseline, required, forbidden
+        "scheduler-worktree-lifecycle",
+        baseline,
+        required,
+        forbidden,
+        message_id=harness.prompt_scope("scheduler-worktree-lifecycle")["message_id"],
     )
     work_item_id = item["id"]
     require(item["state"] == "completed", f"WorkItem not completed: {item}")
@@ -2834,7 +4322,10 @@ def run_scheduler_worktree_isolation_case(
         harness,
         snapshot,
         work_item_id=work_item_id,
-        expected_activation_count=1,
+        expected_source_kinds=(),
+        conversation_message_ids={
+            harness.prompt_scope("scheduler-worktree-lifecycle")["message_id"]
+        },
     )
     harness.restart()
     restarted_items = harness.work_items("scheduler-worktree-after-restart")
@@ -2877,7 +4368,11 @@ def run_scheduler_spawn_agent_supervision_case(
     )
     required, forbidden = phase_tools(phase)
     create_events = harness.assert_tools(
-        "scheduler-spawn-and-complete", baseline, required, forbidden
+        "scheduler-spawn-and-complete",
+        baseline,
+        required,
+        forbidden,
+        message_id=harness.prompt_scope("scheduler-spawn-and-complete")["message_id"],
     )
     work_item_id = item["id"]
     require(item["state"] == "completed", f"WorkItem not completed: {item}")
@@ -2900,8 +4395,7 @@ def run_scheduler_spawn_agent_supervision_case(
     spawn_detail = harness.tool_detail(spawn_event, "scheduler-spawn")
     spawn_result = result_value(spawn_detail)
     require(
-        isinstance(spawn_result.get("agent_id"), str)
-        and spawn_result["agent_id"],
+        isinstance(spawn_result.get("agent_id"), str) and spawn_result["agent_id"],
         f"SpawnAgent result missing agent_id: {spawn_result}",
     )
     task_handle = spawn_result.get("task_handle") or {}
@@ -2915,7 +4409,10 @@ def run_scheduler_spawn_agent_supervision_case(
         harness,
         snapshot,
         work_item_id=work_item_id,
-        expected_activation_count=1,
+        expected_source_kinds=(),
+        conversation_message_ids={
+            harness.prompt_scope("scheduler-spawn-and-complete")["message_id"]
+        },
     )
     harness.restart()
     restarted_items = harness.work_items("scheduler-spawn-after-restart")
@@ -2977,14 +4474,15 @@ def run_scheduler_checkpoint_replay_case(
         expected_state="completed",
         label="scheduler-replay-b-completed",
     )
+    before_restart_snapshot = harness.runtime_db_snapshot(
+        "scheduler-replay-before-restart"
+    )
     harness.restart()
     restarted_items = harness.work_items("scheduler-replay-after-restart")
     restarted_a = next(
         item for item in restarted_items if item["id"] == waiting_a["id"]
     )
-    restarted_b = next(
-        item for item in restarted_items if item["id"] == item_b["id"]
-    )
+    restarted_b = next(item for item in restarted_items if item["id"] == item_b["id"])
     require(
         restarted_a.get("scheduling_state") == "waiting_external",
         f"WorkItem A did not survive restart in waiting state: {restarted_a}",
@@ -3006,7 +4504,13 @@ def run_scheduler_checkpoint_replay_case(
         label="scheduler-replay-a-completed",
     )
     required, forbidden = phase_tools(phase)
-    harness.assert_tools("scheduler-replay-create", baseline, required, forbidden)
+    harness.assert_tools(
+        "scheduler-replay-create",
+        baseline,
+        required,
+        forbidden,
+        message_id=harness.prompt_scope("scheduler-replay-create")["message_id"],
+    )
     work_item_a_id = item_a["id"]
     work_item_b_id = item_b["id"]
     require(item_a["state"] == "completed", f"WorkItem A not completed: {item_a}")
@@ -3032,24 +4536,31 @@ def run_scheduler_checkpoint_replay_case(
         harness,
         snapshot,
         work_item_id=work_item_a_id,
-        expected_activation_count=2,
+        expected_source_kinds=(
+            "work_item_continuation",
+            "work_item_continuation",
+            "triggered_wait",
+        ),
+        conversation_message_ids={
+            harness.prompt_scope("scheduler-replay-create")["message_id"]
+        },
     )
     require_scheduler_engine_activation_chain(
         harness,
         snapshot,
         work_item_id=work_item_b_id,
-        expected_activation_count=1,
+        expected_source_kinds=("work_item_continuation",),
+        conversation_message_ids={
+            harness.prompt_scope("scheduler-replay-create")["message_id"]
+        },
     )
-    waits = [
-        row
-        for row in snapshot["wait_conditions"]
-        if row["work_item_id"] == work_item_a_id
-    ]
-    require(
-        len(waits) == 1
-        and waits[0]["kind"] == "external"
-        and waits[0]["status"] == "resolved",
-        f"replay external wait did not resolve: {waits}",
+    waits = require_scheduler_wait_terminal(
+        harness,
+        snapshot,
+        work_item_id=work_item_a_id,
+        wait_kind="external",
+        require_callback_trigger=True,
+        callback_external_trigger_id=callback["external_trigger_id"],
     )
     require_scheduler_engine_wait_resolution(
         harness,
@@ -3057,22 +4568,26 @@ def run_scheduler_checkpoint_replay_case(
         work_item_id=work_item_a_id,
         wait_ids={wait["wait_condition_id"] for wait in waits},
     )
-    if harness.canonical_scheduler_enabled:
-        demands = [
-            row
-            for row in snapshot["scheduler_work_demands"]
-            if row["work_item_id"] in (work_item_a_id, work_item_b_id)
-        ]
-        require(
-            len(demands) == 2
-            and all(d["status"] == "terminal" for d in demands),
-            f"replay demands did not converge: {demands}",
-        )
-
+    require_checkpoint_restart_activation_lineage(
+        before_restart_snapshot,
+        snapshot,
+        work_item_id=work_item_a_id,
+        wait_id=waits[0]["wait_condition_id"],
+    )
+    require_execution_work_items_terminal(
+        snapshot,
+        agent_id=harness.agent_id,
+        work_item_ids={work_item_a_id, work_item_b_id},
+        label="replay",
+    )
 
 
 CASE_RUNNERS = {
     "runtime-auth-model-delivery": run_runtime_case,
+    "runtime-upgrade-v030": run_runtime_upgrade_previous_release_case,
+    "runtime-upgrade-interrupted-schema47": (
+        run_runtime_upgrade_interrupted_schema47_case
+    ),
     "memory-agent-home-persistence": run_memory_case,
     "workspace-restart-lifecycle": run_workspace_case,
     "workitem-wait-restart-complete": run_workitem_case,
@@ -3101,6 +4616,49 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     )
     cases = manifest.get("cases")
     require(isinstance(cases, list) and cases, "manifest cases must be non-empty")
+    profiles = manifest.get("profiles", {})
+    require(isinstance(profiles, dict), "manifest profiles must be an object")
+    for profile_id, profile in profiles.items():
+        require(
+            isinstance(profile_id, str) and profile_id,
+            "profile id must be non-empty",
+        )
+        require(isinstance(profile, dict), f"profile {profile_id} must be an object")
+        require(
+            profile.get("provider_mode", "live") in {"live", "stub"},
+            f"profile {profile_id} has invalid provider_mode",
+        )
+        require(
+            profile.get("gate_kind", "required") in {"required", "live_canary"},
+            f"profile {profile_id} has invalid gate_kind",
+        )
+        require(
+            profile.get("tool_assertion_mode", "strict") in {"strict", "observe"},
+            f"profile {profile_id} has invalid tool_assertion_mode",
+        )
+        if profile.get("gate_kind") == "live_canary":
+            require(
+                profile.get("provider_mode", "live") == "live",
+                f"profile {profile_id} live canary must use live provider mode",
+            )
+            require(
+                profile.get("tool_assertion_mode") == "observe",
+                f"profile {profile_id} live canary must observe tool assertions",
+            )
+        required = profile.get("required_coverage_ids", [])
+        require(
+            isinstance(required, list)
+            and len(required) == len(set(required))
+            and all(isinstance(value, str) and value for value in required),
+            f"profile {profile_id} required_coverage_ids must be unique strings",
+        )
+        case_ids = profile.get("case_ids", [])
+        require(
+            isinstance(case_ids, list)
+            and len(case_ids) == len(set(case_ids))
+            and all(isinstance(value, str) and value for value in case_ids),
+            f"profile {profile_id} case_ids must be unique strings",
+        )
     seen: set[str] = set()
     for case in cases:
         case_id = case.get("id")
@@ -3126,11 +4684,47 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
                 isinstance(case["requires_model"], bool),
                 f"{case_id} requires_model must be boolean",
             )
+        if "requires_previous_image" in case:
+            require(
+                isinstance(case["requires_previous_image"], bool),
+                f"{case_id} requires_previous_image must be boolean",
+            )
+        result_schema_revision_snapshot = case.get(
+            "result_schema_revision_snapshot"
+        )
+        require(
+            result_schema_revision_snapshot is None
+            or (
+                isinstance(result_schema_revision_snapshot, str)
+                and result_schema_revision_snapshot
+                and "/" not in result_schema_revision_snapshot
+            ),
+            f"{case_id} result_schema_revision_snapshot must be a file label",
+        )
+        coverage_ids = case.get("coverage_ids", [])
+        require(
+            isinstance(coverage_ids, list)
+            and len(coverage_ids) == len(set(coverage_ids))
+            and all(isinstance(value, str) and value for value in coverage_ids),
+            f"{case_id} coverage_ids must be unique strings",
+        )
+        provider_mode = case.get("provider_mode", "live")
+        require(
+            provider_mode in {"live", "stub"},
+            f"{case_id} has invalid provider_mode",
+        )
+        if provider_mode == "stub":
+            require(
+                isinstance(case.get("stub_scenario"), str) and case["stub_scenario"],
+                f"{case_id} stub provider mode requires stub_scenario",
+            )
         runtime_env = case.get("runtime_env", {})
-        require(isinstance(runtime_env, dict), f"{case_id} runtime_env must be an object")
+        require(
+            isinstance(runtime_env, dict), f"{case_id} runtime_env must be an object"
+        )
         require(
             "HOLON_SCHEDULER" not in runtime_env,
-            f"{case_id} must leave HOLON_SCHEDULER to the process matrix",
+            f"{case_id} must not configure the retired HOLON_SCHEDULER selector",
         )
         require(
             all(
@@ -3140,6 +4734,41 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
                 for name, value in runtime_env.items()
             ),
             f"{case_id} runtime_env must contain HOLON_ string entries",
+        )
+        model_runtime_override = case.get("model_runtime_override", {})
+        require(
+            isinstance(model_runtime_override, dict)
+            and all(
+                name
+                in {
+                    "prompt_budget_estimated_tokens",
+                    "compaction_trigger_estimated_tokens",
+                    "compaction_keep_recent_estimated_tokens",
+                }
+                and isinstance(value, int)
+                and value > 0
+                for name, value in model_runtime_override.items()
+            ),
+            f"{case_id} model_runtime_override must contain positive supported integers",
+        )
+        prompt_budget = model_runtime_override.get("prompt_budget_estimated_tokens")
+        compaction_trigger = model_runtime_override.get(
+            "compaction_trigger_estimated_tokens"
+        )
+        keep_recent = model_runtime_override.get(
+            "compaction_keep_recent_estimated_tokens"
+        )
+        require(
+            prompt_budget is None
+            or compaction_trigger is None
+            or compaction_trigger <= prompt_budget,
+            f"{case_id} compaction trigger exceeds prompt budget",
+        )
+        require(
+            compaction_trigger is None
+            or keep_recent is None
+            or keep_recent <= compaction_trigger,
+            f"{case_id} compaction keep-recent exceeds trigger",
         )
         phases = case.get("phases")
         require(isinstance(phases, list) and phases, f"{case_id} needs phases")
@@ -3168,6 +4797,33 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
                 not set(required).intersection(forbidden),
                 f"{case_id}/{phase_id} has required/forbidden tool overlap",
             )
+    known_case_ids = {case["id"] for case in cases}
+    cases_by_id = {case["id"]: case for case in cases}
+    known_coverage_ids = {
+        coverage_id for case in cases for coverage_id in case.get("coverage_ids", [])
+    }
+    for profile_id, profile in profiles.items():
+        profile_case_ids = profile.get("case_ids", [])
+        unknown = sorted(set(profile_case_ids) - known_case_ids)
+        require(not unknown, f"profile {profile_id} has unknown cases: {unknown}")
+        unknown_coverage = sorted(
+            set(profile.get("required_coverage_ids", [])) - known_coverage_ids
+        )
+        require(
+            not unknown_coverage,
+            f"profile {profile_id} has unknown coverage ids: {unknown_coverage}",
+        )
+        if profile.get("provider_mode", "live") == "stub":
+            missing_stub_scenarios = sorted(
+                case_id
+                for case_id in profile_case_ids
+                if not cases_by_id[case_id].get("stub_scenario")
+            )
+            require(
+                not missing_stub_scenarios,
+                f"profile {profile_id} cases require stub_scenario: "
+                f"{missing_stub_scenarios}",
+            )
 
 
 def select_cases(
@@ -3190,6 +4846,19 @@ def select_cases(
         ]
     require(selected, "case selection is empty")
     return selected
+
+
+def resolve_profile(manifest: dict[str, Any], profile_id: str | None) -> dict[str, Any]:
+    if profile_id is None:
+        return {
+            "gate_kind": "suite",
+            "provider_mode": "live",
+            "tool_assertion_mode": "strict",
+            "required_coverage_ids": [],
+        }
+    profiles = manifest.get("profiles", {})
+    require(profile_id in profiles, f"unknown profile: {profile_id}")
+    return profiles[profile_id]
 
 
 def expand_case_matrix(
@@ -3285,7 +4954,10 @@ def image_identity(image: str) -> dict[str, Any]:
 
 def collect_case_metrics(evidence: Path) -> dict[str, Any]:
     tool_counts: dict[str, int] = {}
+    behavioral_variances: list[dict[str, Any]] = []
+    provider_rounds = 0
     provider_attempts = 0
+    seen_event_seqs: set[int] = set()
     token_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     for path in evidence.glob("*-events.json"):
         try:
@@ -3293,26 +4965,75 @@ def collect_case_metrics(evidence: Path) -> dict[str, Any]:
         except (OSError, json.JSONDecodeError):
             continue
         for event in events:
+            event_seq = event.get("event_seq")
+            if isinstance(event_seq, int):
+                if event_seq in seen_event_seqs:
+                    continue
+                seen_event_seqs.add(event_seq)
             event_type = event.get("type")
             if event_type == "tool_executed":
                 name = event.get("payload", {}).get("tool_name", "unknown")
                 tool_counts[name] = tool_counts.get(name, 0) + 1
             if event_type == "provider_round_completed":
+                provider_rounds += 1
                 payload = event.get("payload", {})
                 provider_attempts += len(
-                    (payload.get("provider_attempt_timeline") or {}).get("attempts") or []
+                    (payload.get("provider_attempt_timeline") or {}).get("attempts")
+                    or []
                 )
                 usage = payload.get("token_usage") or {}
                 for key in token_usage:
                     token_usage[key] += int(usage.get(key) or 0)
+    for path in evidence.glob("*-tool-observation.json"):
+        try:
+            observation = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        missing = list(observation.get("missing") or [])
+        forbidden_actual = list(observation.get("forbidden_actual") or [])
+        if missing or forbidden_actual:
+            behavioral_variances.append(
+                {
+                    "scope": path.name.removesuffix("-tool-observation.json"),
+                    "missing_tools": missing,
+                    "forbidden_tools_used": forbidden_actual,
+                }
+            )
     return {
         "tool_counts": tool_counts,
+        "behavioral_variances": behavioral_variances,
+        "provider_rounds": provider_rounds,
         "provider_attempts": provider_attempts,
+        "provider_retries": max(0, provider_attempts - provider_rounds),
         "token_usage": token_usage,
     }
 
 
-def collect_case_schema_revision(evidence: Path) -> int | None:
+def collect_case_schema_revision(
+    evidence: Path,
+    result_snapshot: str | None = None,
+) -> int | None:
+    if result_snapshot is not None:
+        path = evidence / f"{result_snapshot}-runtime-db.json"
+        require(
+            path.is_file(),
+            f"result schema revision snapshot is missing for case "
+            f"{evidence.name}: {path.name}",
+        )
+        try:
+            value = json.loads(path.read_text()).get("schema_revision")
+        except (OSError, json.JSONDecodeError) as error:
+            raise AssertionError(
+                f"result schema revision snapshot is invalid for case "
+                f"{evidence.name}: {path.name}: {error}"
+            ) from error
+        require(
+            isinstance(value, int),
+            f"result schema revision snapshot has no revision for case "
+            f"{evidence.name}: {path.name}",
+        )
+        return value
+
     revisions = set()
     for path in evidence.glob("*-runtime-db.json"):
         try:
@@ -3333,23 +5054,54 @@ def scheduler_acceptance_report(
     run_record: dict[str, Any],
     case_results: list[dict[str, Any]],
     fixture_corpus_revision: str,
+    required_coverage_ids: set[str],
 ) -> dict[str, Any]:
     scheduler_results = [
         result
         for result in case_results
         if result.get("scheduler_engine") in SCHEDULER_ENGINES
     ]
-    expected_cases = {result["base_id"] for result in scheduler_results}
+    expected_cases = set(required_coverage_ids)
     engines = []
     all_revisions = set()
     diagnostics = []
+    missing_schema_revision_cases = sorted(
+        result["id"]
+        for result in scheduler_results
+        if result.get("schema_revision") is None
+    )
+    if missing_schema_revision_cases:
+        diagnostics.append(
+            {
+                "code": "missing_schema_revision_cases",
+                "cases": missing_schema_revision_cases,
+                "case_timeouts": sorted(
+                    result["id"]
+                    for result in scheduler_results
+                    if result["id"] in missing_schema_revision_cases
+                    and result.get("failure_kind") == "case_timeout"
+                ),
+                "evidence_collection_failures": sorted(
+                    result["id"]
+                    for result in scheduler_results
+                    if result["id"] in missing_schema_revision_cases
+                    and result.get("evidence_collection_error")
+                ),
+            }
+        )
     for engine in SCHEDULER_ENGINES:
         results = [
-            result for result in scheduler_results if result["scheduler_engine"] == engine
+            result
+            for result in scheduler_results
+            if result["scheduler_engine"] == engine
         ]
-        actual_cases = {result["base_id"] for result in results}
-        matrix_complete = (
-            actual_cases == expected_cases and len(results) == len(expected_cases)
+        coverage_counts: dict[str, int] = {}
+        for result in results:
+            for coverage_id in result.get("coverage_ids", [result["base_id"]]):
+                coverage_counts[coverage_id] = coverage_counts.get(coverage_id, 0) + 1
+        actual_cases = set(coverage_counts)
+        matrix_complete = actual_cases == expected_cases and all(
+            count == 1 for count in coverage_counts.values()
         )
         revisions = {
             result["schema_revision"]
@@ -3374,6 +5126,11 @@ def scheduler_acceptance_report(
                     "code": "engine_schema_revision_invalid",
                     "engine": engine,
                     "schema_revisions": sorted(revisions),
+                    "missing_cases": sorted(
+                        result["id"]
+                        for result in results
+                        if result.get("schema_revision") is None
+                    ),
                 }
             )
         all_revisions.update(revisions)
@@ -3399,7 +5156,7 @@ def scheduler_acceptance_report(
                 ],
             }
         )
-    if len(all_revisions) != 1:
+    if len(all_revisions) > 1:
         diagnostics.append(
             {
                 "code": "scheduler_schema_revision_mismatch",
@@ -3423,8 +5180,124 @@ def scheduler_acceptance_report(
         "image_digest": run_record["image_digest"],
         "fixture_corpus_revision": fixture_corpus_revision,
         "manifest_sha256": run_record["manifest_sha256"],
+        "missing_schema_revision_cases": missing_schema_revision_cases,
         "engines": engines,
         "diagnostics": diagnostics,
+    }
+
+
+def scheduler_coverage_report(
+    *,
+    run_record: dict[str, Any],
+    case_results: list[dict[str, Any]],
+    required_coverage_ids: set[str],
+    secret_scan_status: str,
+) -> dict[str, Any]:
+    observed: dict[str, list[str]] = {}
+    for result in case_results:
+        for coverage_id in result.get("coverage_ids", []):
+            observed.setdefault(coverage_id, []).append(result["id"])
+    missing = sorted(required_coverage_ids - observed.keys())
+    invalid_counts = {
+        coverage_id: evidence_ids
+        for coverage_id, evidence_ids in sorted(observed.items())
+        if coverage_id in required_coverage_ids
+        and len(evidence_ids) != len(SCHEDULER_ENGINES)
+    }
+    failed = sorted(
+        result["id"] for result in case_results if result["status"] != "pass"
+    )
+    return {
+        "schema_version": SCHEDULER_COVERAGE_REPORT_SCHEMA_VERSION,
+        "status": (
+            "pass"
+            if not missing
+            and not invalid_counts
+            and not failed
+            and secret_scan_status == "pass"
+            else "fail"
+        ),
+        "git_sha": run_record["git_sha"],
+        "image_digest": run_record["image_digest"],
+        "manifest_sha256": run_record["manifest_sha256"],
+        "profile": run_record["profile"],
+        "engines": list(SCHEDULER_ENGINES),
+        "required_coverage_ids": sorted(required_coverage_ids),
+        "observed": observed,
+        "missing_coverage_ids": missing,
+        "duplicate_or_incomplete_coverage_ids": invalid_counts,
+        "unexpected_coverage_ids": sorted(observed.keys() - required_coverage_ids),
+        "failed_evidence_ids": failed,
+        "secret_scan": secret_scan_status,
+    }
+
+
+def scheduler_live_canary_report(
+    *,
+    run_record: dict[str, Any],
+    case_results: list[dict[str, Any]],
+    scheduler_acceptance_status: str,
+    scheduler_coverage_status: str,
+    secret_scan_status: str,
+) -> dict[str, Any]:
+    scheduler_results = [
+        result
+        for result in case_results
+        if result.get("scheduler_engine") in SCHEDULER_ENGINES
+    ]
+    return {
+        "schema_version": SCHEDULER_LIVE_CANARY_REPORT_SCHEMA_VERSION,
+        "status": (
+            "pass"
+            if scheduler_results
+            and all(result["status"] == "pass" for result in scheduler_results)
+            and scheduler_acceptance_status == "pass"
+            and scheduler_coverage_status == "pass"
+            and secret_scan_status == "pass"
+            else "fail"
+        ),
+        "git_sha": run_record["git_sha"],
+        "image_digest": run_record["image_digest"],
+        "manifest_sha256": run_record["manifest_sha256"],
+        "profile": run_record["profile"],
+        "provider_mode": run_record["provider_mode"],
+        "model_route": run_record["model_route"],
+        "tool_assertion_mode": run_record["tool_assertion_mode"],
+        "scheduler_acceptance": scheduler_acceptance_status,
+        "scheduler_coverage": scheduler_coverage_status,
+        "secret_scan": secret_scan_status,
+        "provider_rounds": sum(
+            int(result.get("provider_rounds") or 0) for result in scheduler_results
+        ),
+        "provider_attempts": sum(
+            int(result.get("provider_attempts") or 0) for result in scheduler_results
+        ),
+        "provider_retries": sum(
+            int(result.get("provider_retries") or 0) for result in scheduler_results
+        ),
+        "behavioral_variances": [
+            {
+                "case_id": result["id"],
+                **variance,
+            }
+            for result in scheduler_results
+            for variance in result.get("behavioral_variances", [])
+        ],
+        "cases": [
+            {
+                "id": result["id"],
+                "base_id": result["base_id"],
+                "scheduler_engine": result["scheduler_engine"],
+                "status": result["status"],
+                "error": result["error"],
+                "provider_rounds": result.get("provider_rounds", 0),
+                "provider_attempts": result.get("provider_attempts", 0),
+                "provider_retries": result.get("provider_retries", 0),
+                "tool_counts": result.get("tool_counts", {}),
+                "behavioral_variances": result.get("behavioral_variances", []),
+            }
+            for result in scheduler_results
+        ],
     }
 
 
@@ -3449,7 +5322,9 @@ def write_junit(path: Path, cases: list[dict[str, Any]], duration: float) -> Non
             },
         )
         if case["status"] != "pass":
-            failure = ElementTree.SubElement(node, "failure", {"message": case["error"]})
+            failure = ElementTree.SubElement(
+                node, "failure", {"message": case["error"]}
+            )
             failure.text = case["error"]
     ElementTree.indent(suite)
     ElementTree.ElementTree(suite).write(path, encoding="unicode", xml_declaration=True)
@@ -3461,14 +5336,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--image-digest")
     parser.add_argument("--previous-image")
     parser.add_argument("--model")
-    parser.add_argument("--suite", choices=["core", "extended", "published"], default="core")
+    parser.add_argument(
+        "--suite", choices=["core", "extended", "published"], default="core"
+    )
     parser.add_argument("--case", action="append", dest="cases")
     parser.add_argument("--tag", action="append", default=[])
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument("--profile")
     parser.add_argument("--env-file", type=Path)
+    parser.add_argument("--config-file", type=Path)
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument("--keep-on-failure", action="store_true")
+    parser.add_argument("--timeout", type=int)
     parser.add_argument("--scheduler-matrix", action="store_true")
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--validate-manifest", action="store_true")
@@ -3479,6 +5359,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     manifest = json.loads(args.manifest.read_text())
     validate_manifest(manifest)
+    profile = resolve_profile(manifest, args.profile)
     if args.validate_manifest:
         print(f"valid manifest: {args.manifest}")
         return 0
@@ -3491,38 +5372,45 @@ def main(argv: list[str] | None = None) -> int:
     require(shutil.which("docker") is not None, "docker is required")
     selected = select_cases(
         manifest,
-        requested=args.cases,
+        requested=args.cases or profile.get("case_ids") or None,
         suite=args.suite,
         tags=args.tag,
     )
+    if any(case.get("requires_previous_image") for case in selected):
+        require(
+            bool(args.previous_image),
+            "selected upgrade case requires --previous-image",
+        )
     if args.scheduler_matrix:
         require(
             any("scheduler" in case.get("tags", []) for case in selected),
             "--scheduler-matrix requires at least one scheduler-tagged case",
         )
-    requires_model = any(case.get("requires_model", True) for case in selected)
+    requires_model = any(
+        case.get("requires_model", True)
+        and case.get("provider_mode", profile.get("provider_mode", "live")) == "live"
+        for case in selected
+    )
     model = args.model or first_env(
         "HOLON_E2E_MODEL", "HOLON_LIVE_MODEL", default=DEFAULT_MODEL
     )
-    raw_names = first_env(
-        "HOLON_E2E_CREDENTIAL_ENVS", "HOLON_LIVE_CREDENTIAL_ENVS"
-    )
+    raw_names = first_env("HOLON_E2E_CREDENTIAL_ENVS", "HOLON_LIVE_CREDENTIAL_ENVS")
     credential_envs = [name.strip() for name in raw_names.split(",") if name.strip()]
-    env_file_value = args.env_file or first_env(
-        "HOLON_E2E_DOCKER_ENV_FILE", "HOLON_LIVE_DOCKER_ENV_FILE"
-    )
-    env_file = Path(env_file_value).resolve() if env_file_value else None
+    env_file, config_file = provider_file_paths(args.env_file, args.config_file)
+    runtime_config = load_runtime_config(config_file)
     if requires_model and not credential_envs and env_file is None:
         inferred = inferred_credential_env(model)
         require(
             inferred is not None,
-            "set HOLON_E2E_CREDENTIAL_ENVS or HOLON_E2E_DOCKER_ENV_FILE "
+            "set HOLON_E2E_CREDENTIAL_ENVS or HOLON_E2E_PROVIDER_ENV_FILE "
             f"for model {model}",
         )
         credential_envs = [inferred]
     if requires_model:
         for name in credential_envs:
-            require(name in os.environ, f"required credential environment {name} is unset")
+            require(
+                name in os.environ, f"required credential environment {name} is unset"
+            )
     else:
         credential_envs = []
         env_file = None
@@ -3555,9 +5443,8 @@ def main(argv: list[str] | None = None) -> int:
     started_monotonic = time.monotonic()
     git_sha = run(["git", "rev-parse", "HEAD"]).stdout.strip()
     identity = image_identity(image)
-    image_digest = (
-        args.image_digest
-        or next(iter(identity.get("repo_digests") or []), None)
+    image_digest = args.image_digest or next(
+        iter(identity.get("repo_digests") or []), None
     )
     run_record = {
         "schema_version": EVIDENCE_SCHEMA_VERSION,
@@ -3571,12 +5458,17 @@ def main(argv: list[str] | None = None) -> int:
         "cases": [case["id"] for case in selected],
         "credential_env_names": credential_envs,
         "env_file_used": env_file is not None,
+        "config_file_used": config_file is not None,
         "manifest_sha256": hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
         "scheduler_matrix": args.scheduler_matrix,
+        "profile": args.profile,
+        "gate_kind": profile.get("gate_kind", "suite"),
+        "provider_mode": profile.get("provider_mode", "live"),
+        "tool_assertion_mode": profile.get("tool_assertion_mode", "strict"),
     }
     write_json(evidence_root / "run.json", run_record)
 
-    timeout_override = first_env(
+    timeout_override = args.timeout or first_env(
         "HOLON_E2E_TIMEOUT_SECONDS", "HOLON_LIVE_TIMEOUT_SECONDS"
     )
     keep_on_failure = args.keep_on_failure or env_flag(
@@ -3588,6 +5480,20 @@ def main(argv: list[str] | None = None) -> int:
         selected,
         scheduler_matrix=args.scheduler_matrix,
     )
+    if any(
+        case.get("provider_mode", profile.get("provider_mode", "live")) == "stub"
+        for case, _ in expanded_cases
+    ):
+        run(
+            [
+                "docker",
+                "build",
+                "--tag",
+                OPENAI_STUB_IMAGE,
+                str(OPENAI_STUB_ROOT),
+            ],
+            capture=False,
+        )
     for case, scheduler_engine in expanded_cases:
         case_id = case["id"]
         evidence_id = (
@@ -3599,8 +5505,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"Running {case_id} with {model}{engine_suffix}")
         runtime_env = dict(case.get("runtime_env", {}))
-        if scheduler_engine is not None:
-            runtime_env["HOLON_SCHEDULER"] = scheduler_engine
         harness = CaseHarness(
             case_id=evidence_id,
             image=image,
@@ -3608,6 +5512,7 @@ def main(argv: list[str] | None = None) -> int:
             requires_model=case.get("requires_model", True),
             credential_envs=credential_envs,
             env_file=env_file,
+            runtime_config=runtime_config,
             runtime_env=runtime_env,
             evidence_root=evidence_root,
             timeout_seconds=(
@@ -3616,22 +5521,47 @@ def main(argv: list[str] | None = None) -> int:
                 else int(case["timeout_seconds"])
             ),
             keep=False,
+            provider_mode=case.get(
+                "provider_mode", profile.get("provider_mode", "live")
+            ),
+            stub_scenario=case.get("stub_scenario", profile.get("stub_scenario")),
+            model_runtime_override=case.get("model_runtime_override"),
+            tool_assertion_mode=profile.get("tool_assertion_mode", "strict"),
+            previous_image=args.previous_image,
         )
         control_tokens.append(harness.token)
         error_text = ""
+        failure_kind: str | None = None
+        evidence_collection_error = ""
         try:
             CASE_RUNNERS[case_id](harness, case)
+            harness.assert_stub_complete()
             harness.capture_context("final")
             status = "pass"
             print(f"PASS {case_id}")
         except Exception as error:
             status = "fail"
             error_text = f"{type(error).__name__}: {error}"
+            if isinstance(error, TimeoutError):
+                failure_kind = "case_timeout"
             (harness.evidence / "failure.txt").write_text(error_text + "\n")
             try:
                 harness.capture_context("failure")
             except Exception:
                 pass
+            try:
+                harness.runtime_db_snapshot("failure-final")
+            except Exception as snapshot_error:
+                evidence_collection_error = (
+                    f"{type(snapshot_error).__name__}: {snapshot_error}"
+                )
+                write_json(
+                    harness.evidence / "failure-evidence-collection.json",
+                    {
+                        "status": "failed",
+                        "runtime_db_snapshot_error": evidence_collection_error,
+                    },
+                )
             try:
                 harness.capture_logs()
             except Exception:
@@ -3656,10 +5586,16 @@ def main(argv: list[str] | None = None) -> int:
             "tags": case.get("tags", []),
             "status": status,
             "error": error_text,
+            "failure_kind": failure_kind,
+            "evidence_collection_error": evidence_collection_error,
             "duration_seconds": round(time.monotonic() - case_started, 3),
             "cleanup": cleanup_result["status"],
             "cleanup_errors": cleanup_result["errors"],
-            "schema_revision": collect_case_schema_revision(harness.evidence),
+            "schema_revision": collect_case_schema_revision(
+                harness.evidence,
+                case.get("result_schema_revision_snapshot"),
+            ),
+            "coverage_ids": case.get("coverage_ids", []),
             **collect_case_metrics(harness.evidence),
         }
         write_json(harness.evidence / "case.json", result)
@@ -3678,7 +5614,10 @@ def main(argv: list[str] | None = None) -> int:
                 "duration_seconds": 0.0,
                 "cleanup": "not-applicable",
                 "tool_counts": {},
+                "behavioral_variances": [],
+                "provider_rounds": 0,
                 "provider_attempts": 0,
+                "provider_retries": 0,
                 "token_usage": {
                     "input_tokens": 0,
                     "output_tokens": 0,
@@ -3697,13 +5636,47 @@ def main(argv: list[str] | None = None) -> int:
         "secret_scan": scan["status"],
     }
     write_json(evidence_root / "summary.json", summary)
+    report_failures: list[str] = []
     if args.scheduler_matrix:
+        required_coverage_ids = set(profile.get("required_coverage_ids", []))
+        if not required_coverage_ids:
+            required_coverage_ids = {
+                coverage_id
+                for case in selected
+                for coverage_id in case.get("coverage_ids", [])
+            }
+        coverage_report = scheduler_coverage_report(
+            run_record=run_record,
+            case_results=case_results,
+            required_coverage_ids=required_coverage_ids,
+            secret_scan_status=scan["status"],
+        )
+        write_json(evidence_root / "scheduler-coverage-report.json", coverage_report)
+        if coverage_report["status"] != "pass":
+            report_failures.append("scheduler-coverage-report: fail")
         report = scheduler_acceptance_report(
             run_record=run_record,
             case_results=case_results,
             fixture_corpus_revision=manifest["scheduler_fixture_corpus_revision"],
+            required_coverage_ids=required_coverage_ids,
         )
         write_json(evidence_root / "scheduler-acceptance-report.json", report)
+        if report["status"] != "pass":
+            report_failures.append("scheduler-acceptance-report: fail")
+        if profile.get("gate_kind") == "live_canary":
+            canary_report = scheduler_live_canary_report(
+                run_record=run_record,
+                case_results=case_results,
+                scheduler_acceptance_status=report["status"],
+                scheduler_coverage_status=coverage_report["status"],
+                secret_scan_status=scan["status"],
+            )
+            write_json(
+                evidence_root / "scheduler-live-canary-report.json",
+                canary_report,
+            )
+            if canary_report["status"] != "pass":
+                report_failures.append("scheduler-live-canary-report: fail")
     write_junit(evidence_root / "junit.xml", case_results, duration)
 
     print(f"Evidence: {evidence_root}")
@@ -3711,7 +5684,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{case['id']}: {case['error']}"
         for case in case_results
         if case["status"] != "pass"
-    ]
+    ] + report_failures
     if failures:
         print("\n".join(failures), file=sys.stderr)
         return 1

@@ -7,6 +7,16 @@ pub(crate) const PRE_COMMIT_FAULTS: [crate::runtime_db::transitions::TransitionF
     crate::runtime_db::transitions::TransitionFaultPoint::BeforeCommit,
 ];
 
+pub(crate) const TERMINAL_PRE_COMMIT_FAULTS:
+    [crate::runtime_db::transitions::TransitionFaultPoint; 6] = [
+    crate::runtime_db::transitions::TransitionFaultPoint::AfterValidation,
+    crate::runtime_db::transitions::TransitionFaultPoint::AfterTerminalAgentStateWrite,
+    crate::runtime_db::transitions::TransitionFaultPoint::AfterTerminalTurnRecordWrite,
+    crate::runtime_db::transitions::TransitionFaultPoint::AfterCanonicalWrites,
+    crate::runtime_db::transitions::TransitionFaultPoint::AfterAuditWrites,
+    crate::runtime_db::transitions::TransitionFaultPoint::BeforeCommit,
+];
+
 pub(crate) const POST_COMMIT_FAULTS: [(
     crate::runtime_db::transitions::TransitionFaultPoint,
     &str,
@@ -28,6 +38,8 @@ pub(crate) const POST_COMMIT_FAULTS: [(
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DurableLifecycleSnapshot {
     pub(crate) agent_state: Option<AgentState>,
+    pub(crate) execution_protocol:
+        Option<crate::domain::execution_protocol::ExecutionProtocolState>,
     pub(crate) work_items: Vec<WorkItemRecord>,
     pub(crate) work_item_continuations: Vec<crate::types::WorkItemContinuationFrame>,
     pub(crate) wait_conditions: Vec<crate::types::WaitConditionRecord>,
@@ -135,6 +147,10 @@ impl LifecycleHarness {
                 .agent_states()
                 .latest("default")
                 .expect("read agent state"),
+            execution_protocol: runtime_db
+                .transitions()
+                .load_execution_protocol_state_if_initialized("default")
+                .expect("read execution protocol"),
             work_items: runtime_db
                 .work_items()
                 .latest_all()

@@ -23,7 +23,12 @@ on:
       - "scripts/docker-live-acceptance.py"
       - "scripts/docker_e2e/**"
       - ".github/workflows/e2e-scheduler-nightly.yml"
+      - ".github/workflows/release-e2e.yml"
       - "tests/e2e/scheduler/**"
+      - "apps/macos/**"
+      - "scripts/create-macos-dmg.sh"
+      - "scripts/package-macos-menu-app.sh"
+      - "scripts/verify-macos-menu-app.sh"
   pull_request:
     branches: [main]
     paths:
@@ -46,7 +51,12 @@ on:
       - "scripts/docker-live-acceptance.py"
       - "scripts/docker_e2e/**"
       - ".github/workflows/e2e-scheduler-nightly.yml"
+      - ".github/workflows/release-e2e.yml"
       - "tests/e2e/scheduler/**"
+      - "apps/macos/**"
+      - "scripts/create-macos-dmg.sh"
+      - "scripts/package-macos-menu-app.sh"
+      - "scripts/verify-macos-menu-app.sh"
   workflow_dispatch:
 
 permissions:
@@ -63,6 +73,7 @@ jobs:
       docker: ${{ steps.filter.outputs.docker }}
       rust: ${{ steps.filter.outputs.rust }}
       web: ${{ steps.filter.outputs.web }}
+      macos_app: ${{ steps.filter.outputs.macos_app }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -81,6 +92,8 @@ jobs:
               - 'scripts/docker-e2e.py'
               - 'scripts/docker-live-acceptance.py'
               - 'scripts/docker_e2e/**'
+              - '.github/workflows/e2e-scheduler-nightly.yml'
+              - '.github/workflows/release-e2e.yml'
             rust:
               - '.github/workflows/ci.yml'
               - 'src/**'
@@ -91,10 +104,74 @@ jobs:
               - 'Makefile'
               - 'agent_templates/**'
               - 'builtin_templates/**'
-              - 'web-gui/**'
             web:
               - 'web-gui/**'
               - '.github/workflows/ci.yml'
+            macos_app:
+              - '.github/workflows/ci.yml'
+              - 'apps/macos/**'
+              - 'scripts/package-macos-menu-app.sh'
+              - 'scripts/verify-macos-menu-app.sh'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'build.rs'
+              - 'src/**'
+
+  macos-app:
+    name: Build macOS menu app
+    runs-on: macos-latest
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.macos_app == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Build web GUI
+        run: make web
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install both macOS Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build bundled Holon runtime
+        run: cargo build --release --locked --target aarch64-apple-darwin --target x86_64-apple-darwin
+
+      - name: Merge universal Holon runtime
+        run: |
+          set -euo pipefail
+          mkdir -p target/universal-macos/release
+          lipo -create \
+            target/aarch64-apple-darwin/release/holon \
+            target/x86_64-apple-darwin/release/holon \
+            -output target/universal-macos/release/holon
+
+      - name: Test macOS menu app
+        run: swift test --package-path apps/macos/HolonMenu
+
+      - name: Package unsigned macOS app and DMG
+        run: |
+          set -euo pipefail
+          version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          scripts/package-macos-menu-app.sh \
+            target/universal-macos/release/holon \
+            dist \
+            "$version"
+
+      - name: Upload macOS app build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-holon-macos-app
+          path: |
+            dist/Holon.app
+            dist/Holon-*.dmg
+            dist/Holon-*.dmg.sha256
+          if-no-files-found: error
 
   docker:
     name: Docker
@@ -247,15 +324,17 @@ jobs:
           path: lcov.info
 
   e2e-scheduler:
-    name: E2E Scheduler (optional)
+    name: Scheduler Live Canary (optional)
     needs: changes
     if: contains(github.event.pull_request.labels.*.name, 'e2e-scheduler')
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 20
     env:
-      HOLON_E2E_MODEL: ${{ vars.HOLON_E2E_SCHEDULER_MODEL || 'deepseek/deepseek-v4-flash' }}
-      HOLON_E2E_DOCKER_ENV_FILE: /tmp/holon-e2e.env
+      HOLON_E2E_MODEL: ${{ vars.HOLON_E2E_SCHEDULER_MODEL || 'dashscope-token-plan/qwen-3.7' }}
+      HOLON_E2E_CREDENTIAL_ENV: ${{ vars.HOLON_E2E_SCHEDULER_CREDENTIAL_ENV || 'DASHSCOPE_TOKEN_PLAN_API_KEY' }}
+      HOLON_E2E_CREDENTIAL: ${{ secrets.HOLON_E2E_SCHEDULER_CREDENTIAL || secrets.DASHSCOPE_TOKEN_PLAN_API_KEY || secrets.DEEPSEEK_API_KEY }}
+      HOLON_E2E_CONFIG_JSON: ${{ vars.HOLON_E2E_SCHEDULER_CONFIG_JSON }}
     steps:
       - uses: actions/checkout@v4
 
@@ -272,27 +351,136 @@ jobs:
           cache-from: type=gha,scope=holon-docker
           cache-to: type=gha,mode=max,scope=holon-docker
 
-      - name: Prepare provider environment
+      - name: Prepare provider configuration
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          HOLON_E2E_PROVIDER_ENV_FILE: /tmp/holon-e2e.env
+          HOLON_E2E_PROVIDER_CONFIG_FILE: /tmp/holon-e2e-config.json
         run: |
           set -euo pipefail
-          test -n "${DEEPSEEK_API_KEY}"
+          test -n "${HOLON_E2E_CREDENTIAL}"
+          [[ "${HOLON_E2E_CREDENTIAL_ENV}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]
           umask 077
-          printf 'DEEPSEEK_API_KEY=%s\n' "${DEEPSEEK_API_KEY}" > "${HOLON_E2E_DOCKER_ENV_FILE}"
-          chmod 0600 "${HOLON_E2E_DOCKER_ENV_FILE}"
+          printf '%s=%s\n' \
+            "${HOLON_E2E_CREDENTIAL_ENV}" \
+            "${HOLON_E2E_CREDENTIAL}" > "${HOLON_E2E_PROVIDER_ENV_FILE}"
+          chmod 0600 "${HOLON_E2E_PROVIDER_ENV_FILE}"
+          if [ -n "${HOLON_E2E_CONFIG_JSON}" ]; then
+            printf '%s' "${HOLON_E2E_CONFIG_JSON}" > "${HOLON_E2E_PROVIDER_CONFIG_FILE}"
+            python3 -m json.tool "${HOLON_E2E_PROVIDER_CONFIG_FILE}" >/dev/null
+            chmod 0600 "${HOLON_E2E_PROVIDER_CONFIG_FILE}"
+          fi
 
-      - name: Run scheduler Tier-1 E2E
+      - name: Run scheduler live canary
+        env:
+          HOLON_E2E_PROVIDER_ENV_FILE: /tmp/holon-e2e.env
+        run: |
+          set -euo pipefail
+          config_file=/tmp/holon-e2e-config.json
+          args=(
+            --image holon:e2e
+            --skip-build
+            --profile scheduler-live-canary
+            --scheduler-matrix
+            --env-file "${HOLON_E2E_PROVIDER_ENV_FILE}"
+            --timeout 120
+            --evidence-dir target/docker-e2e/scheduler-live-canary
+          )
+          if [ -s "${config_file}" ]; then
+            args+=(--config-file "${config_file}")
+          fi
+          python3 scripts/docker-e2e.py "${args[@]}"
+
+      - name: Publish live canary summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          report_path = Path(
+              "target/docker-e2e/scheduler-live-canary/"
+              "scheduler-live-canary-report.json"
+          )
+          if not report_path.is_file():
+              raise SystemExit(0)
+          report = json.loads(report_path.read_text())
+          lines = [
+              "# Scheduler Live Canary",
+              "",
+              f"- Status: **{report['status']}**",
+              f"- Model: `{report['model_route']}`",
+              f"- Provider retries: `{report['provider_retries']}`",
+              f"- Tool counts: `{json.dumps(report['cases'][0]['tool_counts'], sort_keys=True)}`",
+              f"- Behavioral variance: `{json.dumps(report['behavioral_variances'], sort_keys=True)}`",
+          ]
+          Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text("\n".join(lines) + "\n")
+          PY
+
+      - name: Upload live canary evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scheduler-live-canary
+          path: target/docker-e2e/scheduler-live-canary
+
+      - name: Remove provider configuration
+        if: always()
+        env:
+          HOLON_E2E_PROVIDER_ENV_FILE: /tmp/holon-e2e.env
+          HOLON_E2E_PROVIDER_CONFIG_FILE: /tmp/holon-e2e-config.json
+        run: rm -f "${HOLON_E2E_PROVIDER_ENV_FILE}" "${HOLON_E2E_PROVIDER_CONFIG_FILE}"
+
+  scheduler-e2e-required:
+    name: Scheduler E2E Required
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.docker == 'true' || needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          push: false
+          tags: holon:scheduler-required
+          cache-from: type=gha,scope=holon-docker
+          cache-to: type=gha,mode=max,scope=holon-docker
+
+      - name: Run deterministic scheduler E2E
         run: |
           set -euo pipefail
           python3 scripts/docker-e2e.py \
-            --image holon:e2e \
+            --image holon:scheduler-required \
             --skip-build \
-            --suite extended \
-            --tag e2e-tier-1 \
-            --env-file "${HOLON_E2E_DOCKER_ENV_FILE}" \
-            --timeout 600
+            --profile scheduler-required \
+            --scheduler-matrix \
+            --timeout 120 \
+            --evidence-dir target/docker-e2e/scheduler-required
 
-      - name: Remove provider environment
+      - name: Verify required reports
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root = Path("target/docker-e2e/scheduler-required")
+          for name in (
+              "summary.json",
+              "scheduler-acceptance-report.json",
+              "scheduler-coverage-report.json",
+          ):
+              report = json.loads((root / name).read_text())
+              if report["status"] != "pass":
+                  raise SystemExit(f"{name} did not pass: {report['status']}")
+          PY
+
+      - name: Upload scheduler evidence
         if: always()
-        run: rm -f "${HOLON_E2E_DOCKER_ENV_FILE}"
+        uses: actions/upload-artifact@v4
+        with:
+          name: scheduler-e2e-required
+          path: target/docker-e2e/scheduler-required

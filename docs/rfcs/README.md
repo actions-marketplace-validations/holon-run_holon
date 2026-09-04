@@ -24,6 +24,7 @@ implementation and tests.
 - [Agent Profile Model](./agent-profile-model.md)
 - [Runtime Scheduler Contract](./runtime-scheduler-contract.md)
 - [Scheduler Cutover Simplification](./scheduler-cutover-simplification.md)
+- [Scheduler–WorkItem Unified Execution Protocol](./scheduler-work-item-unified-execution-protocol.md)
 - [Agent Activation, Settlement, and Dispatch](./agent-activation-settlement-and-dispatch.md)
 - [Result Closure](./result-closure.md)
 - [Continuation Trigger](./continuation-trigger.md)
@@ -40,6 +41,7 @@ implementation and tests.
 - [Turn Model Lineage And Recovery](./turn-model-lineage-and-recovery.md)
 - [Continuation Anchor](./continuation-anchor.md)
 - [Turn-Based Context Projection](./turn-based-context-projection.md)
+- [Deterministic Projection Evaluation Phase 0](./projection-evaluation-phase-0.md)
 - [Operator Interjection Safe Points](./operator-interjection-safe-points.md)
 - [Operator Notification and Intervention](./operator-wait-and-intervention.md)
 - [Waiting Plane And Reactivation](./waiting-plane-and-reactivation.md)
@@ -56,10 +58,12 @@ implementation and tests.
 ## Provenance, Policy, And Execution
 
 - [Provenance, Admission, and Authority](./default-trust-auth-and-control.md)
+- [Session-First Authentication](./session-first-authentication.md)
 - [Remote Operator Transport and Delivery](./remote-operator-transport-and-delivery.md)
 - [Execution Policy and Virtual Execution Boundary](./execution-policy-and-virtual-execution-boundary.md)
 - [Runtime Configuration Surface](./runtime-configuration-surface.md)
 - [Extensible Model And Provider Configuration](./extensible-model-provider-configuration.md)
+- [First-Class Ollama Provider](./first-class-ollama-provider.md)
 - [Model Capability Resolution](./model-capability-resolution.md)
 - [Model Metadata Precedence](./model-metadata-precedence.md)
 
@@ -77,6 +81,8 @@ implementation and tests.
 ## Eventing And Client Surface
 
 - [Event Stream Interface Design](./event-stream-interface.md)
+- [macOS Menu App And Daemon Lifecycle](./macos-menu-app-and-daemon-lifecycle.md)
+- [Event-Ledger Web Synchronization and Browser-Local Read State](./observer-sync-agent-summary-and-read-markers.md)
 - [Debug Prompt JSON Envelope](./debug-prompt-json-envelope.md)
 - [Operator Display Levels and Event Presentation](./operator-display-levels-and-event-presentation.md)
 

@@ -26,6 +26,10 @@ pub fn provider_doctor(config: &AppConfig) -> Value {
             .providers
             .get(&model_ref.provider)
             .map(|provider| {
+                let security_warnings = provider
+                    .unauthenticated_cleartext_remote_warning()
+                    .into_iter()
+                    .collect::<Vec<_>>();
                 json!({
                     "base_url": provider.base_url,
                     "transport": provider.transport.as_str(),
@@ -37,6 +41,7 @@ pub fn provider_doctor(config: &AppConfig) -> Value {
                         "external": provider.auth.external,
                         "credential_configured": provider.has_configured_credential(),
                     },
+                    "security_warnings": security_warnings,
                 })
             })
             .unwrap_or_else(|| json!({"error": "provider_not_configured"}));
@@ -348,6 +353,12 @@ fn resolved_model_availability_entry(
         .as_str()
         .or_else(|| availability["failure_kind"].as_str())
         .map(ToString::to_string);
+    let failure_kind = availability["failure_kind"]
+        .as_str()
+        .map(ToString::to_string);
+    let failure_disposition = availability["disposition"]
+        .as_str()
+        .map(ToString::to_string);
     let unavailable_reason = if available {
         None
     } else if !provider_configured {
@@ -387,6 +398,8 @@ fn resolved_model_availability_entry(
         credential_configured: credential_configured || available,
         available,
         unavailable_reason,
+        failure_kind,
+        failure_disposition,
         policy,
         resolved_capabilities,
     }
@@ -520,7 +533,10 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
-        config::{provider_registry_for_tests, AppConfig, ControlAuthMode, ModelRef, ProviderId},
+        config::{
+            built_in_provider_registry_with_settings, provider_registry_for_tests, AppConfig,
+            ControlAuthMode, ModelRef, ModelRouteRef, ProviderId,
+        },
         model_catalog::{ModelMetadataSource, ModelRuntimeOverride},
     };
 
@@ -560,6 +576,7 @@ mod tests {
             max_relevant_episodes: 3,
             control_token: Some("control-value".into()),
             control_auth_mode: ControlAuthMode::Auto,
+            auth: Default::default(),
             api_cors: Default::default(),
             config_file_path: home_path.join("config.json"),
             stored_config: Default::default(),
@@ -576,7 +593,6 @@ mod tests {
             default_tool_output_tokens: crate::tool::helpers::DEFAULT_TOOL_OUTPUT_TOKENS as u32,
             max_tool_output_tokens: crate::tool::helpers::MAX_TOOL_OUTPUT_TOKENS as u32,
             disable_provider_fallback: false,
-            scheduler_engine: crate::config::SchedulerEngineMode::Canonical,
             tui_alternate_screen: crate::config::AltScreenMode::Auto,
             validated_model_overrides: HashMap::new(),
             validated_unknown_model_fallback: None,
@@ -643,6 +659,7 @@ mod tests {
             openai.unavailable_reason.as_deref(),
             Some("credential_missing")
         );
+        assert_eq!(openai.failure_disposition.as_deref(), Some("fail_fast"));
     }
 
     #[test]
@@ -938,5 +955,30 @@ mod tests {
             .expect("onboarding sections")
             .iter()
             .any(|section| section["id"].as_str() == Some("model_provider")));
+    }
+
+    #[test]
+    fn provider_doctor_warns_for_remote_cleartext_unauthenticated_endpoint() {
+        let mut fixture = test_config(Some("openai-key"));
+        let ollama_id = ProviderId::parse("ollama").unwrap();
+        let mut built_ins = built_in_provider_registry_with_settings(&HashMap::new()).unwrap();
+        fixture
+            .config
+            .providers
+            .insert(ollama_id.clone(), built_ins.remove(&ollama_id).unwrap());
+        fixture.config.default_model =
+            ModelRouteRef::parse_compatible("ollama/qwen3.8:latest").unwrap();
+        let ollama = fixture
+            .config
+            .providers
+            .get_mut(&ollama_id)
+            .expect("ollama provider");
+        ollama.base_url = "http://192.0.2.10:11434".into();
+
+        let doctor = provider_doctor(&fixture.config);
+        let warning = doctor["providers"][0]["settings"]["security_warnings"][0]
+            .as_str()
+            .expect("security warning");
+        assert!(warning.contains("remote, cleartext HTTP, and unauthenticated"));
     }
 }

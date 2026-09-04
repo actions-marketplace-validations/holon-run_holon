@@ -1,4 +1,6 @@
 use super::*;
+use crate::config::ModelRouteRef;
+use crate::runtime::turn::TurnModelSelection;
 use crate::runtime::turn::TurnTerminalTransition;
 use crate::tool::{ApplyPatchSurface, ToolSpec};
 use crate::types::ExecutionAdmissionProvenance;
@@ -12,16 +14,41 @@ impl RuntimeHandle {
         loop_control: LoopControlOptions,
     ) -> Result<()> {
         let terminal_transition = self
-            .process_interactive_message_deferred(
+            .process_interactive_message_deferred_with_cleanup(
                 message,
                 continuation_resolution,
-                self.legacy_execution_admission_provenance(message, continuation_resolution, None)?,
+                self.execution_admission_provenance(message, continuation_resolution, None)?,
                 loop_control,
             )
             .await?;
         self.persist_terminal_transition(&terminal_transition)
             .await?;
         Ok(())
+    }
+
+    pub(super) async fn process_interactive_message_deferred_with_cleanup(
+        &self,
+        message: &MessageEnvelope,
+        continuation_resolution: Option<&ContinuationResolution>,
+        execution_admission_provenance: ExecutionAdmissionProvenance,
+        loop_control: LoopControlOptions,
+    ) -> Result<TurnTerminalTransition> {
+        let result = Box::pin(self.process_interactive_message_deferred(
+            message,
+            continuation_resolution,
+            execution_admission_provenance,
+            loop_control,
+        ))
+        .await;
+        let cleanup = self.reconfigure_provider_for_turn(None).await;
+        match (result, cleanup) {
+            (Ok(transition), Ok(())) => Ok(transition),
+            (Ok(_), Err(error)) => Err(error.context("failed to clear turn-local model selection")),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(cleanup_error)) => Err(error.context(format!(
+                "also failed to clear turn-local model selection: {cleanup_error}"
+            ))),
+        }
     }
 
     pub(super) async fn process_interactive_message_deferred(
@@ -40,6 +67,32 @@ impl RuntimeHandle {
             execution_admission_provenance,
         )
         .await?;
+        let model_selection = TurnModelSelection::from_message(message)?;
+        self.reconfigure_provider_for_turn(model_selection.fallback_model())
+            .await?;
+        if let Some(recovery) = model_selection.recovery.as_ref() {
+            let (turn_id, run_id) = {
+                let guard = self.inner.agent.lock().await;
+                (
+                    guard.state.current_turn_id.clone(),
+                    guard.state.current_run_id.clone(),
+                )
+            };
+            self.inner.storage.append_event(&AuditEvent::legacy(
+                "recovery_turn_started",
+                serde_json::json!({
+                    "agent_id": message.agent_id,
+                    "message_id": message.id,
+                    "turn_id": turn_id,
+                    "run_id": run_id,
+                    "fallback_model_ref": recovery.fallback_model_ref,
+                    "source_turn_id": recovery.source_turn_id,
+                    "source_message_id": recovery.source_message_id,
+                    "source_terminal_kind": recovery.source_terminal_kind,
+                    "source_round": recovery.source_round,
+                }),
+            ))?;
+        }
         self.record_incoming_transcript_entry(message)?;
         self.inner
             .storage
@@ -64,8 +117,9 @@ impl RuntimeHandle {
             }
             let state = guard.state.clone();
             drop(guard);
-            let (provider, available_tools, apply_patch_surface, _, _) =
-                self.provider_tool_selection(&identity).await?;
+            let (provider, available_tools, apply_patch_surface, _, _) = self
+                .provider_tool_selection_for_turn(&identity, model_selection.fallback_model())
+                .await?;
             let prompt_tools = provider.prompt_tool_specs(&available_tools);
             let workspace = self.workspace_view_from_state(&state)?;
             let execution = self.execution_snapshot_for_view(
@@ -114,26 +168,35 @@ impl RuntimeHandle {
                 "rendered_system_chars": built.rendered_system_prompt.chars().count(),
             }),
         ))?;
-        let outcome = self
+        let mut outcome = self
             .run_agent_loop_deferred(
                 &message.agent_id,
                 message.authority_class.clone(),
                 built,
+                model_selection,
                 loop_control,
             )
             .await?;
         crate::diagnostics::record_turn_total(context_build_started.elapsed());
         let cleanup_started = std::time::Instant::now();
 
-        if outcome.terminal_kind.is_failure() {
+        if outcome.prepared_work_item_completion.is_some() {
+            // The completion report brief, WorkItem transition, tool execution,
+            // Turn terminal, queue claim, and execution outcome are committed
+            // together by the outer canonical terminal settlement.
+        } else if outcome.terminal_kind.is_failure() {
             let mut brief =
                 brief::make_failure(&message.agent_id, message, outcome.final_text.clone());
+            if !outcome.final_citations.is_empty() {
+                brief.citations = Some(outcome.final_citations.clone());
+            }
             brief.turn_index = Some(outcome.turn_index);
             bind_brief_to_assistant_round(
                 &mut brief,
                 outcome.final_text_source_assistant_round_id.as_deref(),
             );
             self.persist_brief(&brief).await?;
+            outcome.terminal.no_brief_reason = None;
         } else if !outcome.final_text.trim().is_empty() {
             // Always generate the normal result brief (no longer suppressed for
             // promoted completion reports). The same turn supports multiple briefs,
@@ -143,17 +206,43 @@ impl RuntimeHandle {
             // has no operator delivery, so it must not create an empty result brief.
             let mut brief =
                 brief::make_result(&message.agent_id, message, outcome.final_text.clone());
+            if !outcome.final_citations.is_empty() {
+                brief.citations = Some(outcome.final_citations.clone());
+            }
             brief.turn_index = Some(outcome.turn_index);
             bind_brief_to_assistant_round(
                 &mut brief,
                 outcome.final_text_source_assistant_round_id.as_deref(),
             );
             self.persist_brief(&brief).await?;
+            outcome.terminal.no_brief_reason = None;
         }
-        let turn_record = self.build_turn_record(&outcome.terminal).await?;
+        let mut turn_record = self.build_turn_record(&outcome.terminal).await?;
+        if let Some(prepared) = outcome.prepared_work_item_completion.as_ref() {
+            if !turn_record.produced_brief_ids.contains(&prepared.brief.id) {
+                turn_record
+                    .produced_brief_ids
+                    .push(prepared.brief.id.clone());
+            }
+            if !turn_record
+                .completed_work_item_ids
+                .contains(&prepared.record.id)
+            {
+                turn_record
+                    .completed_work_item_ids
+                    .push(prepared.record.id.clone());
+            }
+            if let Some(tool_execution) = prepared.tool_execution.as_ref() {
+                if !turn_record.tool_execution_ids.contains(&tool_execution.id) {
+                    turn_record
+                        .tool_execution_ids
+                        .push(tool_execution.id.clone());
+                }
+            }
+        }
         self.promote_turn_active_skills().await?;
 
-        if outcome.should_sleep {
+        if outcome.should_sleep && outcome.prepared_work_item_completion.is_none() {
             if outcome.allow_sleep_runnable_work_override {
                 self.transition_to_sleep(outcome.sleep_duration_ms).await?;
             } else {
@@ -166,6 +255,8 @@ impl RuntimeHandle {
         Ok(TurnTerminalTransition {
             terminal: outcome.terminal,
             turn_record,
+            prepared_work_item_completion: outcome.prepared_work_item_completion,
+            terminal_tool_executions: outcome.terminal_tool_executions,
         })
     }
 
@@ -358,6 +449,20 @@ impl RuntimeHandle {
         Option<ProviderNativeWebSearchRequest>,
         BuiltinWebSearchSelectionDiagnostics,
     )> {
+        self.provider_tool_selection_for_turn(identity, None).await
+    }
+
+    pub(super) async fn provider_tool_selection_for_turn(
+        &self,
+        identity: &AgentIdentityView,
+        fallback_model: Option<&ModelRouteRef>,
+    ) -> Result<(
+        Arc<dyn AgentProvider>,
+        Vec<ToolSpec>,
+        ApplyPatchSurface,
+        Option<ProviderNativeWebSearchRequest>,
+        BuiltinWebSearchSelectionDiagnostics,
+    )> {
         let provider = self.current_provider().await;
         let web_config = self.web_config();
         let native_search_provider = web_config.native_search_provider();
@@ -406,7 +511,7 @@ impl RuntimeHandle {
         let native_web_search = native_web_search_selection.request;
         let apply_patch_surface = {
             let guard = self.inner.agent.lock().await;
-            self.apply_patch_surface_for_state(&guard.state)
+            self.apply_patch_surface_for_turn(&guard.state, fallback_model)
         };
         let available_tools = filter_native_web_search_tools(
             self.filtered_tool_specs_for_apply_patch_surface(identity, apply_patch_surface)?,
@@ -471,6 +576,9 @@ async fn probe_builtin_web_search_capability(
     ) {
         (ProviderNativeWebSearchKind::OpenAi, "openai_responses", "web_search_preview")
         | (ProviderNativeWebSearchKind::OpenAi, "openai_codex_responses", "web_search")
+        | (ProviderNativeWebSearchKind::DeepSeek, "openai_responses", "web_search")
+        | (ProviderNativeWebSearchKind::DeepSeek, "openai_responses", "web_search_2025_08_26")
+        | (ProviderNativeWebSearchKind::DeepSeek, "anthropic_messages", "web_search_20250305")
         | (ProviderNativeWebSearchKind::Anthropic, "anthropic_messages", "web_search_20250305") => {
             true
         }

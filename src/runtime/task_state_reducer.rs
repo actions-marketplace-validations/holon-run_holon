@@ -1,8 +1,5 @@
 use super::{scheduler, *};
-use crate::types::{
-    ExecutionAdmissionProvenance, WaitConditionKind, WaitConditionStatus, WakeSource,
-    WorkItemRecord, WorkItemState,
-};
+use crate::types::{BriefKind, ExecutionAdmissionProvenance};
 use sha2::{Digest, Sha256};
 
 const TASK_TRANSITION_MAX_ATTEMPTS: usize = 3;
@@ -62,11 +59,30 @@ fn task_status_phase(status: &TaskStatus) -> u8 {
 pub(super) struct TaskTransition<'a> {
     pub(super) task: &'a TaskRecord,
     pub(super) event_kind: &'static str,
+    pub(super) message_evidence: Option<&'a MessageEnvelope>,
+    pub(super) admit_result_message: bool,
 }
 
 impl<'a> TaskTransition<'a> {
     pub(super) fn new(task: &'a TaskRecord, event_kind: &'static str) -> Self {
-        Self { task, event_kind }
+        Self {
+            task,
+            event_kind,
+            message_evidence: None,
+            admit_result_message: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_message_evidence(mut self, message: &'a MessageEnvelope) -> Self {
+        self.message_evidence = Some(message);
+        self
+    }
+
+    pub(super) fn with_terminal_result(mut self, message: &'a MessageEnvelope) -> Self {
+        self.message_evidence = Some(message);
+        self.admit_result_message = true;
+        self
     }
 }
 
@@ -97,6 +113,14 @@ impl RuntimeHandle {
                     if task_transition_error_is_retryable_conflict(&error)
                         && attempt + 1 < TASK_TRANSITION_MAX_ATTEMPTS =>
                 {
+                    if transition.admit_result_message {
+                        // The attempt future has returned, so its local agent
+                        // guard is dropped before this refresh re-locks it.
+                        let agent_id = transition.task.agent_id.as_str();
+                        if !self.refresh_enqueue_agent_state_baseline(agent_id).await? {
+                            return Err(error);
+                        }
+                    }
                     continue;
                 }
                 Err(error) if task_transition_error_is_retryable_conflict(&error) => {
@@ -143,13 +167,24 @@ impl RuntimeHandle {
         };
 
         let agent_id = self.agent_id().await?;
-        let mut state = self.agent_state().await?;
-        let expected_state = state.clone();
+        let mut agent_guard = if transition.admit_result_message {
+            Some(self.inner.agent.lock().await)
+        } else {
+            None
+        };
+        let (mut state, expected_state) = if let Some(guard) = agent_guard.as_ref() {
+            (guard.state.clone(), guard.last_persisted_state.clone())
+        } else {
+            let state = self.agent_state().await?;
+            let expected_state = state.clone();
+            (state, expected_state)
+        };
         if !matches!(state.status, AgentStatus::Stopped) && state.current_run_id.is_none() {
             scheduler::apply_idle_projection(&mut state, &self.inner.storage)?;
         }
+        let mut expected_wait_conditions = Vec::new();
         let mut wait_conditions = Vec::new();
-        let mut work_items = Vec::new();
+        let work_items = Vec::new();
         let mut audit_events = Vec::new();
         let mut index_changes = Vec::new();
         if task_will_change {
@@ -184,114 +219,154 @@ impl RuntimeHandle {
             }
         }
         if is_terminal_task_status(&task.status) {
-            let matching = self
-                .inner
-                .storage
-                .active_wait_conditions_for_agent(&agent_id)?
-                .into_iter()
-                .filter(|condition| {
-                    condition.wake_sources.iter().any(|source| {
-                        matches!(source, WakeSource::TaskResult { task_id } if task_id == &task.id)
-                    })
-                })
-                .collect::<Vec<_>>();
-            let now = Utc::now();
-            let mut resolved_ids = Vec::with_capacity(matching.len());
-            let mut updated_work_item_ids = std::collections::BTreeSet::new();
-            for condition in matching {
-                let mut resolved = condition.clone();
-                resolved.status = WaitConditionStatus::Resolved;
-                resolved.updated_at = now;
-                resolved.resolved_at = Some(now);
-                wait_conditions.push(resolved.clone());
-                resolved_ids.push(condition.id);
-                if resolved.kind == WaitConditionKind::Task {
-                    if let Some(work_item_id) = resolved.work_item_id.as_deref() {
-                        if updated_work_item_ids.insert(work_item_id.to_string()) {
-                            if let Some(existing) =
-                                self.inner.runtime_db.work_items().latest(work_item_id)?
-                            {
-                                if existing.state == WorkItemState::Open
-                                    && existing.blocked_by.as_deref()
-                                        == Some(resolved.waiting_for.as_str())
-                                {
-                                    let mut record = WorkItemRecord {
-                                        revision: existing.revision + 1,
-                                        blocked_by: None,
-                                        recheck_at: None,
-                                        recheck_consumed_at: None,
-                                        updated_at: now,
-                                        ..existing.clone()
-                                    };
-                                    let plan_artifact_changed =
-                                        crate::work_item_plan::refresh_plan_artifact_metadata(
-                                            self.agent_home().as_path(),
-                                            &mut record,
-                                        )?;
-                                    if plan_artifact_changed {
-                                        if let Some(event) =
-                                            self.work_item_plan_artifact_refreshed_event(&record)
-                                        {
-                                            audit_events.push(event);
-                                        }
-                                    }
-                                    audit_events.push(self.work_item_written_event(
-                                        "wait_for_task_resolved",
-                                        &record,
-                                        serde_json::json!({
-                                            "wait_condition_id": resolved.id,
-                                        }),
-                                    ));
-                                    index_changes.extend(
-                                        self.inner.storage.index_changes_for_work_item(&record)?,
-                                    );
-                                    work_items.push(
-                                        crate::runtime_db::transitions::WorkItemMutation::Update {
-                                            record,
-                                            expected_revision: existing.revision,
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                    }
+            if let Some(message) = transition.message_evidence {
+                if let Some(wait_trigger) = self.wait_trigger_transition_for_message(message)? {
+                    expected_wait_conditions.push(wait_trigger.expected);
+                    wait_conditions.push(wait_trigger.record.clone());
+                    audit_events.push(AuditEvent::legacy(
+                        "wait_condition_triggered",
+                        serde_json::json!({
+                            "agent_id": agent_id,
+                            "wait_condition_id": wait_trigger.record.id,
+                            "trigger_message_id": message.id,
+                            "work_item_id": wait_trigger.record.work_item_id,
+                        }),
+                    ));
                 }
-            }
-            if !resolved_ids.is_empty() {
-                audit_events.push(AuditEvent::legacy(
-                    "wait_conditions_resolved",
-                    serde_json::json!({
-                        "agent_id": agent_id,
-                        "task_id": task.id,
-                        "reason": "task_result",
-                        "wait_condition_ids": resolved_ids,
-                    }),
-                ));
             }
         }
         #[cfg(test)]
         self.inject_task_transition_conflict_if_armed().await?;
+        #[cfg(test)]
+        self.inject_terminal_task_transition_conflict_if_armed()?;
+        let existing_queue_entry = transition
+            .message_evidence
+            .filter(|_| transition.admit_result_message)
+            .map(|message| self.inner.runtime_db.queue_entries().latest(&message.id))
+            .transpose()?
+            .flatten();
+        let result_message_is_new = transition
+            .message_evidence
+            .filter(|_| transition.admit_result_message)
+            .map(|message| self.inner.storage.read_message_by_id(&message.id))
+            .transpose()?
+            .flatten()
+            .is_none();
+        let queue_entry = transition
+            .message_evidence
+            .filter(|_| transition.admit_result_message)
+            .filter(|_| {
+                existing_queue_entry.as_ref().is_none_or(|entry| {
+                    matches!(
+                        entry.status,
+                        QueueEntryStatus::Queued | QueueEntryStatus::Interrupted
+                    )
+                })
+            })
+            .map(|message| QueueEntryRecord {
+                message_id: message.id.clone(),
+                agent_id: message.agent_id.clone(),
+                priority: message.priority.clone(),
+                status: QueueEntryStatus::Queued,
+                created_at: existing_queue_entry
+                    .as_ref()
+                    .map_or(message.created_at, |entry| entry.created_at),
+                updated_at: Utc::now(),
+            });
+        if let Some(message) = transition
+            .message_evidence
+            .filter(|_| queue_entry.is_some() && result_message_is_new)
+        {
+            audit_events.extend([
+                AuditEvent::legacy(
+                    "message_admitted",
+                    serde_json::json!({
+                        "message_id": message.id,
+                        "agent_id": message.agent_id,
+                        "kind": message.kind,
+                        "origin": message.origin,
+                        "authority_class": message.authority_class,
+                        "delivery_surface": message.delivery_surface,
+                        "admission_context": message.admission_context,
+                        "trigger_kind": message.trigger_kind,
+                        "work_item_id": message.work_item_id,
+                        "task_id": message.task_id,
+                        "source_refs": message.source_refs,
+                        "correlation_id": message.correlation_id,
+                        "causation_id": message.causation_id,
+                    }),
+                ),
+                AuditEvent::typed(
+                    RuntimeEventKind::MessageEnqueued,
+                    &MessageLifecycleAuditEvent::from_message(message),
+                )?,
+            ]);
+        }
+        let queue_needs_push = queue_entry.as_ref().is_some_and(|entry| {
+            agent_guard.as_ref().is_some_and(|guard| {
+                guard
+                    .queue
+                    .peek_next_matching(|message| message.id == entry.message_id)
+                    .is_none()
+            })
+        });
+        if queue_needs_push {
+            state.pending = agent_guard
+                .as_ref()
+                .map_or(state.pending.saturating_add(1), |guard| {
+                    guard.queue.len().saturating_add(1)
+                });
+            state.last_wake_reason = Some("TaskResult".into());
+            state.total_message_count = self
+                .inner
+                .storage
+                .count_messages()?
+                .saturating_add(usize::from(result_message_is_new));
+            scheduler::apply_message_wake_projection(&mut state);
+        }
         let agent_state =
             (state != expected_state).then(|| crate::runtime_db::transitions::AgentStateMutation {
                 expected: Some(Box::new(expected_state)),
-                record: Box::new(state),
+                record: Box::new(state.clone()),
             });
-        let commit = self.inner.runtime_db.transitions().commit_task(
-            &crate::runtime_db::transitions::TaskTransitionCommand {
+        let message_evidence = transition
+            .message_evidence
+            .map(|message| {
+                let mut message = message.clone();
+                message.normalize_admission_fields();
+                message
+            })
+            .into_iter()
+            .collect();
+        let commit =
+            self.commit_task_transition(&crate::runtime_db::transitions::TaskTransitionCommand {
                 agent_id,
                 task: persisted_task,
+                queue_entry,
                 work_items,
+                expected_wait_conditions,
                 wait_conditions,
                 agent_state,
+                message_evidence,
                 audit_events,
                 index_changes,
-                notify_scheduler: false,
+                notify_scheduler: queue_needs_push,
                 commit_on_idempotent: emit_event
                     && !task_will_change
                     && is_terminal_task_status(&task.status),
                 fault: self.take_transition_fault(),
-            },
-        )?;
+            })?;
+        let mut commit = commit;
+        if let (Some(guard), Some(message)) = (
+            agent_guard.as_mut(),
+            transition.message_evidence.filter(|_| queue_needs_push),
+        ) {
+            guard.queue.push(message.clone());
+            guard.state = state.clone();
+            guard.last_persisted_state = state;
+            commit.effects.agent_state = None;
+        }
+        drop(agent_guard);
         self.apply_transition_commit(commit).await;
         Ok(())
     }
@@ -332,6 +407,48 @@ impl RuntimeHandle {
             .store(count, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    fn inject_terminal_task_transition_conflict_if_armed(&self) -> Result<()> {
+        let remaining = match self
+            .inner
+            .terminal_task_transition_conflicts_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            }) {
+            Ok(remaining) => remaining,
+            Err(_) => return Ok(()),
+        };
+        let mut state = self
+            .inner
+            .runtime_db
+            .agent_states()
+            .latest(&self.inner.default_agent_id)?
+            .expect("test runtime agent state");
+        state.pending_wake_hint = Some(crate::types::PendingWakeHint {
+            reason: "test_terminal_conflict".into(),
+            description: Some(format!(
+                "concurrent terminal task transition test attempt {remaining}"
+            )),
+            source: Some("test".into()),
+            scope: None,
+            external_trigger_id: None,
+            resource: None,
+            body: None,
+            content_type: None,
+            correlation_id: None,
+            causation_id: None,
+            created_at: Utc::now(),
+        });
+        self.inner.storage.write_agent(&state)
+    }
+
+    #[cfg(test)]
+    fn inject_terminal_task_transition_conflicts(&self, count: usize) {
+        self.inner
+            .terminal_task_transition_conflicts_remaining
+            .store(count, Ordering::SeqCst);
+    }
+
     pub(super) async fn persist_task_transition(
         &self,
         task: &TaskRecord,
@@ -339,6 +456,33 @@ impl RuntimeHandle {
     ) -> Result<()> {
         self.apply_task_transition(TaskTransition::new(task, event_kind))
             .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn persist_task_transition_with_message(
+        &self,
+        task: &TaskRecord,
+        event_kind: &'static str,
+        message: &MessageEnvelope,
+    ) -> Result<()> {
+        self.apply_task_transition(
+            TaskTransition::new(task, event_kind).with_message_evidence(message),
+        )
+        .await
+    }
+
+    pub(super) async fn commit_terminal_task_result(
+        &self,
+        task: &TaskRecord,
+        event_kind: &'static str,
+        message: &MessageEnvelope,
+    ) -> Result<()> {
+        let mut message = message.clone();
+        message.normalize_admission_fields();
+        self.apply_task_transition(
+            TaskTransition::new(task, event_kind).with_terminal_result(&message),
+        )
+        .await
     }
 
     pub(super) async fn reduce_task_status_message(&self, task: TaskRecord) -> Result<()> {
@@ -354,12 +498,9 @@ impl RuntimeHandle {
         model_reentry: bool,
         continuation_resolution: Option<&ContinuationResolution>,
     ) -> Result<()> {
-        let execution_admission_provenance = self.legacy_execution_admission_provenance(
-            message,
-            continuation_resolution,
-            Some(&task),
-        )?;
-        if let Some(transition) = self
+        let execution_admission_provenance =
+            self.execution_admission_provenance(message, continuation_resolution, Some(&task))?;
+        let transition = self
             .reduce_task_result_message_deferred(
                 message,
                 task,
@@ -367,10 +508,8 @@ impl RuntimeHandle {
                 continuation_resolution,
                 execution_admission_provenance,
             )
-            .await?
-        {
-            self.persist_terminal_transition(&transition).await?;
-        }
+            .await?;
+        self.persist_terminal_transition(&transition).await?;
         Ok(())
     }
 
@@ -381,9 +520,19 @@ impl RuntimeHandle {
         model_reentry: bool,
         continuation_resolution: Option<&ContinuationResolution>,
         execution_admission_provenance: ExecutionAdmissionProvenance,
-    ) -> Result<Option<turn::TurnTerminalTransition>> {
+    ) -> Result<turn::TurnTerminalTransition> {
         if should_ignore_task_update(self.inner.runtime_db.tasks().latest(&task.id)?, &task) {
-            return Ok(None);
+            self.begin_reducer_only_turn(message, execution_admission_provenance)
+                .await?;
+            return self
+                .build_reducer_only_terminal_transition("reducer_only/duplicate_task_result", false)
+                .await;
+        }
+        let parent_turn_already_delivered =
+            task_result_parent_turn_already_delivered(&self.inner.storage, &task)?;
+        if !model_reentry || parent_turn_already_delivered {
+            self.begin_reducer_only_turn(message, execution_admission_provenance.clone())
+                .await?;
         }
         self.persist_task_transition(&task, "task_result_received")
             .await?;
@@ -397,7 +546,8 @@ impl RuntimeHandle {
             TaskStatus::Running => "running",
             TaskStatus::Queued => "queued",
         };
-        let emit_result_brief = should_emit_task_result_brief(&task);
+        let emit_result_brief =
+            should_emit_task_result_brief(&task) && !parent_turn_already_delivered;
         let result_text = match &message.body {
             MessageBody::Text { text } => {
                 format!("Task {} {}: {}", task.id, task_status_label, text)
@@ -409,7 +559,7 @@ impl RuntimeHandle {
                 format!("Task {} {}: {}", task.id, task_status_label, text)
             }
         };
-        if model_reentry {
+        if model_reentry && !parent_turn_already_delivered {
             if emit_result_brief {
                 let brief = brief::make_task_result(&message.agent_id, &task.id, &result_text);
                 self.persist_brief(&brief).await?;
@@ -424,7 +574,7 @@ impl RuntimeHandle {
                 guard.persist_state(&self.inner.storage)?;
             }
             let transition = self
-                .process_interactive_message_deferred(
+                .process_interactive_message_deferred_with_cleanup(
                     message,
                     continuation_resolution,
                     execution_admission_provenance,
@@ -433,14 +583,32 @@ impl RuntimeHandle {
                     },
                 )
                 .await?;
-            return Ok(Some(transition));
-        } else {
+            return Ok(transition);
+        } else if !model_reentry {
             if emit_result_brief {
                 let brief = brief::make_result(&message.agent_id, message, result_text);
                 self.persist_brief(&brief).await?;
             }
+        } else {
+            self.inner.storage.append_event(&AuditEvent::legacy(
+                "stale_task_result_rejoin_suppressed",
+                serde_json::json!({
+                    "agent_id": message.agent_id,
+                    "task_id": task.id,
+                    "parent_turn_id": task_parent_turn_id(&task),
+                    "reason": "parent_turn_already_delivered",
+                }),
+            ))?;
         }
-        Ok(None)
+        self.build_reducer_only_terminal_transition(
+            if parent_turn_already_delivered {
+                "reducer_only/parent_turn_already_delivered"
+            } else {
+                "reducer_only/task_result_without_model_reentry"
+            },
+            emit_result_brief,
+        )
+        .await
     }
 }
 
@@ -478,6 +646,29 @@ fn stable_terminal_task_event_id(event_kind: &str, task: &TaskRecord) -> String 
 
 fn should_emit_task_result_brief(task: &TaskRecord) -> bool {
     task.kind != TaskKind::CommandTask
+}
+
+fn task_parent_turn_id(task: &TaskRecord) -> Option<&str> {
+    task.detail
+        .as_ref()
+        .and_then(|detail| detail.get("parent_turn_id"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn task_result_parent_turn_already_delivered(
+    storage: &AppStorage,
+    task: &TaskRecord,
+) -> Result<bool> {
+    let Some(parent_turn_id) = task_parent_turn_id(task) else {
+        return Ok(false);
+    };
+    let Some(parent_turn) = storage.read_turn_by_id(parent_turn_id)? else {
+        return Ok(false);
+    };
+    Ok(storage
+        .read_briefs_by_ids(&parent_turn.produced_brief_ids)?
+        .iter()
+        .any(|brief| brief.kind == BriefKind::Result))
 }
 
 #[cfg(test)]
@@ -770,6 +961,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_task_result_retry_releases_agent_lock_before_refresh() {
+        let runtime = runtime();
+        runtime.inject_terminal_task_transition_conflicts(1);
+        let message = task_result_message("task-1");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            runtime.commit_terminal_task_result(
+                &task("task-1", TaskStatus::Completed, true),
+                "task_completed",
+                &message,
+            ),
+        )
+        .await
+        .expect("terminal task transition retry should not deadlock")
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .agent_state()
+                .await
+                .unwrap()
+                .pending_wake_hint
+                .as_ref()
+                .map(|hint| hint.reason.as_str()),
+            Some("test_terminal_conflict")
+        );
+        assert_eq!(
+            runtime
+                .storage()
+                .read_message_by_id(&message.id)
+                .unwrap()
+                .map(|stored| stored.id),
+            Some(message.id)
+        );
+    }
+
+    #[tokio::test]
     async fn exhausted_task_transition_conflicts_only_requeue_task_results() {
         let runtime = runtime();
         {
@@ -872,6 +1101,51 @@ mod tests {
         }));
         let transcript = runtime.storage().read_recent_transcript(10).unwrap();
         assert!(transcript.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delivered_parent_turn_suppresses_stale_task_result_reentry_and_brief() {
+        let runtime = runtime();
+        let mut delivered = BriefRecord::new(
+            "default",
+            BriefKind::Result,
+            "Original operator answer.",
+            Some("operator-message".into()),
+            None,
+        );
+        delivered.turn_id = Some("turn-parent".into());
+        runtime.storage().append_brief(&delivered).unwrap();
+        let mut parent_turn = TurnRecord::new("default", "turn-parent", 1);
+        parent_turn.produced_brief_ids = vec![delivered.id.clone()];
+        runtime.storage().append_turn(&parent_turn).unwrap();
+
+        let mut stale = task("task-1", TaskStatus::Completed, false);
+        stale.detail = Some(json!({"parent_turn_id": "turn-parent"}));
+        runtime
+            .reduce_task_result_message(&task_result_message("task-1"), stale, true, None)
+            .await
+            .unwrap();
+
+        let briefs = runtime.storage().read_recent_briefs(10).unwrap();
+        assert_eq!(briefs, vec![delivered]);
+        assert!(runtime
+            .recent_events(20)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "stale_task_result_rejoin_suppressed"));
+        let terminal = runtime
+            .agent_state()
+            .await
+            .unwrap()
+            .last_turn_terminal
+            .expect("suppressed TaskResult should still complete its reducer-only turn");
+        assert_eq!(terminal.kind, TurnTerminalKind::Completed);
+        assert_eq!(
+            terminal.reason.as_deref(),
+            Some("reducer_only/parent_turn_already_delivered")
+        );
+        assert!(terminal.last_assistant_message.is_none());
     }
 
     #[tokio::test]

@@ -18,13 +18,83 @@ impl RuntimeHandle {
         scheduler_state: &AgentState,
     ) -> Result<MessageDispatchPlan> {
         let task = match message.kind {
-            MessageKind::TaskStatus | MessageKind::TaskResult => {
+            MessageKind::TaskStatus => {
                 tasks::task_from_message(message, &message.agent_id).map(Some)
             }
+            MessageKind::TaskResult => tasks::task_from_message(message, &message.agent_id)
+                .or_else(|error| {
+                    let durable_task = message
+                        .task_id
+                        .as_deref()
+                        .filter(|task_id| {
+                            message.authority_class == AuthorityClass::RuntimeInstruction
+                                && message.admission_context == Some(AdmissionContext::RuntimeOwned)
+                                && message.delivery_surface
+                                    == Some(MessageDeliverySurface::TaskRejoin)
+                                && matches!(
+                                    &message.origin,
+                                    MessageOrigin::Task {
+                                        task_id: origin_task_id
+                                    } if origin_task_id == *task_id
+                                )
+                        })
+                        .map(|task_id| self.inner.storage.latest_task_record(task_id))
+                        .transpose()?
+                        .flatten()
+                        .filter(|task| {
+                            task.agent_id == message.agent_id
+                                && task.work_item_id == message.work_item_id
+                                && task.parent_message_id.as_deref() == Some(message.id.as_str())
+                        });
+                    let Some(task) = durable_task else {
+                        return Err(error);
+                    };
+                    let wait_authority = if let Some(work_item_id) = task.work_item_id.as_deref() {
+                        exact_triggered_or_resolved_task_result_wait(
+                            &self.inner.storage,
+                            message,
+                            &task.id,
+                            work_item_id,
+                        )?
+                        .is_some()
+                    } else {
+                        false
+                    };
+                    let terminal_with_explicit_work_item = matches!(
+                        task.status,
+                        TaskStatus::Completed
+                            | TaskStatus::Failed
+                            | TaskStatus::Cancelled
+                            | TaskStatus::Interrupted
+                    ) && task.effective_work_item_id()
+                        == Some(message.work_item_id.as_deref().unwrap_or_default());
+                    if terminal_with_explicit_work_item || task.terminal_reentry() || wait_authority
+                    {
+                        Ok(task)
+                    } else {
+                        Err(error)
+                    }
+                })
+                .map(Some),
             _ => Ok(None),
         };
-        let continuation_trigger =
+        let mut continuation_trigger =
             ContinuationTrigger::from_message(message, task.as_ref().ok().and_then(Option::as_ref));
+        if let Some(trigger) = continuation_trigger.as_mut() {
+            // An explicit agent-scope WaitFor that targeted this exact task
+            // authorizes terminal task result reentry even when the prior
+            // closure waiting_reason was polluted by unrelated waits.
+            if trigger.kind == crate::types::ContinuationTriggerKind::TaskResult
+                && trigger.task_result_outcome.is_some()
+                && trigger.task_work_item_id.is_none()
+            {
+                if let Some(task_id) = message.task_id.as_deref() {
+                    trigger.exact_task_wait =
+                        exact_agent_scope_task_result_wait(&self.inner.storage, message, task_id)?
+                            .is_some();
+                }
+            }
+        }
         let matching_wait_work_item_id = if continuation_trigger.is_some() {
             let matching_waits = self
                 .inner
@@ -39,16 +109,28 @@ impl RuntimeHandle {
         } else {
             None
         };
+        let message_work_item_id = match message.work_item_id.as_deref() {
+            Some(work_item_id)
+                if self
+                    .inner
+                    .storage
+                    .latest_work_item(work_item_id)?
+                    .is_some_and(|work_item| work_item.state != WorkItemState::Open) =>
+            {
+                None
+            }
+            work_item_id => work_item_id,
+        };
         let continuation_work_item_id = matching_wait_work_item_id
             .as_deref()
-            .or(message.work_item_id.as_deref())
+            .or(message_work_item_id)
             .or(scheduler_state.current_turn_work_item_id.as_deref())
             .or(scheduler_state.current_work_item_id.as_deref());
         let continuation_resolution = continuation_trigger.as_ref().map(|trigger| {
             resolve_continuation(&prior_closure, trigger, continuation_work_item_id)
         });
         let model_turn_allowed = !matches!(scheduler_state.status, AgentStatus::Stopped);
-        let execution_admission_provenance = self.legacy_execution_admission_provenance(
+        let execution_admission_provenance = self.execution_admission_provenance(
             message,
             continuation_resolution.as_ref(),
             task.as_ref().ok().and_then(Option::as_ref),
@@ -81,11 +163,6 @@ impl RuntimeHandle {
             scheduler_state.pending,
             self.now(),
         )?;
-        let scheduler_projection = if self.inner.scheduler_engine.is_canonical() {
-            scheduler_projection
-        } else {
-            scheduler_projection.without_canonical_authority()
-        };
         let scheduler_decision = scheduler::decide_next_action(
             &scheduler_projection,
             scheduler::SchedulerBoundary::MessageProcessing,
@@ -110,12 +187,10 @@ impl RuntimeHandle {
         plan: MessageDispatchPlan,
         scheduler_decision: &scheduler::SchedulerDecision,
     ) -> Result<()> {
-        if let Some(transition) = self
+        let transition = self
             .process_message_with_plan_deferred(message, plan, scheduler_decision)
-            .await?
-        {
-            self.persist_terminal_transition(&transition).await?;
-        }
+            .await?;
+        self.persist_terminal_transition(&transition).await?;
         Ok(())
     }
 
@@ -124,7 +199,7 @@ impl RuntimeHandle {
         mut message: MessageEnvelope,
         plan: MessageDispatchPlan,
         scheduler_decision: &scheduler::SchedulerDecision,
-    ) -> Result<Option<turn::TurnTerminalTransition>> {
+    ) -> Result<turn::TurnTerminalTransition> {
         message.normalize_admission_fields();
         self.inner.storage.append_event(&AuditEvent::typed(
             RuntimeEventKind::MessageProcessingStarted,
@@ -139,8 +214,27 @@ impl RuntimeHandle {
             ..
         } = plan;
         let model_reentry = scheduler_decision.model_reentry;
+        let reducer_only_dispatch = match message.kind {
+            MessageKind::OperatorPrompt
+            | MessageKind::WebhookEvent
+            | MessageKind::CallbackEvent
+            | MessageKind::TimerTick
+            | MessageKind::SystemTick
+            | MessageKind::ChannelEvent
+            | MessageKind::InternalFollowup => !model_reentry,
+            MessageKind::TaskStatus
+            | MessageKind::Control
+            | MessageKind::BriefAck
+            | MessageKind::BriefResult => true,
+            MessageKind::TaskResult => false,
+        };
+        if reducer_only_dispatch {
+            self.begin_reducer_only_turn(&message, execution_admission_provenance.clone())
+                .await?;
+        }
         let task = task?;
         let mut terminal_transition = None;
+        let mut reducer_only_reason = None;
         if let Some(trigger) = continuation_trigger.as_ref() {
             self.record_continuation_trigger_received(&message, trigger, &prior_closure)
                 .await?;
@@ -172,7 +266,7 @@ impl RuntimeHandle {
                         guard.persist_state(&self.inner.storage)?;
                     }
                     terminal_transition = Some(
-                        self.process_interactive_message_deferred(
+                        self.process_interactive_message_deferred_with_cleanup(
                             &message,
                             continuation_resolution.as_ref(),
                             execution_admission_provenance.clone(),
@@ -182,23 +276,27 @@ impl RuntimeHandle {
                         )
                         .await?,
                     );
+                } else {
+                    reducer_only_reason = Some("reducer_only/model_reentry_suppressed");
                 }
             }
             MessageKind::TaskStatus => {
                 let task = task.ok_or_else(|| anyhow!("task status message should parse task"))?;
                 self.reduce_task_status_message(task).await?;
+                reducer_only_reason = Some("reducer_only/task_status");
             }
             MessageKind::TaskResult => {
                 let task = task.ok_or_else(|| anyhow!("task result message should parse task"))?;
-                terminal_transition = self
-                    .reduce_task_result_message_deferred(
+                terminal_transition = Some(
+                    self.reduce_task_result_message_deferred(
                         &message,
                         task,
                         model_reentry,
                         continuation_resolution.as_ref(),
                         execution_admission_provenance,
                     )
-                    .await?;
+                    .await?,
+                );
             }
             MessageKind::Control => {
                 let action = match &message.body {
@@ -207,9 +305,19 @@ impl RuntimeHandle {
                     _ => return Err(anyhow!("unknown control action")),
                 };
                 self.control(action).await?;
+                reducer_only_reason = Some("reducer_only/control");
             }
-            MessageKind::BriefAck | MessageKind::BriefResult => {}
+            MessageKind::BriefAck | MessageKind::BriefResult => {
+                reducer_only_reason = Some("reducer_only/brief_notification");
+            }
         }
+
+        terminal_transition = match terminal_transition {
+            Some(transition) if transition.prepared_work_item_completion.is_some() => {
+                return Ok(transition);
+            }
+            transition => transition,
+        };
 
         if let Some(resolution) = continuation_resolution.as_ref() {
             self.persist_last_continuation(resolution).await?;
@@ -271,7 +379,16 @@ impl RuntimeHandle {
         ))?;
 
         info!("processed message {}", message.id);
-        Ok(terminal_transition)
+        match terminal_transition {
+            Some(transition) => Ok(transition),
+            None => {
+                self.build_reducer_only_terminal_transition(
+                    reducer_only_reason.unwrap_or("reducer_only/message_consumed"),
+                    false,
+                )
+                .await
+            }
+        }
     }
 
     async fn refresh_current_work_item_refs(
@@ -313,7 +430,7 @@ impl RuntimeHandle {
         record.work_refs = merged;
         record.revision = record.revision.saturating_add(1);
         record.updated_at = Utc::now();
-        let commit = self.inner.runtime_db.transitions().commit_work_item(
+        let commit = self.commit_work_item_transition(
             &crate::runtime_db::transitions::WorkItemTransitionCommand {
                 agent_id: agent.id.clone(),
                 mutation: crate::runtime_db::transitions::WorkItemMutation::Update {

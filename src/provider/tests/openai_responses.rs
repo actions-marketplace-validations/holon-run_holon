@@ -7,9 +7,12 @@ use std::sync::{
 
 use super::support::*;
 use super::*;
-use crate::config::{ModelRef, ProviderId};
+use crate::config::{ModelRef, ProviderEndpointId, ProviderId, ProviderTransportKind};
 use crate::model_catalog::ModelRuntimeOverride;
-use crate::provider::transports::set_stream_idle_timeout_override_for_tests;
+use crate::provider::retry::{classify_provider_error, ProviderFailureKind, RetryDisposition};
+use crate::provider::transports::{
+    set_stream_idle_timeout_override_for_tests, OpenAiCompactionPolicy,
+};
 use crate::provider::{
     ContinuationScopeId, ProviderNativeWebSearchKind, ProviderNativeWebSearchRequest,
 };
@@ -116,6 +119,143 @@ fn openai_text_response_with_provider_metadata(response_id: &str, text: &str) ->
     })
 }
 
+#[test]
+fn openai_responses_preserves_url_citations_and_strips_sentinels() {
+    let response = parse_openai_response(json!({
+        "id": "resp_citations",
+        "status": "completed",
+        "usage": { "input_tokens": 10, "output_tokens": 5 },
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": "Current answer. \u{e200}cite\u{e202}turn0search0\u{e202}turn0search1\u{e201} After.",
+                "annotations": [{
+                    "type": "url_citation",
+                    "url": "https://example.com/source",
+                    "title": "Example Source",
+                    "start_index": -1,
+                    "end_index": 9999
+                }, {
+                    "type": "url_citation",
+                    "url_citation": {
+                        "url": "https://example.com/source",
+                        "title": "Duplicate"
+                    }
+                }, {
+                    "type": "url_citation",
+                    "url": "javascript:alert(1)",
+                    "title": "Unsafe"
+                }, {
+                    "type": "file_citation",
+                    "file_id": "file_1"
+                }]
+            }]
+        }]
+    }))
+    .unwrap();
+
+    assert!(matches!(
+        &response.blocks[0],
+        ModelBlock::Text { text } if text == "Current answer.  After."
+    ));
+    assert!(matches!(
+        &response.blocks[1],
+        ModelBlock::Citations { citations }
+            if citations == &vec![crate::types::Citation {
+                url: "https://example.com/source".to_string(),
+                title: Some("Example Source".to_string()),
+            }]
+    ));
+}
+
+#[test]
+fn openai_responses_strips_malformed_citation_without_consuming_following_text() {
+    let response = parse_openai_response(openai_text_response(
+        "resp_malformed_citation",
+        "Before \u{e200}cite\u{e202}turn0search0\u{e202}turn0search1 normal answer",
+    ))
+    .unwrap();
+
+    assert!(matches!(
+        &response.blocks[0],
+        ModelBlock::Text { text } if text == "Before  normal answer"
+    ));
+}
+
+#[test]
+fn openai_responses_classifies_empty_output_as_retryable_with_usage() {
+    let error = parse_openai_response(json!({
+        "id": "resp_empty",
+        "status": "completed",
+        "usage": { "input_tokens": 4, "output_tokens": 893 },
+        "output": []
+    }))
+    .expect_err("empty output should fail");
+
+    let classification = classify_provider_error(&error);
+    assert_eq!(classification.kind, ProviderFailureKind::EmptyResponse);
+    assert_eq!(classification.disposition, RetryDisposition::Retryable);
+    assert_eq!(
+        crate::provider::provider_error_token_usage(&error)
+            .map(|usage| (usage.input_tokens, usage.output_tokens)),
+        Some((4, 893))
+    );
+}
+
+#[test]
+fn openai_responses_classifies_empty_message_content_as_retryable() {
+    let error = parse_openai_response(json!({
+        "id": "resp_empty_message",
+        "status": "completed",
+        "usage": { "input_tokens": 4, "output_tokens": 0 },
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": []
+        }]
+    }))
+    .expect_err("empty message content should fail");
+
+    let classification = classify_provider_error(&error);
+    assert_eq!(classification.kind, ProviderFailureKind::EmptyResponse);
+    assert_eq!(classification.disposition, RetryDisposition::Retryable);
+}
+
+#[test]
+fn openai_responses_keeps_nonempty_unsupported_items_fail_fast() {
+    let error = parse_openai_response(json!({
+        "id": "resp_unsupported",
+        "status": "completed",
+        "usage": { "input_tokens": 4, "output_tokens": 1 },
+        "output": [{ "type": "unsupported_provider_item" }]
+    }))
+    .expect_err("unsupported wire item should fail");
+
+    let classification = classify_provider_error(&error);
+    assert_eq!(classification.kind, ProviderFailureKind::InvalidResponse);
+    assert_eq!(classification.disposition, RetryDisposition::FailFast);
+}
+
+#[test]
+fn openai_responses_keeps_malformed_message_content_fail_fast() {
+    let error = parse_openai_response(json!({
+        "id": "resp_malformed_message",
+        "status": "completed",
+        "usage": { "input_tokens": 4, "output_tokens": 0 },
+        "output": [{
+            "type": "message",
+            "role": "assistant"
+        }]
+    }))
+    .expect_err("message without content should fail");
+
+    let classification = classify_provider_error(&error);
+    assert_eq!(classification.kind, ProviderFailureKind::InvalidResponse);
+    assert_eq!(classification.disposition, RetryDisposition::FailFast);
+}
+
 fn set_remote_compaction_trigger(config: &mut crate::config::AppConfig, model_ref: &str) {
     config.validated_model_overrides.insert(
         ModelRef::parse(model_ref).unwrap(),
@@ -157,6 +297,70 @@ fn openai_reasoning_and_tool_call_sse_response(response_id: &str) -> String {
         ),
         response_id
     )
+}
+
+fn deepseek_reasoning_and_tool_call_sse_response(response_id: &str) -> String {
+    let response = json!({
+        "id": response_id,
+        "status": "completed",
+        "usage": { "input_tokens": 12, "output_tokens": 4 },
+        "output": [{
+            "type": "reasoning",
+            "content": [{
+                "type": "reasoning_text",
+                "text": "inspect the workspace first"
+            }]
+        }, {
+            "type": "custom_tool_call",
+            "call_id": "patch-1",
+            "name": "apply_patch",
+            "input": "*** Begin Patch\n*** Add File: note.txt\n+ok\n*** End Patch\n"
+        }]
+    });
+    format!(
+        "event: response.completed\ndata: {}\n\n",
+        json!({
+            "type": "response.completed",
+            "response": response,
+        })
+    )
+}
+
+#[test]
+fn reasoning_text_round_trips_without_becoming_assistant_text() {
+    let encoded = serde_json::to_value(ModelBlock::ReasoningText {
+        text: "durable provider reasoning".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        encoded,
+        json!({
+            "type": "reasoning_text",
+            "text": "durable provider reasoning",
+        })
+    );
+
+    let decoded: ModelBlock = serde_json::from_value(encoded).unwrap();
+    assert!(matches!(
+        decoded,
+        ModelBlock::ReasoningText { text } if text == "durable provider reasoning"
+    ));
+
+    let input = build_openai_input(&[ConversationMessage::AssistantBlocks(vec![
+        ModelBlock::Text {
+            text: "visible".into(),
+        },
+        ModelBlock::ReasoningText {
+            text: "durable provider reasoning".into(),
+        },
+    ])])
+    .unwrap();
+    assert_eq!(input[0]["content"][0]["text"], json!("visible"));
+    assert_eq!(input[1]["type"], json!("reasoning"));
+    assert_eq!(
+        input[1]["content"][0]["text"],
+        json!("durable provider reasoning")
+    );
 }
 
 fn openai_unicode_text_and_tool_call_sse_response(response_id: &str) -> String {
@@ -233,6 +437,216 @@ async fn openai_from_config_uses_resolved_max_output_override_on_the_wire() {
 
     let response_bodies = response_bodies.lock().unwrap();
     assert_eq!(response_bodies[0]["max_output_tokens"], json!(1_234));
+}
+
+#[tokio::test]
+async fn deepseek_responses_streams_and_replays_full_history_across_provider_restart() {
+    let captured_bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured_for_server = captured_bodies.clone();
+    let response_attempts = Arc::new(AtomicUsize::new(0));
+    let response_attempts_for_server = response_attempts.clone();
+    let compact_attempts = Arc::new(AtomicUsize::new(0));
+    let compact_attempts_for_server = compact_attempts.clone();
+    let base_url = spawn_test_server(
+        Router::new()
+            .route(
+                "/responses",
+                post(move |Json(body): Json<Value>| {
+                    let captured = captured_for_server.clone();
+                    let attempts = response_attempts_for_server.clone();
+                    async move {
+                        captured.lock().unwrap().push(body);
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        let response = if attempt == 0 {
+                            deepseek_reasoning_and_tool_call_sse_response("resp_1")
+                        } else {
+                            openai_text_sse_response("resp_2", "done")
+                        };
+                        ([("content-type", "text/event-stream")], response)
+                    }
+                }),
+            )
+            .route(
+                "/responses/compact",
+                post(move |Json(_body): Json<Value>| {
+                    let attempts = compact_attempts_for_server.clone();
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            ),
+    )
+    .await;
+    let fixture = test_config(
+        "deepseek/deepseek-v4-pro",
+        &[],
+        Some("deepseek-key"),
+        None,
+        false,
+    );
+    let mut provider_config = fixture
+        .config
+        .providers
+        .get(&ProviderId::openai())
+        .unwrap()
+        .clone();
+    let deepseek = ProviderId::parse("deepseek").unwrap();
+    provider_config.id = deepseek.clone();
+    provider_config.route_provider = deepseek;
+    provider_config.route_endpoint = ProviderEndpointId::parse("responses").unwrap();
+    provider_config.transport = ProviderTransportKind::OpenAiResponses;
+    provider_config.base_url = base_url;
+    provider_config.builtin_web_search = None;
+    provider_config.reasoning_effort = Some("high".into());
+
+    let first_provider = OpenAiProvider::from_runtime_config_with_compaction_policy(
+        &provider_config,
+        "deepseek-v4-pro",
+        384_000,
+        fixture.config.home_dir.as_path(),
+        OpenAiCompactionPolicy {
+            trigger_input_tokens: 1,
+        },
+    )
+    .unwrap();
+    let mut first_request = provider_turn_request_with_prompt_frame();
+    first_request.tools = vec![
+        crate::tool::tools::apply_patch_tool::definition_for_surface(
+            crate::tool::apply_patch::ApplyPatchSurface::CodexDslFreeform,
+        )
+        .unwrap()
+        .spec,
+    ];
+    first_request.native_web_search = Some(ProviderNativeWebSearchRequest {
+        kind: ProviderNativeWebSearchKind::DeepSeek,
+        provider_id: "deepseek".into(),
+        provider_model_ref: "deepseek@responses/deepseek-v4-pro".into(),
+        advertised_tool_type: "web_search".into(),
+        backend_kind: "deepseek_web_search".into(),
+        max_results: None,
+    });
+    let first = first_provider.complete_turn(first_request).await.unwrap();
+    assert!(matches!(
+        &first.blocks[0],
+        ModelBlock::ReasoningText { text } if text == "inspect the workspace first"
+    ));
+    assert!(matches!(
+        &first.blocks[1],
+        ModelBlock::ToolUse { id, name, kind, .. }
+            if id == "patch-1"
+                && name == "ApplyPatch"
+                && *kind == crate::provider::ModelToolCallKind::Custom
+    ));
+    let diagnostics = first
+        .request_diagnostics
+        .as_ref()
+        .expect("DeepSeek request diagnostics");
+    assert_eq!(diagnostics.provider_id.as_deref(), Some("deepseek"));
+    assert_eq!(
+        diagnostics.provider_model_ref.as_deref(),
+        Some("deepseek@responses/deepseek-v4-pro")
+    );
+    assert_eq!(
+        diagnostics.provider_transport.as_deref(),
+        Some("openai_responses")
+    );
+    assert_eq!(diagnostics.endpoint_dialect.as_deref(), Some("responses"));
+    assert_eq!(diagnostics.streaming, Some(true));
+    assert_eq!(diagnostics.reasoning_effort.as_deref(), Some("high"));
+    let stable_prefix = diagnostics
+        .stable_prefix
+        .as_ref()
+        .expect("stable prefix diagnostics");
+    assert_eq!(stable_prefix.schema_version, 1);
+    assert_eq!(stable_prefix.algorithm, "sha256");
+    assert_eq!(stable_prefix.dynamic_tail_items, 1);
+    assert!(stable_prefix
+        .components
+        .iter()
+        .any(|component| component.name == "tools"));
+    assert_eq!(
+        diagnostics
+            .native_web_search
+            .as_ref()
+            .map(|search| search.lowered),
+        Some(true)
+    );
+
+    let persisted_blocks = serde_json::to_vec(&first.blocks).unwrap();
+    drop(first_provider);
+    let restored_blocks: Vec<ModelBlock> = serde_json::from_slice(&persisted_blocks).unwrap();
+
+    let mut followup = provider_turn_request_with_prompt_frame();
+    followup.tools = vec![
+        crate::tool::tools::apply_patch_tool::definition_for_surface(
+            crate::tool::apply_patch::ApplyPatchSurface::CodexDslFreeform,
+        )
+        .unwrap()
+        .spec,
+    ];
+    followup.conversation.extend([
+        ConversationMessage::AssistantBlocks(restored_blocks),
+        ConversationMessage::UserToolResults(vec![ToolResultBlock {
+            tool_use_id: "patch-1".into(),
+            content: "ok".into(),
+            is_error: false,
+            error: None,
+        }]),
+    ]);
+    let restarted_provider = OpenAiProvider::from_runtime_config_with_compaction_policy(
+        &provider_config,
+        "deepseek-v4-pro",
+        384_000,
+        fixture.config.home_dir.as_path(),
+        OpenAiCompactionPolicy {
+            trigger_input_tokens: 1,
+        },
+    )
+    .unwrap();
+    let second = restarted_provider.complete_turn(followup).await.unwrap();
+    assert!(matches!(
+        &second.blocks[0],
+        ModelBlock::Text { text } if text == "done"
+    ));
+
+    let bodies = captured_bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    for body in bodies.iter() {
+        assert_eq!(body["stream"], json!(true));
+        assert_eq!(body["reasoning"], json!({ "effort": "high" }));
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+    assert!(bodies[0]["tools"]
+        .as_array()
+        .expect("DeepSeek tools")
+        .iter()
+        .any(|tool| tool == &json!({ "type": "web_search" })));
+    assert!(bodies.iter().all(|body| {
+        body["tools"]
+            .as_array()
+            .expect("DeepSeek tools")
+            .iter()
+            .any(|tool| tool["type"] == "custom" && tool["name"] == "apply_patch")
+    }));
+    let replayed = bodies[1]["input"].as_array().unwrap();
+    assert!(replayed.iter().any(|item| {
+        item["type"] == "reasoning"
+            && item["content"][0]["type"] == "reasoning_text"
+            && item["content"][0]["text"] == "inspect the workspace first"
+    }));
+    assert!(replayed.iter().any(|item| {
+        item["type"] == "custom_tool_call"
+            && item["call_id"] == "patch-1"
+            && item["name"] == "apply_patch"
+    }));
+    assert!(replayed.iter().any(|item| {
+        item["type"] == "custom_tool_call_output"
+            && item["call_id"] == "patch-1"
+            && item["output"] == "ok"
+    }));
+    assert_eq!(compact_attempts.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

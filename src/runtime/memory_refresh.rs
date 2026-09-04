@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    storage::WorkQueueReadModel,
-    types::{BriefKind, TaskStatus, TodoItemState},
-};
+use crate::types::{BriefKind, TaskStatus, TodoItemState};
 
 const CONTINUE_ACTIVE_SIGNAL_SCAN_LIMIT: usize = 512;
 
@@ -16,20 +13,24 @@ enum IdleTickTrigger {
 
 fn idle_tick_trigger_from_state(
     pending_wake_hint: Option<PendingWakeHint>,
-    projection: WorkQueueReadModel,
+    work_reactivation: Option<(
+        crate::types::WorkItemRecord,
+        crate::types::WorkReactivationMode,
+    )>,
     due_rechecks: Vec<crate::types::WorkItemRecord>,
 ) -> Option<IdleTickTrigger> {
     if let Some(pending) = pending_wake_hint {
         Some(IdleTickTrigger::WakeHint(pending))
     } else {
-        if let Some(current) = projection.current_runnable {
-            return Some(IdleTickTrigger::WorkQueueActive(current.work_item));
-        }
-        projection
-            .queued_runnable
-            .into_iter()
-            .next()
-            .map(|item| IdleTickTrigger::WorkQueueQueued(item.work_item))
+        work_reactivation
+            .map(|(work_item, mode)| match mode {
+                crate::types::WorkReactivationMode::ContinueActive => {
+                    IdleTickTrigger::WorkQueueActive(work_item)
+                }
+                crate::types::WorkReactivationMode::ActivateQueued => {
+                    IdleTickTrigger::WorkQueueQueued(work_item)
+                }
+            })
             .or_else(|| {
                 if due_rechecks.is_empty() {
                     None
@@ -76,7 +77,8 @@ impl RuntimeHandle {
                 "message_id": message.id,
                 "trigger_kind": trigger.kind,
                 "contentful": trigger.contentful,
-                "task_terminal": trigger.task_terminal,
+                "task_terminal": trigger.task_result_outcome.is_some(),
+                "task_result_outcome": trigger.task_result_outcome,
                 "wake_hint_source": trigger.wake_hint_source,
                 "prior_closure_outcome": prior_closure.outcome,
                 "prior_waiting_reason": prior_closure.waiting_reason
@@ -140,9 +142,12 @@ impl RuntimeHandle {
                 work_queue_projection.clone(),
                 self.now(),
             )?;
+        let work_reactivation = scheduler_projection
+            .work_reactivation_work_item()
+            .map(|(work_item, mode)| (work_item.clone(), mode));
         let trigger = idle_tick_trigger_from_state(
             pending_wake_hint,
-            work_queue_projection,
+            work_reactivation,
             due_rechecks.clone(),
         );
 
@@ -656,14 +661,11 @@ impl RuntimeHandle {
         message.work_item_id = work_item_id;
         message.correlation_id = correlation_id;
         message.causation_id = causation_id;
-        if let Some((wait_id, wait_generation)) = self
+        if let Some(wait_id) = self
             .exact_external_wait_correlation(pending.external_trigger_id.as_deref())
             .await?
         {
             message.source_refs.insert("wait_id".into(), wait_id);
-            message
-                .source_refs
-                .insert("wait_generation".into(), wait_generation.to_string());
         }
         self.inner.storage.append_event(&AuditEvent::legacy(
             "system_tick_emitted",
@@ -817,8 +819,6 @@ impl RuntimeHandle {
                             queue_record,
                         ),
                         scheduler_claim_work_item: None,
-                        scheduler_protocol_bootstrap: None,
-                        scheduler_protocol_commands: Vec::new(),
                         agent_state: Some(crate::runtime_db::transitions::AgentStateMutation {
                             expected: Some(Box::new(expected_persisted_state)),
                             record: Box::new(committed_state.clone()),
@@ -836,7 +836,7 @@ impl RuntimeHandle {
                     Ok(commit) => commit,
                     Err(error) => {
                         let can_retry = attempt + 1 < super::ENQUEUE_AGENT_STATE_MAX_ATTEMPTS
-                            && super::retryable_enqueue_agent_state_conflict(&error, &agent_id);
+                            && super::retryable_enqueue_conflict(&error, &agent_id);
                         if !can_retry {
                             return Err(error);
                         }
@@ -926,68 +926,6 @@ impl RuntimeHandle {
             }),
         ))?;
         let _ = self.enqueue(message).await?;
-        Ok(())
-    }
-
-    pub(super) async fn emit_task_results_from_interrupted_tasks(
-        &self,
-        tasks: &[TaskRecord],
-    ) -> Result<()> {
-        let agent_id = self.agent_id().await?;
-        let mut message_ids = Vec::with_capacity(tasks.len());
-        for task in tasks {
-            let status_before_restart = task
-                .detail
-                .as_ref()
-                .and_then(|detail| detail.get("status_before_restart"))
-                .and_then(|value| value.as_str())
-                .unwrap_or("running");
-            let message = MessageEnvelope {
-                id: super::tasks::restart_task_result_message_id(&task.id),
-                turn_id: Some(crate::ids::turn_id()),
-                work_item_id: task.effective_work_item_id().map(ToString::to_string),
-                metadata: Some(serde_json::json!({
-                    "task_id": task.id,
-                    "task_kind": task.kind,
-                    "task_status": "interrupted",
-                    "task_summary": task.summary,
-                    "task_detail": task.detail,
-                    "task_recovery": task.recovery,
-                    "work_item_id": task.effective_work_item_id(),
-                    "status_before_restart": status_before_restart,
-                    "interrupted_reason": "runtime_restarted"
-                })),
-                ..MessageEnvelope::new(
-                    agent_id.clone(),
-                    MessageKind::TaskResult,
-                    MessageOrigin::Task {
-                        task_id: task.id.clone(),
-                    },
-                    AuthorityClass::RuntimeInstruction,
-                    Priority::Next,
-                    MessageBody::Text {
-                        text: format!(
-                            "task {} was interrupted because the runtime restarted",
-                            task.id
-                        ),
-                    },
-                )
-                .with_admission(
-                    MessageDeliverySurface::TaskRejoin,
-                    AdmissionContext::RuntimeOwned,
-                )
-            };
-            message_ids.push(message.id.clone());
-            let _ = self.enqueue(message).await?;
-        }
-        self.inner.storage.append_event(&AuditEvent::legacy(
-            "task_restart_results_emitted",
-            serde_json::json!({
-                "agent_id": agent_id,
-                "task_ids": tasks.iter().map(|task| task.id.clone()).collect::<Vec<_>>(),
-                "message_ids": message_ids,
-            }),
-        ))?;
         Ok(())
     }
 }
@@ -1101,6 +1039,49 @@ mod tests {
         } else {
             repository.insert_new(record).unwrap();
         }
+        persist_test_work_execution(test_runtime, record);
+    }
+
+    fn persist_test_work_execution(test_runtime: &TestRuntime, record: &WorkItemRecord) {
+        use crate::domain::execution_protocol::{
+            ExecutionProtocolState, WorkItemExecutionRecord, WorkItemExecutionState,
+        };
+
+        let mut execution = test_runtime
+            .runtime
+            .inner
+            .runtime_db
+            .transitions()
+            .load_execution_protocol_state_if_initialized(&record.agent_id)
+            .unwrap()
+            .unwrap_or_else(|| ExecutionProtocolState::empty(&record.agent_id));
+        let generation = execution
+            .work_items
+            .get(&record.id)
+            .map_or(record.revision.max(1), WorkItemExecutionRecord::generation);
+        let state = record.blocked_by.as_ref().map_or_else(
+            || WorkItemExecutionState::Runnable {
+                generation,
+                recovery_ref: None,
+            },
+            |reason| WorkItemExecutionState::Paused {
+                generation,
+                reason: reason.clone(),
+            },
+        );
+        execution.work_items.insert(
+            record.id.clone(),
+            WorkItemExecutionRecord {
+                source_revision: record.revision,
+                state,
+            },
+        );
+        test_runtime
+            .runtime
+            .inner
+            .runtime_db
+            .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &execution))
+            .unwrap();
     }
 
     fn add_current_work_item(test_runtime: &TestRuntime, id: &str, target: &str) -> WorkItemRecord {
@@ -1719,12 +1700,7 @@ mod tests {
         let mut updated = queued.clone();
         updated.revision += 1;
         updated.updated_at = chrono::Utc::now();
-        test_runtime
-            .runtime
-            .inner
-            .storage
-            .append_work_item(&updated)
-            .unwrap();
+        persist_test_work_item(&test_runtime, &updated);
 
         assert!(rt
             .block_on(test_runtime.runtime.maybe_emit_pending_system_tick(None))
@@ -2309,12 +2285,7 @@ mod tests {
             state: TodoItemState::InProgress,
         }];
         active.updated_at = chrono::Utc::now();
-        test_runtime
-            .runtime
-            .inner
-            .storage
-            .append_work_item(&active)
-            .unwrap();
+        persist_test_work_item(&test_runtime, &active);
         append_result_brief_for_work_item(&test_runtime, &active.id, "Progress report.");
 
         let rt = tokio::runtime::Runtime::new().unwrap();

@@ -18,7 +18,7 @@ use crate::{
 use super::{build_http_client, request_send_timeout, response_body_timeout};
 use crate::provider::retry::{
     classify_reqwest_transport_error_with_trace, classify_status_error_with_trace,
-    invalid_response_error, timeout_transport_error_with_trace,
+    invalid_response_error, parse_retry_after, timeout_transport_error_with_trace,
 };
 
 #[derive(Clone)]
@@ -193,6 +193,7 @@ impl AgentProvider for GeminiProvider {
         }
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = parse_retry_after(response.headers());
             let body = match tokio::time::timeout(response_body_timeout(), response.text()).await {
                 Ok(Ok(text)) => text,
                 _ => String::new(),
@@ -209,6 +210,7 @@ impl AgentProvider for GeminiProvider {
                 status,
                 body,
                 request_trace.as_ref(),
+                retry_after,
             ));
         }
 
@@ -347,13 +349,22 @@ fn conversation_message_to_gemini_content(message: &ConversationMessage) -> Opti
                         }),
                         function_response: None,
                     },
-                    ModelBlock::Thinking { .. } | ModelBlock::RedactedThinking { .. } => {
+                    ModelBlock::Thinking { .. }
+                    | ModelBlock::ReasoningText { .. }
+                    | ModelBlock::RedactedThinking { .. }
+                    | ModelBlock::ProviderToolUse { .. }
+                    | ModelBlock::ProviderToolResult { .. } => {
                         GeminiPart {
                             text: None,
                             function_call: None,
                             function_response: None,
                         }
                     }
+                    ModelBlock::Citations { .. } => GeminiPart {
+                        text: None,
+                        function_call: None,
+                        function_response: None,
+                    },
                 })
                 .filter(|part| part.text.is_some() || part.function_call.is_some())
                 .collect::<Vec<_>>();
@@ -420,6 +431,12 @@ fn gemini_response_to_provider_turn_response(
         provider_request_id: None,
         request_diagnostics: Some(ProviderRequestDiagnostics {
             request_lowering_mode: "gemini_generate_content".to_string(),
+            provider_id: Some("gemini".to_string()),
+            provider_model_ref: None,
+            provider_transport: Some("gemini_generate_content".to_string()),
+            endpoint_dialect: Some("gemini".to_string()),
+            streaming: Some(false),
+            reasoning_effort: None,
             anthropic_cache: None,
             anthropic_context_management: None,
             openai_request_controls: None,
@@ -427,6 +444,7 @@ fn gemini_response_to_provider_turn_response(
             openai_remote_compaction: None,
             native_web_search: None,
             response_format: None,
+            stable_prefix: None,
         }),
     })
 }

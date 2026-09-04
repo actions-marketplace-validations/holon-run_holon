@@ -27,7 +27,7 @@ use crate::config::{
     ProviderAuthConfig, ProviderBuiltinWebSearchConfig, ProviderConfigFile,
     ProviderEndpointConfigFile, ProviderEndpointId, ProviderId, ProviderPlanConfigFile,
     ProviderRegistry, ProviderRuntimeConfig, ProviderTransportKind, RuntimeModelCatalog,
-    SchedulerEngineMode, XSearchRuntimeConfig, DEFAULT_LOCAL_AGENT_ID, DEFAULT_X_SEARCH_MODEL,
+    XSearchRuntimeConfig, DEFAULT_LOCAL_AGENT_ID, DEFAULT_X_SEARCH_MODEL,
     OPENAI_CODEX_CREDENTIAL_PROFILE,
 };
 
@@ -152,6 +152,7 @@ fn test_app_config(default_model: &str, fallback_models: &[&str]) -> TestAppConf
         max_relevant_episodes: 3,
         control_token: Some("control-value".into()),
         control_auth_mode: ControlAuthMode::Auto,
+        auth: Default::default(),
         api_cors: Default::default(),
         config_file_path: home_path.join("config.json"),
         stored_config: Default::default(),
@@ -167,7 +168,6 @@ fn test_app_config(default_model: &str, fallback_models: &[&str]) -> TestAppConf
         default_tool_output_tokens: crate::tool::helpers::DEFAULT_TOOL_OUTPUT_TOKENS as u32,
         max_tool_output_tokens: crate::tool::helpers::MAX_TOOL_OUTPUT_TOKENS as u32,
         disable_provider_fallback: false,
-        scheduler_engine: crate::config::SchedulerEngineMode::Canonical,
         tui_alternate_screen: crate::config::AltScreenMode::Auto,
         validated_model_overrides: HashMap::new(),
         validated_unknown_model_fallback: None,
@@ -596,44 +596,43 @@ fn set_get_and_unset_round_trip_runtime_disable_provider_fallback() {
 }
 
 #[test]
-fn set_get_and_unset_round_trip_runtime_scheduler() {
+fn runtime_scheduler_is_not_a_mutable_config_key() {
     let mut config = HolonConfigFile::default();
-    set_config_key(&mut config, "runtime.scheduler", "legacy").unwrap();
-    assert_eq!(
-        get_config_key(&config, "runtime.scheduler").unwrap(),
-        json!("legacy")
-    );
-
-    unset_config_key(&mut config, "runtime.scheduler").unwrap();
-    assert_eq!(
-        get_config_key(&config, "runtime.scheduler").unwrap(),
-        Value::Null
-    );
+    assert!(set_config_key(&mut config, "runtime.scheduler", "canonical").is_err());
+    assert!(get_config_key(&config, "runtime.scheduler").is_err());
+    assert!(unset_config_key(&mut config, "runtime.scheduler").is_err());
 }
 
 #[test]
-fn scheduler_engine_precedence_is_env_then_config_then_canonical() {
+fn retired_scheduler_selector_accepts_only_canonical_compatibility_value() {
     let mut config = HolonConfigFile::default();
-    assert_eq!(
-        super::resolve_scheduler_engine_from_values(None, &config).unwrap(),
-        SchedulerEngineMode::Canonical
-    );
+    super::validate_retired_scheduler_selector_values(None, None).unwrap();
+    config.runtime.scheduler = Some("legacy".into());
+    super::validate_retired_scheduler_selector_values(Some("canonical"), Some("legacy")).unwrap();
+    let legacy = super::validate_retired_scheduler_selector_values(
+        None,
+        config.runtime.scheduler.as_deref(),
+    )
+    .unwrap_err();
+    assert!(legacy.to_string().contains("v0.31.1"));
+    let obsolete =
+        super::validate_retired_scheduler_selector_values(Some("shadow"), None).unwrap_err();
+    assert!(obsolete.to_string().contains("is obsolete"));
+}
 
-    config.runtime.scheduler = Some(SchedulerEngineMode::Legacy);
-    assert_eq!(
-        super::resolve_scheduler_engine_from_values(None, &config).unwrap(),
-        SchedulerEngineMode::Legacy
-    );
-    assert_eq!(
-        super::resolve_scheduler_engine_from_values(Some("canonical"), &config).unwrap(),
-        SchedulerEngineMode::Canonical
-    );
-    assert!(
-        super::resolve_scheduler_engine_from_values(Some("shadow"), &config)
-            .unwrap_err()
-            .to_string()
-            .contains("expects legacy or canonical")
-    );
+#[test]
+fn app_config_rejects_legacy_scheduler_config() {
+    let home = tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.json"),
+        r#"{
+          "model":{"default":"openai/gpt-5.4"},
+          "runtime":{"scheduler":"legacy"}
+        }"#,
+    )
+    .unwrap();
+    let error = AppConfig::load_with_home(Some(home.path().to_path_buf())).unwrap_err();
+    assert!(error.to_string().contains("v0.31.1"));
 }
 
 #[test]
@@ -648,9 +647,7 @@ fn app_config_rejects_invalid_scheduler_env() {
 
     let error = AppConfig::load_with_home_for_config_inspection(Some(home.path().to_path_buf()))
         .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("scheduler engine expects legacy or canonical"));
+    assert!(error.to_string().contains("is obsolete"));
 }
 
 #[test]
@@ -1011,7 +1008,7 @@ fn built_in_provider_registry_declares_provider_specific_builtin_search() {
         .get(&ProviderId::parse("deepseek").unwrap())
         .unwrap();
     let deepseek_search = deepseek.builtin_web_search.as_ref().unwrap();
-    assert_eq!(deepseek_search.kind, ProviderNativeWebSearchKind::Anthropic);
+    assert_eq!(deepseek_search.kind, ProviderNativeWebSearchKind::DeepSeek);
     assert_eq!(deepseek_search.advertised_tool_type, "web_search_20250305");
     assert_eq!(deepseek_search.backend_kind, "deepseek_web_search");
 
@@ -2161,6 +2158,7 @@ fn resolves_compatible_reasoning_effort_for_non_codex_route() {
         .unwrap();
 
     assert!(route.validate_reasoning_effort("xhigh").is_ok());
+    assert!(route.validate_reasoning_effort("none").is_ok());
     assert!(route.validate_reasoning_effort("arbitrary").is_err());
 }
 
@@ -2247,6 +2245,9 @@ fn schema_contains_expected_keys() {
         .map(|entry| entry.key)
         .collect::<Vec<_>>();
     assert!(keys.contains(&"model.default"));
+    assert!(keys.contains(&"auth.mode"));
+    assert!(keys.contains(&"auth.oidc.issuer_url"));
+    assert!(keys.contains(&"auth.session.absolute_ttl_seconds"));
     assert!(keys.contains(&"models.catalog"));
     assert!(keys.contains(&"model.unknown_fallback"));
     assert!(keys.contains(&"providers.<id>.endpoints.<endpoint_id>.transport"));
@@ -2257,7 +2258,7 @@ fn schema_contains_expected_keys() {
     assert!(keys.contains(&"runtime.default_tool_output_tokens"));
     assert!(keys.contains(&"runtime.max_tool_output_tokens"));
     assert!(keys.contains(&"runtime.disable_provider_fallback"));
-    assert!(keys.contains(&"runtime.scheduler"));
+    assert!(!keys.contains(&"runtime.scheduler"));
     assert!(keys.contains(&"tui.alternate_screen"));
     assert!(keys.contains(&"web.fetch.enabled"));
     assert!(keys.contains(&"web.fetch.allowed_hosts"));
@@ -2266,6 +2267,159 @@ fn schema_contains_expected_keys() {
     assert!(keys.contains(&"web.fetch.max_redirects"));
     assert!(keys.contains(&"web.search.provider"));
     assert!(keys.contains(&"web.providers.<name>.capabilities"));
+}
+
+#[test]
+fn auth_config_schema_round_trips_persisted_values() {
+    let mut config = HolonConfigFile::default();
+    set_config_key(&mut config, "auth.mode", "oidc").unwrap();
+    set_config_key(
+        &mut config,
+        "auth.oidc.issuer_url",
+        "https://issuer.example",
+    )
+    .unwrap();
+    set_config_key(&mut config, "auth.oidc.client_id", "client").unwrap();
+    set_config_key(&mut config, "auth.session.idle_ttl_seconds", "120").unwrap();
+
+    assert_eq!(get_config_key(&config, "auth.mode").unwrap(), json!("oidc"));
+    assert_eq!(
+        get_config_key(&config, "auth.oidc.issuer_url").unwrap(),
+        json!("https://issuer.example")
+    );
+    assert_eq!(
+        get_config_key(&config, "auth.session.idle_ttl_seconds").unwrap(),
+        json!(120)
+    );
+}
+
+#[test]
+fn load_persisted_config_materializes_auth_settings() {
+    let home = tempdir().unwrap();
+    save_persisted_config_at(
+        &persisted_config_path(home.path()),
+        &HolonConfigFile {
+            auth: crate::config::AuthConfigFile {
+                mode: Some(crate::authentication::AuthenticationMode::Oidc),
+                oidc: Some(crate::config::OidcConfigFile {
+                    issuer_url: "https://issuer.example".into(),
+                    client_id: "client".into(),
+                    client_secret_env: None,
+                    redirect_uri: Some("http://localhost/callback".into()),
+                }),
+                session: crate::config::SessionConfigFile {
+                    absolute_ttl_seconds: Some(900),
+                    idle_ttl_seconds: Some(300),
+                },
+            },
+            model: ModelConfigFile {
+                default: Some("anthropic/claude-sonnet-4-6".into()),
+                ..ModelConfigFile::default()
+            },
+            ..HolonConfigFile::default()
+        },
+    )
+    .unwrap();
+
+    let config = AppConfig::load_with_home(Some(home.path().to_path_buf())).unwrap();
+    assert_eq!(
+        config.auth.mode,
+        crate::authentication::AuthenticationMode::Oidc
+    );
+    let oidc = config.auth.oidc.as_ref().expect("OIDC settings");
+    assert_eq!(oidc.issuer_url, "https://issuer.example");
+    assert_eq!(oidc.client_id, "client");
+    assert_eq!(
+        oidc.redirect_uri.as_deref(),
+        Some("http://localhost/callback")
+    );
+    assert_eq!(config.auth.session.absolute_ttl_seconds, Some(900));
+    assert_eq!(config.auth.session.idle_ttl_seconds, 300);
+}
+
+#[test]
+fn load_persisted_config_rejects_invalid_auth_settings() {
+    let oidc = || crate::config::OidcConfigFile {
+        issuer_url: "https://issuer.example".into(),
+        client_id: "client".into(),
+        client_secret_env: None,
+        redirect_uri: None,
+    };
+    let cases = vec![
+        (
+            "local mode with OIDC settings",
+            crate::config::AuthConfigFile {
+                mode: Some(crate::authentication::AuthenticationMode::Local),
+                oidc: Some(oidc()),
+                ..Default::default()
+            },
+        ),
+        (
+            "OIDC mode without provider settings",
+            crate::config::AuthConfigFile {
+                mode: Some(crate::authentication::AuthenticationMode::Oidc),
+                ..Default::default()
+            },
+        ),
+        (
+            "idle session TTL greater than absolute TTL",
+            crate::config::AuthConfigFile {
+                session: crate::config::SessionConfigFile {
+                    absolute_ttl_seconds: Some(60),
+                    idle_ttl_seconds: Some(61),
+                },
+                ..Default::default()
+            },
+        ),
+    ];
+
+    for (name, auth) in cases {
+        let home = tempdir().unwrap();
+        save_persisted_config_at(
+            &persisted_config_path(home.path()),
+            &HolonConfigFile {
+                auth,
+                model: ModelConfigFile {
+                    default: Some("anthropic/claude-sonnet-4-6".into()),
+                    ..ModelConfigFile::default()
+                },
+                ..HolonConfigFile::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            AppConfig::load_with_home(Some(home.path().to_path_buf())).is_err(),
+            "{name} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn load_persisted_config_normalizes_zero_absolute_session_ttl_to_unlimited() {
+    let home = tempdir().unwrap();
+    save_persisted_config_at(
+        &persisted_config_path(home.path()),
+        &HolonConfigFile {
+            auth: crate::config::AuthConfigFile {
+                session: crate::config::SessionConfigFile {
+                    absolute_ttl_seconds: Some(0),
+                    idle_ttl_seconds: Some(1),
+                },
+                ..Default::default()
+            },
+            model: ModelConfigFile {
+                default: Some("anthropic/claude-sonnet-4-6".into()),
+                ..ModelConfigFile::default()
+            },
+            ..HolonConfigFile::default()
+        },
+    )
+    .unwrap();
+
+    let config = AppConfig::load_with_home(Some(home.path().to_path_buf())).unwrap();
+    assert_eq!(config.auth.session.absolute_ttl_seconds, None);
+    assert_eq!(config.auth.session.idle_ttl_seconds, 1);
 }
 
 #[test]
@@ -2866,6 +3020,99 @@ fn runtime_model_catalog_materializes_legacy_provider_as_default_route_endpoint(
 }
 
 #[test]
+fn runtime_model_catalog_exposes_deepseek_responses_without_changing_default_route() {
+    let mut fixture = test_app_config("deepseek/deepseek-v4-pro", &[]);
+    let built_ins = built_in_provider_registry_with_settings(&HashMap::new()).unwrap();
+    let deepseek = ProviderId::parse("deepseek").unwrap();
+    fixture
+        .config
+        .providers
+        .insert(deepseek.clone(), built_ins.get(&deepseek).unwrap().clone());
+    let catalog = RuntimeModelCatalog::from_config(&fixture.config);
+
+    let default_route = catalog
+        .resolve_explicit_model_route(
+            &ContextConfig::default(),
+            &route_ref("deepseek@default/deepseek-v4-pro"),
+            ModelRouteCapability::Turn,
+        )
+        .unwrap();
+    assert_eq!(
+        default_route.endpoint.runtime_config.transport,
+        ProviderTransportKind::AnthropicMessages
+    );
+    assert_eq!(
+        default_route.endpoint.runtime_config.base_url,
+        "https://api.deepseek.com/anthropic"
+    );
+
+    let responses_route = catalog
+        .resolve_explicit_model_route(
+            &ContextConfig::default(),
+            &route_ref("deepseek@responses/deepseek-v4-pro"),
+            ModelRouteCapability::Turn,
+        )
+        .unwrap();
+    assert_eq!(
+        responses_route.route_ref.as_string(),
+        "deepseek@responses/deepseek-v4-pro"
+    );
+    assert_eq!(
+        responses_route.endpoint.runtime_config.transport,
+        ProviderTransportKind::OpenAiResponses
+    );
+    assert_eq!(
+        responses_route.endpoint.runtime_config.base_url,
+        "https://api.deepseek.com/v1"
+    );
+    let responses_search = responses_route
+        .endpoint
+        .runtime_config
+        .builtin_web_search
+        .as_ref()
+        .expect("DeepSeek Responses should advertise native web search");
+    assert_eq!(responses_search.kind, ProviderNativeWebSearchKind::DeepSeek);
+    assert_eq!(responses_search.advertised_tool_type, "web_search");
+
+    assert_eq!(
+        ModelRouteRef::parse_compatible("deepseek/deepseek-v4-pro")
+            .unwrap()
+            .as_string(),
+        "deepseek@default/deepseek-v4-pro"
+    );
+}
+
+#[test]
+fn runtime_model_catalog_derives_deepseek_responses_from_an_explicit_allowlist() {
+    let mut fixture = test_app_config("deepseek/deepseek-v4-pro", &[]);
+    let built_ins = built_in_provider_registry_with_settings(&HashMap::new()).unwrap();
+    let deepseek = ProviderId::parse("deepseek").unwrap();
+    let mut runtime = built_ins.get(&deepseek).unwrap().clone();
+    runtime.base_url = "https://proxy.example/deepseek/anthropic/".into();
+    runtime.reasoning_effort = Some("high".into());
+    runtime.codex_home = Some(PathBuf::from("/should-not-leak"));
+    runtime.originator = Some("anthropic-only-originator".into());
+    runtime.context_management.enabled = true;
+    fixture.config.providers.insert(deepseek, runtime);
+
+    let catalog = RuntimeModelCatalog::from_config(&fixture.config);
+    let responses_route = catalog
+        .resolve_explicit_model_route(
+            &ContextConfig::default(),
+            &route_ref("deepseek@responses/deepseek-v4-pro"),
+            ModelRouteCapability::Turn,
+        )
+        .unwrap();
+    let runtime = &responses_route.endpoint.runtime_config;
+
+    assert_eq!(runtime.base_url, "https://proxy.example/deepseek/v1");
+    assert_eq!(runtime.reasoning_effort.as_deref(), Some("high"));
+    assert!(runtime.codex_home.is_none());
+    assert!(runtime.originator.is_none());
+    assert!(!runtime.context_management.enabled);
+}
+
+#[test]
 fn runtime_model_catalog_routes_opencode_go_models_by_published_transport() {
     let mut fixture = test_app_config("opencode-go/minimax-m3", &[]);
     let built_ins = built_in_provider_registry_with_settings(&HashMap::new()).unwrap();
@@ -3012,6 +3259,40 @@ fn generate_image_selection_auto_uses_turn_chain() {
         .unwrap();
 
     assert_eq!(selected.as_string(), "openai@default/gpt-image-2");
+}
+
+#[test]
+fn generate_image_selection_uses_current_turn_fallback_model() {
+    let mut fixture = test_app_config("openai/gpt-image-2", &["openai/recovery-image"]);
+    let recovery_model = ModelRef::parse("openai/recovery-image").unwrap();
+    let recovery_override = ModelRuntimeOverride {
+        capabilities: Some(ModelCapabilityOverride {
+            image_generation: Some(true),
+            ..ModelCapabilityOverride::default()
+        }),
+        ..ModelRuntimeOverride::default()
+    };
+    fixture
+        .config
+        .validated_model_overrides
+        .insert(recovery_model.clone(), recovery_override.clone());
+    fixture
+        .config
+        .stored_config
+        .models
+        .catalog
+        .insert(recovery_model.as_string(), recovery_override);
+    let catalog = RuntimeModelCatalog::from_config(&fixture.config);
+
+    let selected = catalog
+        .select_generate_image_model(
+            &ContextConfig::default(),
+            None,
+            Some(&route_ref("openai/recovery-image")),
+        )
+        .unwrap();
+
+    assert_eq!(selected.as_string(), "openai@default/recovery-image");
 }
 
 #[test]

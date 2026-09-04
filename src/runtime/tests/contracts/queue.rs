@@ -2,7 +2,7 @@ use super::super::support::*;
 use crate::types::{AdmissionContext, MessageDeliverySurface, MessageEnvelope, QueueEntryRecord};
 
 #[tokio::test]
-async fn legacy_work_queue_settlement_does_not_require_scheduler_partition() {
+async fn queue_settlement_commits_with_canonical_execution_protocol() {
     let harness = LifecycleHarness::new();
     let message = harness
         .runtime()
@@ -165,16 +165,22 @@ async fn queue_replays_unprocessed_message_once_after_restart() {
     let mut harness = LifecycleHarness::with_provider(provider.clone());
     let message = harness
         .runtime()
-        .enqueue(MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "recover me".into(),
-            },
-        ))
+        .enqueue(
+            MessageEnvelope::new(
+                "default",
+                MessageKind::OperatorPrompt,
+                MessageOrigin::Operator { actor_id: None },
+                AuthorityClass::OperatorInstruction,
+                Priority::Normal,
+                MessageBody::Text {
+                    text: "recover me".into(),
+                },
+            )
+            .with_admission(
+                MessageDeliverySurface::CliPrompt,
+                AdmissionContext::LocalProcess,
+            ),
+        )
         .await
         .unwrap();
 

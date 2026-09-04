@@ -6,6 +6,8 @@ import { Card } from "../../components/ui/Card";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { Skeleton } from "../../components/ui/Skeleton";
 import { AgentStateBadge, StatusBadge } from "../../components/ui/StatusChip";
+import { ROSTER_STALE_EXTENDED_RETRY_ATTEMPTS } from "../../runtime/global-sync-coordinator";
+import type { RosterDiscoveryState } from "../../runtime/types";
 import { compactModelRouteDisplay } from "../../lib/model-route-ref";
 import type { AgentSummary, DashboardMetric, RuntimeConnection } from "../../runtime/types";
 
@@ -13,12 +15,13 @@ interface DashboardPageProps {
   agents: AgentSummary[];
   metrics: DashboardMetric[];
   connection: RuntimeConnection;
+  discovery?: RosterDiscoveryState;
   loading: boolean;
   onRefresh: () => void;
   onOpenAgent: (agentId: string) => void;
 }
 
-export function DashboardPage({ agents, metrics, connection, loading, onRefresh, onOpenAgent }: DashboardPageProps) {
+export function DashboardPage({ agents, metrics, connection, discovery, loading, onRefresh, onOpenAgent }: DashboardPageProps) {
   const { t } = useTranslation();
   const hasAgents = agents.length > 0;
   const hasConnectionError = Boolean(connection.error);
@@ -47,6 +50,22 @@ export function DashboardPage({ agents, metrics, connection, loading, onRefresh,
             </div>
           </div>
 
+          {discovery?.freshness === "stale" ? (
+            <div className="roster-discovery-banner stale" role="status">
+              <strong>{t("dashboard.rosterStaleTitle")}</strong>
+              <span>
+                {discovery.retryAttempt >= ROSTER_STALE_EXTENDED_RETRY_ATTEMPTS
+                  ? t("dashboard.rosterStaleExtendedBody", { attempt: discovery.retryAttempt })
+                  : t("dashboard.rosterStaleBody")}
+              </span>
+            </div>
+          ) : null}
+          {discovery?.freshness === "unauthorized" ? (
+            <div className="roster-discovery-banner unauthorized" role="alert">
+              <strong>{t("dashboard.rosterUnauthorizedTitle")}</strong>
+              <span>{t("dashboard.rosterUnauthorizedBody")}</span>
+            </div>
+          ) : null}
           {dashboardState ? <DashboardStateCard state={dashboardState} detail={connection.error ?? connection.summary} /> : null}
 
           {metrics.length > 0 ? (

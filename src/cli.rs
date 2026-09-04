@@ -17,6 +17,49 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     }
 }
 
+#[derive(Debug, Subcommand)]
+pub enum TimerCommands {
+    Create {
+        #[command(flatten)]
+        options: TimerCreateArgs,
+    },
+    List {
+        #[arg(long, default_value_t = 50, value_parser = parse_positive_usize)]
+        limit: usize,
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    Cancel {
+        timer_id: String,
+        #[arg(long)]
+        agent: Option<String>,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct TimerCreateArgs {
+    #[arg(long)]
+    pub after_ms: u64,
+    #[arg(long)]
+    pub every_ms: Option<u64>,
+    #[arg(long)]
+    pub summary: Option<String>,
+    #[arg(long)]
+    pub agent: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct LegacyTimerCreateArgs {
+    #[arg(long)]
+    pub after_ms: Option<u64>,
+    #[arg(long)]
+    pub every_ms: Option<u64>,
+    #[arg(long)]
+    pub summary: Option<String>,
+    #[arg(long)]
+    pub agent: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Top-level CLI
 // ---------------------------------------------------------------------------
@@ -36,6 +79,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    #[command(about = "Show the declared caller context for this CLI invocation")]
+    Context,
+    #[command(about = "Show machine-readable CLI command metadata")]
+    Commands,
     #[command(about = "Interactively set up Holon or print secret-safe onboarding diagnostics")]
     Onboard {
         #[arg(long)]
@@ -89,15 +136,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: MemoryIndexCommands,
     },
+    #[command(args_conflicts_with_subcommands = true)]
     Timer {
-        #[arg(long)]
-        after_ms: u64,
-        #[arg(long)]
-        every_ms: Option<u64>,
-        #[arg(long)]
-        summary: Option<String>,
-        #[arg(long)]
-        agent: Option<String>,
+        #[command(subcommand)]
+        command: Option<TimerCommands>,
+        #[command(flatten)]
+        legacy: LegacyTimerCreateArgs,
     },
     #[command(about = "Deprecated: use `holon agent start|stop|abort [agent-id]`")]
     Control {
@@ -201,6 +245,14 @@ pub enum Commands {
         #[command(subcommand)]
         command: DebugCommands,
     },
+    #[command(
+        name = "models-dev",
+        about = "models.dev snapshot refresh, validation, and audit"
+    )]
+    ModelsDev {
+        #[command(subcommand)]
+        command: ModelsDevCommands,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -265,12 +317,18 @@ pub enum DaemonCommands {
     Start {
         #[command(flatten)]
         options: ServeOptions,
+        #[arg(long, env = "HOLON_DAEMON_START_TIMEOUT_SECS", value_parser = clap::value_parser!(u64).range(1..=86400))]
+        start_timeout: Option<u64>,
     },
     Stop,
+    #[command(hide = true)]
+    PrepareUpdate,
     Status,
     Restart {
         #[command(flatten)]
         options: ServeOptions,
+        #[arg(long, env = "HOLON_DAEMON_START_TIMEOUT_SECS", value_parser = clap::value_parser!(u64).range(1..=86400))]
+        start_timeout: Option<u64>,
     },
     Logs {
         #[arg(long, default_value_t = 80)]
@@ -395,6 +453,12 @@ pub enum WorkspaceCommands {
 
 #[derive(Debug, Subcommand)]
 pub enum TaskCommands {
+    List {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        agent: Option<String>,
+    },
     Run {
         summary: String,
         #[arg(long)]
@@ -493,6 +557,11 @@ pub enum EventsCommands {
         max_level: Option<EventMaxLevelCli>,
         #[arg(long)]
         agent: Option<String>,
+        #[arg(
+            long,
+            help = "Read directly from the local runtime database without requiring a running daemon"
+        )]
+        offline: bool,
     },
     #[command(
         about = "Stream stable event envelopes as newline-delimited JSON",
@@ -520,6 +589,44 @@ pub enum WorkItemCommands {
     },
     Get {
         work_item_id: String,
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    Create {
+        objective: String,
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    Pick {
+        work_item_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        clear_blocker: bool,
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    Update {
+        work_item_id: String,
+        #[arg(long)]
+        objective: Option<String>,
+        #[arg(long)]
+        plan_status: Option<String>,
+        #[arg(long)]
+        todo_json: Option<String>,
+        #[arg(long)]
+        blocked_by_json: Option<String>,
+        #[arg(long)]
+        recheck_after: Option<u64>,
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    Complete {
+        work_item_id: String,
+        #[arg(long, conflicts_with = "report_file")]
+        report: Option<String>,
+        #[arg(long, conflicts_with = "report")]
+        report_file: Option<PathBuf>,
         #[arg(long)]
         agent: Option<String>,
     },
@@ -553,6 +660,16 @@ pub enum DebugCommands {
             default_value = "operator-instruction"
         )]
         authority_class: AuthorityClass,
+        #[arg(
+            long,
+            help = "Output canonical ProjectionManifest JSON instead of the text dump"
+        )]
+        manifest: bool,
+        #[arg(
+            long,
+            help = "Override the prompt budget (estimated tokens) for this debug prompt"
+        )]
+        budget: Option<usize>,
     },
     Latency {
         #[arg(long)]
@@ -578,12 +695,18 @@ pub enum DebugCommands {
     },
     #[command(about = "Inspect scheduler bootstrap recovery candidates without applying repairs")]
     SchedulerRecovery {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all_affected")]
         agent: Option<String>,
+        #[arg(long, conflicts_with = "all_affected")]
+        message_id: Option<String>,
+        #[arg(long)]
+        all_affected: bool,
         #[arg(long)]
         json: bool,
         #[arg(long)]
         apply: bool,
+        #[arg(long, requires = "apply")]
+        no_backup: bool,
     },
     #[command(hide = true)]
     SchedulerRecoveryFixture {
@@ -610,7 +733,42 @@ pub enum DebugCommands {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum ModelsDevCommands {
+    #[command(
+        about = "Fetch the models.dev snapshot, generate artifact, and write to models.dev/"
+    )]
+    Refresh {
+        #[arg(long, default_value = "https://models.dev/api.json")]
+        url: String,
+        #[arg(long, default_value = "models.dev")]
+        output_dir: PathBuf,
+    },
+    #[command(about = "Validate the checked-in models.dev snapshot and artifact")]
+    Validate {
+        #[arg(long, default_value = "models.dev")]
+        input_dir: PathBuf,
+    },
+    #[command(about = "Audit provider mappings against a snapshot")]
+    Audit {
+        #[arg(long, default_value = "models.dev/snapshot.json")]
+        snapshot: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum RuntimeDbDebugCommands {
+    Audit {
+        #[arg(long, value_enum, default_value_t = RuntimeDbAuditCheckArg::All)]
+        check: RuntimeDbAuditCheckArg,
+        #[arg(long, value_name = "RFC3339")]
+        baseline_through: Option<String>,
+        #[arg(long, default_value_t = 5, value_parser = parse_positive_usize)]
+        sample_limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     Retention {
         #[arg(long)]
         dry_run: bool,
@@ -621,6 +779,13 @@ pub enum RuntimeDbDebugCommands {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RuntimeDbAuditCheckArg {
+    ProjectionEffects,
+    BriefIntegrity,
+    All,
 }
 
 #[derive(Debug, Subcommand)]
@@ -900,6 +1065,14 @@ mod tests {
             .filter(|e| !e.path.contains('.'))
             .map(|e| e.path.as_str())
             .collect();
+        assert!(
+            top_level.contains(&"context"),
+            "context should be in snapshot"
+        );
+        assert!(
+            top_level.contains(&"commands"),
+            "commands should be in snapshot"
+        );
         assert!(top_level.contains(&"serve"), "serve should be in snapshot");
         assert!(top_level.contains(&"run"), "run should be in snapshot");
         assert!(top_level.contains(&"agent"), "agent should be in snapshot");

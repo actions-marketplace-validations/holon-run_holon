@@ -10,28 +10,49 @@
 //! - [`repositories`]: domain repository implementations.
 //! - [`index_outbox`]: runtime index outbox repository.
 
+pub mod audit;
+pub mod authentication;
 pub mod connection;
 pub mod evidence;
+mod legacy_scheduler_wire;
 pub mod migrations;
 pub mod repositories;
 pub mod retention;
+pub mod retired_scheduler_cleanup;
 pub mod storage_domain;
 pub(crate) mod transitions;
 pub mod types;
 pub mod write_queue;
 
+pub mod observer_sync;
+
 mod index_outbox;
 
 // Re-export public types that are referenced as `crate::runtime_db::Type`.
+pub use crate::runtime_db::audit::{
+    AgentBriefIntegrityAudit, BriefIntegrityAudit, BriefIntegrityCategory, BriefIntegrityCounts,
+    ProjectionEffectInventoryGroup, ProjectionEffectsAudit, RuntimeDbAuditBaseline,
+    RuntimeDbAuditCheck, RuntimeDbAuditDatabase, RuntimeDbAuditOptions, RuntimeDbAuditReport,
+    ViolationSplit,
+};
+pub use crate::runtime_db::authentication::AuthenticationRepository;
 pub use crate::runtime_db::evidence::{
     EvidenceKind, EvidencePayloadRow, EvidenceQuery, EvidenceRow,
 };
 pub use crate::runtime_db::index_outbox::{
     RuntimeIndexChange, RuntimeIndexOperation, RuntimeIndexOutboxRepository, RuntimeIndexOutboxRow,
 };
+pub use crate::runtime_db::observer_sync::{
+    AgentEventRecoveryWindow, AgentRosterLatestBriefRow, AgentRosterRow, AgentRosterSnapshotRows,
+};
 pub use crate::runtime_db::retention::{
     RuntimeDbCompactReport, RuntimeDbRetentionPolicy, RuntimeDbRetentionReport,
     RuntimeDbRetentionTableReport,
+};
+pub use crate::runtime_db::retired_scheduler_cleanup::{
+    RetiredSchedulerCleanupBlocker, RetiredSchedulerCleanupBlockerKind,
+    RetiredSchedulerCleanupInventory, RetiredSchedulerFallbackAction,
+    RetiredSchedulerFallbackActionKind, RetiredSchedulerFallbackResult,
 };
 pub use crate::runtime_db::storage_domain::{ExpectedStorageDomain, StorageDomainSnapshot};
 pub use crate::runtime_db::types::{
@@ -63,8 +84,10 @@ use crate::runtime_db::connection::{
     unlock, LockMode,
 };
 use crate::runtime_db::migrations::{
-    apply_migration, backfill_wait_condition_payload_columns, backfill_work_item_recheck_columns,
-    current_schema_version, ensure_migration_table, max_known_migration_version, MIGRATIONS,
+    apply_migration, apply_release_baseline, backfill_wait_condition_payload_columns,
+    backfill_work_item_recheck_columns, current_schema_version, ensure_migration_table,
+    max_known_migration_version, MIGRATIONS, PUBLISHED_MIGRATION_FLOOR, RELEASE_BASELINE_TARGET,
+    RETIRED_SCHEDULER_SCHEMA_PREDECESSOR,
 };
 use crate::runtime_db::storage_domain::{
     read_storage_domain_connection, upsert_storage_domain, upsert_storage_domain_checkpoint_json,
@@ -279,6 +302,45 @@ impl RuntimeDb {
         Ok(db)
     }
 
+    /// Opens an existing database for the offline scheduler recovery command.
+    ///
+    /// Recovery must be able to inspect and settle schema 46 rows that block
+    /// the destructive scheduler-schema migration. All other callers must use
+    /// [`Self::open_and_migrate`].
+    pub fn open_for_scheduler_recovery(
+        path: impl Into<PathBuf>,
+        lock_path: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let path = path.into();
+        if !path.is_file() {
+            bail!(
+                "scheduler recovery requires an existing runtime database: {}",
+                path.display()
+            );
+        }
+        let writer = RuntimeDbWriter::open(path.clone(), open_connection(&path)?)?;
+        let db = Self {
+            writer,
+            path,
+            lock_path: lock_path.into(),
+        };
+        let current_version: i64 = db.connection()?.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        let max_known_version = max_known_migration_version();
+        if !(RETIRED_SCHEDULER_SCHEMA_PREDECESSOR..=max_known_version).contains(&current_version) {
+            bail!(
+                "scheduler recovery supports runtime db schemas {} through {}, found {}",
+                RETIRED_SCHEDULER_SCHEMA_PREDECESSOR,
+                max_known_version,
+                current_version
+            );
+        }
+        Ok(db)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -326,6 +388,10 @@ impl RuntimeDb {
         Ok(backup_path)
     }
 
+    pub fn create_scheduler_recovery_backup(&self) -> Result<PathBuf> {
+        self.create_verified_backup("scheduler-recovery")
+    }
+
     pub fn transaction<T>(&self, f: impl FnMut(&Transaction<'_>) -> Result<T>) -> Result<T> {
         self.writer.append_wait(f)
     }
@@ -357,6 +423,39 @@ impl RuntimeDb {
     pub fn current_schema_version(&self) -> Result<i64> {
         let connection = self.connection()?;
         current_schema_version(&connection)
+    }
+
+    pub fn retired_scheduler_cleanup_inventory(&self) -> Result<RetiredSchedulerCleanupInventory> {
+        let connection = self.connection()?;
+        retired_scheduler_cleanup::retired_scheduler_cleanup_inventory(&connection)
+    }
+
+    pub fn apply_retired_scheduler_cleanup_fallback(
+        &self,
+        agent_id: &str,
+    ) -> Result<RetiredSchedulerFallbackResult> {
+        self.apply_retired_scheduler_cleanup_fallbacks(&[agent_id.to_string()])
+            .map(|mut results| {
+                results
+                    .pop()
+                    .expect("one fallback result is returned for one agent")
+            })
+    }
+
+    pub fn apply_retired_scheduler_cleanup_fallbacks(
+        &self,
+        agent_ids: &[String],
+    ) -> Result<Vec<RetiredSchedulerFallbackResult>> {
+        self.transaction(|tx| {
+            agent_ids
+                .iter()
+                .map(|agent_id| {
+                    retired_scheduler_cleanup::apply_retired_scheduler_cleanup_fallback(
+                        tx, agent_id,
+                    )
+                })
+                .collect()
+        })
     }
 
     pub fn work_items(&self) -> WorkItemRepository<'_> {
@@ -401,6 +500,10 @@ impl RuntimeDb {
 
     pub fn audit_events(&self) -> AuditEventSink<'_> {
         AuditEventSink { db: self }
+    }
+
+    pub fn authentication(&self) -> AuthenticationRepository<'_> {
+        AuthenticationRepository { db: self }
     }
 
     pub fn agent_states(&self) -> AgentStateRepository<'_> {
@@ -698,12 +801,31 @@ impl RuntimeDb {
                 max_known_version
             );
         }
-        for migration in MIGRATIONS {
-            apply_migration(&mut connection, migration)?;
+        if current_version <= PUBLISHED_MIGRATION_FLOOR
+            && max_known_version >= RELEASE_BASELINE_TARGET
+        {
+            for migration in MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version <= PUBLISHED_MIGRATION_FLOOR)
+            {
+                apply_migration(&mut connection, migration)?;
+            }
+            apply_release_baseline(&mut connection)?;
+            for migration in MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version > RELEASE_BASELINE_TARGET)
+            {
+                apply_migration(&mut connection, migration)?;
+            }
+        } else {
+            for migration in MIGRATIONS {
+                apply_migration(&mut connection, migration)?;
+            }
         }
-        ensure_event_log_epoch(&connection)?;
+        ensure_runtime_identity_metadata(&connection)?;
         backfill_wait_condition_payload_columns(&connection)?;
         backfill_work_item_recheck_columns(&connection)?;
+        observer_sync::verify_observer_sync_foundations(&mut connection)?;
         Ok(())
     }
 
@@ -717,14 +839,54 @@ impl RuntimeDb {
             )
             .context("runtime event-log epoch is missing")
     }
+
+    /// Stable public identity of this runtime installation. Survives
+    /// restarts and ordinary reopens; a replaced or rebuilt database mints a
+    /// new one. Not a secret.
+    pub fn runtime_id(&self) -> Result<String> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT value FROM runtime_metadata WHERE key = 'runtime_id'",
+                [],
+                |row| row.get(0),
+            )
+            .context("runtime installation id is missing")
+    }
+
+    /// Monotone visibility policy generation. Bumping it rotates every
+    /// derived `visibility_scope_id` without touching the event-log epoch.
+    pub fn visibility_policy_generation(&self) -> Result<u64> {
+        let connection = self.connection()?;
+        let value: String = connection
+            .query_row(
+                "SELECT value FROM runtime_metadata WHERE key = 'visibility_policy_generation'",
+                [],
+                |row| row.get(0),
+            )
+            .context("visibility policy generation is missing")?;
+        value
+            .parse()
+            .with_context(|| format!("invalid visibility policy generation {value}"))
+    }
 }
 
-fn ensure_event_log_epoch(connection: &Connection) -> Result<()> {
+fn ensure_runtime_identity_metadata(connection: &Connection) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     connection.execute(
         "INSERT OR IGNORE INTO runtime_metadata (key, value, created_at, updated_at)
          VALUES ('event_log_epoch', ?1, ?2, ?2)",
         rusqlite::params![crate::ids::event_log_epoch_id(), now],
+    )?;
+    connection.execute(
+        "INSERT OR IGNORE INTO runtime_metadata (key, value, created_at, updated_at)
+         VALUES ('runtime_id', ?1, ?2, ?2)",
+        rusqlite::params![crate::ids::runtime_installation_id(), now],
+    )?;
+    connection.execute(
+        "INSERT OR IGNORE INTO runtime_metadata (key, value, created_at, updated_at)
+         VALUES ('visibility_policy_generation', '0', ?1, ?1)",
+        rusqlite::params![now],
     )?;
     Ok(())
 }

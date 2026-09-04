@@ -26,6 +26,9 @@ use crate::{
         ExecCommandDuplicatePolicy, ExecCommandOutcome, ExecCommandResult, ExternalTriggerScope,
         ExternalTriggerStatus, MessageBody, MessageEnvelope, MessageKind, MessageOrigin, Priority,
         TaskHandle, TaskKind, TaskRecord, TaskRecoverySpec, TaskStatus, ToolArtifactRef,
+        HOLON_CALLER_AGENT_ID_ENV, HOLON_CALLER_AUTHORITY_CLASS_ENV,
+        HOLON_CALLER_SOURCE_ACTIVATION_ID_ENV, HOLON_CALLER_SOURCE_TASK_ID_ENV,
+        HOLON_CALLER_SOURCE_TURN_ID_ENV, HOLON_CALLER_SOURCE_WORK_ITEM_ID_ENV,
     },
     utf8::IncrementalUtf8LossyDecoder,
 };
@@ -519,6 +522,40 @@ impl RuntimeHandle {
                 self.agent_home().to_string_lossy().into_owned(),
             ),
         ];
+        let state = self.agent_state().await?;
+        if let Some(binding) = state.current_execution_binding.as_ref() {
+            env.push((HOLON_CALLER_AGENT_ID_ENV.to_string(), agent_id.clone()));
+            env.push((
+                HOLON_CALLER_SOURCE_TURN_ID_ENV.to_string(),
+                binding.turn_id.clone(),
+            ));
+            if let Some(work_item_id) = binding.work_item_id.as_ref() {
+                env.push((
+                    HOLON_CALLER_SOURCE_WORK_ITEM_ID_ENV.to_string(),
+                    work_item_id.clone(),
+                ));
+            }
+            if let Some(activation_id) = binding.activation_id.as_ref() {
+                env.push((
+                    HOLON_CALLER_SOURCE_ACTIVATION_ID_ENV.to_string(),
+                    activation_id.clone(),
+                ));
+            }
+            if let Some(message) = self
+                .storage()
+                .read_message_by_id(&binding.source_message_id)?
+            {
+                if let Some(task_id) = message.task_id {
+                    env.push((HOLON_CALLER_SOURCE_TASK_ID_ENV.to_string(), task_id));
+                }
+                env.push((
+                    HOLON_CALLER_AUTHORITY_CLASS_ENV.to_string(),
+                    serde_json::to_string(&message.authority_class)?
+                        .trim_matches('"')
+                        .to_string(),
+                ));
+            }
+        }
         if let Some(trigger_url) = self.command_external_trigger_url(&agent_id).await? {
             env.push(("HOLON_EXTERNAL_TRIGGER_URL".to_string(), trigger_url));
         }
@@ -575,6 +612,7 @@ impl RuntimeHandle {
             None,
             false,
         );
+        let detail = self.task_creation_detail(&task_id, detail).await?;
         let diagnostics = self.command_cost_diagnostics_for(&resolved.spec);
         let work_item_id = self.task_work_item_binding().await;
         let task = TaskRecord {
@@ -666,6 +704,7 @@ impl RuntimeHandle {
                             Some(&err.to_string()),
                             true,
                         ),
+                        None,
                         None,
                     )
                     .await;
@@ -795,20 +834,9 @@ impl RuntimeHandle {
             terminal.status.clone(),
             detail.clone(),
             Some(&result_message.id),
+            Some(&result_message),
         )
         .await?;
-        let enqueue_result = self.enqueue(result_message).await;
-        if let Err(err) = enqueue_result {
-            self.inner
-                .storage
-                .append_event(&crate::types::AuditEvent::legacy(
-                    "command_task_result_enqueue_failed",
-                    serde_json::json!({
-                        "task_id": task_record.id,
-                        "error": err.to_string(),
-                    }),
-                ))?;
-        }
 
         self.inner.task_handles.lock().await.remove(&task_record.id);
         Ok(())
@@ -856,13 +884,16 @@ impl RuntimeHandle {
                 parent_message_id: None,
                 work_item_id: task_record.work_item_id.clone(),
                 summary: task_record.summary.clone(),
-                detail: Some(command_task_detail(
-                    resolved,
-                    promoted_from_exec_command,
-                    captured,
-                    None,
-                    None,
-                    false,
+                detail: Some(self.task_detail_preserving_rejoin_contract(
+                    task_record,
+                    command_task_detail(
+                        resolved,
+                        promoted_from_exec_command,
+                        captured,
+                        None,
+                        None,
+                        false,
+                    ),
                 )),
                 recovery: task_record.recovery.clone(),
             };
@@ -941,6 +972,7 @@ impl RuntimeHandle {
         status: TaskStatus,
         detail: serde_json::Value,
         parent_message_id: Option<&str>,
+        message_evidence: Option<&MessageEnvelope>,
     ) -> Result<()> {
         let fallback = TaskRecord {
             id: task_record.id.clone(),
@@ -952,14 +984,23 @@ impl RuntimeHandle {
             parent_message_id: parent_message_id.map(ToString::to_string),
             work_item_id: task_record.work_item_id.clone(),
             summary: task_record.summary.clone(),
-            detail: Some(detail),
+            detail: Some(self.task_detail_preserving_rejoin_contract(task_record, detail)),
             recovery: task_record.recovery.clone(),
         };
-        self.apply_task_transition_silent(task_state_reducer::TaskTransition::new(
-            &fallback,
-            "command_task_terminal_persisted",
-        ))
-        .await?;
+        if let Some(message_evidence) = message_evidence {
+            self.commit_terminal_task_result(
+                &fallback,
+                "command_task_terminal_persisted",
+                message_evidence,
+            )
+            .await?;
+        } else {
+            self.apply_task_transition_silent(task_state_reducer::TaskTransition::new(
+                &fallback,
+                "command_task_terminal_persisted",
+            ))
+            .await?;
+        }
         Ok(())
     }
 
@@ -1787,9 +1828,11 @@ mod tests {
             .contains("failed to query command status"));
 
         let events = runtime.inner.storage.read_recent_events(20).unwrap();
-        assert!(!events
-            .iter()
-            .any(|event| event.kind == "command_task_terminal_persisted"));
+        assert!(events.iter().any(|event| {
+            event.kind == "command_task_terminal_persisted"
+                && event.data["task_id"].as_str() == Some(task.id.as_str())
+                && event.data["status"].as_str() == Some("failed")
+        }));
         assert!(!events
             .iter()
             .any(|event| event.kind == "command_task_running_persisted"));

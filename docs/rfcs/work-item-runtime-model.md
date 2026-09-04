@@ -595,10 +595,23 @@ Shape:
 The target tool contract should not ask the agent to duplicate the completion
 report in a tool argument.
 
-When the same assistant round contains both operator-facing completion report
-text and a successful `CompleteWorkItem` call for the focused WorkItem, the
-runtime should promote that text into the WorkItem result summary, delivery
-summary, and completion brief.
+Before committing `CompleteWorkItem`, the runtime requires a unique, non-empty
+operator-facing report candidate. It may come from immediately preceding
+same-round text or from a text-only follow-up round requested after a tool-only
+call. The WorkItem terminal state, completion intent binding, result brief,
+focus/wait cleanup, and continuation effects are committed atomically as one
+`Open -> Completed` transition.
+
+A tool-only call validates ownership, execution binding, and current WorkItem
+revision, then records an `awaiting_completion_report` request and a `Deferred`
+tool execution without changing the WorkItem lifecycle. The follow-up report is
+accepted only while those fences remain unchanged. If acquisition is abandoned
+or the Turn terminates first, the WorkItem remains open and the deferred tool
+execution becomes `Interrupted`; the normal agent-tool path does not persist an
+intermediate `Completing` state.
+
+When completion succeeds, the runtime promotes the report text into the
+WorkItem completion brief.
 The promoted completion brief is the terminal user-facing delivery for that
 turn; runtime finalization should not emit a second result brief with the same
 completion.

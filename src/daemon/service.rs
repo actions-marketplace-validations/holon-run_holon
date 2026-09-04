@@ -1,4 +1,11 @@
-use std::{env, fs, path::PathBuf, sync::Arc};
+use std::{
+    env, fs,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -13,7 +20,9 @@ use crate::{
     web::{WebProviderCapabilityMetadata, WebProviderKind},
 };
 
-use super::daemon_paths;
+use super::{daemon_paths, DaemonLifecycleOwner};
+
+pub const DAEMON_CONTROL_PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeServiceMetadata {
@@ -23,6 +32,14 @@ pub struct RuntimeServiceMetadata {
     pub http_addr: String,
     pub started_at: DateTime<Utc>,
     pub config_fingerprint: String,
+    #[serde(default)]
+    pub product_version: String,
+    #[serde(default)]
+    pub control_protocol_version: u32,
+    #[serde(default)]
+    pub lifecycle_owner: DaemonLifecycleOwner,
+    #[serde(default)]
+    pub executable_path: PathBuf,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub serve_args: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -39,6 +56,14 @@ pub struct RuntimeStatusResponse {
     pub http_addr: String,
     pub started_at: DateTime<Utc>,
     pub config_fingerprint: String,
+    #[serde(default)]
+    pub product_version: String,
+    #[serde(default)]
+    pub control_protocol_version: u32,
+    #[serde(default)]
+    pub lifecycle_owner: DaemonLifecycleOwner,
+    #[serde(default)]
+    pub executable_path: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<RuntimeActivitySummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,7 +116,6 @@ pub struct RuntimeConfigSurface {
     pub default_tool_output_tokens: u32,
     pub max_tool_output_tokens: u32,
     pub disable_provider_fallback: bool,
-    pub scheduler: crate::config::SchedulerEngineMode,
     pub runtime_db_retention: crate::runtime_db::RuntimeDbRetentionPolicy,
     pub providers: Vec<RuntimeProviderSummary>,
     pub web_search: RuntimeWebSearchSummary,
@@ -168,7 +192,6 @@ impl RuntimeConfigSurface {
             default_tool_output_tokens: config.default_tool_output_tokens,
             max_tool_output_tokens: config.max_tool_output_tokens,
             disable_provider_fallback: config.disable_provider_fallback,
-            scheduler: config.scheduler_engine,
             runtime_db_retention: config
                 .runtime_db_retention_policy()
                 .expect("runtime database retention policy was validated during config load"),
@@ -181,13 +204,16 @@ impl RuntimeConfigSurface {
                     base_url: provider.base_url.clone(),
                     oauth_supported: crate::auth::oauth_provider_config(provider.id.as_str())
                         .is_some(),
-                    api_key_supported: provider.transport.as_str() != "openai_codex_responses",
+                    api_key_supported: provider.auth.kind != crate::config::CredentialKind::None
+                        && provider.transport.as_str() != "openai_codex_responses",
                     credential_source: provider.auth.source.as_str().to_string(),
                     credential_kind: provider.auth.kind.as_str().to_string(),
                     credential_env: provider.auth.env.clone(),
                     credential_profile: provider.auth.profile.clone(),
                     credential_external: provider.auth.external.clone(),
-                    credential_configured: provider.has_configured_credential(),
+                    credential_configured: provider.auth.kind
+                        == crate::config::CredentialKind::None
+                        || provider.has_configured_credential(),
                     configured_in_config: config.stored_config.providers.contains_key(&provider.id),
                 })
                 .collect(),
@@ -263,10 +289,19 @@ pub struct RuntimeServiceHandle {
 struct RuntimeServiceInner {
     metadata: RuntimeServiceMetadata,
     shutdown_tx: watch::Sender<bool>,
+    healthy: AtomicBool,
 }
 
 impl RuntimeServiceHandle {
     pub fn new(config: &AppConfig) -> Result<Self> {
+        Self::new_with_health(config, true)
+    }
+
+    pub fn new_starting(config: &AppConfig) -> Result<Self> {
+        Self::new_with_health(config, false)
+    }
+
+    fn new_with_health(config: &AppConfig, healthy: bool) -> Result<Self> {
         let (shutdown_tx, _) = watch::channel(false);
         Ok(Self {
             inner: Arc::new(RuntimeServiceInner {
@@ -277,6 +312,11 @@ impl RuntimeServiceHandle {
                     http_addr: config.http_addr.clone(),
                     started_at: Utc::now(),
                     config_fingerprint: super::config_fingerprint(config)?,
+                    product_version: env!("HOLON_VERSION").into(),
+                    control_protocol_version: DAEMON_CONTROL_PROTOCOL_VERSION,
+                    lifecycle_owner: DaemonLifecycleOwner::Standalone,
+                    executable_path: env::current_exe()
+                        .map_err(|err| anyhow!("failed to resolve current executable: {err}"))?,
                     serve_args: env::var(super::DAEMON_SERVE_ARGS_ENV)
                         .ok()
                         .and_then(|value| serde_json::from_str(&value).ok())
@@ -284,8 +324,13 @@ impl RuntimeServiceHandle {
                     control_token_env_configured: env::var_os("HOLON_CONTROL_TOKEN").is_some(),
                 },
                 shutdown_tx,
+                healthy: AtomicBool::new(healthy),
             }),
         })
+    }
+
+    pub fn mark_healthy(&self) {
+        self.inner.healthy.store(true, Ordering::Release);
     }
 
     pub fn status_response(
@@ -297,13 +342,17 @@ impl RuntimeServiceHandle {
     ) -> RuntimeStatusResponse {
         RuntimeStatusResponse {
             ok: true,
-            healthy: true,
+            healthy: self.inner.healthy.load(Ordering::Acquire),
             pid: self.inner.metadata.pid,
             home_dir: self.inner.metadata.home_dir.clone(),
             socket_path: self.inner.metadata.socket_path.clone(),
             http_addr: self.inner.metadata.http_addr.clone(),
             started_at: self.inner.metadata.started_at,
             config_fingerprint: self.inner.metadata.config_fingerprint.clone(),
+            product_version: self.inner.metadata.product_version.clone(),
+            control_protocol_version: self.inner.metadata.control_protocol_version,
+            lifecycle_owner: self.inner.metadata.lifecycle_owner,
+            executable_path: self.inner.metadata.executable_path.clone(),
             startup_surface: Some(startup_surface),
             runtime_surface: Some(runtime_surface),
             activity: Some(activity),
@@ -318,13 +367,17 @@ impl RuntimeServiceHandle {
     ) -> RuntimeStatusResponse {
         RuntimeStatusResponse {
             ok: true,
-            healthy: true,
+            healthy: self.inner.healthy.load(Ordering::Acquire),
             pid: self.inner.metadata.pid,
             home_dir: self.inner.metadata.home_dir.clone(),
             socket_path: self.inner.metadata.socket_path.clone(),
             http_addr: self.inner.metadata.http_addr.clone(),
             started_at: self.inner.metadata.started_at,
             config_fingerprint: self.inner.metadata.config_fingerprint.clone(),
+            product_version: self.inner.metadata.product_version.clone(),
+            control_protocol_version: self.inner.metadata.control_protocol_version,
+            lifecycle_owner: self.inner.metadata.lifecycle_owner,
+            executable_path: self.inner.metadata.executable_path.clone(),
             startup_surface: Some(startup_surface),
             runtime_surface: Some(runtime_surface),
             activity: None,

@@ -144,6 +144,12 @@ impl RuntimeReadModels {
             .take(3)
             .cloned()
             .collect::<Vec<_>>();
+        let completing = items
+            .iter()
+            .filter(|item| item.candidate_class == WorkItemCandidateClass::Completing)
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>();
         let completed_recent = items
             .iter()
             .filter(|item| item.candidate_class == WorkItemCandidateClass::CompletedRecent)
@@ -179,6 +185,7 @@ impl RuntimeReadModels {
             yielded,
             waiting_for_operator,
             blocked,
+            completing,
             completed_recent,
         })
     }
@@ -261,11 +268,9 @@ impl RuntimeReadModels {
             });
         }
 
-        if let Some(item) = work_queue
-            .items
-            .iter()
-            .find(|item| item.scheduling_state == WorkItemSchedulingState::WaitingTask)
-        {
+        if let Some(item) = work_queue.items.iter().find(|item| {
+            item.is_current && item.scheduling_state == WorkItemSchedulingState::WaitingTask
+        }) {
             let task_id = self
                 .active_wait_conditions()?
                 .into_iter()
@@ -284,11 +289,9 @@ impl RuntimeReadModels {
             });
         }
 
-        if let Some(item) = work_queue
-            .items
-            .iter()
-            .find(|item| item.scheduling_state == WorkItemSchedulingState::WaitingExternal)
-        {
+        if let Some(item) = work_queue.items.iter().find(|item| {
+            item.is_current && item.scheduling_state == WorkItemSchedulingState::WaitingExternal
+        }) {
             return Ok(AgentPostureProjection {
                 posture: AgentSchedulingPosture::WaitingForExternal,
                 reason: item.posture_reason(),
@@ -298,7 +301,11 @@ impl RuntimeReadModels {
             });
         }
 
-        if let Some(item) = work_queue.waiting_for_operator.first() {
+        if let Some(item) = work_queue
+            .waiting_for_operator
+            .iter()
+            .find(|item| item.is_current)
+        {
             return Ok(AgentPostureProjection {
                 posture: AgentSchedulingPosture::WaitingForOperator,
                 reason: item.posture_reason(),
@@ -310,8 +317,14 @@ impl RuntimeReadModels {
 
         if let Some(item) = work_queue
             .blocked
-            .first()
-            .or_else(|| work_queue.triggered_blocked.first())
+            .iter()
+            .find(|item| item.is_current)
+            .or_else(|| {
+                work_queue
+                    .triggered_blocked
+                    .iter()
+                    .find(|item| item.is_current)
+            })
         {
             return Ok(AgentPostureProjection {
                 posture: AgentSchedulingPosture::Blocked,

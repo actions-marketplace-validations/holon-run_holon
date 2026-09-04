@@ -49,15 +49,16 @@ deepseek/deepseek-v4-flash
 The suite requires network access and provider quota, so ordinary pull-request
 CI only validates its manifest and Python runner. Each release candidate runs
 the core cases plus all scheduler-tagged cases through the protected
-`Release E2E` workflow. Scheduler cases run twice with
-`HOLON_SCHEDULER=legacy` and `HOLON_SCHEDULER=canonical`. Each engine uses a
-separate `holon serve` process, Docker volume, runtime database, and evidence
-directory while sharing the same user-visible and persistence assertions.
+`Release E2E` workflow. Scheduler cases run once with the canonical scheduler.
+The runner retains `scheduler_engine="canonical"` in attestation evidence for
+schema stability, but does not set the retired `HOLON_SCHEDULER` selector.
+Each case uses a separate `holon serve` process, Docker volume, runtime
+database, and evidence directory.
 
 The release gate does not install scheduler manifest/preflight rows, stage
-shadow authority, or import synthetic cutover evidence. It validates the
-temporary process-level rollback switch directly and records canonical-only
-protocol assertions only when the canonical engine is selected.
+shadow authority, or import synthetic cutover evidence. It validates
+canonical-only protocol assertions and records one consistent runtime schema
+revision.
 
 Run locally with a credential environment variable:
 
@@ -75,11 +76,28 @@ OPENROUTER_API_KEY='...' \
 make docker-e2e
 ```
 
-Alternatively, set `HOLON_E2E_DOCKER_ENV_FILE` or pass `--env-file` to an
+Alternatively, set `HOLON_E2E_PROVIDER_ENV_FILE` or pass `--env-file` to an
 untracked Docker env file with mode `0600`. The runner records only the
 credential variable names and whether a file was used. It never records the
-file path or values. Existing `HOLON_LIVE_*` variables remain accepted during
-the compatibility period.
+file path or values. The legacy `HOLON_E2E_DOCKER_ENV_FILE` and existing
+`HOLON_LIVE_*` variables remain accepted during the compatibility period.
+
+Pass `--config-file` or set `HOLON_E2E_PROVIDER_CONFIG_FILE` to seed a
+non-secret Holon `config.json` into each case volume. The legacy
+`HOLON_E2E_CONFIG_FILE` remains accepted during the compatibility period. Keep
+credentials in the env file rather than the config file. The protected CI,
+nightly, and release workflows expose the same split through repository
+configuration:
+
+- `HOLON_E2E_SCHEDULER_MODEL`: model route; defaults to the same
+  `dashscope-token-plan/qwen-3.7` route used by `holon-trigger`.
+- `HOLON_E2E_SCHEDULER_CREDENTIAL_ENV`: provider credential variable name.
+- `HOLON_E2E_SCHEDULER_CONFIG_JSON`: optional non-secret `config.json` content.
+- `HOLON_E2E_SCHEDULER_CREDENTIAL`: Secret containing the credential value.
+
+The scheduled scheduler workflow compares the current revision with the
+previous scheduled run and skips the expensive Docker matrix when no
+scheduler-relevant code changed. Manual dispatch always runs.
 
 The checked-in case definitions live in
 `tests/e2e/docker/manifest.json`. The stable runner is
@@ -115,16 +133,17 @@ When a candidate image is already published, use an immutable reference:
 ```bash
 python3 scripts/docker-e2e.py \
   --image-digest ghcr.io/holon-run/holon@sha256:... \
+  --previous-image ghcr.io/holon-run/holon:v0.30.0 \
   --skip-build \
   --suite core
 ```
 
 The summary records the Git SHA, image ID and repository digest, requested
 model route, manifest hash, timings, provider attempts, token usage, tool
-counts, cleanup status, and previous image when supplied. A matrix run also
+counts, cleanup status, and previous image when supplied. A scheduler run also
 writes `scheduler-acceptance-report.json`, which binds the result to the Git
 SHA, immutable image digest, runtime schema revision, fixture corpus revision,
-manifest hash, both scheduler engines, and their per-case evidence identities.
+manifest hash, the canonical scheduler label, and per-case evidence identities.
 
 ### Checked-in cases
 
@@ -179,8 +198,8 @@ manifest hash, both scheduler engines, and their per-case evidence identities.
 
 #### Scheduler release acceptance cases
 
-The protected release run selects every case tagged `scheduler` and expands
-each into isolated `legacy` and `canonical` processes. The corpus includes:
+The protected release run selects every case tagged `scheduler` and runs each
+once in an isolated canonical process. The corpus includes:
 
 1. `scheduler-task-wait-resume` validates autonomous scheduling, promoted task
    yield/rejoin, external wait-resume, exact completion delivery binding, and
@@ -188,9 +207,8 @@ each into isolated `legacy` and `canonical` processes. The corpus includes:
 2. Provider-failure retry, multi-WorkItem scheduling, external/operator waits,
    interjection, compaction, worktree isolation, child supervision, and
    checkpoint replay retain their real process and persistence assertions.
-3. The canonical process additionally requires settled activation, demand,
-   and wait-generation state. The legacy process requires those canonical
-   execution tables to remain unused.
+3. Every scheduler case requires the canonical execution, WorkItem, queue,
+   task, and wait evidence appropriate to that scenario.
 
 These cases validate the complete boundary:
 
@@ -214,13 +232,19 @@ jobs:
    scheduler-tagged cases with `--scheduler-matrix` in one attested runner
    invocation.
 
+The manual dispatch must provide exactly one previous-release source.
+`previous_image` is a full container image reference and is validated without
+fallback; `previous_ref` is a release tag used to download the checksummed Linux
+binary and build the local upgrade image. The resolved image, source kind, and
+release ref are recorded in the run summary and attestation.
+
 The E2E job has read-only repository/package permissions and cannot publish a
 GitHub release, promote `latest`, or update Homebrew. Evidence is retained as a
 workflow artifact. Its attestation embeds the machine-readable scheduler
-acceptance report. The tag-triggered release workflow verifies that both
-engines passed against the same Git SHA, schema revision, fixture corpus, and
-candidate digest before publishing, then promotes that exact digest instead of
-rebuilding the container image.
+acceptance report. The tag-triggered release workflow verifies that the
+canonical scheduler suite passed against the same Git SHA, schema revision,
+fixture corpus, and candidate digest before publishing, then promotes that
+exact digest instead of rebuilding the container image.
 
 ## Phases
 
@@ -262,8 +286,11 @@ Exercise:
    WorkItems, tasks, waits, and workspace state.
 2. Interrupt tool execution, task completion, and worktree cleanup at
    controlled points; reconciliation must not duplicate side effects.
-3. Start from the current recommended release's runtime data and upgrade to
-   the candidate image.
+3. Start `v0.30.0` against an isolated shared volume, complete a real
+   deterministic agent turn, then start the candidate against that same
+   volume. The required release case verifies schema migration provenance,
+   preserved message/brief identities, and a successful post-upgrade agent
+   turn.
 4. Cover a locked database, missing workspace path, and orphaned worktree,
    verifying diagnostics and retention behavior.
 

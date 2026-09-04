@@ -1,23 +1,26 @@
 use super::lifecycle::{
-    effective_config_mismatch_summary, probe_runtime, runtime_status_matches_metadata,
-    set_prepare_runtime_before_server_hook, should_retry_startup_stability_probe,
-    wait_for_startup_stability_with_probe, ProbeRuntime,
+    effective_config_mismatch_summary, lifecycle_lock, probe_runtime,
+    runtime_status_matches_metadata, set_prepare_runtime_before_server_hook,
+    should_retry_startup_stability_probe, validate_incompatible_runtime_identity_with_executable,
+    wait_for_startup_stability_with_probe, web_url, ProbeRuntime,
 };
 use super::state::{
     persist_last_runtime_failure, DAEMON_LOG_TAIL_LINE_CHAR_LIMIT, DAEMON_LOG_TAIL_READ_BYTE_LIMIT,
 };
 use super::{
     clear_persisted_daemon_lifecycle_failures, config_fingerprint, daemon_log_hint, daemon_logs,
-    daemon_paths, daemon_start, daemon_status, daemon_stop, ensure_serve_preflight,
-    load_last_runtime_failure, persist_daemon_lifecycle_failure, prepare_runtime_before_server,
-    runtime_activity_summary, DaemonLifecycleState, RuntimeActivityState, RuntimeConfigSurface,
-    RuntimeControlAuthMode, RuntimeServiceMetadata, RuntimeStartupSurface, RuntimeStatusResponse,
+    daemon_paths, daemon_prepare_update, daemon_start, daemon_status, daemon_stop,
+    ensure_serve_preflight, load_daemon_desired_running, load_last_runtime_failure,
+    persist_daemon_desired_running, persist_daemon_lifecycle_failure,
+    prepare_runtime_before_server, runtime_activity_summary, DaemonLifecycleAction,
+    DaemonLifecycleState, RuntimeActivityState, RuntimeConfigSurface, RuntimeControlAuthMode,
+    RuntimeServiceMetadata, RuntimeStartupSurface, RuntimeStatusResponse,
 };
 use crate::config::{provider_registry_for_tests, AppConfig, ProviderId};
 use crate::{
     host::RuntimeHost,
     provider::StubProvider,
-    runtime_db::RuntimeDb,
+    runtime_db::{RuntimeDb, RuntimeDbLock},
     storage::AppStorage,
     types::{
         AgentIdentityRecord, AgentKind, AgentOwnership, AgentProfilePreset, AgentState,
@@ -28,6 +31,7 @@ use crate::{
 use chrono::Utc;
 use std::{
     fs,
+    path::PathBuf,
     process::Command,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -75,6 +79,7 @@ fn test_config() -> AppConfig {
         max_relevant_episodes: 3,
         control_token: Some("secret".into()),
         control_auth_mode: crate::config::ControlAuthMode::Auto,
+        auth: Default::default(),
         api_cors: Default::default(),
         config_file_path: home.path().join("config.json"),
         stored_config: Default::default(),
@@ -91,7 +96,6 @@ fn test_config() -> AppConfig {
         default_tool_output_tokens: crate::tool::helpers::DEFAULT_TOOL_OUTPUT_TOKENS as u32,
         max_tool_output_tokens: crate::tool::helpers::MAX_TOOL_OUTPUT_TOKENS as u32,
         disable_provider_fallback: false,
-        scheduler_engine: crate::config::SchedulerEngineMode::Canonical,
         tui_alternate_screen: crate::config::AltScreenMode::Auto,
         validated_model_overrides: std::collections::HashMap::new(),
         validated_unknown_model_fallback: None,
@@ -139,6 +143,135 @@ fn daemon_paths_use_run_dir_convention() {
         paths.shutdown_failure_path,
         config.run_dir().join("shutdown_failure.json")
     );
+    assert_eq!(
+        paths.lifecycle_lock_path,
+        config.run_dir().join("lifecycle.lock")
+    );
+    assert_eq!(
+        paths.desired_state_path,
+        config.run_dir().join("desired_state.json")
+    );
+}
+
+fn replacement_metadata(
+    config: &AppConfig,
+    pid: u32,
+    executable_path: PathBuf,
+) -> RuntimeServiceMetadata {
+    RuntimeServiceMetadata {
+        pid,
+        home_dir: config.home_dir.clone(),
+        socket_path: config.socket_path.clone(),
+        http_addr: config.http_addr.clone(),
+        started_at: Utc::now(),
+        config_fingerprint: config_fingerprint(config).unwrap(),
+        product_version: "incompatible-build".into(),
+        control_protocol_version: 0,
+        lifecycle_owner: crate::daemon::DaemonLifecycleOwner::Standalone,
+        executable_path,
+        serve_args: Vec::new(),
+        control_token_env_configured: false,
+    }
+}
+
+#[test]
+fn incompatible_runtime_identity_rejects_home_or_socket_mismatch() {
+    let config = test_config();
+    let mut metadata = replacement_metadata(&config, 42, PathBuf::new());
+    metadata.home_dir = config.home_dir.join("other");
+
+    let error = validate_incompatible_runtime_identity_with_executable(
+        &config,
+        &metadata,
+        PathBuf::from("/tmp/holon").as_path(),
+    )
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("recorded home or control socket"));
+}
+
+#[test]
+fn incompatible_runtime_identity_rejects_pid_mismatch() {
+    let config = test_config();
+    fs::create_dir_all(config.run_dir()).unwrap();
+    fs::write(daemon_paths(&config).pid_path, "41\n").unwrap();
+    let metadata = replacement_metadata(&config, 42, PathBuf::new());
+
+    let error = validate_incompatible_runtime_identity_with_executable(
+        &config,
+        &metadata,
+        PathBuf::from("/tmp/holon").as_path(),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("records PID 41"));
+    assert!(error.to_string().contains("metadata records PID 42"));
+}
+
+#[test]
+fn incompatible_runtime_identity_rejects_wrong_executable_name() {
+    let config = test_config();
+    fs::create_dir_all(config.run_dir()).unwrap();
+    fs::write(daemon_paths(&config).pid_path, "42\n").unwrap();
+    let metadata = replacement_metadata(&config, 42, PathBuf::new());
+
+    let error = validate_incompatible_runtime_identity_with_executable(
+        &config,
+        &metadata,
+        PathBuf::from("/tmp/not-holon").as_path(),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("its executable is"));
+}
+
+#[test]
+fn incompatible_runtime_identity_rejects_different_executable_path() {
+    let config = test_config();
+    fs::create_dir_all(config.run_dir()).unwrap();
+    fs::write(daemon_paths(&config).pid_path, "42\n").unwrap();
+    let executable_dir = tempdir().unwrap();
+    let recorded_dir = tempdir().unwrap();
+    let actual_executable = executable_dir.path().join("holon");
+    let recorded_executable = recorded_dir.path().join("holon");
+    fs::write(&actual_executable, b"actual").unwrap();
+    fs::write(&recorded_executable, b"recorded").unwrap();
+    let metadata = replacement_metadata(&config, 42, recorded_executable);
+
+    let error = validate_incompatible_runtime_identity_with_executable(
+        &config,
+        &metadata,
+        &actual_executable,
+    )
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("does not match recorded executable"));
+}
+
+#[test]
+fn incompatible_runtime_identity_accepts_matching_identity() {
+    let config = test_config();
+    fs::create_dir_all(config.run_dir()).unwrap();
+    fs::write(daemon_paths(&config).pid_path, "42\n").unwrap();
+    let executable_dir = tempdir().unwrap();
+    let actual_executable = executable_dir.path().join("holon");
+    fs::write(&actual_executable, b"holon").unwrap();
+    let metadata = replacement_metadata(&config, 42, actual_executable.clone());
+
+    validate_incompatible_runtime_identity_with_executable(&config, &metadata, &actual_executable)
+        .unwrap();
+}
+
+#[test]
+fn daemon_web_url_uses_a_connectable_loopback_address() {
+    assert_eq!(web_url("0.0.0.0:7878"), "http://127.0.0.1:7878");
+    assert_eq!(web_url("[::]:7878"), "http://[::1]:7878");
+    assert_eq!(web_url("127.0.0.1:7878"), "http://127.0.0.1:7878");
+    assert_eq!(web_url("https://holon.example"), "https://holon.example");
 }
 
 #[test]
@@ -151,6 +284,10 @@ fn runtime_service_metadata_round_trips() {
         http_addr: config.http_addr.clone(),
         started_at: Utc::now(),
         config_fingerprint: config_fingerprint(&config).unwrap(),
+        product_version: env!("HOLON_VERSION").into(),
+        control_protocol_version: crate::daemon::DAEMON_CONTROL_PROTOCOL_VERSION,
+        lifecycle_owner: crate::daemon::DaemonLifecycleOwner::Standalone,
+        executable_path: std::env::current_exe().unwrap(),
         serve_args: Vec::new(),
         control_token_env_configured: false,
     };
@@ -158,6 +295,128 @@ fn runtime_service_metadata_round_trips() {
     let decoded: RuntimeServiceMetadata = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(decoded.pid, 42);
     assert_eq!(decoded.home_dir, config.home_dir);
+}
+
+#[test]
+fn runtime_service_metadata_defaults_new_lifecycle_fields_for_old_records() {
+    let decoded: RuntimeServiceMetadata = serde_json::from_value(serde_json::json!({
+        "pid": 42,
+        "home_dir": "/tmp/holon",
+        "socket_path": "/tmp/holon/run/control.sock",
+        "http_addr": "127.0.0.1:7878",
+        "started_at": "2026-08-28T00:00:00Z",
+        "config_fingerprint": "old"
+    }))
+    .unwrap();
+
+    assert_eq!(decoded.product_version, "");
+    assert_eq!(decoded.control_protocol_version, 0);
+    assert_eq!(
+        decoded.lifecycle_owner,
+        crate::daemon::DaemonLifecycleOwner::Standalone
+    );
+    assert!(decoded.executable_path.as_os_str().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_status_reports_old_live_metadata_as_version_mismatch() {
+    let config = test_config();
+    let paths = daemon_paths(&config);
+    fs::create_dir_all(config.run_dir()).unwrap();
+    fs::write(&paths.pid_path, format!("{}\n", std::process::id())).unwrap();
+    fs::write(
+        &paths.metadata_path,
+        serde_json::to_vec(&serde_json::json!({
+            "pid": std::process::id(),
+            "home_dir": config.home_dir,
+            "socket_path": config.socket_path,
+            "http_addr": config.http_addr,
+            "started_at": "2026-08-28T00:00:00Z",
+            "config_fingerprint": config_fingerprint(&config).unwrap()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let status = daemon_status(&config).await.unwrap();
+    assert_eq!(status.state, DaemonLifecycleState::VersionMismatch);
+    assert_eq!(status.control_protocol_version, None);
+    assert!(status.message.contains("control protocol version 0"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_status_accepts_different_product_build_with_compatible_protocol() {
+    let config = test_config();
+    let paths = daemon_paths(&config);
+    fs::create_dir_all(config.run_dir()).unwrap();
+    fs::write(&paths.pid_path, format!("{}\n", std::process::id())).unwrap();
+    fs::write(
+        &paths.metadata_path,
+        serde_json::to_vec(&RuntimeServiceMetadata {
+            pid: std::process::id(),
+            home_dir: config.home_dir.clone(),
+            socket_path: config.socket_path.clone(),
+            http_addr: config.http_addr.clone(),
+            started_at: Utc::now(),
+            config_fingerprint: config_fingerprint(&config).unwrap(),
+            product_version: "0.32.0 (old-build)".into(),
+            control_protocol_version: crate::daemon::DAEMON_CONTROL_PROTOCOL_VERSION,
+            lifecycle_owner: crate::daemon::DaemonLifecycleOwner::Standalone,
+            executable_path: std::env::current_exe().unwrap(),
+            serve_args: Vec::new(),
+            control_token_env_configured: false,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let status = daemon_status(&config).await.unwrap();
+    assert_eq!(status.state, DaemonLifecycleState::Degraded);
+    assert_eq!(
+        status.product_version.as_deref(),
+        Some("0.32.0 (old-build)")
+    );
+    assert_eq!(
+        status.control_protocol_version,
+        Some(crate::daemon::DAEMON_CONTROL_PROTOCOL_VERSION)
+    );
+    assert!(!status.message.contains("product version"));
+}
+
+#[test]
+fn daemon_desired_state_round_trips_without_affecting_runtime_files() {
+    let config = test_config();
+    assert_eq!(load_daemon_desired_running(&config).unwrap(), None);
+
+    persist_daemon_desired_running(&config, true).unwrap();
+    assert_eq!(load_daemon_desired_running(&config).unwrap(), Some(true));
+
+    persist_daemon_desired_running(&config, false).unwrap();
+    assert_eq!(load_daemon_desired_running(&config).unwrap(), Some(false));
+    assert!(!daemon_paths(&config).metadata_path.exists());
+}
+
+#[tokio::test]
+async fn daemon_lifecycle_lock_rejects_a_second_holder() {
+    let config = test_config();
+    let _lock = lifecycle_lock(&config).await.unwrap();
+    let second = RuntimeDbLock::try_lock(daemon_paths(&config).lifecycle_lock_path);
+    assert!(second.is_err());
+}
+
+#[tokio::test]
+async fn daemon_prepare_update_stops_without_changing_desired_state() {
+    let config = test_config();
+    persist_daemon_desired_running(&config, true).unwrap();
+
+    let result = daemon_prepare_update(&config).await.unwrap();
+
+    assert_eq!(result.action, DaemonLifecycleAction::PrepareUpdate);
+    assert_eq!(result.status.state, DaemonLifecycleState::Stopped);
+    assert!(result.status.desired_running);
+    assert_eq!(load_daemon_desired_running(&config).unwrap(), Some(true));
 }
 
 #[test]
@@ -370,6 +629,10 @@ fn effective_config_mismatch_summary_lists_actionable_differences() {
         http_addr: "127.0.0.1:7878".into(),
         started_at: Utc::now(),
         config_fingerprint: "actual".into(),
+        product_version: env!("HOLON_VERSION").into(),
+        control_protocol_version: crate::daemon::DAEMON_CONTROL_PROTOCOL_VERSION,
+        lifecycle_owner: crate::daemon::DaemonLifecycleOwner::Standalone,
+        executable_path: std::env::current_exe().unwrap(),
         activity: None,
         startup_surface: Some(RuntimeStartupSurface {
             home_dir: expected.home_dir.clone(),
@@ -422,6 +685,46 @@ fn runtime_config_surface_reports_available_search_provider_capabilities() {
         native.capabilities.status,
         crate::web::WebProviderSupportStatus::NativeOnly
     );
+}
+
+#[test]
+fn runtime_config_surface_reports_credential_free_providers_as_ready() {
+    let mut config = test_config();
+    let ollama_id = crate::config::ProviderId::parse("ollama").unwrap();
+    config.providers.insert(
+        ollama_id.clone(),
+        crate::config::ProviderRuntimeConfig {
+            id: ollama_id.clone(),
+            route_provider: ollama_id,
+            route_endpoint: crate::config::ProviderEndpointId::default_endpoint(),
+            transport: crate::config::ProviderTransportKind::AnthropicMessages,
+            base_url: "http://127.0.0.1:11434".into(),
+            auth: crate::config::ProviderAuthConfig {
+                source: crate::config::CredentialSource::None,
+                kind: crate::config::CredentialKind::None,
+                env: None,
+                profile: None,
+                external: None,
+            },
+            credential: None,
+            credential_store_path: None,
+            codex_home: None,
+            originator: None,
+            reasoning_effort: None,
+            context_management: Default::default(),
+            builtin_web_search: None,
+        },
+    );
+
+    let surface = RuntimeConfigSurface::new(&config);
+    let ollama = surface
+        .providers
+        .iter()
+        .find(|provider| provider.id == "ollama")
+        .expect("ollama provider should be reported");
+    assert_eq!(ollama.credential_kind, "none");
+    assert!(!ollama.api_key_supported);
+    assert!(ollama.credential_configured);
 }
 
 #[tokio::test]
@@ -518,6 +821,10 @@ async fn probe_runtime_reports_running_when_socket_missing_but_pid_alive() {
         http_addr: metadata_http.clone(),
         started_at: Utc::now(),
         config_fingerprint: config_fingerprint(&config).unwrap(),
+        product_version: env!("HOLON_VERSION").into(),
+        control_protocol_version: crate::daemon::DAEMON_CONTROL_PROTOCOL_VERSION,
+        lifecycle_owner: crate::daemon::DaemonLifecycleOwner::Standalone,
+        executable_path: std::env::current_exe().unwrap(),
         serve_args: Vec::new(),
         control_token_env_configured: false,
     };
@@ -552,6 +859,10 @@ async fn probe_runtime_reports_running_when_socket_refuses_but_pid_alive() {
         http_addr: config.http_addr.clone(),
         started_at: Utc::now(),
         config_fingerprint: config_fingerprint(&config).unwrap(),
+        product_version: env!("HOLON_VERSION").into(),
+        control_protocol_version: crate::daemon::DAEMON_CONTROL_PROTOCOL_VERSION,
+        lifecycle_owner: crate::daemon::DaemonLifecycleOwner::Standalone,
+        executable_path: std::env::current_exe().unwrap(),
         serve_args: Vec::new(),
         control_token_env_configured: false,
     };
@@ -578,6 +889,10 @@ fn runtime_status_metadata_match_rejects_foreign_runtime() {
         http_addr: config.http_addr.clone(),
         started_at: Utc::now(),
         config_fingerprint: config_fingerprint(&config).unwrap(),
+        product_version: env!("HOLON_VERSION").into(),
+        control_protocol_version: crate::daemon::DAEMON_CONTROL_PROTOCOL_VERSION,
+        lifecycle_owner: crate::daemon::DaemonLifecycleOwner::Standalone,
+        executable_path: std::env::current_exe().unwrap(),
         serve_args: Vec::new(),
         control_token_env_configured: false,
     };
@@ -590,6 +905,10 @@ fn runtime_status_metadata_match_rejects_foreign_runtime() {
         http_addr: metadata.http_addr.clone(),
         started_at: metadata.started_at,
         config_fingerprint: metadata.config_fingerprint.clone(),
+        product_version: env!("HOLON_VERSION").into(),
+        control_protocol_version: crate::daemon::DAEMON_CONTROL_PROTOCOL_VERSION,
+        lifecycle_owner: crate::daemon::DaemonLifecycleOwner::Standalone,
+        executable_path: std::env::current_exe().unwrap(),
         activity: None,
         startup_surface: None,
         runtime_surface: None,
@@ -617,6 +936,10 @@ async fn daemon_status_surfaces_dead_pid_and_leftover_socket_as_stale() {
         http_addr: config.http_addr.clone(),
         started_at: Utc::now(),
         config_fingerprint: config_fingerprint(&config).unwrap(),
+        product_version: env!("HOLON_VERSION").into(),
+        control_protocol_version: crate::daemon::DAEMON_CONTROL_PROTOCOL_VERSION,
+        lifecycle_owner: crate::daemon::DaemonLifecycleOwner::Standalone,
+        executable_path: std::env::current_exe().unwrap(),
         serve_args: Vec::new(),
         control_token_env_configured: false,
     };
@@ -650,6 +973,10 @@ async fn serve_preflight_cleans_dead_pid_and_leftover_socket_state() {
         http_addr: config.http_addr.clone(),
         started_at: Utc::now(),
         config_fingerprint: config_fingerprint(&config).unwrap(),
+        product_version: env!("HOLON_VERSION").into(),
+        control_protocol_version: crate::daemon::DAEMON_CONTROL_PROTOCOL_VERSION,
+        lifecycle_owner: crate::daemon::DaemonLifecycleOwner::Standalone,
+        executable_path: std::env::current_exe().unwrap(),
         serve_args: Vec::new(),
         control_token_env_configured: false,
     };
@@ -785,6 +1112,10 @@ async fn daemon_stop_treats_missing_pid_process_as_stale_state() {
         http_addr: config.http_addr.clone(),
         started_at: Utc::now(),
         config_fingerprint: config_fingerprint(&config).unwrap(),
+        product_version: env!("HOLON_VERSION").into(),
+        control_protocol_version: crate::daemon::DAEMON_CONTROL_PROTOCOL_VERSION,
+        lifecycle_owner: crate::daemon::DaemonLifecycleOwner::Standalone,
+        executable_path: std::env::current_exe().unwrap(),
         serve_args: Vec::new(),
         control_token_env_configured: false,
     };
@@ -818,6 +1149,10 @@ async fn daemon_stop_uses_recorded_runtime_http_addr_when_socket_is_missing() {
         http_addr: metadata_http.clone(),
         started_at: Utc::now(),
         config_fingerprint: config_fingerprint(&config).unwrap(),
+        product_version: env!("HOLON_VERSION").into(),
+        control_protocol_version: crate::daemon::DAEMON_CONTROL_PROTOCOL_VERSION,
+        lifecycle_owner: crate::daemon::DaemonLifecycleOwner::Standalone,
+        executable_path: std::env::current_exe().unwrap(),
         serve_args: Vec::new(),
         control_token_env_configured: false,
     };
@@ -912,6 +1247,10 @@ async fn daemon_stop_errors_on_permission_denied_signals() {
         http_addr: config.http_addr.clone(),
         started_at: Utc::now(),
         config_fingerprint: config_fingerprint(&config).unwrap(),
+        product_version: env!("HOLON_VERSION").into(),
+        control_protocol_version: crate::daemon::DAEMON_CONTROL_PROTOCOL_VERSION,
+        lifecycle_owner: crate::daemon::DaemonLifecycleOwner::Standalone,
+        executable_path: std::env::current_exe().unwrap(),
         serve_args: Vec::new(),
         control_token_env_configured: false,
     };

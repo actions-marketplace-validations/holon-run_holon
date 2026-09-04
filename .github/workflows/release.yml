@@ -74,13 +74,21 @@ jobs:
              and .status == "pass"
              and (.image.ref | contains("@sha256:"))
              and (.model_route | length > 0)
+             and (.previous_release.image | type == "string" and length > 0)
+             and (
+               (.previous_release.source == "previous_image"
+                and .previous_release.ref == null)
+               or
+               (.previous_release.source == "previous_ref"
+                and (.previous_release.ref | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")))
+             )
              and .scheduler_acceptance.schema_version == 1
              and .scheduler_acceptance.status == "pass"
              and .scheduler_acceptance.git_sha == $sha
              and (.scheduler_acceptance.runtime_schema_revision | type == "number")
              and (.scheduler_acceptance.fixture_corpus_revision | length > 0)
              and (.scheduler_acceptance.image_digest | contains("@sha256:"))
-             and ([.scheduler_acceptance.engines[] | .engine] == ["legacy", "canonical"])
+             and ([.scheduler_acceptance.engines[] | .engine] == ["canonical"])
              and ([.scheduler_acceptance.engines[] | .status] | all(. == "pass"))' \
             release-e2e-gate/release-e2e-attestation.json >/dev/null
 
@@ -103,7 +111,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Keep the official GNU/Linux binary compatible with glibc 2.35.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             asset: holon-linux-amd64
           - os: macos-latest
@@ -148,11 +157,128 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  macos-app:
+    name: Build macOS menu app
+    runs-on: macos-latest
+    needs: e2e-gate
+    env:
+      MACOS_DEVELOPER_ID_APPLICATION: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION }}
+      MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+      MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+      MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+      HOLON_SPARKLE_FEED_URL: ${{ vars.HOLON_SPARKLE_FEED_URL }}
+      HOLON_SPARKLE_PUBLIC_KEY: ${{ secrets.HOLON_SPARKLE_PUBLIC_KEY }}
+      HOLON_SPARKLE_PRIVATE_KEY: ${{ secrets.HOLON_SPARKLE_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Build web GUI
+        run: make web
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install both macOS Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Validate macOS release credentials
+        run: |
+          set -euo pipefail
+          required=(
+            MACOS_DEVELOPER_ID_APPLICATION
+            MACOS_CERTIFICATE_P12
+            MACOS_CERTIFICATE_PASSWORD
+            MACOS_NOTARY_APPLE_ID
+            MACOS_NOTARY_PASSWORD
+            MACOS_NOTARY_TEAM_ID
+            HOLON_SPARKLE_FEED_URL
+            HOLON_SPARKLE_PUBLIC_KEY
+            HOLON_SPARKLE_PRIVATE_KEY
+          )
+          for name in "${required[@]}"; do
+            if [ -z "${!name:-}" ]; then
+              echo "Required macOS release credential is not configured: ${name}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Import Developer ID certificate
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/holon-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          certificate="$RUNNER_TEMP/holon-developer-id.p12"
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$keychain"
+          security list-keychain -d user -s "$keychain" login.keychain-db
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain"
+
+      - name: Build bundled Holon runtime
+        run: cargo build --release --locked --target aarch64-apple-darwin --target x86_64-apple-darwin
+
+      - name: Merge universal Holon runtime
+        run: |
+          set -euo pipefail
+          mkdir -p target/universal-macos/release
+          lipo -create \
+            target/aarch64-apple-darwin/release/holon \
+            target/x86_64-apple-darwin/release/holon \
+            -output target/universal-macos/release/holon
+
+      - name: Test macOS menu app
+        run: swift test --package-path apps/macos/HolonMenu
+
+      - name: Package macOS app and DMG
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          scripts/package-macos-menu-app.sh \
+            target/universal-macos/release/holon \
+            dist \
+            "$version"
+
+      - name: Generate signed Sparkle appcast
+        run: |
+          set -euo pipefail
+          scripts/generate-macos-appcast.sh \
+            dist \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/"
+
+      - name: Upload macOS app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-holon-macos-app
+          path: |
+            dist/Holon-*.dmg
+            dist/Holon-*.dmg.sha256
+            dist/appcast.xml
+          if-no-files-found: error
+
   release:
     name: Publish GitHub release
     runs-on: ubuntu-latest
     needs:
       - build
+      - macos-app
       - e2e-gate
     permissions:
       contents: write
@@ -181,8 +307,8 @@ jobs:
           set -euo pipefail
           (
             cd dist-artifacts
-            rm -f ./*.sha256
-            shasum -a 256 ./*.tar.gz | sort -k2 > checksums.txt
+            rm -f ./*.tar.gz.sha256
+            shasum -a 256 ./*.tar.gz ./*.dmg | sort -k2 > checksums.txt
           )
           bash scripts/generate-homebrew-formula.sh \
             "$GITHUB_REF_NAME" \
@@ -200,24 +326,22 @@ jobs:
         run: |
           set -euo pipefail
           cat > release-notes.md <<EOF
-          ## Runtime line
+          This release ships the session-first authentication stack — unified session auth across the HTTP API, SSE, and the web GUI, OIDC login with Authorization Code + PKCE and verified RSA ID tokens, and a dedicated /login page with 24-hour idle session expiry — alongside an agent-aware holon CLI control plane, models.dev supplemental catalog auto-drafting, context_not_found diagnostics, and WaitFor/wake correctness fixes.
 
-          Holon ${GITHUB_REF_NAME} is part of the Rust runtime line. The Rust runtime is now the main \`holon\` binary.
-
-          This minor release expands web search provider metadata and configuration, fixes Gemini prompt projection and model capability routing, and strengthens runtime lifecycle consistency, continuation recovery, and Web GUI event handling. It also retires the legacy random workspace ID compatibility path after its migration window.
-
-          Supported binary assets for this release are Linux amd64, macOS amd64, and macOS arm64.
+          Supported binary assets for this release are Linux amd64, macOS amd64, and macOS arm64. The macOS app DMG is a universal binary supporting both x86_64 and arm64. The Linux amd64 binary supports Ubuntu 22.04 or newer (glibc 2.35 or newer).
 
           ## Changes
 
-          - Expose web search provider metadata, complete built-in search provider coverage, and align provider selection and settings behavior for non-default endpoints ([#2292](https://github.com/holon-run/holon/pull/2292), [#2297](https://github.com/holon-run/holon/pull/2297), [#2300](https://github.com/holon-run/holon/pull/2300)).
-          - Deduplicate Gemini system and context prompt sections while preserving the structured GenerateContent request contract ([#2296](https://github.com/holon-run/holon/pull/2296)).
-          - Validate reasoning effort against the resolved model route and capability metadata, including fallback diagnostics ([#2281](https://github.com/holon-run/holon/pull/2281), [#2283](https://github.com/holon-run/holon/pull/2283), [#2285](https://github.com/holon-run/holon/pull/2285)).
-          - Strengthen persisted runtime lifecycle transitions by publishing audit events after persistence, requiring turn ownership, preserving queue/wait terminal states, and enforcing first-writer-wins task completion ([#2276](https://github.com/holon-run/holon/pull/2276), [#2289](https://github.com/holon-run/holon/pull/2289), [#2290](https://github.com/holon-run/holon/pull/2290), [#2293](https://github.com/holon-run/holon/pull/2293)).
-          - Recover oversized continuations by shrinking projected recent turns instead of abandoning resumable work ([#2295](https://github.com/holon-run/holon/pull/2295)).
-          - Close lagged SSE streams, recover Web GUI event gaps from a contiguous cursor, and keep WorkItem detail state visible during refreshes ([#2247](https://github.com/holon-run/holon/pull/2247), [#2287](https://github.com/holon-run/holon/pull/2287), [#2288](https://github.com/holon-run/holon/pull/2288)).
-          - Retire lazy migration and alias resolution for unsupported legacy random workspace IDs while preserving canonical workspace behavior ([#2298](https://github.com/holon-run/holon/pull/2298)).
-          - Expand mainline CI coverage for runtime lifecycle concurrency and the Web GUI test suite, and refresh onboarding-focused project documentation ([#2242](https://github.com/holon-run/holon/pull/2242), [#2277](https://github.com/holon-run/holon/pull/2277), [#2280](https://github.com/holon-run/holon/pull/2280)).
+          - Add the session-first authentication foundation and unify HTTP session-first authentication across API, SSE, and web surfaces ([#2744](https://github.com/holon-run/holon/pull/2744), [#2758](https://github.com/holon-run/holon/pull/2758)).
+          - Add OIDC session issuance with Authorization Code + PKCE, enable JWT RSA ID token verification, and improve login and session UX with a unified /login page and 24-hour idle session expiry ([#2752](https://github.com/holon-run/holon/pull/2752), [#2763](https://github.com/holon-run/holon/pull/2763), [#2772](https://github.com/holon-run/holon/pull/2772)).
+          - Add the agent-aware holon CLI control plane ([#2746](https://github.com/holon-run/holon/pull/2746)).
+          - Auto-draft new models for supported providers from the models.dev supplemental catalog and refresh the model snapshot and artifact ([#2749](https://github.com/holon-run/holon/pull/2749), [#2751](https://github.com/holon-run/holon/pull/2751)).
+          - Diagnose context_not_found divergence and fall back across doubled-prefix workspace path variants ([#2759](https://github.com/holon-run/holon/pull/2759)).
+          - Persist the WaitFor fast-path wake promise for terminal task results and unify wait/wake resume authorization ([#2745](https://github.com/holon-run/holon/pull/2745), [#2748](https://github.com/holon-run/holon/pull/2748)).
+          - Abort orphaned queue entries when an agent is stopped or deleted, and retain the worktree branch when a merge proof fails ([#2769](https://github.com/holon-run/holon/pull/2769), [#2765](https://github.com/holon-run/holon/pull/2765)).
+          - Make the file-mutation prompt goal-oriented with scenario defaults, tolerate pure-add modify patches against missing targets, and apply turn fallback binding to the ApplyPatch invocation surface ([#2764](https://github.com/holon-run/holon/pull/2764), [#2756](https://github.com/holon-run/holon/pull/2756), [#2760](https://github.com/holon-run/holon/pull/2760)).
+          - Web GUI: auto-restore exact unread certainty when the read marker catches up, clarify runtime connection status, and address settings review follow-ups ([#2771](https://github.com/holon-run/holon/pull/2771), [#2773](https://github.com/holon-run/holon/pull/2773), [#2762](https://github.com/holon-run/holon/pull/2762)).
+          - Improve the holon-reviewer template with skill layering and a permission protocol, and make daemon startup readiness explicit ([#2774](https://github.com/holon-run/holon/pull/2774), [#2757](https://github.com/holon-run/holon/pull/2757)).
 
           ## Install
 
@@ -251,6 +375,9 @@ jobs:
           body_path: release-notes.md
           files: |
             dist-artifacts/*.tar.gz
+            dist-artifacts/*.dmg
+            dist-artifacts/*.dmg.sha256
+            dist-artifacts/appcast.xml
             dist-artifacts/checksums.txt
 
       - name: Push Homebrew formula
@@ -278,6 +405,15 @@ jobs:
           fi
           git commit -m "Update Holon formula for ${GITHUB_REF_NAME}"
           git push origin main
+
+  smoke:
+    name: Smoke published release
+    needs: release
+    uses: ./.github/workflows/release-smoke.yml
+    with:
+      version: ${{ github.ref_name }}
+    permissions:
+      contents: read
 
   container:
     name: Publish container image

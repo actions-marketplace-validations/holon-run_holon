@@ -14,11 +14,11 @@ use crate::{
         AgentDeletionResponse, AgentDeletionStatusResponse, AttachWorkspaceRequest,
         BatchGetBriefsRequest, BatchGetBriefsResponse, BatchGetMessagesRequest,
         BatchGetMessagesResponse, BatchGetTranscriptEntriesRequest,
-        BatchGetTranscriptEntriesResponse, ClearAgentModelRequest, ControlPromptRequest,
-        CreateAgentRequest, DebugPromptRequest, DeleteAgentRequest, DetachWorkspaceRequest,
-        ExitWorkspaceRequest, ModelConfigMigrationRequest, RuntimeConfigReadResponse,
-        RuntimeConfigUpdateRequest, RuntimeConfigUpdateResponse, SetAgentModelRequest,
-        TaskInputRequest, TaskStopRequest,
+        BatchGetTranscriptEntriesResponse, CancelTimerRequest, ClearAgentModelRequest,
+        ControlPromptRequest, CreateAgentRequest, CreateTimerRequest, DebugPromptRequest,
+        DeleteAgentRequest, DetachWorkspaceRequest, ExitWorkspaceRequest,
+        ModelConfigMigrationRequest, RuntimeConfigReadResponse, RuntimeConfigUpdateRequest,
+        RuntimeConfigUpdateResponse, SetAgentModelRequest, TaskInputRequest, TaskStopRequest,
     },
     http_dto::AgentStateSnapshotDto,
     model_catalog::BuiltInModelMetadata,
@@ -201,6 +201,10 @@ pub struct StreamEventEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<Value>,
     pub payload: Value,
+    /// Additive classification emitted while `events.projection-effect.v1`
+    /// is advertised; absent on older envelopes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_effect: Option<crate::runtime_event::ProjectionEffect>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -498,6 +502,45 @@ impl LocalClient {
             .await
     }
 
+    pub async fn timers(&self, agent_id: &str, limit: usize) -> Result<Vec<TimerRecord>> {
+        self.get_json(&format!("/agents/{agent_id}/timers?limit={limit}"))
+            .await
+    }
+
+    pub async fn timer(&self, agent_id: &str, timer_id: &str) -> Result<TimerRecord> {
+        self.get_json(&format!("/agents/{agent_id}/timers/{timer_id}"))
+            .await
+    }
+
+    pub async fn create_timer(
+        &self,
+        agent_id: &str,
+        duration_ms: u64,
+        interval_ms: Option<u64>,
+        summary: Option<String>,
+    ) -> Result<TimerRecord> {
+        self.post_control_json(
+            &format!("/control/agents/{agent_id}/timers"),
+            &CreateTimerRequest {
+                duration_ms,
+                interval_ms,
+                summary,
+                authority_class: Some(AuthorityClass::OperatorInstruction),
+            },
+        )
+        .await
+    }
+
+    pub async fn cancel_timer(&self, agent_id: &str, timer_id: &str) -> Result<TimerRecord> {
+        self.post_control_json(
+            &format!("/control/agents/{agent_id}/timers/{timer_id}/cancel"),
+            &CancelTimerRequest {
+                authority_class: Some(AuthorityClass::OperatorInstruction),
+            },
+        )
+        .await
+    }
+
     pub async fn agent_transcript_entry(
         &self,
         agent_id: &str,
@@ -579,6 +622,7 @@ impl LocalClient {
             &TaskInputRequest {
                 text: text.into(),
                 authority_class: Some(AuthorityClass::OperatorInstruction),
+                invocation_context: None,
             },
         )
         .await
@@ -589,6 +633,7 @@ impl LocalClient {
             &format!("/control/agents/{agent_id}/tasks/{task_id}/stop"),
             &TaskStopRequest {
                 authority_class: Some(AuthorityClass::OperatorInstruction),
+                invocation_context: None,
             },
         )
         .await
@@ -747,6 +792,8 @@ impl LocalClient {
                 &DebugPromptRequest {
                     text: text.into(),
                     authority_class: Some(authority_class),
+                    manifest: None,
+                    budget: None,
                 },
             )
             .await?;
@@ -2023,6 +2070,7 @@ mod tests {
     #[tokio::test]
     async fn sse_comment_heartbeat_does_not_emit_event_and_preserves_liveness() {
         let event = StreamEventEnvelope {
+            projection_effect: None,
             event_log_epoch: Some("epoch-test".into()),
             contract_version: crate::runtime_event::LEGACY_RUNTIME_EVENT_CONTRACT_VERSION,
             payload_schema: crate::runtime_event::LEGACY_PAYLOAD_SCHEMA.into(),

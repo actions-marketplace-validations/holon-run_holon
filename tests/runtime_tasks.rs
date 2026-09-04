@@ -3,11 +3,44 @@ mod runtime_tasks;
 
 mod support;
 
+use std::future::Future;
+
+use tokio::sync::Semaphore;
+
+const MAX_CONCURRENT_RUNTIME_TESTS: usize = 4;
+static RUNTIME_TEST_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_RUNTIME_TESTS);
+
+fn run_on_large_stack<F, Fut>(name: &str, test: F) -> anyhow::Result<()>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + 'static,
+{
+    let test_thread = std::thread::Builder::new()
+        .name(name.into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(test())
+        })?;
+
+    match test_thread.join() {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
 macro_rules! runtime_async_tests {
     ($($name:ident),* $(,)?) => {
         $(
             #[tokio::test]
             async fn $name() -> anyhow::Result<()> {
+                // Each fixture starts a full runtime with background workers.
+                // Bound suite-local concurrency so fixed protocol timeouts do
+                // not become host-load dependent when the harness runs all
+                // integration tests in parallel.
+                let _permit = RUNTIME_TEST_PERMITS.acquire().await?;
                 runtime_tasks::$name().await
             }
         )*
@@ -17,9 +50,9 @@ macro_rules! runtime_async_tests {
 runtime_async_tests!(
     background_task_rejoins_main_session,
     background_command_task_result_wakes_sleeping_agent_via_canonical_lifecycle_nudge,
+    late_terminal_task_wait_fast_path_wakes_agent_with_durable_wait,
     stop_task_cancels_running_background_task,
     lifecycle_stop_interrupts_active_command_task,
-    tool_use_round_trip_executes_and_returns_result,
     file_tools_can_modify_workspace_and_reenter_context,
     shell_tools_capture_command_output,
     shell_tools_truncate_large_output_before_provider_reinjection,
@@ -61,3 +94,11 @@ runtime_async_tests!(
     exec_command_reuses_equivalent_scheduled_background_task,
     exec_command_terminal_tasks_do_not_block_new_run,
 );
+
+#[test]
+fn tool_use_round_trip_executes_and_returns_result() -> anyhow::Result<()> {
+    run_on_large_stack("runtime-task-tool-use-round-trip", || async {
+        let _permit = RUNTIME_TEST_PERMITS.acquire().await?;
+        runtime_tasks::tool_use_round_trip_executes_and_returns_result().await
+    })
+}

@@ -211,6 +211,12 @@
     "aliases": []
   },
   {
+    "path": "commands",
+    "positionals": [],
+    "flags": [],
+    "aliases": []
+  },
+  {
     "path": "config",
     "positionals": [],
     "flags": [],
@@ -500,6 +506,12 @@
     "aliases": []
   },
   {
+    "path": "context",
+    "positionals": [],
+    "flags": [],
+    "aliases": []
+  },
+  {
     "path": "control",
     "positionals": [
       {
@@ -541,6 +553,12 @@
     "aliases": []
   },
   {
+    "path": "daemon.prepare-update",
+    "positionals": [],
+    "flags": [],
+    "aliases": []
+  },
+  {
     "path": "daemon.restart",
     "positionals": [],
     "flags": [
@@ -579,6 +597,13 @@
       },
       {
         "long": "port",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "start-timeout",
         "short": null,
         "default_value": null,
         "possible_values": null,
@@ -647,6 +672,13 @@
       },
       {
         "long": "port",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "start-timeout",
         "short": null,
         "default_value": null,
         "possible_values": null,
@@ -768,6 +800,23 @@
           "external-evidence"
         ],
         "required": false
+      },
+      {
+        "long": "budget",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "manifest",
+        "short": null,
+        "default_value": null,
+        "possible_values": [
+          "true",
+          "false"
+        ],
+        "required": false
       }
     ],
     "aliases": []
@@ -776,6 +825,48 @@
     "path": "debug.runtime-db",
     "positionals": [],
     "flags": [],
+    "aliases": []
+  },
+  {
+    "path": "debug.runtime-db.audit",
+    "positionals": [],
+    "flags": [
+      {
+        "long": "baseline-through",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "check",
+        "short": null,
+        "default_value": "all",
+        "possible_values": [
+          "projection-effects",
+          "brief-integrity",
+          "all"
+        ],
+        "required": false
+      },
+      {
+        "long": "json",
+        "short": null,
+        "default_value": null,
+        "possible_values": [
+          "true",
+          "false"
+        ],
+        "required": false
+      },
+      {
+        "long": "sample-limit",
+        "short": null,
+        "default_value": "5",
+        "possible_values": null,
+        "required": false
+      }
+    ],
     "aliases": []
   },
   {
@@ -855,6 +946,16 @@
         "required": false
       },
       {
+        "long": "all-affected",
+        "short": null,
+        "default_value": null,
+        "possible_values": [
+          "true",
+          "false"
+        ],
+        "required": false
+      },
+      {
         "long": "apply",
         "short": null,
         "default_value": null,
@@ -866,6 +967,23 @@
       },
       {
         "long": "json",
+        "short": null,
+        "default_value": null,
+        "possible_values": [
+          "true",
+          "false"
+        ],
+        "required": false
+      },
+      {
+        "long": "message-id",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "no-backup",
         "short": null,
         "default_value": null,
         "possible_values": [
@@ -1038,6 +1156,16 @@
         "required": false
       },
       {
+        "long": "offline",
+        "short": null,
+        "default_value": null,
+        "possible_values": [
+          "true",
+          "false"
+        ],
+        "required": false
+      },
+      {
         "long": "order",
         "short": null,
         "default_value": "desc",
@@ -1081,6 +1209,71 @@
         "long": "workspace",
         "short": null,
         "default_value": null,
+        "possible_values": null,
+        "required": false
+      }
+    ],
+    "aliases": []
+  },
+  {
+    "path": "models-dev",
+    "positionals": [],
+    "flags": [],
+    "aliases": []
+  },
+  {
+    "path": "models-dev.audit",
+    "positionals": [],
+    "flags": [
+      {
+        "long": "json",
+        "short": null,
+        "default_value": null,
+        "possible_values": [
+          "true",
+          "false"
+        ],
+        "required": false
+      },
+      {
+        "long": "snapshot",
+        "short": null,
+        "default_value": "models.dev/snapshot.json",
+        "possible_values": null,
+        "required": false
+      }
+    ],
+    "aliases": []
+  },
+  {
+    "path": "models-dev.refresh",
+    "positionals": [],
+    "flags": [
+      {
+        "long": "output-dir",
+        "short": null,
+        "default_value": "models.dev",
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "url",
+        "short": null,
+        "default_value": "https://models.dev/api.json",
+        "possible_values": null,
+        "required": false
+      }
+    ],
+    "aliases": []
+  },
+  {
+    "path": "models-dev.validate",
+    "positionals": [],
+    "flags": [
+      {
+        "long": "input-dir",
+        "short": null,
+        "default_value": "models.dev",
         "possible_values": null,
         "required": false
       }
@@ -1727,6 +1920,27 @@
     "aliases": []
   },
   {
+    "path": "task.list",
+    "positionals": [],
+    "flags": [
+      {
+        "long": "agent",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "limit",
+        "short": null,
+        "default_value": "50",
+        "possible_values": null,
+        "required": false
+      }
+    ],
+    "aliases": []
+  },
+  {
     "path": "task.output",
     "positionals": [
       {
@@ -1891,6 +2105,62 @@
         "short": null,
         "default_value": null,
         "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "agent",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "every-ms",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "summary",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      }
+    ],
+    "aliases": []
+  },
+  {
+    "path": "timer.cancel",
+    "positionals": [
+      {
+        "name": "timer_id",
+        "value_name": "TIMER_ID",
+        "index": null,
+        "required": true
+      }
+    ],
+    "flags": [
+      {
+        "long": "agent",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      }
+    ],
+    "aliases": []
+  },
+  {
+    "path": "timer.create",
+    "positionals": [],
+    "flags": [
+      {
+        "long": "after-ms",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
         "required": true
       },
       {
@@ -1911,6 +2181,27 @@
         "long": "summary",
         "short": null,
         "default_value": null,
+        "possible_values": null,
+        "required": false
+      }
+    ],
+    "aliases": []
+  },
+  {
+    "path": "timer.list",
+    "positionals": [],
+    "flags": [
+      {
+        "long": "agent",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "limit",
+        "short": null,
+        "default_value": "50",
         "possible_values": null,
         "required": false
       }
@@ -1990,6 +2281,62 @@
     "aliases": []
   },
   {
+    "path": "work-item.complete",
+    "positionals": [
+      {
+        "name": "work_item_id",
+        "value_name": "WORK_ITEM_ID",
+        "index": null,
+        "required": true
+      }
+    ],
+    "flags": [
+      {
+        "long": "agent",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "report",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "report-file",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      }
+    ],
+    "aliases": []
+  },
+  {
+    "path": "work-item.create",
+    "positionals": [
+      {
+        "name": "objective",
+        "value_name": "OBJECTIVE",
+        "index": null,
+        "required": true
+      }
+    ],
+    "flags": [
+      {
+        "long": "agent",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      }
+    ],
+    "aliases": []
+  },
+  {
     "path": "work-item.get",
     "positionals": [
       {
@@ -2025,6 +2372,100 @@
         "long": "limit",
         "short": null,
         "default_value": "50",
+        "possible_values": null,
+        "required": false
+      }
+    ],
+    "aliases": []
+  },
+  {
+    "path": "work-item.pick",
+    "positionals": [
+      {
+        "name": "work_item_id",
+        "value_name": "WORK_ITEM_ID",
+        "index": null,
+        "required": true
+      }
+    ],
+    "flags": [
+      {
+        "long": "agent",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "clear-blocker",
+        "short": null,
+        "default_value": null,
+        "possible_values": [
+          "true",
+          "false"
+        ],
+        "required": false
+      },
+      {
+        "long": "reason",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      }
+    ],
+    "aliases": []
+  },
+  {
+    "path": "work-item.update",
+    "positionals": [
+      {
+        "name": "work_item_id",
+        "value_name": "WORK_ITEM_ID",
+        "index": null,
+        "required": true
+      }
+    ],
+    "flags": [
+      {
+        "long": "agent",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "blocked-by-json",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "objective",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "plan-status",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "recheck-after",
+        "short": null,
+        "default_value": null,
+        "possible_values": null,
+        "required": false
+      },
+      {
+        "long": "todo-json",
+        "short": null,
+        "default_value": null,
         "possible_values": null,
         "required": false
       }

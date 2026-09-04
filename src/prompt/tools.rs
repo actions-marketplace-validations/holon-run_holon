@@ -56,6 +56,17 @@ pub fn tool_sections_with_context(
             guidance(include_str!("tool_guidance/tool_wait_for.md")),
         ));
     }
+    if names.contains(&tn::CREATE_TIMER)
+        || names.contains(&tn::LIST_TIMERS)
+        || names.contains(&tn::GET_TIMER)
+        || names.contains(&tn::CANCEL_TIMER)
+    {
+        sections.push(section(
+            "tool_timer",
+            PromptStability::Stable,
+            guidance(include_str!("tool_guidance/tool_timer.md")),
+        ));
+    }
     if names.contains(&tn::SPAWN_AGENT) {
         sections.push(section(
             "tool_spawn_agent",
@@ -134,6 +145,11 @@ pub fn tool_sections_with_context(
             "tool_exec_command",
             PromptStability::Stable,
             guidance(include_str!("tool_guidance/tool_exec_command.md")),
+        ));
+        sections.push(section(
+            "holon_cli_contract",
+            PromptStability::Stable,
+            guidance(include_str!("tool_guidance/tool_holon_cli.md")),
         ));
     }
     if names.contains(&tn::EXEC_COMMAND_BATCH) {
@@ -340,6 +356,25 @@ mod tests {
         }];
         let sections = tool_sections(&tools);
         assert!(sections.iter().any(|s| s.name == "tool_exec_command"));
+        assert!(sections.iter().any(|s| s.name == "holon_cli_contract"));
+    }
+
+    #[test]
+    fn holon_cli_guidance_preserves_provenance_boundary() {
+        let tools = vec![ToolSpec {
+            name: "ExecCommand".into(),
+            description: String::new(),
+            input_schema: json!({}),
+            freeform_grammar: None,
+        }];
+        let section = tool_sections(&tools)
+            .into_iter()
+            .find(|section| section.name == "holon_cli_contract")
+            .expect("holon cli contract section");
+        assert!(section.content.contains("not authentication"));
+        assert!(section.content.contains("holon commands"));
+        assert!(section.content.contains("holon context"));
+        assert!(section.content.contains("recursive `holon run`"));
     }
 
     #[test]
@@ -571,6 +606,28 @@ mod tests {
     }
 
     #[test]
+    fn test_timer_section_describes_persistent_lifecycle_boundary() {
+        let tools = vec![ToolSpec {
+            name: "CreateTimer".into(),
+            description: String::new(),
+            input_schema: json!({}),
+            freeform_grammar: None,
+        }];
+        let sections = tool_sections(&tools);
+        let section = sections
+            .iter()
+            .find(|section| section.name == "tool_timer")
+            .expect("timer section");
+        assert!(section
+            .content
+            .contains("persistent independent or repeating"));
+        assert!(section.content.contains("does not pause the current turn"));
+        assert!(section.content.contains("WaitFor"));
+        assert!(section.content.contains("recheck_after_ms"));
+        assert!(section.content.contains("CancelTimer"));
+    }
+
+    #[test]
     fn test_exec_command_batch_section_emitted_when_available() {
         let tools = vec![ToolSpec {
             name: "ExecCommandBatch".into(),
@@ -675,7 +732,9 @@ mod tests {
             .iter()
             .find(|s| s.name == "tool_file_mutation")
             .expect("file mutation section");
-        assert!(section.content.contains("centered on ApplyPatch"));
+        assert!(section.content.contains("scenario-based"));
+        assert!(section.content.contains("default to ApplyPatch"));
+        assert!(section.content.contains("bounded heredoc are equivalent"));
         assert!(section
             .content
             .contains("Relative patch paths resolve from the active workspace"));
@@ -686,7 +745,7 @@ mod tests {
         assert!(section
             .content
             .contains("do not retry the same large failed patch unchanged"));
-        assert!(section.content.contains("bounded script or heredoc"));
+        assert!(section.content.contains("Avoid in-place shell rewrites"));
         assert!(section
             .content
             .contains("do not re-read the same file merely to confirm"));

@@ -21,16 +21,17 @@ use holon::{
     ingress::{WakeDisposition, WakeHint},
     policy::validate_message_kind_for_origin,
     provider::{
-        AgentProvider, ModelBlock, ProviderTurnRequest, ProviderTurnResponse, StubProvider,
+        AgentProvider, ConversationMessage, ModelBlock, ProviderTurnRequest, ProviderTurnResponse,
+        StubProvider,
     },
     system::{WorkspaceAccessMode, WorkspaceProjectionKind},
     tool::{ToolCall, ToolError, ToolRegistry, ToolResult},
     types::{
-        AgentKind, AgentProfilePreset, AgentStatus, AuthorityClass, BriefKind,
+        AdmissionContext, AgentKind, AgentProfilePreset, AgentStatus, AuthorityClass, BriefKind,
         CallbackDeliveryMode, ChildAgentPhase, ClosureOutcome, CommandTaskSpec, ControlAction,
-        ExternalTriggerStatus, FailureArtifactCategory, MessageBody, MessageEnvelope, MessageKind,
-        MessageOrigin, OperatorNotificationBoundary, OperatorTransportBinding,
-        OperatorTransportBindingStatus, OperatorTransportCapabilities,
+        ExternalTriggerStatus, FailureArtifactCategory, MessageBody, MessageDeliverySurface,
+        MessageEnvelope, MessageKind, MessageOrigin, OperatorNotificationBoundary,
+        OperatorTransportBinding, OperatorTransportBindingStatus, OperatorTransportCapabilities,
         OperatorTransportDeliveryAuth, OperatorTransportDeliveryAuthKind, Priority, TaskStatus,
         TodoItem, TodoItemState, TokenUsage, TranscriptEntry, TranscriptEntryKind, WaitingReason,
         WorkItemState,
@@ -178,16 +179,22 @@ pub async fn background_command_task_result_wakes_sleeping_agent_via_canonical_l
     let runtime = host.default_runtime().await?;
 
     runtime
-        .enqueue(MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "sleep until the background command finishes".into(),
-            },
-        ))
+        .enqueue(
+            MessageEnvelope::new(
+                "default",
+                MessageKind::OperatorPrompt,
+                MessageOrigin::Operator { actor_id: None },
+                AuthorityClass::OperatorInstruction,
+                Priority::Normal,
+                MessageBody::Text {
+                    text: "sleep until the background command finishes".into(),
+                },
+            )
+            .with_admission(
+                MessageDeliverySurface::CliPrompt,
+                AdmissionContext::LocalProcess,
+            ),
+        )
         .await?;
 
     wait_until_async_for(Duration::from_secs(10), || {
@@ -241,13 +248,202 @@ pub async fn background_command_task_result_wakes_sleeping_agent_via_canonical_l
         .as_ref()
         .is_some_and(|continuation| {
             continuation.trigger_kind == holon::types::ContinuationTriggerKind::TaskResult
-                && !continuation.model_reentry
+                && continuation.model_reentry
         }));
     let tasks = runtime.storage().latest_task_records()?;
     assert!(tasks.iter().any(|record| {
         record.id == task.id
             && record.status == TaskStatus::Completed
             && record.wait_policy() == holon::types::TaskWaitPolicy::Background
+    }));
+    Ok(())
+}
+
+struct FastPathWaitProvider {
+    requests: Mutex<Vec<String>>,
+}
+
+impl FastPathWaitProvider {
+    fn new() -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn captured_requests(&self) -> Vec<String> {
+        self.requests.lock().await.clone()
+    }
+}
+
+fn first_task_id_in_tool_results(request: &ProviderTurnRequest) -> Option<String> {
+    request.conversation.iter().find_map(|message| {
+        let ConversationMessage::UserToolResults(blocks) = message else {
+            return None;
+        };
+        blocks.iter().find_map(|block| {
+            let start = block.content.find("task_")?;
+            let task_id: String = block.content[start..]
+                .chars()
+                .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+                .collect();
+            (!task_id.is_empty()).then_some(task_id)
+        })
+    })
+}
+
+#[async_trait]
+impl AgentProvider for FastPathWaitProvider {
+    async fn complete_turn(&self, request: ProviderTurnRequest) -> Result<ProviderTurnResponse> {
+        let prompt_text = delegated_prompt_text(&request);
+        let call = {
+            let mut requests = self.requests.lock().await;
+            requests.push(prompt_text);
+            requests.len()
+        };
+        let response = |blocks: Vec<ModelBlock>| {
+            Ok(ProviderTurnResponse {
+                blocks,
+                stop_reason: None,
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_usage: None,
+                provider_message_id: None,
+                provider_request_id: None,
+                request_diagnostics: None,
+            })
+        };
+        match call {
+            1 => response(vec![ModelBlock::ToolUse {
+                id: "fastpath-exec".into(),
+                name: "ExecCommand".into(),
+                input: json!({
+                    "cmd": "sleep 3 && printf fastpath_e2e_done",
+                    "yield_time_ms": 500
+                }),
+                kind: holon::provider::ModelToolCallKind::Function,
+            }]),
+            2 => response(vec![ModelBlock::ToolUse {
+                id: "fastpath-hold".into(),
+                name: "ExecCommand".into(),
+                input: json!({
+                    "cmd": "sleep 6",
+                    "yield_time_ms": 30000
+                }),
+                kind: holon::provider::ModelToolCallKind::Function,
+            }]),
+            3 => {
+                let task_id = first_task_id_in_tool_results(&request)
+                    .expect("promoted task result should expose the task id");
+                response(vec![ModelBlock::ToolUse {
+                    id: "fastpath-wait".into(),
+                    name: "WaitFor".into(),
+                    input: json!({
+                        "reason": "wait for the completed check task",
+                        "wake": "task_result",
+                        "resource": task_id
+                    }),
+                    kind: holon::provider::ModelToolCallKind::Function,
+                }])
+            }
+            4 => response(vec![ModelBlock::Text {
+                text: "fastpath result observed".into(),
+            }]),
+            _ => anyhow::bail!("unexpected provider call {call}"),
+        }
+    }
+}
+
+pub async fn late_terminal_task_wait_fast_path_wakes_agent_with_durable_wait() -> Result<()> {
+    let provider = Arc::new(FastPathWaitProvider::new());
+    let host = RuntimeHost::new_with_provider(test_config(), provider.clone())?;
+    let runtime = host.default_runtime().await?;
+
+    // Deterministic fast-path shape: a command task is promoted to the
+    // background, completes while the turn is still running (the inline
+    // sleep holds the turn open), and only then does the model call
+    // WaitFor(task_result) on the already-terminal task
+    // (holon-run/holon#2743). The fast path must register a durable
+    // Triggered wait and re-queue the exact result message so the sleeping
+    // agent is woken with model reentry instead of a liveness_only reduce.
+    let prompt = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "run the check and wait for its result".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::CliPrompt,
+        AdmissionContext::LocalProcess,
+    );
+    runtime.enqueue(prompt).await?;
+
+    if wait_until_async_for(Duration::from_secs(30), || {
+        let provider = provider.clone();
+        async move { Ok(provider.captured_requests().await.len() >= 4) }
+    })
+    .await
+    .is_err()
+    {
+        let requests = provider.captured_requests().await;
+        eprintln!("DIAG provider calls: {}", requests.len());
+        let events = runtime.recent_events(40).await?;
+        for event in events.iter().rev() {
+            eprintln!(
+                "DIAG event {} {} {}",
+                event.created_at,
+                event.kind,
+                serde_json::to_string(&event.data).unwrap_or_default()
+            );
+        }
+        for task in runtime.storage().latest_task_records()? {
+            eprintln!("DIAG task {} {:?}", task.id, task.status);
+        }
+        let summary = runtime.agent_summary().await?;
+        eprintln!(
+            "DIAG closure {:?} waiting {:?}",
+            summary.closure.outcome, summary.closure.waiting_reason
+        );
+        anyhow::bail!("fastpath reentry did not happen");
+    }
+
+    let requests = provider.captured_requests().await;
+    let reentry_prompt = requests
+        .get(3)
+        .expect("late task result should re-enter the model");
+    assert!(
+        reentry_prompt.contains("fastpath_e2e_done"),
+        "re-entry prompt should carry the task result: {reentry_prompt}"
+    );
+    let state = runtime.agent_state().await?;
+    assert!(state
+        .last_continuation
+        .as_ref()
+        .is_some_and(|continuation| {
+            continuation.trigger_kind == holon::types::ContinuationTriggerKind::TaskResult
+                && continuation.model_reentry
+        }));
+    let events = runtime.recent_events(50).await?;
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "late_task_result_queued"));
+    assert!(events.iter().any(|event| {
+        event.kind == "wait_condition_registered"
+            && event
+                .data
+                .get("initial_status")
+                .and_then(|value| value.as_str())
+                == Some("triggered")
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "wait_condition_triggered"
+            && event
+                .data
+                .get("trigger_message_id")
+                .is_some_and(serde_json::Value::is_string)
     }));
     Ok(())
 }
@@ -354,16 +550,22 @@ pub async fn tool_use_round_trip_executes_and_returns_result() -> Result<()> {
     let runtime = host.default_runtime().await?;
 
     runtime
-        .enqueue(MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "inspect session state".into(),
-            },
-        ))
+        .enqueue(
+            MessageEnvelope::new(
+                "default",
+                MessageKind::OperatorPrompt,
+                MessageOrigin::Operator { actor_id: None },
+                AuthorityClass::OperatorInstruction,
+                Priority::Normal,
+                MessageBody::Text {
+                    text: "inspect session state".into(),
+                },
+            )
+            .with_admission(
+                MessageDeliverySurface::CliPrompt,
+                AdmissionContext::LocalProcess,
+            ),
+        )
         .await?;
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
@@ -458,16 +660,22 @@ pub async fn file_tools_can_modify_workspace_and_reenter_context() -> Result<()>
     let runtime = host.default_runtime().await?;
 
     runtime
-        .enqueue(MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "create a note and confirm its content".into(),
-            },
-        ))
+        .enqueue(
+            MessageEnvelope::new(
+                "default",
+                MessageKind::OperatorPrompt,
+                MessageOrigin::Operator { actor_id: None },
+                AuthorityClass::OperatorInstruction,
+                Priority::Normal,
+                MessageBody::Text {
+                    text: "create a note and confirm its content".into(),
+                },
+            )
+            .with_admission(
+                MessageDeliverySurface::CliPrompt,
+                AdmissionContext::LocalProcess,
+            ),
+        )
         .await?;
     eventually_for(Duration::from_secs(10), || {
         Ok(workspace.join("notes/result.txt").exists())
@@ -495,16 +703,22 @@ pub async fn shell_tools_capture_command_output() -> Result<()> {
     let runtime = host.default_runtime().await?;
 
     runtime
-        .enqueue(MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "run a shell command and summarize it".into(),
-            },
-        ))
+        .enqueue(
+            MessageEnvelope::new(
+                "default",
+                MessageKind::OperatorPrompt,
+                MessageOrigin::Operator { actor_id: None },
+                AuthorityClass::OperatorInstruction,
+                Priority::Normal,
+                MessageBody::Text {
+                    text: "run a shell command and summarize it".into(),
+                },
+            )
+            .with_admission(
+                MessageDeliverySurface::CliPrompt,
+                AdmissionContext::LocalProcess,
+            ),
+        )
         .await?;
     wait_until_async_for(Duration::from_secs(10), || {
         let runtime = runtime.clone();
@@ -531,16 +745,22 @@ pub async fn shell_tools_truncate_large_output_before_provider_reinjection() -> 
     let runtime = host.default_runtime().await?;
 
     runtime
-        .enqueue(MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "inspect a large shell output safely".into(),
-            },
-        ))
+        .enqueue(
+            MessageEnvelope::new(
+                "default",
+                MessageKind::OperatorPrompt,
+                MessageOrigin::Operator { actor_id: None },
+                AuthorityClass::OperatorInstruction,
+                Priority::Normal,
+                MessageBody::Text {
+                    text: "inspect a large shell output safely".into(),
+                },
+            )
+            .with_admission(
+                MessageDeliverySurface::CliPrompt,
+                AdmissionContext::LocalProcess,
+            ),
+        )
         .await?;
     wait_until_async_for(Duration::from_secs(10), || {
         let runtime = runtime.clone();
@@ -891,16 +1111,22 @@ pub async fn tool_schema_and_dispatch_errors_are_recorded_without_corrupting_run
     let runtime = host.default_runtime().await?;
 
     runtime
-        .enqueue(MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "trigger tool failures".into(),
-            },
-        ))
+        .enqueue(
+            MessageEnvelope::new(
+                "default",
+                MessageKind::OperatorPrompt,
+                MessageOrigin::Operator { actor_id: None },
+                AuthorityClass::OperatorInstruction,
+                Priority::Normal,
+                MessageBody::Text {
+                    text: "trigger tool failures".into(),
+                },
+            )
+            .with_admission(
+                MessageDeliverySurface::CliPrompt,
+                AdmissionContext::LocalProcess,
+            ),
+        )
         .await?;
 
     eventually_for(Duration::from_secs(10), || {
@@ -1019,16 +1245,22 @@ pub async fn runtime_provider_failure_surfaces_failure_brief_and_transcript_entr
     let runtime = host.default_runtime().await?;
 
     runtime
-        .enqueue(MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "trigger runtime failure".into(),
-            },
-        ))
+        .enqueue(
+            MessageEnvelope::new(
+                "default",
+                MessageKind::OperatorPrompt,
+                MessageOrigin::Operator { actor_id: None },
+                AuthorityClass::OperatorInstruction,
+                Priority::Normal,
+                MessageBody::Text {
+                    text: "trigger runtime failure".into(),
+                },
+            )
+            .with_admission(
+                MessageDeliverySurface::CliPrompt,
+                AdmissionContext::LocalProcess,
+            ),
+        )
         .await?;
 
     eventually_for(Duration::from_secs(10), || {
@@ -1116,16 +1348,22 @@ pub async fn runtime_failure_brief_and_transcript_sanitize_long_provider_error()
     let runtime = host.default_runtime().await?;
 
     runtime
-        .enqueue(MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "trigger verbose runtime failure".into(),
-            },
-        ))
+        .enqueue(
+            MessageEnvelope::new(
+                "default",
+                MessageKind::OperatorPrompt,
+                MessageOrigin::Operator { actor_id: None },
+                AuthorityClass::OperatorInstruction,
+                Priority::Normal,
+                MessageBody::Text {
+                    text: "trigger verbose runtime failure".into(),
+                },
+            )
+            .with_admission(
+                MessageDeliverySurface::CliPrompt,
+                AdmissionContext::LocalProcess,
+            ),
+        )
         .await?;
 
     eventually_for(Duration::from_secs(10), || {
@@ -1188,16 +1426,22 @@ pub async fn runtime_failure_brief_and_transcript_redact_short_provider_secret()
     let runtime = host.default_runtime().await?;
 
     runtime
-        .enqueue(MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "trigger sensitive runtime failure".into(),
-            },
-        ))
+        .enqueue(
+            MessageEnvelope::new(
+                "default",
+                MessageKind::OperatorPrompt,
+                MessageOrigin::Operator { actor_id: None },
+                AuthorityClass::OperatorInstruction,
+                Priority::Normal,
+                MessageBody::Text {
+                    text: "trigger sensitive runtime failure".into(),
+                },
+            )
+            .with_admission(
+                MessageDeliverySurface::CliPrompt,
+                AdmissionContext::LocalProcess,
+            ),
+        )
         .await?;
 
     eventually_for(Duration::from_secs(10), || {
@@ -2258,7 +2502,7 @@ pub async fn command_task_result_is_canonical_lifecycle_nudge_on_completion() ->
             event.kind == "continuation_resolved"
                 && event.data["message_id"] == message.id
                 && event.data["resolution"]["trigger_kind"] == "task_result"
-                && event.data["resolution"]["model_reentry"] == false
+                && event.data["resolution"]["model_reentry"] == true
         }))
     })
     .await?;
@@ -2558,16 +2802,22 @@ pub async fn exec_command_auto_promotes_long_running_command_task() -> Result<()
     let runtime = host.default_runtime().await?;
 
     runtime
-        .enqueue(MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "run a long command".into(),
-            },
-        ))
+        .enqueue(
+            MessageEnvelope::new(
+                "default",
+                MessageKind::OperatorPrompt,
+                MessageOrigin::Operator { actor_id: None },
+                AuthorityClass::OperatorInstruction,
+                Priority::Normal,
+                MessageBody::Text {
+                    text: "run a long command".into(),
+                },
+            )
+            .with_admission(
+                MessageDeliverySurface::CliPrompt,
+                AdmissionContext::LocalProcess,
+            ),
+        )
         .await?;
 
     eventually_for(Duration::from_secs(10), || {

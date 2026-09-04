@@ -56,6 +56,14 @@ fault-injection, and divergence gates pass.
 > historical `scheduler_activation_authorities` table remains only as a
 > compatibility row derived from the admission while the existing schema
 > foreign key is retained.
+>
+> **Control-state model superseded:** The activation/settlement protocol's
+> provenance, fencing, deterministic transition, atomic commit, immutable
+> evidence, and process-global cutover boundaries remain accepted. Its
+> long-term use of activation slot, dispatch reservation, WorkDemand,
+> scheduler wait mirrors, and missing-settlement recovery as joint future
+> eligibility authority is superseded by
+> [Scheduler–WorkItem Unified Execution Protocol](./scheduler-work-item-unified-execution-protocol.md).
 
 ## Status And Relationship To Existing RFCs
 
@@ -527,6 +535,17 @@ arms the new generation atomically.
 authority. Exact external resume requires a runtime-owned or
 capability-authenticated correlation carrying `wait_id + generation`.
 
+A terminal task result for an unbound task that does not request unconditional
+terminal re-entry is narrower. The terminal task transition resolves matching
+agent-lifecycle task waits and binds each resolved wait to the exact durable
+result message id in the same transaction as task and message evidence. The
+canonical scheduler may then lower the unique match to
+`ExactWaitResume(AgentLifecycle, wait_id)` and claim it with
+`TriggeredWait(wait_id, result_message_id)`. A result with no such exact wait is
+reducer-only; it must not create a lifecycle nudge or consume queue-head
+no-progress budget. A duplicate or historical result cannot resume the wait
+because its message identity does not match the resolved generation.
+
 Canonical scheduler tables persist `owner_kind + owner_id` and retain
 row-local primary-key, unique, `NOT NULL`, `CHECK`, generation, and idempotency
 constraints. Cross-table lifecycle consistency is enforced by typed commands,
@@ -627,6 +646,60 @@ All terminal tools lower into the same runtime settlement command:
 - interruption;
 - reducer-only completion; and
 - explicit continuation or pause.
+
+A claimed message that completes through a reducer-only path still produces a
+terminal `TurnRecord` for that activation. Duplicate, already-delivered, or
+policy-suppressed input may omit provider, assistant-round, token-usage, and
+delivery evidence, but it must not use an absent terminal Turn to mean
+success. Queue `Processed`, the terminal Turn, and execution settlement commit
+atomically.
+
+### Unsettled Claim Reconciliation
+
+`Processed` without a matching terminal Turn remains a protocol conflict. The
+runtime represents it as a typed `ExecutionSettlementConflict`, not a string
+matched error and not permission to weaken the terminal evidence invariant.
+
+Bootstrap recovery, online settlement conflict handling, and
+`debug scheduler-recovery` inspect/apply use the same durable-facts planner.
+For a dequeued claim the planner chooses one of:
+
+- settle from a matching terminal Turn;
+- interrupt and requeue when exact source, owner, and revision fences prove
+  replay is safe;
+- interrupt and quarantine when an exact cancelled task wait proves that the
+  result's continuation authority was revoked;
+- interrupt and quarantine when replay evidence is ambiguous or the claim is
+  already a recovery attempt; or
+- no-op when the claim already converged.
+
+An exact cancelled task wait is negative authority evidence, not incomplete
+evidence and not replay authority. The runtime must never restore that wait,
+replay its `TaskResult`, or mark the claim `Processed`; bootstrap, online
+settlement conflict handling, and debug recovery all use
+`task_result_wait_cancelled` for the canonical interrupt-and-quarantine
+decision. Missing, duplicate, or identity-mismatched waits remain ambiguous and
+fail closed.
+
+Automatic replay is bounded to one recovery generation. A second failure for
+the same recovery chain is not requeued again. Quarantine atomically records an
+interrupted execution outcome and `QueueEntryStatus::Quarantined`, preserves
+the message and attempt as audit evidence, releases the agent execution lane,
+and permits the next operator message to be claimed. Quarantine never rewrites
+unknown work as `Processed`.
+
+Every automatic decision emits durable `unsettled_claim_reconciled` evidence
+with the decision, reason, and recovery generation. Runtime diagnostics count
+missing terminal conflicts, unsettled-claim recoveries, and poison-message
+quarantines. The debug recovery projection exposes the same decision and
+generation used by apply. Operators may constrain both inspect and apply to one
+TaskResult claim with `--message-id`; the selector must match exactly one
+candidate and does not override eligibility.
+
+Every retained dequeued TaskResult claim also reports its age, whether it still
+blocks the execution lane, and a `recoverable` or `unhealthy` health class.
+Ambiguous claims remain fail-closed and ineligible, but they must be externally
+visible as unhealthy rather than silently represented as an ordinary no-op.
 
 A WorkItem-bound activation must include one WorkItem disposition.
 
@@ -827,8 +900,11 @@ callback capability does not make one semantic wait reusable.
 
 External and operator events trigger waits but do not resolve them. The
 consuming activation must resolve, cancel, or rearm. A matching runtime-owned
-terminal task result may perform trigger, consume, and resolve in one
-transaction while retaining all logical audit facts.
+terminal task result persists the terminal task, message evidence, queued
+message row, and exact `Triggered(message_id)` wait binding in one transaction.
+Canonical activation claim then atomically changes that same wait generation to
+`Resolved(message_id)` while creating the execution attempt and retaining all
+logical audit facts.
 
 `recheck_after_ms` is a fallback wake source for the same wait generation, not
 a separate generic blocker timer.
@@ -850,10 +926,12 @@ wait and the turn creates a WorkItem wait, `AdoptActivationWorkStateCommand`
 may carry the exact source wait identity and expected dispatch revision. The
 same transaction must verify that the reservation belongs to the source
 lifecycle owner, settle the activation, resolve the source wait exactly once,
-and install the target WorkItem demand, wait, focus, and dispatch reservation.
-A stale revision or foreign reservation fails closed. After the adoption is
-recorded, settlement replay reuses the stored command result and must not
-reconstruct a different payload from the post-handoff dispatch state.
+and install the target WorkItem demand, wait, and focus while reopening
+dispatch for unrelated runnable WorkItems. The target wait remains fenced by
+its exact owner and generation; it does not reserve the agent lane. A stale
+revision or foreign reservation fails closed. After the adoption is recorded,
+settlement replay reuses the stored command result and must not reconstruct a
+different payload from the post-handoff dispatch state.
 
 Bootstrap reconciliation has the same atomicity requirement when
 `AdoptLegacyWorkStateCommand` refreshes the WorkItem that owns the exact current
@@ -1117,6 +1195,19 @@ read-only and reports the same ordered recovery plan, typed evidence,
 conflicts, holds, and stable command identities that the apply path would use.
 No debug path may repair protocol state through direct SQL.
 
+Recovery also compares canonical lane ownership with authoritative WorkItem and
+wait lifecycle facts. A completed or missing WorkItem that still owns canonical
+focus or dispatch is terminalized by a fenced reducer command, and the exact
+reserved wait is resolved before the lane reopens. The command does not rebuild
+old continuations or reinterpret an unbound message as a wait resume.
+
+`scheduler-recovery --apply` creates and verifies a full SQLite backup by
+default. An operator may explicitly select `--no-backup` only with `--apply`;
+this changes only the backup policy, not daemon-stop locking, source
+revalidation, reducer fences, command-result evidence, or recovery semantics.
+Human and JSON output plus recovery audit evidence record the selected backup
+policy and whether a backup was created.
+
 Compatibility adoption is isolated per legacy WorkItem. Each candidate is
 revalidated and committed in deterministic order. A stale source, typed
 protocol rejection, or invalid candidate poststate rolls back and diagnoses
@@ -1162,9 +1253,15 @@ The target write set atomically commits:
 - queue settlement; and
 - audit/outbox facts.
 
-If implementation needs an internal `Completing` intent to stage the report,
-that state is canonical and recoverable. The public lifecycle does not need to
-expose it initially.
+The normal completion path must not persist an intermediate `Completing`
+lifecycle. Once the runtime has the complete assistant round, it already has
+the target, report candidate, provenance, execution binding, and expected
+revisions needed for one atomic `Open -> Completed` command. A missing or empty
+report candidate rejects the command without releasing focus, cancelling waits,
+or changing the WorkItem.
+
+Legacy `Completing` records remain recoverable through the control completion
+API, but new agent-tool completion commands do not create that state.
 
 ## Required Invariants
 
@@ -1286,7 +1383,7 @@ are otherwise unchanged. Configuration parsing must reject an authoritative
 class without a matching successful manifest and consumed canonical
 preflight record.
 
-For the local-tool cutover surface, `HOLON_SCHEDULER=authoritative` is an
+For the historical local-tool cutover surface, `HOLON_SCHEDULER=authoritative` was an
 explicit startup authority command for
 `SchedulerScenarioClass::PRODUCTION_AUTHORITY`. It may bypass the manifest's
 sample-count, observation-duration, and verified-evidence completion gates
@@ -1348,7 +1445,7 @@ Exit gate:
 
 ### Phase 3: Production Shadow
 
-- the legacy scheduler remains authoritative;
+- the legacy scheduler remained authoritative during the historical cutover;
 - every legacy admission and terminal boundary produces a shadow candidate,
   activation, and settlement;
 - compare binding, admission, wait consume, WorkItem disposition, queue
@@ -1524,12 +1621,14 @@ commands and never edits scheduler tables directly.
 #### Restart Task Rejoin
 
 Daemon restart marks each non-reattached in-flight task `interrupted` exactly
-once and enqueues one standard runtime-owned `TaskResult` per task. The
-message preserves the original task id and effective WorkItem binding and
-uses the ordinary `TaskRejoin` delivery surface. Tasks from different
-WorkItems never share an aggregate model turn. The former unbound
-`task_restart` content message is not an execution or scheduling mechanism;
-restart aggregation may remain only as audit evidence.
+once through the ordinary typed terminal-result transaction. That transaction
+atomically persists one standard runtime-owned `TaskResult`, its queued row,
+and any exact `Triggered(message_id)` wait. The message preserves the original
+task id and effective WorkItem binding and uses the ordinary `TaskRejoin`
+delivery surface. Tasks from different WorkItems never share an aggregate
+model turn. The former unbound `task_restart` content message is not an
+execution or scheduling mechanism; restart aggregation may remain only as
+audit evidence.
 
 #### Pre-claim Authority Failure
 
@@ -1539,6 +1638,14 @@ demand, missing or mismatched wait generation, unresolved canonical
 scenario, or incompatible WorkItem state cannot silently fall back to a
 legacy model turn and cannot return an ordinary pre-claim error that leaves a
 hot retry loop.
+
+An external input carrying an exact wait correlation is terminally dropped only
+when durable authority proves that wait generation is obsolete, inactive, or
+no longer the WorkItem execution generation. The runtime never downgrades that
+payload to an unbound lifecycle nudge. A later valid queue entry may then
+advance normally. Ambiguous authority and transient claim conflicts retain the
+entry but wait for an authority notification or bounded retry interval instead
+of self-notifying a hot loop.
 
 The runtime reports a fenced scenario hard blocker before queue claim. That
 transaction records the stable blocker code and rolls the scenario back to
@@ -1669,7 +1776,7 @@ overhead without weakening correctness gates.
 The protocol deliberately defers:
 
 - whether interaction affinity becomes a separate persisted record initially;
-- whether public WorkItem lifecycle exposes `Completing` or `Failed`;
+- whether public WorkItem lifecycle exposes `Failed`;
 - final configuration key spelling and storage representation, but not the
   rollout manifest fields, authority states, or transition preconditions;
 - multi-agent assignment policy;

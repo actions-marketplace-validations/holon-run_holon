@@ -7,10 +7,32 @@
  */
 
 const DB_NAME = "holon-webgui-cache";
-const DB_VERSION = 1;
-export const CACHE_SCHEMA_VERSION = 4;
+const DB_VERSION = 2;
+export const CACHE_SCHEMA_VERSION = 5;
 const SESSIONS_STORE = "sessions";
 const META_STORE = "meta";
+const MODEL_CATALOG_STORE = "modelCatalog";
+
+export interface CachedSyncCoverage {
+  eventLogEpoch?: string;
+  contiguousSeq: number;
+  observedSeq: number;
+  retainedOldestSeq?: number;
+  retainedNewestSeq?: number;
+  gaps: Array<{ afterSeq: number; beforeSeq: number }>;
+}
+
+export interface CachedSemanticHistoryState {
+  eventLogEpoch?: string;
+  cursorSeq?: number;
+  hasOlder: boolean;
+}
+
+export interface CachedAgentReadState {
+  unreadCount?: number;
+  lastUnreadDeliverySeq?: number;
+  lastReadDeliverySeq?: number;
+}
 
 export interface CachedAgentSession {
   remoteKey: string;
@@ -26,6 +48,16 @@ export interface CachedAgentSession {
   briefRecordsById: Record<string, unknown>;
   newestSeq?: number;
   oldestSeq?: number;
+  syncCoverage?: CachedSyncCoverage;
+  semanticHistoryByDisplayLevel?: Record<string, CachedSemanticHistoryState>;
+  readState?: CachedAgentReadState;
+  cachedAt: number;
+}
+
+export interface CachedModelCatalog {
+  remoteKey: string;
+  schemaVersion: number;
+  options: unknown[];
   cachedAt: number;
 }
 
@@ -54,6 +86,9 @@ function openDB(): Promise<IDBDatabase | null> {
       }
       if (!db.objectStoreNames.contains(META_STORE)) {
         db.createObjectStore(META_STORE, { keyPath: "remoteKey" });
+      }
+      if (!db.objectStoreNames.contains(MODEL_CATALOG_STORE)) {
+        db.createObjectStore(MODEL_CATALOG_STORE, { keyPath: "remoteKey" });
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -133,26 +168,66 @@ export async function cacheDeleteSession(remoteKey: string, agentId: string): Pr
   }
 }
 
+export async function cachePutModelCatalog(catalog: CachedModelCatalog): Promise<void> {
+  const db = await openDB();
+  if (!db) return;
+  try {
+    await runRequest(db, MODEL_CATALOG_STORE, "readwrite", (store) => store.put(catalog));
+  } catch {
+    // Silent fallback — cache is best-effort.
+  }
+}
+
+export async function cacheGetModelCatalog(remoteKey: string): Promise<CachedModelCatalog | undefined> {
+  const db = await openDB();
+  if (!db) return undefined;
+  try {
+    const catalog = await runRequest<CachedModelCatalog>(db, MODEL_CATALOG_STORE, "readonly", (store) =>
+      store.get(remoteKey),
+    );
+    return catalog?.schemaVersion === CACHE_SCHEMA_VERSION ? catalog : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function cacheClearRemote(remoteKey: string): Promise<void> {
   const db = await openDB();
   if (!db) return;
   try {
-    const store = db.transaction(SESSIONS_STORE, "readwrite").objectStore(SESSIONS_STORE);
-    const index = store.index("byRemoteKey");
-    const range = IDBKeyRange.only(remoteKey);
-    await new Promise<void>((resolve, reject) => {
-      const request = index.openCursor(range);
-      request.onsuccess = () => {
-        const cursor = request.result;
-        if (cursor) {
-          cursor.delete();
-          cursor.continue();
-        } else {
-          resolve();
-        }
-      };
-      request.onerror = () => reject(request.error);
-    });
+    await Promise.all([
+      new Promise<void>((resolve, reject) => {
+        const store = db.transaction(SESSIONS_STORE, "readwrite").objectStore(SESSIONS_STORE);
+        const request = store.index("byRemoteKey").openCursor(IDBKeyRange.only(remoteKey));
+        request.onsuccess = () => {
+          const cursor = request.result;
+          if (cursor) {
+            cursor.delete();
+            cursor.continue();
+          } else {
+            resolve();
+          }
+        };
+        request.onerror = () => reject(request.error);
+      }),
+      new Promise<void>((resolve, reject) => {
+        const store = db.transaction(MODEL_CATALOG_STORE, "readwrite").objectStore(MODEL_CATALOG_STORE);
+        const request = store.openCursor();
+        request.onsuccess = () => {
+          const cursor = request.result;
+          if (cursor) {
+            const catalog = cursor.value as CachedModelCatalog;
+            if (catalog.remoteKey === remoteKey || catalog.remoteKey.startsWith(`${remoteKey}#`)) {
+              cursor.delete();
+            }
+            cursor.continue();
+          } else {
+            resolve();
+          }
+        };
+        request.onerror = () => reject(request.error);
+      }),
+    ]);
   } catch {
     // Silent fallback.
   }

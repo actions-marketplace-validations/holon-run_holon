@@ -2,12 +2,57 @@
 
 Holon releases are published from version tags.
 
+## macOS menu app
+
+The macOS release also builds `Holon.app` for macOS 13 or later. The app is a
+native SwiftUI menu bar control plane and bundles the matching Rust runtime at
+`Contents/Resources/bin/holon`.
+The DMG is a universal (x86_64 + arm64) artifact, so one download supports
+Apple Silicon and Intel Macs.
+The DMG volume opens with `Holon.app` beside an `/Applications` symlink and a
+baked-in Finder layout, so installing is the usual drag-to-Applications step;
+`scripts/create-macos-dmg.sh` builds and verifies that layout.
+
+Local packaging:
+
+```bash
+make macos-menu-package
+```
+
+Pull requests that change the macOS menu app, its packaging scripts, the
+bundled Rust runtime, or the embedded web GUI run the `macos-app` CI job on
+`macos-latest`. That job builds and tests the app and produces an unsigned DMG;
+documentation-only or Linux-only changes do not schedule it.
+
+The script always verifies the bundle and emits `Holon-<version>.dmg` plus a
+SHA-256 file. Local notarization may use `MACOS_NOTARY_PROFILE`. GitHub Actions
+imports the Developer ID certificate and uses Apple ID notarization with:
+
+- `MACOS_DEVELOPER_ID_APPLICATION`
+- `MACOS_CERTIFICATE_P12` and `MACOS_CERTIFICATE_PASSWORD`
+- `MACOS_NOTARY_APPLE_ID`, `MACOS_NOTARY_PASSWORD`, and
+  `MACOS_NOTARY_TEAM_ID`
+- `HOLON_SPARKLE_PUBLIC_KEY`
+- `HOLON_SPARKLE_PRIVATE_KEY`, used only to sign update archives and appcast
+  entries
+- `HOLON_SPARKLE_FEED_URL`
+
+These values are required for production tag releases. An unsigned local bundle
+remains supported for development and smoke verification.
+
+The tag-based `Release` workflow already includes the macOS app job. It imports
+the certificate into a temporary keychain, signs the app and bundled runtime,
+notarizes both the app archive and DMG, staples the notarization ticket, signs
+the Sparkle appcast, and publishes the DMG with the other release assets. The
+certificate secret must contain the base64-encoded `.p12` export; no signing
+secret is needed for pull requests.
+
 Every release tag is blocked until the protected **Release E2E** workflow has
 passed for the exact tag commit and intended release tag. That workflow builds
 one candidate image after protected-environment approval, records its immutable
 digest, runs the production image smoke test, executes the real-LLM core suite
 against that exact digest, and uploads a machine-readable attestation. The
-default model route is `deepseek/deepseek-v4-flash`.
+default model route is `dashscope-token-plan/qwen-3.7`.
 
 ## Versioning
 
@@ -18,7 +63,13 @@ from a commit whose crate version is `0.13.0`.
 
 Before creating the tag:
 
-1. Run the `Release E2E` workflow with the candidate commit and intended tag.
+1. Run the `Release E2E` workflow with the candidate commit, intended tag, and
+   exactly one previous-release source:
+   - `previous_image`: a full, resolvable container image reference; or
+   - `previous_ref`: a release tag such as `v0.31.1`, used to build an image
+     from that release's verified Linux binary asset.
+   The workflow fails rather than falling back when an explicit image is
+   invalid, when both inputs are set, or when neither input is set.
 2. Select the protected `release-e2e` environment approval.
 3. Confirm the uploaded `summary.json`, JUnit report, and secret scan all pass.
 4. Record the successful workflow run and candidate digest in the release
@@ -45,6 +96,8 @@ The release workflow builds and uploads:
 - `holon-linux-amd64.tar.gz`
 - `holon-darwin-amd64.tar.gz`
 - `holon-darwin-arm64.tar.gz`
+- `Holon-<version>.dmg` (universal macOS app) with its SHA-256 file and the
+  signed Sparkle `appcast.xml`
 - `checksums.txt`
 
 After the GitHub release is published successfully, the workflow promotes the
@@ -84,7 +137,11 @@ Before pushing the tag, verify:
 - the public GHCR tags promote the verified candidate digest rather than
   rebuilding a new image
 - when an upgrade case is available, it used the current recommended release
-  image as `previous_image`
+  through exactly one of `previous_image` or `previous_ref`, and the attestation
+  records the resolved image and source
+- the host real-data upgrade verification passed for the previous release ->
+  candidate pair (`scripts/upgrade-verify-realdata/README.md`): migration,
+  preservation, and cross-upgrade memory recall with a real model
 - the GHCR image is currently declared as Linux amd64 only
 - `Formula/holon.rb` will be generated, and either pushed to
   `holon-run/homebrew-tap` or retained as a workflow artifact when

@@ -1252,8 +1252,17 @@ pub(crate) fn bigmodel_builtin_web_search_config() -> ProviderBuiltinWebSearchCo
 pub(crate) fn deepseek_builtin_web_search_config() -> ProviderBuiltinWebSearchConfig {
     ProviderBuiltinWebSearchConfig {
         enabled: true,
-        kind: ProviderNativeWebSearchKind::Anthropic,
+        kind: ProviderNativeWebSearchKind::DeepSeek,
         advertised_tool_type: "web_search_20250305".to_string(),
+        backend_kind: "deepseek_web_search".to_string(),
+    }
+}
+
+pub(crate) fn deepseek_responses_builtin_web_search_config() -> ProviderBuiltinWebSearchConfig {
+    ProviderBuiltinWebSearchConfig {
+        enabled: true,
+        kind: ProviderNativeWebSearchKind::DeepSeek,
+        advertised_tool_type: "web_search".to_string(),
         backend_kind: "deepseek_web_search".to_string(),
     }
 }
@@ -1337,14 +1346,14 @@ pub(crate) fn materialize_provider_config(
 
 pub(crate) fn validate_openai_reasoning_effort(value: &str) -> Result<()> {
     match value {
-        "low" | "medium" | "high" | "xhigh" | "max" => Ok(()),
+        "none" | "low" | "medium" | "high" | "xhigh" | "max" => Ok(()),
         "ultra" => Err(anyhow!(
             "OpenAI Codex reasoning_effort 'ultra' is unavailable; \
              Holon does not yet implement the required orchestration semantics"
         )),
         _ => Err(anyhow!(
             "invalid OpenAI Codex reasoning_effort '{value}'; \
-             must be one of low, medium, high, xhigh, max"
+             must be one of none, low, medium, high, xhigh, max"
         )),
     }
 }
@@ -1356,6 +1365,7 @@ mod reasoning_effort_tests {
     #[test]
     fn codex_reasoning_effort_vocabulary_allows_max_but_not_ultra() {
         validate_openai_reasoning_effort("max").unwrap();
+        validate_openai_reasoning_effort("none").unwrap();
         let error = validate_openai_reasoning_effort("ultra").unwrap_err();
         assert!(error.to_string().contains("orchestration semantics"));
     }
@@ -1416,6 +1426,29 @@ pub(crate) fn validate_provider_builtin_web_search(
             } else {
                 Err(anyhow!(
                     "providers.{}.builtin_web_search.advertised_tool_type must be web_search_20250305 for Anthropic Messages native search",
+                    provider_id.as_str()
+                ))
+            }
+        }
+        (ProviderTransportKind::AnthropicMessages, ProviderNativeWebSearchKind::DeepSeek) => {
+            if search.advertised_tool_type == "web_search_20250305" {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "providers.{}.builtin_web_search.advertised_tool_type must be web_search_20250305 for DeepSeek Anthropic-compatible native search",
+                    provider_id.as_str()
+                ))
+            }
+        }
+        (ProviderTransportKind::OpenAiResponses, ProviderNativeWebSearchKind::DeepSeek) => {
+            if matches!(
+                search.advertised_tool_type.as_str(),
+                "web_search" | "web_search_2025_08_26"
+            ) {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "providers.{}.builtin_web_search.advertised_tool_type must be web_search or web_search_2025_08_26 for DeepSeek Responses native search",
                     provider_id.as_str()
                 ))
             }

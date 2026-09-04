@@ -1,10 +1,10 @@
 use super::super::*;
 use super::support::*;
-use crate::domain::scheduler_protocol::SchedulerOwner;
+use crate::domain::scheduler::SchedulerOwner;
 use crate::types::{
-    AgentPostureProjection, AgentSchedulingPosture, ToolExecutionStatus, WaitConditionKind,
-    WaitConditionRecord, WaitConditionStatus, WakeSource, WorkItemPlanStatus,
-    WorkItemSchedulingState, WorkItemState, WorkReactivationMode,
+    AdmissionContext, AgentPostureProjection, AgentSchedulingPosture, MessageDeliverySurface,
+    ToolExecutionStatus, WaitConditionKind, WaitConditionRecord, WaitConditionStatus, WakeSource,
+    WorkItemPlanStatus, WorkItemSchedulingState, WorkItemState, WorkReactivationMode,
 };
 use chrono::DateTime;
 use serde::de::DeserializeOwned;
@@ -131,6 +131,8 @@ fn append_active_external_wait_condition(
             resolved_at: None,
             cancelled_at: None,
             turn_id: None,
+            trigger_message_id: None,
+            triggered_at: None,
         })
         .unwrap();
 }
@@ -159,6 +161,8 @@ fn append_operator_wait_condition(
             resolved_at: None,
             cancelled_at: None,
             turn_id: None,
+            trigger_message_id: None,
+            triggered_at: None,
         })
         .unwrap();
 }
@@ -304,6 +308,7 @@ fn build_scheduler_fixture(name: &str) -> (tempfile::TempDir, AppStorage, AgentS
             kind,
             reason: Some("fixture terminal".into()),
             last_assistant_message: None,
+            no_brief_reason: None,
             checkpoint: None,
             completed_at: Utc::now(),
             duration_ms: 1,
@@ -787,6 +792,8 @@ fn idle_boundary_decision_waits_for_non_current_work_item_wait() {
             resolved_at: None,
             cancelled_at: None,
             turn_id: None,
+            trigger_message_id: None,
+            triggered_at: None,
         })
         .unwrap();
 
@@ -828,6 +835,7 @@ fn idle_boundary_decision_reactivates_runnable_work_while_asleep() {
     work_item.id = "work-current".into();
     work_item.plan_status = WorkItemPlanStatus::Ready;
     storage.append_work_item(&work_item).unwrap();
+    seed_runnable_work_execution(&storage, &work_item);
     storage.write_agent(&agent).unwrap();
 
     let projection = scheduler::SchedulerProjection::from_state(&storage, &agent).unwrap();
@@ -851,6 +859,7 @@ fn decide_next_action_prioritizes_wake_hint_over_work_queue_but_not_wait_facts()
     work_item.id = "work-1".into();
     work_item.revision = 7;
     append_work_item_at_revision(&storage, &work_item);
+    seed_runnable_work_execution(&storage, &work_item);
 
     let pending = PendingWakeHint {
         reason: "external update".into(),
@@ -913,6 +922,7 @@ fn queued_runnable_work_is_not_suppressed_by_unrelated_agent_waiting_intent() {
     work_item.id = "work-queued".into();
     work_item.revision = 4;
     append_work_item_at_revision(&storage, &work_item);
+    seed_runnable_work_execution(&storage, &work_item);
     append_active_external_wait_condition(&storage, "agent-wait", "default", None);
 
     let projection = scheduler::SchedulerProjection::from_state(&storage, &agent).unwrap();
@@ -985,6 +995,7 @@ fn scheduling_advisories_detect_idle_posture_with_runnable_work() {
     let work_item = WorkItemRecord::new("default", "runnable work", WorkItemState::Open);
     agent.current_work_item_id = Some(work_item.id.clone());
     storage.append_work_item(&work_item).unwrap();
+    seed_runnable_work_execution(&storage, &work_item);
     storage.write_agent(&agent).unwrap();
 
     let projection = scheduler::SchedulerProjection::from_state(&storage, &agent).unwrap();
@@ -1040,6 +1051,8 @@ fn scheduling_advisories_detect_weak_external_wait_and_unrecoverable_blocker() {
             cancelled_at: None,
 
             turn_id: None,
+            trigger_message_id: None,
+            triggered_at: None,
         })
         .unwrap();
 
@@ -1116,6 +1129,8 @@ fn scheduling_advisories_do_not_warn_for_common_legal_waits() {
             cancelled_at: None,
 
             turn_id: None,
+            trigger_message_id: None,
+            triggered_at: None,
         })
         .unwrap();
 
@@ -1162,6 +1177,8 @@ fn scheduling_advisory_append_dedupes_interleaved_recent_events() {
             cancelled_at: None,
 
             turn_id: None,
+            trigger_message_id: None,
+            triggered_at: None,
         })
         .unwrap();
     let appended = scheduler::append_scheduling_advisories(&storage, &agent, 0).unwrap();
@@ -1276,13 +1293,16 @@ fn append_task_wait_condition(
             resolved_at: None,
             cancelled_at: None,
             turn_id: None,
+            trigger_message_id: None,
+            triggered_at: None,
         })
         .unwrap();
 }
-fn append_open_work_item(storage: &AppStorage, id: &str, agent_id: &str) {
+fn append_open_work_item(storage: &AppStorage, id: &str, agent_id: &str) -> WorkItemRecord {
     let mut record = WorkItemRecord::new(agent_id, "test objective", WorkItemState::Open);
     record.id = id.into();
     storage.append_work_item(&record).unwrap();
+    record
 }
 
 #[test]
@@ -1372,6 +1392,179 @@ fn unbound_terminal_task_result_is_lifecycle_nudge_without_a_wait() {
 }
 
 #[test]
+fn runtime_owned_unbound_child_followup_is_lifecycle_nudge() {
+    let message = MessageEnvelope::new(
+        "child",
+        MessageKind::InternalFollowup,
+        MessageOrigin::Task {
+            task_id: "task-parent".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "delegated objective".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+
+    assert_eq!(
+        scheduler::canonical_activation_candidate(&message, None, None).unwrap(),
+        Some(
+            scheduler::CanonicalActivationCandidate::LifecycleExternalNudge {
+                agent_id: "child".into(),
+            }
+        )
+    );
+}
+
+#[test]
+fn trusted_bound_provider_recovery_has_a_dedicated_candidate() {
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::InternalFollowup,
+        MessageOrigin::System {
+            subsystem: "model_lineage_recovery".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Next,
+        MessageBody::Text {
+            text: "continue provider recovery".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    message.work_item_id = Some("work-provider-recovery".into());
+    message.metadata = Some(serde_json::json!({
+        "provider_recovery": {
+            "fallback_model_ref": "anthropic/claude-sonnet-4-6",
+            "source_turn_id": "turn-provider-failure",
+            "source_message_id": "message-provider-failure",
+            "source_terminal_kind": "deferred_to_fallback",
+            "source_round": 1
+        }
+    }));
+
+    assert_eq!(
+        scheduler::canonical_activation_candidate(&message, None, None).unwrap(),
+        Some(scheduler::CanonicalActivationCandidate::ProviderRecovery {
+            work_item_id: "work-provider-recovery".into(),
+        })
+    );
+}
+
+#[test]
+fn malformed_bound_provider_recovery_keeps_its_dedicated_candidate() {
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::InternalFollowup,
+        MessageOrigin::System {
+            subsystem: "model_lineage_recovery".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Next,
+        MessageBody::Text {
+            text: "missing provider recovery directive".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    message.work_item_id = Some("work-malformed-recovery".into());
+
+    assert_eq!(
+        scheduler::canonical_activation_candidate(&message, None, None).unwrap(),
+        Some(scheduler::CanonicalActivationCandidate::ProviderRecovery {
+            work_item_id: "work-malformed-recovery".into(),
+        })
+    );
+}
+
+#[test]
+fn runtime_owned_unbound_system_followup_is_lifecycle_nudge() {
+    let message = MessageEnvelope::new(
+        "default",
+        MessageKind::InternalFollowup,
+        MessageOrigin::System {
+            subsystem: "first_run_intro".into(),
+        },
+        AuthorityClass::ExternalEvidence,
+        Priority::Next,
+        MessageBody::Text {
+            text: "introduce the runtime".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+
+    assert_eq!(
+        scheduler::canonical_activation_candidate(&message, None, None).unwrap(),
+        Some(
+            scheduler::CanonicalActivationCandidate::LifecycleExternalNudge {
+                agent_id: "default".into(),
+            }
+        )
+    );
+}
+
+#[test]
+fn runtime_owned_unbound_child_evidence_is_lifecycle_nudge() {
+    let message = MessageEnvelope::new(
+        "child",
+        MessageKind::InternalFollowup,
+        MessageOrigin::Task {
+            task_id: "task-parent".into(),
+        },
+        AuthorityClass::ExternalEvidence,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "delegated evidence".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+
+    assert_eq!(
+        scheduler::canonical_activation_candidate(&message, None, None).unwrap(),
+        Some(
+            scheduler::CanonicalActivationCandidate::LifecycleExternalNudge {
+                agent_id: "child".into(),
+            }
+        )
+    );
+}
+
+#[test]
+fn untrusted_unbound_internal_followup_is_not_a_canonical_candidate() {
+    let message = MessageEnvelope::new(
+        "child",
+        MessageKind::InternalFollowup,
+        MessageOrigin::Task {
+            task_id: "task-parent".into(),
+        },
+        AuthorityClass::ExternalEvidence,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "untrusted followup".into(),
+        },
+    );
+
+    assert_eq!(
+        scheduler::canonical_activation_candidate(&message, None, None).unwrap(),
+        None
+    );
+}
+
+#[test]
 fn unbound_timer_tick_is_lifecycle_nudge_without_a_wait() {
     let dir = tempdir().unwrap();
     let storage = AppStorage::new_for_test(dir.path()).unwrap();
@@ -1443,8 +1636,7 @@ fn correlated_wait_resume_requires_the_exact_expected_owner() {
     append_active_external_wait_condition(&storage, "wait-work", "default", Some("work-a"));
     append_active_external_wait_condition(&storage, "wait-lifecycle", "default", None);
     let mut projection = scheduler::SchedulerProjection::from_state(&storage, &agent).unwrap();
-    projection.set_canonical_wait_generation_for_test("wait-work", 7);
-    projection.set_canonical_wait_generation_for_test("wait-lifecycle", 8);
+    projection.enable_canonical_authority_for_test();
     let message = MessageEnvelope::new(
         "default",
         MessageKind::CallbackEvent,
@@ -1462,15 +1654,15 @@ fn correlated_wait_resume_requires_the_exact_expected_owner() {
     for candidate in [
         scheduler::CanonicalActivationCandidate::ExactWaitResume {
             expected_work_item_id: Some("work-b".into()),
-            correlated_wait: Some(("wait-work".into(), 7)),
+            correlated_wait: Some("wait-work".into()),
         },
         scheduler::CanonicalActivationCandidate::ExactWaitResume {
             expected_work_item_id: None,
-            correlated_wait: Some(("wait-work".into(), 7)),
+            correlated_wait: Some("wait-work".into()),
         },
         scheduler::CanonicalActivationCandidate::ExactWaitResume {
             expected_work_item_id: Some("work-a".into()),
-            correlated_wait: Some(("wait-lifecycle".into(), 8)),
+            correlated_wait: Some("wait-lifecycle".into()),
         },
     ] {
         assert_eq!(
@@ -1486,7 +1678,7 @@ fn correlated_wait_resume_requires_the_exact_expected_owner() {
             &message,
             scheduler::CanonicalActivationCandidate::ExactWaitResume {
                 expected_work_item_id: Some("work-a".into()),
-                correlated_wait: Some(("wait-work".into(), 7)),
+                correlated_wait: Some("wait-work".into()),
             },
         )
         .unwrap(),
@@ -1503,7 +1695,7 @@ fn correlated_wait_resume_requires_the_exact_expected_owner() {
             &message,
             scheduler::CanonicalActivationCandidate::ExactWaitResume {
                 expected_work_item_id: None,
-                correlated_wait: Some(("wait-lifecycle".into(), 8)),
+                correlated_wait: Some("wait-lifecycle".into()),
             },
         )
         .unwrap(),
@@ -1512,6 +1704,23 @@ fn correlated_wait_resume_requires_the_exact_expected_owner() {
                 agent_id: "default".into(),
             },
             wait_id: "wait-lifecycle".into(),
+        })
+    );
+    assert_eq!(
+        scheduler::resolve_canonical_activation_scenario(
+            &projection,
+            &message,
+            scheduler::CanonicalActivationCandidate::ExactWaitResume {
+                expected_work_item_id: Some("work-a".into()),
+                correlated_wait: Some("wait-work".into()),
+            },
+        )
+        .unwrap(),
+        Some(scheduler::CanonicalActivationScenario::ExactWaitResume {
+            owner: SchedulerOwner::WorkItem {
+                work_item_id: "work-a".into(),
+            },
+            wait_id: "wait-work".into(),
         })
     );
 }
@@ -1531,7 +1740,7 @@ fn unbound_operator_input_exactly_resumes_agent_wait_or_becomes_nudge() {
         matched_waiting_reason: true,
         evidence: Vec::new(),
     };
-    let message = MessageEnvelope::new(
+    let mut message = MessageEnvelope::new(
         "default",
         MessageKind::OperatorPrompt,
         MessageOrigin::Operator {
@@ -1542,11 +1751,16 @@ fn unbound_operator_input_exactly_resumes_agent_wait_or_becomes_nudge() {
         MessageBody::Text {
             text: "continue".into(),
         },
+    )
+    .with_admission(
+        MessageDeliverySurface::CliPrompt,
+        AdmissionContext::LocalProcess,
     );
+    message.message_seq = Some(1);
 
     append_operator_wait_condition(&storage, "wait-operator", "default", None);
     let mut projection = scheduler::SchedulerProjection::from_state(&storage, &agent).unwrap();
-    projection.set_canonical_wait_generation_for_test("wait-operator", 1);
+    projection.enable_canonical_authority_for_test();
     let candidate = scheduler::canonical_activation_candidate(&message, Some(&continuation), None)
         .unwrap()
         .unwrap();
@@ -1569,6 +1783,207 @@ fn unbound_operator_input_exactly_resumes_agent_wait_or_becomes_nudge() {
         .unwrap();
     assert_eq!(
         scheduler::resolve_canonical_activation_scenario(&projection, &message, candidate).unwrap(),
+        Some(
+            scheduler::CanonicalActivationScenario::LifecycleExternalNudge {
+                agent_id: "default".into(),
+            }
+        )
+    );
+}
+
+#[test]
+fn explicitly_bound_operator_input_resumes_work_item_wait() {
+    let dir = tempdir().unwrap();
+    let storage = AppStorage::new_for_test(dir.path()).unwrap();
+    let agent = AgentState::new("default");
+    storage.write_agent(&agent).unwrap();
+    append_open_work_item(&storage, "wi-operator", "default");
+    append_operator_wait_condition(&storage, "wait-operator", "default", Some("wi-operator"));
+
+    let mut projection = scheduler::SchedulerProjection::from_state(&storage, &agent).unwrap();
+    projection.enable_canonical_authority_for_test();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator {
+            actor_id: Some("operator".into()),
+        },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "continue".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::CliPrompt,
+        AdmissionContext::LocalProcess,
+    );
+    message.message_seq = Some(1);
+    message.work_item_id = Some("wi-operator".into());
+    let candidate = scheduler::canonical_activation_candidate(&message, None, None)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        scheduler::resolve_canonical_activation_scenario(&projection, &message, candidate).unwrap(),
+        Some(
+            scheduler::CanonicalActivationScenario::ExplicitlyBoundOperatorInput {
+                work_item_id: "wi-operator".into(),
+                wait_id: Some("wait-operator".into()),
+            },
+        )
+    );
+}
+
+#[test]
+fn authenticated_operator_ingress_can_activate_low_authority_prompt_without_upgrade() {
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator {
+            actor_id: Some("holon_run".into()),
+        },
+        AuthorityClass::IntegrationSignal,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "run controlled prompt".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RunOnce,
+        AdmissionContext::LocalProcess,
+    );
+    message.message_seq = Some(1);
+
+    assert!(scheduler::authenticated_operator_ingress(&message));
+    let candidate = scheduler::canonical_activation_candidate(&message, None, None)
+        .unwrap()
+        .expect("authenticated low-authority operator input should be activatable");
+    assert_eq!(
+        candidate,
+        scheduler::CanonicalActivationCandidate::ExactWaitResume {
+            expected_work_item_id: None,
+            correlated_wait: None,
+        }
+    );
+    assert_eq!(message.authority_class, AuthorityClass::IntegrationSignal);
+
+    message.message_seq = None;
+    assert!(!scheduler::authenticated_operator_ingress(&message));
+    assert_eq!(
+        scheduler::canonical_activation_candidate(&message, None, None).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn trusted_high_authority_operator_prompt_keeps_legacy_activation_path() {
+    let message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "legacy trusted prompt".into(),
+        },
+    );
+
+    assert_eq!(
+        scheduler::canonical_activation_candidate(&message, None, None).unwrap(),
+        Some(scheduler::CanonicalActivationCandidate::ExactWaitResume {
+            expected_work_item_id: None,
+            correlated_wait: None,
+        })
+    );
+}
+
+#[test]
+fn explicitly_bound_low_authority_operator_input_preserves_content_trust() {
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator {
+            actor_id: Some("holon_run".into()),
+        },
+        AuthorityClass::ExternalEvidence,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "run external evidence".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::CliPrompt,
+        AdmissionContext::LocalProcess,
+    );
+    message.message_seq = Some(1);
+    message.work_item_id = Some("wi-operator".into());
+
+    assert!(scheduler::authenticated_operator_ingress(&message));
+    let candidate = scheduler::canonical_activation_candidate(&message, None, None)
+        .unwrap()
+        .expect("bound low-authority operator input should be activatable");
+    assert!(matches!(
+        candidate,
+        scheduler::CanonicalActivationCandidate::ExplicitlyBoundOperatorInput {
+            work_item_id
+        } if work_item_id == "wi-operator"
+    ));
+    assert_eq!(message.authority_class, AuthorityClass::ExternalEvidence);
+}
+
+#[test]
+fn normal_operator_input_resumes_work_item_wait_but_interject_does_not() {
+    let dir = tempdir().unwrap();
+    let storage = AppStorage::new_for_test(dir.path()).unwrap();
+    let agent = AgentState::new("default");
+    storage.write_agent(&agent).unwrap();
+    append_open_work_item(&storage, "wi-operator", "default");
+    append_operator_wait_condition(&storage, "wait-operator", "default", Some("wi-operator"));
+
+    let mut projection = scheduler::SchedulerProjection::from_state(&storage, &agent).unwrap();
+    projection.enable_canonical_authority_for_test();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator {
+            actor_id: Some("operator".into()),
+        },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "continue".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::CliPrompt,
+        AdmissionContext::LocalProcess,
+    );
+    message.message_seq = Some(1);
+    let candidate = scheduler::canonical_activation_candidate(&message, None, None)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        scheduler::resolve_canonical_activation_scenario(&projection, &message, candidate).unwrap(),
+        Some(scheduler::CanonicalActivationScenario::ExactWaitResume {
+            owner: SchedulerOwner::WorkItem {
+                work_item_id: "wi-operator".into(),
+            },
+            wait_id: "wait-operator".into(),
+        })
+    );
+
+    let interject = MessageEnvelope {
+        priority: Priority::Interject,
+        ..message
+    };
+    let candidate = scheduler::canonical_activation_candidate(&interject, None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        scheduler::resolve_canonical_activation_scenario(&projection, &interject, candidate)
+            .unwrap(),
         Some(
             scheduler::CanonicalActivationScenario::LifecycleExternalNudge {
                 agent_id: "default".into(),
@@ -1610,8 +2025,9 @@ fn wait_resume_claim_authority_scope_is_derived_without_shadow_evidence() {
     let storage = AppStorage::new_for_test(dir.path()).unwrap();
     let agent = AgentState::new("default");
     storage.write_agent(&agent).unwrap();
-    append_open_work_item(&storage, "wi-1", "default");
+    let work_item = append_open_work_item(&storage, "wi-1", "default");
     append_task_wait_condition(&storage, "wait-1", "default", Some("wi-1"), "task-1");
+    seed_waiting_work_execution(&storage, &work_item, "wait-1");
     let projection = scheduler::SchedulerProjection::from_state(&storage, &agent).unwrap();
     let message = MessageEnvelope::new(
         "default",
@@ -1652,6 +2068,8 @@ fn timer_tick_only_matches_the_wait_for_the_same_timer() {
         resolved_at: None,
         cancelled_at: None,
         turn_id: None,
+        trigger_message_id: None,
+        triggered_at: None,
     };
     let mut other = matching.clone();
     other.id = "wait-other".into();
@@ -1875,6 +2293,8 @@ fn setup_waiting_operator_work_item(
             resolved_at: None,
             cancelled_at: None,
             turn_id: None,
+            trigger_message_id: None,
+            triggered_at: None,
         })
         .unwrap();
 }
@@ -1969,4 +2389,61 @@ fn waiting_operator_with_future_recheck_still_waits() {
         decision.unwrap().kind,
         scheduler::SchedulerDecisionKind::WaitForOperator
     );
+}
+
+#[test]
+fn waiting_external_with_interrupted_replay_does_not_return_liveness_only_wait() {
+    let dir = tempdir().unwrap();
+    let storage = AppStorage::new_for_test(dir.path()).unwrap();
+    let mut agent = AgentState::new("default");
+    agent.current_work_item_id = Some("work-external-replay".into());
+    append_active_external_wait_condition(
+        &storage,
+        "wait-external-replay",
+        "default",
+        Some("work-external-replay"),
+    );
+    storage.write_agent(&agent).unwrap();
+    storage
+        .append_queue_entry(&QueueEntryRecord {
+            message_id: "msg-interrupted-replay".into(),
+            agent_id: "default".into(),
+            priority: Priority::Normal,
+            status: QueueEntryStatus::Interrupted,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+
+    let projection = scheduler::SchedulerProjection::from_state(&storage, &agent).unwrap();
+    assert_eq!(
+        projection.waiting_work_item_scheduling_state,
+        Some(WorkItemSchedulingState::WaitingExternal)
+    );
+    assert!(projection.has_interrupted_replay);
+    assert!(scheduler::wait_decision_for_projection(&projection).is_none());
+}
+
+#[test]
+fn waiting_external_without_interrupted_replay_remains_liveness_only() {
+    let dir = tempdir().unwrap();
+    let storage = AppStorage::new_for_test(dir.path()).unwrap();
+    let mut agent = AgentState::new("default");
+    agent.current_work_item_id = Some("work-external-idle".into());
+    append_active_external_wait_condition(
+        &storage,
+        "wait-external-idle",
+        "default",
+        Some("work-external-idle"),
+    );
+    storage.write_agent(&agent).unwrap();
+
+    let projection = scheduler::SchedulerProjection::from_state(&storage, &agent).unwrap();
+    let decision =
+        scheduler::wait_decision_for_projection(&projection).expect("external wait decision");
+    assert_eq!(
+        decision.kind,
+        scheduler::SchedulerDecisionKind::WaitForExternalChange
+    );
+    assert!(decision.liveness_only);
 }

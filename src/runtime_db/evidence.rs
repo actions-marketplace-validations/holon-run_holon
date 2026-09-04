@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::runtime_db::index_outbox::RuntimeIndexChange;
 use crate::runtime_db::EVIDENCE_PREVIEW_LIMIT;
+use crate::types::AgentRegistryStatus;
 use crate::types::{
     AgentDeletionJob, AgentIdentityRecord, AgentState, AuditEvent, BriefRecord,
     DeliverySummaryRecord, ExecutionRootEntry, MessageEnvelope, ToolExecutionRecord,
@@ -239,8 +240,8 @@ pub(crate) fn upsert_agent_state_tx(tx: &Transaction<'_>, record: &AgentState) -
     tx.execute(
         "INSERT INTO agent_states (
             agent_id, status, turn_index, current_run_id, current_work_item_id,
-            active_workspace_id, updated_at, payload_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            active_workspace_id, updated_at, payload_json, control_revision
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)
          ON CONFLICT(agent_id) DO UPDATE SET
             status = excluded.status,
             turn_index = excluded.turn_index,
@@ -248,7 +249,8 @@ pub(crate) fn upsert_agent_state_tx(tx: &Transaction<'_>, record: &AgentState) -
             current_work_item_id = excluded.current_work_item_id,
             active_workspace_id = excluded.active_workspace_id,
             updated_at = excluded.updated_at,
-            payload_json = excluded.payload_json
+            payload_json = excluded.payload_json,
+            control_revision = agent_states.control_revision + 1
          WHERE excluded.turn_index >= agent_states.turn_index",
         params![
             record.id,
@@ -367,10 +369,62 @@ pub(crate) fn upsert_execution_root_entry_tx(
     Ok(())
 }
 
+/// Enforces the durable Agent identity reservation invariant inside every
+/// registry write: an id retired in this runtime event-log epoch can never
+/// regain availability. Deletion only moves the reservation to `retired`;
+/// the reservation row itself is never removed.
+pub(crate) fn reserve_agent_identity_tx(
+    tx: &Transaction<'_>,
+    record: &AgentIdentityRecord,
+) -> Result<()> {
+    let retired: Option<bool> = tx
+        .query_row(
+            "SELECT reservation_state = 'retired'
+             FROM agent_identity_reservations
+             WHERE agent_id = ?1",
+            [&record.agent_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    if retired == Some(true) {
+        if record.status != AgentRegistryStatus::Deleted {
+            return Err(anyhow!(
+                "agent id {} was retired in this runtime event-log epoch; \
+                 retired agent ids are never reused",
+                record.agent_id
+            ));
+        }
+        // Re-asserting the tombstone keeps the reservation retired; the
+        // registry write below remains an idempotent stale-safe no-op.
+        return Ok(());
+    }
+    if record.status == AgentRegistryStatus::Deleted {
+        tx.execute(
+            "INSERT INTO agent_identity_reservations (agent_id, reservation_state, reserved_at, retired_at, source)
+             VALUES (?1, 'retired', ?2, ?2, 'agent_registry')
+             ON CONFLICT(agent_id) DO UPDATE SET
+               reservation_state = 'retired',
+               retired_at = excluded.retired_at",
+            params![record.agent_id, now],
+        )?;
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO agent_identity_reservations (agent_id, reservation_state, reserved_at, retired_at, source)
+         VALUES (?1, 'active', ?2, NULL, 'agent_registry')",
+        params![record.agent_id, now],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn upsert_agent_identity_tx(
     tx: &Transaction<'_>,
     record: &AgentIdentityRecord,
 ) -> Result<()> {
+    // The reservation guard runs before the registry write so a retired id
+    // can never regain availability, not even through a stale replay.
+    reserve_agent_identity_tx(tx, record)?;
     let payload_json = serde_json::to_string(record)?;
     let kind = enum_string(&record.kind)?;
     let visibility = enum_string(&record.visibility)?;
@@ -640,6 +694,150 @@ pub(crate) fn insert_brief_evidence_tx(tx: &Transaction<'_>, brief: &BriefRecord
     )
 }
 
+/// Outcome of the single-transition Brief publication: the stored Brief
+/// record (with its immutable `created_event_seq` linkage), the committed
+/// `brief_created` audit event, and whether this call inserted the event or
+/// reused an idempotently identical existing row.
+#[derive(Debug, Clone)]
+pub struct BriefCreatedCommit {
+    pub brief: BriefRecord,
+    pub event: AuditEvent,
+    pub event_inserted: bool,
+}
+
+/// Inserts or links a Brief record against an already-allocated
+/// `brief_created` event sequence, inside the caller's transaction. The
+/// linkage is immutable: an existing different linkage is a conflict, an
+/// absent linkage is filled, and the payload's non-linkage content must
+/// match on retry.
+pub(crate) fn upsert_brief_with_created_event_seq_tx(
+    tx: &Transaction<'_>,
+    brief: &BriefRecord,
+    event_seq: u64,
+) -> Result<BriefRecord> {
+    if let Some(payload_json) = tx
+        .query_row(
+            "SELECT payload_json FROM briefs WHERE evidence_id = ?1",
+            [&brief.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        let mut existing: BriefRecord = serde_json::from_str(&payload_json)?;
+        let stored_linkage = existing.created_event_seq;
+        let mut incoming = brief.clone();
+        incoming.created_event_seq = None;
+        existing.created_event_seq = None;
+        anyhow::ensure!(
+            existing == incoming,
+            "conflicting brief content for evidence_id {}",
+            brief.id
+        );
+        if stored_linkage == Some(event_seq) {
+            existing.created_event_seq = stored_linkage;
+            return Ok(existing);
+        }
+        anyhow::ensure!(
+            stored_linkage.is_none(),
+            "brief {} already linked to created_event_seq {}, refusing relink to {}",
+            brief.id,
+            stored_linkage.unwrap_or_default(),
+            event_seq
+        );
+        existing.created_event_seq = Some(event_seq);
+        tx.execute(
+            "UPDATE briefs SET payload_json = ?1, created_event_seq = ?2
+             WHERE evidence_id = ?3",
+            params![
+                full_payload_json(&existing)?,
+                i64::try_from(event_seq).ok(),
+                &brief.id
+            ],
+        )?;
+        return Ok(existing);
+    }
+    let mut linked = brief.clone();
+    linked.created_event_seq = Some(event_seq);
+    insert_evidence_tx(
+        tx,
+        EvidenceInsert {
+            table: EvidenceKind::Brief.table_name(),
+            evidence_id: &linked.id,
+            agent_id: &linked.agent_id,
+            turn_id: linked.turn_id.as_deref(),
+            message_id: linked.related_message_id.as_deref(),
+            task_id: linked.related_task_id.as_deref(),
+            work_item_id: linked.work_item_id.as_deref(),
+            created_at: linked.created_at,
+            kind: enum_string(&linked.kind)?,
+            preview: Some(truncate_evidence_string(&linked.text)),
+            payload_json: full_payload_json(&linked)?,
+        },
+    )?;
+    tx.execute(
+        "UPDATE briefs SET created_event_seq = ?1 WHERE evidence_id = ?2",
+        params![i64::try_from(event_seq).ok(), &linked.id],
+    )?;
+    Ok(linked)
+}
+
+/// Single-transition Brief publication: allocates the audit event sequence,
+/// appends the idempotent `brief_created` event, links the Brief record to
+/// the committed sequence, and records index changes, all in one SQLite
+/// transaction. When the event is observed, the Brief record is already
+/// readable.
+pub(crate) fn append_brief_with_created_event_tx(
+    tx: &Transaction<'_>,
+    agent_id: Option<&str>,
+    brief: &BriefRecord,
+    event: &AuditEvent,
+    index_changes: &[RuntimeIndexChange],
+) -> Result<BriefCreatedCommit> {
+    let (event, event_inserted) = append_audit_event_tx(tx, agent_id, event)?;
+    let brief = upsert_brief_with_created_event_seq_tx(tx, brief, event.event_seq)?;
+    insert_runtime_index_changes_tx(tx, index_changes)?;
+    Ok(BriefCreatedCommit {
+        brief,
+        event,
+        event_inserted,
+    })
+}
+
+/// Links transition `brief_evidence` rows against the `brief_created` events
+/// committed by the same transition. At most one event may reference a
+/// carried Brief; a Brief without its event in this transition stays
+/// unlinked rather than blocking the committed transition.
+pub(crate) fn link_transition_brief_created_events_tx(
+    tx: &Transaction<'_>,
+    brief_evidence: &[BriefRecord],
+    committed_events: &[AuditEvent],
+) -> Result<()> {
+    const BRIEF_CREATED_WIRE_NAME: &str = "brief_created";
+    for brief in brief_evidence {
+        let matches = committed_events
+            .iter()
+            .filter(|event| {
+                event.kind == BRIEF_CREATED_WIRE_NAME
+                    && event
+                        .data
+                        .get("brief_id")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|brief_id| brief_id == brief.id)
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            matches.len() <= 1,
+            "transition carried {} brief_created events for brief {}",
+            matches.len(),
+            brief.id
+        );
+        if let Some(event) = matches.first() {
+            upsert_brief_with_created_event_seq_tx(tx, brief, event.event_seq)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn insert_delivery_summary_evidence_tx(
     tx: &Transaction<'_>,
     record: &DeliverySummaryRecord,
@@ -839,6 +1037,7 @@ fn insert_audit_event_with_sequence_tx(
         event.id,
         event.event_seq
     );
+    crate::runtime_db::observer_sync::record_appended_event_projection_effect(tx, event)?;
     Ok(())
 }
 

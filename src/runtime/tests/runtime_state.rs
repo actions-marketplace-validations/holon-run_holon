@@ -1,18 +1,570 @@
 use super::super::*;
 use super::support::*;
-use crate::domain::scheduler_protocol::{
-    ActivationCause, ActivationSlot, AgentDispatchState, SchedulerOwner, Snapshot,
-    WaitGenerationRecord, WaitIdentity, WaitRecord, WaitState, WorkDemand, WorkStatus,
-};
 use crate::types::{
     ActiveSkillRecord, AuthorityClass, BriefKind, BriefRecord, CompletionReportState,
     QueueEntryStatus, SkillActivationSource, SkillActivationState, SkillLoadReason, SkillScope,
-    WaitConditionKind, WaitConditionRecord, WaitConditionStatus, WakeSource, WorkItemPlanStatus,
-    WorkItemRecord, WorkItemSchedulingState, WorkItemState,
+    TodoItem, TodoItemState, WaitConditionKind, WaitConditionRecord, WaitConditionStatus,
+    WakeSource, WorkItemPlanStatus, WorkItemRecord, WorkItemSchedulingState, WorkItemState,
 };
 
 struct BlockingProvider {
     started: Arc<tokio::sync::Notify>,
+}
+
+struct OpenExternalWakeClaimFixture {
+    harness: LifecycleHarness,
+    work_item_id: String,
+    wait_id: String,
+    message_id: String,
+    attempt_id: String,
+}
+
+async fn open_external_wake_claim_fixture() -> OpenExternalWakeClaimFixture {
+    let harness = LifecycleHarness::new();
+    let (work_item_id, wait_id, message_id, attempt_id) = {
+        let runtime = harness.runtime();
+        let work_item = runtime
+            .create_work_item(
+                "recover an interrupted external wake".into(),
+                None,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+        let trigger_id = runtime
+            .create_external_trigger(
+                "resume external wait".into(),
+                "github".into(),
+                ExternalTriggerScope::Agent,
+                CallbackDeliveryMode::WakeHint,
+                Some("external state changed".into()),
+                Some("holon-run/holon#2686".into()),
+            )
+            .await
+            .unwrap()
+            .external_trigger_id;
+
+        let mut wait_message = MessageEnvelope::new(
+            "default",
+            MessageKind::SystemTick,
+            MessageOrigin::System {
+                subsystem: "work_queue".into(),
+            },
+            AuthorityClass::RuntimeInstruction,
+            Priority::Normal,
+            MessageBody::Text {
+                text: "wait for external state".into(),
+            },
+        )
+        .with_admission(
+            MessageDeliverySurface::RuntimeSystem,
+            AdmissionContext::RuntimeOwned,
+        );
+        bind_autonomous_work_queue_tick(&mut wait_message, &work_item, "continue_active");
+        wait_message.turn_id = Some("turn-external-wait-recovery".into());
+        let wait_message = runtime.enqueue(wait_message).await.unwrap();
+        assert!(matches!(
+            scheduler_executor::SchedulerDecisionExecutor::new(runtime)
+                .poll()
+                .await
+                .unwrap(),
+            scheduler_executor::RunLoopPoll::Message(_)
+        ));
+        let wait = runtime
+            .register_wait_for(
+                "default",
+                Some(work_item.id.clone()),
+                WaitForWakeKind::External,
+                Some("holon-run/holon#2686".into()),
+                "external state must change".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        let wait_id = wait.condition.id;
+        finish_claimed_test_run(runtime).await;
+        let terminal = terminal_transition(&wait_message, Some(&work_item.id));
+        runtime
+            .commit_queue_terminal_settlement(
+                QueueEntryRecord {
+                    message_id: wait_message.id.clone(),
+                    agent_id: wait_message.agent_id.clone(),
+                    priority: wait_message.priority,
+                    status: QueueEntryStatus::Processed,
+                    created_at: wait_message.created_at,
+                    updated_at: Utc::now(),
+                },
+                Vec::new(),
+                true,
+                Some(&terminal),
+            )
+            .await
+            .unwrap();
+
+        let delivery = runtime
+            .deliver_callback(
+                &trigger_id,
+                CallbackDeliveryPayload {
+                    body: Some(MessageBody::Json {
+                        value: serde_json::json!({"status": "ready"}),
+                    }),
+                    content_type: Some("application/json".into()),
+                    correlation_id: Some("corr-external-wake-recovery".into()),
+                    causation_id: Some("external-change-2686".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(delivery.disposition, CallbackIngressDisposition::Triggered);
+        let wake_message = runtime
+            .storage()
+            .read_recent_messages(16)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.source_refs.get("wait_id") == Some(&wait_id))
+            .expect("external wake should persist its exact wait correlation");
+        let scheduled = scheduler_executor::SchedulerDecisionExecutor::new(runtime)
+            .poll()
+            .await
+            .unwrap();
+        let scheduler_executor::RunLoopPoll::Message(scheduled) = scheduled else {
+            panic!("external wake should claim the exact wait");
+        };
+        assert_eq!(scheduled.message.id, wake_message.id);
+        finish_claimed_test_run(runtime).await;
+
+        let attempt_id = scheduler_executor::canonical_activation_id(&wake_message.id);
+        let execution = runtime
+            .inner
+            .runtime_db
+            .transitions()
+            .load_execution_protocol_state_if_initialized("default")
+            .unwrap()
+            .expect("external wake claim should initialize execution authority");
+        assert_eq!(
+            execution.attempts[&attempt_id].state,
+            crate::domain::execution_protocol::ExecutionAttemptState::Open
+        );
+        assert!(matches!(
+            &execution.attempts[&attempt_id].source.identity,
+            crate::domain::execution_protocol::ExecutionSourceIdentity::TriggeredWait {
+                wait_id: admitted_wait_id,
+                trigger_message_id,
+            } if admitted_wait_id == &wait_id && trigger_message_id == &wake_message.id
+        ));
+
+        (work_item.id, wait_id, wake_message.id, attempt_id)
+    };
+
+    OpenExternalWakeClaimFixture {
+        harness,
+        work_item_id,
+        wait_id,
+        message_id,
+        attempt_id,
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_recovers_open_external_wake_claim_and_releases_execution_lane() {
+    let mut fixture = open_external_wake_claim_fixture().await;
+    fixture.harness.restart();
+    let runtime = fixture.harness.runtime();
+
+    assert_eq!(
+        runtime.recover_scheduler_bootstrap_claims().await.unwrap(),
+        1
+    );
+    assert_eq!(
+        runtime.recover_scheduler_bootstrap_claims().await.unwrap(),
+        0
+    );
+
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("bootstrap recovery should preserve execution authority");
+    let attempt = &execution.attempts[&fixture.attempt_id];
+    assert_eq!(
+        attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Interrupted
+    );
+    assert!(execution.open_attempt().is_none());
+    assert!(matches!(
+        &attempt.source.identity,
+        crate::domain::execution_protocol::ExecutionSourceIdentity::TriggeredWait {
+            wait_id,
+            trigger_message_id,
+        } if wait_id == &fixture.wait_id && trigger_message_id == &fixture.message_id
+    ));
+    assert!(matches!(
+        &execution.work_items[&fixture.work_item_id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Runnable {
+            recovery_ref: Some(recovery_ref),
+            ..
+        } if recovery_ref == "interrupted"
+    ));
+    assert_eq!(
+        runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest(&fixture.message_id)
+            .unwrap()
+            .expect("external wake queue entry should remain auditable")
+            .status,
+        QueueEntryStatus::Interrupted
+    );
+    let wait = runtime
+        .storage()
+        .latest_wait_conditions()
+        .unwrap()
+        .into_iter()
+        .find(|wait| wait.id == fixture.wait_id)
+        .expect("external wait provenance should remain durable");
+    assert_eq!(wait.status, WaitConditionStatus::Resolved);
+    assert_eq!(
+        wait.work_item_id.as_deref(),
+        Some(fixture.work_item_id.as_str())
+    );
+    assert_eq!(wait.trigger_message_id(), Some(fixture.message_id.as_str()));
+    assert_eq!(
+        runtime
+            .storage()
+            .read_recent_events(64)
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event.kind == "scheduler_bootstrap_claim_recovered"
+                    && event.data["message_id"] == fixture.message_id
+            })
+            .count(),
+        1
+    );
+
+    let operator = runtime
+        .enqueue(trusted_operator_prompt(
+            None,
+            "continue after interrupted external wake",
+        ))
+        .await
+        .unwrap();
+    let mut operator_claimed = false;
+    for _ in 0..4 {
+        match scheduler_executor::SchedulerDecisionExecutor::new(runtime)
+            .poll()
+            .await
+            .unwrap()
+        {
+            scheduler_executor::RunLoopPoll::Message(scheduled)
+                if scheduled.message.id == operator.id =>
+            {
+                operator_claimed = true;
+                break;
+            }
+            scheduler_executor::RunLoopPoll::Idle => {}
+            _ => panic!("unexpected scheduler result while draining recovery"),
+        }
+    }
+    assert!(
+        operator_claimed,
+        "recovered lane should admit operator input"
+    );
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        execution
+            .attempts
+            .values()
+            .filter(|attempt| {
+                attempt.source_message_id.as_deref() == Some(fixture.message_id.as_str())
+            })
+            .count(),
+        1,
+        "bootstrap recovery must not duplicate the external wake execution"
+    );
+    assert_eq!(
+        execution
+            .open_attempt()
+            .and_then(|attempt| attempt.source_message_id.as_deref()),
+        Some(operator.id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn scheduler_recovery_routes_external_wake_claim_through_generic_interruption() {
+    use crate::domain::execution_protocol::{ExecutionAttemptState, ExecutionProtocolCommand};
+
+    let fixture = open_external_wake_claim_fixture().await;
+    let runtime = fixture.harness.runtime();
+    let report =
+        scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
+            .unwrap();
+
+    assert!(report.task_result_claim_recoveries.is_empty());
+    let candidate = report
+        .candidates
+        .iter()
+        .find(|candidate| candidate.activation_id == fixture.attempt_id)
+        .expect("ordinary external wake should remain a generic recovery candidate");
+    assert!(candidate.eligible);
+    assert_eq!(candidate.reason, "execution_interruption");
+    assert_eq!(
+        candidate.target_queue_status,
+        Some(QueueEntryStatus::Aborted)
+    );
+    assert!(matches!(
+        candidate.proposed_commands.as_slice(),
+        [ExecutionProtocolCommand::Interrupt(command)]
+            if command.attempt_id == fixture.attempt_id
+    ));
+
+    assert_eq!(
+        apply_scheduler_recovery_plan_with_backup_policy(
+            &runtime.inner.storage,
+            &runtime.inner.runtime_db,
+            "default",
+            &report,
+            SchedulerRecoveryBackupPolicy::SkipApproved,
+        )
+        .unwrap(),
+        (1, None)
+    );
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        execution.attempts[&fixture.attempt_id].state,
+        ExecutionAttemptState::Interrupted
+    );
+    assert!(execution.open_attempt().is_none());
+    assert_eq!(
+        runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest(&fixture.message_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        QueueEntryStatus::Aborted
+    );
+    let events = runtime.storage().read_recent_events(64).unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "scheduler_execution_recovered"
+            && event.data["activation_id"] == fixture.attempt_id
+    }));
+    assert!(!events.iter().any(|event| {
+        event.kind == "scheduler_task_result_claim_recovered"
+            && event.data["activation_id"] == fixture.attempt_id
+    }));
+
+    let recovered =
+        scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
+            .unwrap();
+    assert!(recovered.task_result_claim_recoveries.is_empty());
+    assert!(recovered
+        .candidates
+        .iter()
+        .all(|candidate| candidate.activation_id != fixture.attempt_id));
+    assert_eq!(
+        apply_scheduler_recovery_plan_with_backup_policy(
+            &runtime.inner.storage,
+            &runtime.inner.runtime_db,
+            "default",
+            &recovered,
+            SchedulerRecoveryBackupPolicy::SkipApproved,
+        )
+        .unwrap(),
+        (0, None)
+    );
+}
+
+#[tokio::test]
+async fn cancelled_task_result_wait_quarantines_open_claim_and_releases_lane() {
+    use crate::domain::execution_protocol::ExecutionAttemptState;
+
+    let fixture = cancelled_wait_task_result_claim_fixture("task-cancelled-wait-recovery").await;
+    let report = isolated_task_result_claim_report(&fixture.runtime);
+    let [candidate] = report.task_result_claim_recoveries.as_slice() else {
+        panic!("expected one cancelled-wait TaskResult claim candidate: {report:#?}");
+    };
+    assert!(candidate.eligible, "candidate: {candidate:#?}");
+    assert_eq!(candidate.health, SchedulerUnsettledClaimHealth::Recoverable);
+    assert!(candidate.lane_blocked);
+    assert_eq!(candidate.reason, "task_result_wait_cancelled");
+    assert_eq!(candidate.recovery_decision, "interrupt_and_quarantine");
+    assert!(candidate
+        .evidence
+        .iter()
+        .any(|evidence| evidence.starts_with("cancelled_wait:")));
+    assert_eq!(
+        candidate
+            .proposed_queue_entry
+            .as_ref()
+            .map(|entry| entry.status.clone()),
+        Some(QueueEntryStatus::Quarantined)
+    );
+
+    assert_eq!(
+        fixture
+            .runtime
+            .recover_scheduler_bootstrap_claims()
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .recover_scheduler_bootstrap_claims()
+            .await
+            .unwrap(),
+        0
+    );
+    let recovered = fixture
+        .runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("recovered execution partition");
+    assert_eq!(
+        recovered.attempts[&fixture.attempt_id].state,
+        ExecutionAttemptState::Interrupted
+    );
+    assert!(matches!(
+        recovered.work_items[&fixture.work_item_id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Runnable { .. }
+    ));
+    assert_eq!(
+        fixture
+            .runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest(&fixture.result.id)
+            .unwrap()
+            .expect("quarantined TaskResult")
+            .status,
+        QueueEntryStatus::Quarantined
+    );
+}
+
+#[tokio::test]
+async fn scheduler_recovery_apply_quarantines_cancelled_task_result_claim_atomically() {
+    let fixture = cancelled_wait_task_result_claim_fixture("task-cancelled-wait-debug-apply").await;
+    let report = isolated_task_result_claim_report(&fixture.runtime);
+    let [candidate] = report.task_result_claim_recoveries.as_slice() else {
+        panic!("expected one cancelled-wait TaskResult claim candidate: {report:#?}");
+    };
+    assert!(candidate.eligible);
+    assert_eq!(candidate.reason, "task_result_wait_cancelled");
+
+    assert_eq!(
+        apply_scheduler_recovery_plan_with_backup_policy(
+            &fixture.runtime.inner.storage,
+            &fixture.runtime.inner.runtime_db,
+            "default",
+            &report,
+            SchedulerRecoveryBackupPolicy::SkipApproved,
+        )
+        .unwrap(),
+        (1, None)
+    );
+    assert_eq!(
+        apply_scheduler_recovery_plan_with_backup_policy(
+            &fixture.runtime.inner.storage,
+            &fixture.runtime.inner.runtime_db,
+            "default",
+            &report,
+            SchedulerRecoveryBackupPolicy::SkipApproved,
+        )
+        .unwrap(),
+        (0, None)
+    );
+    let recovered = isolated_task_result_claim_report(&fixture.runtime);
+    assert!(recovered.task_result_claim_recoveries.is_empty());
+    assert_eq!(
+        fixture
+            .runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest(&fixture.result.id)
+            .unwrap()
+            .expect("quarantined TaskResult")
+            .status,
+        QueueEntryStatus::Quarantined
+    );
+}
+
+#[tokio::test]
+async fn scheduler_recovery_quarantines_task_result_claim_with_missing_wait() {
+    use crate::domain::execution_protocol::ExecutionAttemptState;
+
+    let fixture = missing_wait_task_result_claim_fixture("task-missing-wait-debug-apply").await;
+    let report = isolated_task_result_claim_report(&fixture.runtime);
+    let [candidate] = report.task_result_claim_recoveries.as_slice() else {
+        panic!("expected one missing-wait TaskResult claim candidate: {report:#?}");
+    };
+    assert!(candidate.eligible);
+    assert_eq!(candidate.reason, "task_result_wait_missing");
+    assert_eq!(candidate.recovery_decision, "interrupt_and_quarantine");
+
+    assert_eq!(
+        apply_scheduler_recovery_plan_with_backup_policy(
+            &fixture.runtime.inner.storage,
+            &fixture.runtime.inner.runtime_db,
+            "default",
+            &report,
+            SchedulerRecoveryBackupPolicy::SkipApproved,
+        )
+        .unwrap(),
+        (1, None)
+    );
+    let execution = fixture
+        .runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        execution.attempts[&fixture.attempt_id].state,
+        ExecutionAttemptState::Interrupted
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest(&fixture.result.id)
+            .unwrap()
+            .expect("quarantined TaskResult")
+            .status,
+        QueueEntryStatus::Quarantined
+    );
+    assert!(isolated_task_result_claim_report(&fixture.runtime)
+        .task_result_claim_recoveries
+        .is_empty());
 }
 
 struct GatedFailingProvider {
@@ -22,7 +574,12 @@ struct GatedFailingProvider {
 
 struct CanonicalCompletionProvider {
     work_item_id: String,
-    calls: Mutex<usize>,
+    calls: Arc<Mutex<usize>>,
+}
+
+struct WorkItemReentryProbeProvider {
+    started: Arc<tokio::sync::Notify>,
+    observed_work_items: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -60,6 +617,36 @@ impl AgentProvider for CanonicalCompletionProvider {
             request_diagnostics: None,
         })
     }
+
+    fn select_model_lineage(
+        &self,
+        _model_ref: &crate::config::ModelRouteRef,
+    ) -> Option<Arc<dyn AgentProvider>> {
+        Some(Arc::new(Self {
+            work_item_id: self.work_item_id.clone(),
+            calls: self.calls.clone(),
+        }))
+    }
+}
+
+#[async_trait]
+impl AgentProvider for WorkItemReentryProbeProvider {
+    async fn complete_turn(&self, request: ProviderTurnRequest) -> Result<ProviderTurnResponse> {
+        let current_work_item = request
+            .prompt_frame
+            .context_blocks
+            .into_iter()
+            .find(|block| block.text.starts_with("## current_work_item\n"))
+            .map(|block| block.text)
+            .expect("provider re-entry should include the current WorkItem prompt block");
+        self.observed_work_items
+            .lock()
+            .await
+            .push(current_work_item);
+        self.started.notify_one();
+        // Keep the provider round open so the test can inspect re-entry before settlement.
+        std::future::pending::<Result<ProviderTurnResponse>>().await
+    }
 }
 
 fn trusted_operator_prompt(work_item_id: Option<&str>, text: &str) -> MessageEnvelope {
@@ -79,6 +666,279 @@ fn trusted_operator_prompt(work_item_id: Option<&str>, text: &str) -> MessageEnv
     );
     message.work_item_id = work_item_id.map(ToString::to_string);
     message
+}
+
+fn provider_recovery_message(runtime: &RuntimeHandle, work_item_id: &str) -> MessageEnvelope {
+    use crate::domain::execution_protocol::{
+        AdmitExecution, AdmittedFences, ConversationOutcome, ExecutionAttempt,
+        ExecutionAttemptState, ExecutionBinding, ExecutionOrigin, ExecutionOutcome,
+        ExecutionOutcomeRecord, ExecutionPriority, ExecutionProvenance, ExecutionSource,
+        ExecutionSourceIdentity, ExecutionTrust, SettleExecution,
+    };
+
+    let mut source = trusted_operator_prompt(None, "source provider failure");
+    source.turn_id = Some("turn-provider-failure".into());
+    source.message_seq = Some(1);
+    runtime.storage().append_message(&source).unwrap();
+    let mut source_turn = TurnRecord::new("default", "turn-provider-failure", 1);
+    source_turn.trigger = Some(crate::types::TurnTriggerSummary::from_message(&source));
+    source_turn.input_message_ids = vec![source.id.clone()];
+    source_turn.terminal = Some(crate::types::TurnTerminalSummary {
+        kind: TurnTerminalKind::DeferredToFallback,
+        reason: None,
+        no_brief_reason: None,
+        completed_at: Utc::now(),
+        duration_ms: 1,
+    });
+    runtime.storage().append_turn(&source_turn).unwrap();
+
+    let state = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap_or_else(|| {
+            crate::domain::execution_protocol::ExecutionProtocolState::empty("default")
+        });
+    let source_attempt_id = format!("attempt-provider-failure:{}", source.id);
+    let admitted = crate::domain::execution_protocol::admit_execution(
+        &state,
+        &AdmitExecution {
+            attempt: ExecutionAttempt {
+                attempt_id: source_attempt_id.clone(),
+                agent_id: "default".into(),
+                source_message_id: Some(source.id.clone()),
+                source: ExecutionSource {
+                    identity: ExecutionSourceIdentity::QueueMessage {
+                        message_id: source.id.clone(),
+                    },
+                    generation: 1,
+                },
+                binding: ExecutionBinding::AgentLifecycle {
+                    agent_id: "default".into(),
+                },
+                provenance: ExecutionProvenance {
+                    origin: ExecutionOrigin::Operator,
+                    trust: ExecutionTrust::OperatorInstruction,
+                    priority: ExecutionPriority::Interject,
+                    correlation_id: None,
+                    causation_id: None,
+                },
+                admitted_fences: AdmittedFences {
+                    source_revision: 1,
+                    work_item_source_revision: None,
+                    work_item_generation: None,
+                    rejoin: None,
+                    agent_control_revision: 1,
+                    host_registry_revision: 1,
+                },
+                state: ExecutionAttemptState::Open,
+                run_id: None,
+                turn_id: source.turn_id.clone(),
+                recovery_of_attempt_id: None,
+                terminal_outcome_id: None,
+                admitted_at: Utc::now().to_rfc3339(),
+                terminal_at: None,
+            },
+        },
+    )
+    .unwrap();
+    let settled = crate::domain::execution_protocol::settle_execution(
+        &admitted.state,
+        &SettleExecution {
+            outcome: ExecutionOutcomeRecord {
+                outcome_id: format!("outcome-provider-failure:{}", source.id),
+                attempt_id: source_attempt_id,
+                outcome: ExecutionOutcome::Conversation(ConversationOutcome::Replied),
+                created_at: Utc::now().to_rfc3339(),
+            },
+        },
+    )
+    .unwrap();
+    runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &settled.state))
+        .unwrap();
+
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::InternalFollowup,
+        MessageOrigin::System {
+            subsystem: "model_lineage_recovery".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Next,
+        MessageBody::Text {
+            text: "continue provider recovery".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    message.work_item_id = Some(work_item_id.into());
+    message.causation_id = Some(source.id.clone());
+    message
+        .source_refs
+        .insert("source_turn_id".into(), "turn-provider-failure".into());
+    message
+        .source_refs
+        .insert("source_message_id".into(), source.id.clone());
+    message.metadata = Some(serde_json::json!({
+        "provider_recovery": {
+            "fallback_model_ref": "anthropic/claude-sonnet-4-6",
+            "source_turn_id": "turn-provider-failure",
+            "source_message_id": source.id,
+            "source_terminal_kind": "deferred_to_fallback",
+            "source_round": 1
+        }
+    }));
+    message
+}
+
+fn append_default_host_identity(runtime: &RuntimeHandle) {
+    runtime
+        .runtime_db()
+        .agent_identities()
+        .upsert(&crate::types::AgentIdentityRecord::new(
+            "default",
+            AgentKind::Default,
+            AgentVisibility::Public,
+            AgentOwnership::SelfOwned,
+            AgentProfilePreset::PublicNamed,
+            None,
+            None,
+        ))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn canonical_agent_lifecycle_binding_does_not_inherit_replay_or_message_work_item() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item("unrelated focused work item".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::SystemTick,
+        MessageOrigin::System {
+            subsystem: "agent_lifecycle".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "agent lifecycle wake".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    message.work_item_id = Some(work_item.id.clone());
+    let source_turn_id = "turn-interrupted-agent-lifecycle";
+    let mut source_turn = TurnRecord::new("default", source_turn_id, 1);
+    source_turn.current_work_item_id = Some(work_item.id.clone());
+    runtime.storage().append_turn(&source_turn).unwrap();
+    message
+        .source_refs
+        .insert("replay_source_turn_id".into(), source_turn_id.into());
+    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+    let state = crate::domain::execution_protocol::ExecutionProtocolState::empty("default");
+    let admitted = crate::domain::execution_protocol::admit_execution(
+        &state,
+        &crate::domain::execution_protocol::AdmitExecution {
+            attempt: crate::domain::execution_protocol::ExecutionAttempt {
+                attempt_id: activation_id.clone(),
+                agent_id: "default".into(),
+                source_message_id: Some(message.id.clone()),
+                source: crate::domain::execution_protocol::ExecutionSource {
+                    identity:
+                        crate::domain::execution_protocol::ExecutionSourceIdentity::QueueMessage {
+                            message_id: message.id.clone(),
+                        },
+                    generation: 1,
+                },
+                binding: crate::domain::execution_protocol::ExecutionBinding::AgentLifecycle {
+                    agent_id: "default".into(),
+                },
+                provenance: crate::domain::execution_protocol::ExecutionProvenance {
+                    origin: crate::domain::execution_protocol::ExecutionOrigin::System,
+                    trust: crate::domain::execution_protocol::ExecutionTrust::RuntimeInstruction,
+                    priority: crate::domain::execution_protocol::ExecutionPriority::Normal,
+                    correlation_id: None,
+                    causation_id: None,
+                },
+                admitted_fences: crate::domain::execution_protocol::AdmittedFences {
+                    source_revision: 1,
+                    work_item_source_revision: None,
+                    work_item_generation: None,
+                    rejoin: None,
+                    agent_control_revision: 1,
+                    host_registry_revision: 1,
+                },
+                state: crate::domain::execution_protocol::ExecutionAttemptState::Open,
+                run_id: None,
+                turn_id: None,
+                recovery_of_attempt_id: None,
+                terminal_outcome_id: None,
+                admitted_at: Utc::now().to_rfc3339(),
+                terminal_at: None,
+            },
+        },
+    )
+    .unwrap();
+    runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &admitted.state))
+        .unwrap();
+
+    runtime
+        .begin_interactive_turn_with_provenance(
+            Some(&message),
+            None,
+            None,
+            crate::types::ExecutionAdmissionProvenance::Canonical {
+                scenario_class: scheduler::WORK_ITEM_AUTONOMOUS_CONTINUATION_SCENARIO,
+                activation_id,
+            },
+        )
+        .await
+        .unwrap();
+    let state = runtime.agent_state().await.unwrap();
+    let binding = state.current_execution_binding.as_ref().unwrap();
+    assert!(matches!(
+        binding.owner,
+        Some(crate::types::TurnOwner::AgentLifecycle { .. })
+    ));
+    assert_eq!(binding.work_item_id, None);
+    assert_eq!(state.current_turn_work_item_id, None);
+    assert_eq!(
+        state
+            .current_execution_binding
+            .as_ref()
+            .and_then(|binding| binding.claimed_work_revision),
+        None
+    );
 }
 
 struct OperatorInterjectionProbeProvider {
@@ -107,8 +967,9 @@ fn task_wait_condition_for_work_item(task_id: &str, work_item_id: &str) -> WaitC
         expires_at: None,
         resolved_at: None,
         cancelled_at: None,
-
         turn_id: None,
+        trigger_message_id: None,
+        triggered_at: None,
     }
 }
 
@@ -127,99 +988,172 @@ fn task_result_message(task_id: &str) -> MessageEnvelope {
     )
 }
 
-fn canonical_waiting_snapshot(
-    work_item: &WorkItemRecord,
-    wait_id: &str,
-    wait_generation: u64,
-) -> Snapshot {
-    Snapshot {
-        slot: ActivationSlot::Idle,
-        dispatch: AgentDispatchState::Awaiting {
-            wait: WaitIdentity {
-                id: wait_id.into(),
-                generation: wait_generation,
-            },
-        },
-        dispatch_revision: 1,
-        focus: Some(work_item.id.clone()),
-        work: std::collections::BTreeMap::from([(
-            work_item.id.clone(),
-            WorkDemand {
-                metadata_revision: work_item.revision,
-                scheduling_generation: work_item.revision,
-                status: WorkStatus::Waiting {
-                    wait_id: wait_id.into(),
-                },
-                capabilities: Default::default(),
-                locks: Default::default(),
-                locality: "runtime".into(),
-                cost_class: "default".into(),
-            },
-        )]),
-        waits: std::collections::BTreeMap::from([(
-            wait_id.into(),
-            WaitRecord {
-                current_generation: wait_generation,
-                generations: std::collections::BTreeMap::from([(
-                    wait_generation,
-                    WaitGenerationRecord {
-                        owner: SchedulerOwner::WorkItem {
-                            work_item_id: work_item.id.clone(),
-                        },
-                        state: WaitState::Active,
-                        trigger: None,
-                        consuming_activation_id: None,
-                    },
-                )]),
-            },
-        )]),
-        activations: Default::default(),
-        activation_admissions: Default::default(),
-        settlements: Default::default(),
-        missing_settlements: Default::default(),
-        admitted_generations: Default::default(),
-        continuation_admissions: Default::default(),
-        activation_inputs: Default::default(),
-    }
+fn append_completed_rejoin_task(
+    runtime: &RuntimeHandle,
+    task_id: &str,
+    work_item_id: &str,
+    parent_turn_id: &str,
+) {
+    runtime
+        .storage()
+        .append_task(&TaskRecord {
+            id: task_id.into(),
+            agent_id: "default".into(),
+            kind: TaskKind::CommandTask,
+            status: TaskStatus::Completed,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            parent_message_id: None,
+            work_item_id: Some(work_item_id.into()),
+            summary: Some(format!("{task_id} completed")),
+            detail: Some(serde_json::json!({
+                "rejoin_obligation_id": task_id,
+                "rejoin_generation": 1,
+                "parent_turn_id": parent_turn_id,
+            })),
+            recovery: None,
+        })
+        .unwrap();
 }
 
-fn canonical_lifecycle_waiting_snapshot(wait_id: &str, wait_generation: u64) -> Snapshot {
-    Snapshot {
-        slot: ActivationSlot::Idle,
-        dispatch: AgentDispatchState::Awaiting {
-            wait: WaitIdentity {
-                id: wait_id.into(),
-                generation: wait_generation,
+fn append_running_rejoin_task(runtime: &RuntimeHandle, task_id: &str, work_item_id: &str) {
+    runtime
+        .storage()
+        .append_task(&TaskRecord {
+            id: task_id.into(),
+            agent_id: "default".into(),
+            kind: TaskKind::CommandTask,
+            status: TaskStatus::Running,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            parent_message_id: None,
+            work_item_id: Some(work_item_id.into()),
+            summary: Some(format!("{task_id} running")),
+            detail: None,
+            recovery: None,
+        })
+        .unwrap();
+}
+
+fn persist_waiting_work_execution(
+    runtime: &RuntimeHandle,
+    work_item: &WorkItemRecord,
+    wait_id: &str,
+) {
+    let generation = work_item.revision.max(1);
+    persist_work_execution(
+        runtime,
+        work_item,
+        work_item.revision,
+        crate::domain::execution_protocol::WorkItemExecutionState::Waiting {
+            generation,
+            wait: crate::domain::execution_protocol::WaitReference {
+                wait_id: wait_id.into(),
             },
         },
-        dispatch_revision: 1,
-        focus: None,
-        work: Default::default(),
-        waits: std::collections::BTreeMap::from([(
-            wait_id.into(),
-            WaitRecord {
-                current_generation: wait_generation,
-                generations: std::collections::BTreeMap::from([(
-                    wait_generation,
-                    WaitGenerationRecord {
-                        owner: SchedulerOwner::AgentLifecycle {
-                            agent_id: "default".into(),
-                        },
-                        state: WaitState::Active,
-                        trigger: None,
-                        consuming_activation_id: None,
-                    },
-                )]),
-            },
-        )]),
-        activations: Default::default(),
-        activation_admissions: Default::default(),
-        settlements: Default::default(),
-        missing_settlements: Default::default(),
-        admitted_generations: Default::default(),
-        continuation_admissions: Default::default(),
-        activation_inputs: Default::default(),
+    );
+}
+
+fn persist_work_execution(
+    runtime: &RuntimeHandle,
+    work_item: &WorkItemRecord,
+    source_revision: u64,
+    state: crate::domain::execution_protocol::WorkItemExecutionState,
+) {
+    let mut execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap_or_else(|| {
+            crate::domain::execution_protocol::ExecutionProtocolState::empty("default")
+        });
+    execution.work_items.insert(
+        work_item.id.clone(),
+        crate::domain::execution_protocol::WorkItemExecutionRecord {
+            source_revision,
+            state,
+        },
+    );
+    runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &execution))
+        .unwrap();
+}
+
+fn persist_execution_transition_only(
+    runtime: &RuntimeHandle,
+    transition: crate::runtime_db::transitions::ExecutionProtocolTransition,
+) {
+    use crate::domain::execution_protocol::ExecutionProtocolCommand;
+
+    let mut state = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("execution transition requires initialized authority");
+    for command in transition.commands {
+        state = match command {
+            ExecutionProtocolCommand::RegisterWorkItem(command) => {
+                crate::domain::execution_protocol::register_work_item_execution(&state, &command)
+            }
+            ExecutionProtocolCommand::AdvanceWorkItemSourceRevision(command) => {
+                crate::domain::execution_protocol::advance_work_item_source_revision(
+                    &state, &command,
+                )
+            }
+            ExecutionProtocolCommand::SetWorkItemReadiness(command) => {
+                crate::domain::execution_protocol::set_work_item_readiness(&state, &command)
+            }
+            ExecutionProtocolCommand::SuspendWorkItemContinuation(command) => {
+                crate::domain::execution_protocol::suspend_work_item_continuation(&state, &command)
+            }
+            ExecutionProtocolCommand::ResumeWorkItemContinuation(command) => {
+                crate::domain::execution_protocol::resume_work_item_continuation(&state, &command)
+            }
+            ExecutionProtocolCommand::ReconcileWorkItemContinuationYield(command) => {
+                crate::domain::execution_protocol::reconcile_work_item_continuation_yield(
+                    &state, &command,
+                )
+            }
+            ExecutionProtocolCommand::SetWorkItemWaiting(command) => {
+                crate::domain::execution_protocol::set_work_item_waiting(&state, &command)
+            }
+            ExecutionProtocolCommand::CompleteWorkItem(command) => {
+                crate::domain::execution_protocol::complete_work_item_execution(&state, &command)
+            }
+            ExecutionProtocolCommand::Admit(command) => {
+                crate::domain::execution_protocol::admit_execution(&state, &command)
+            }
+            ExecutionProtocolCommand::Settle(command) => {
+                crate::domain::execution_protocol::settle_execution(&state, &command)
+            }
+            ExecutionProtocolCommand::Interrupt(command) => {
+                crate::domain::execution_protocol::interrupt_execution(&state, &command)
+            }
+            ExecutionProtocolCommand::RecoverInterruptedTaskResultClaim(command) => {
+                crate::domain::execution_protocol::recover_interrupted_task_result_claim(
+                    &state, &command,
+                )
+            }
+            ExecutionProtocolCommand::RecoverUnadvancedTaskResultClaim(command) => {
+                crate::domain::execution_protocol::recover_unadvanced_task_result_claim(
+                    &state, &command,
+                )
+            }
+        }
+        .expect("test execution transition should be valid")
+        .state;
     }
+    runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &state))
+        .unwrap();
 }
 
 #[test]
@@ -379,7 +1313,7 @@ fn runtime_projection_cache_rebuilds_current_agent_active_task_projection() {
 #[async_trait]
 impl AgentProvider for BlockingProvider {
     async fn complete_turn(&self, _request: ProviderTurnRequest) -> Result<ProviderTurnResponse> {
-        self.started.notify_waiters();
+        self.started.notify_one();
         std::future::pending::<Result<ProviderTurnResponse>>().await
     }
 }
@@ -402,7 +1336,7 @@ impl AgentProvider for OperatorInterjectionProbeProvider {
         drop(calls);
         self.requests.lock().await.push(request);
         if call == 1 {
-            self.first_tool_round.notify_waiters();
+            self.first_tool_round.notify_one();
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             Ok(ProviderTurnResponse {
                 blocks: vec![ModelBlock::ToolUse {
@@ -442,6 +1376,54 @@ impl AgentProvider for OperatorInterjectionProbeProvider {
     fn configured_model_refs(&self) -> Vec<String> {
         vec!["stub".into()]
     }
+}
+
+#[tokio::test]
+async fn model_override_reasoning_effort_does_not_leak_into_deferred_fallback() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.json"),
+        r#"{"model":{"default":"openai/gpt-5.4"}}"#,
+    )
+    .unwrap();
+    let mut config =
+        crate::config::AppConfig::load_with_home(Some(home.path().to_path_buf())).unwrap();
+    config.workspace_dir = workspace.path().to_path_buf();
+    let primary =
+        crate::config::ModelRouteRef::parse_compatible("openai-codex/gpt-5.6-luna").unwrap();
+    let fallback = crate::config::ModelRouteRef::parse_compatible("openai-codex/gpt-5.5").unwrap();
+    config.default_model = primary.clone();
+    config.fallback_models = vec![fallback.clone()];
+    config
+        .providers
+        .get_mut(&crate::config::ProviderId::openai_codex())
+        .unwrap()
+        .credential = Some(
+        r#"{"tokens":{"access_token":"test-token","refresh_token":"test-refresh","account_id":"test-account"}}"#
+            .into(),
+    );
+
+    let host = RuntimeHost::new(config).unwrap();
+    let runtime = host.default_runtime().await.unwrap();
+    runtime
+        .set_model_override(primary.clone(), Some("max".into()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        runtime.inner.provider.read().await.configured_model_refs(),
+        vec![primary.as_string(), fallback.as_string()]
+    );
+
+    runtime
+        .reconfigure_provider_for_turn(Some(&fallback))
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.inner.provider.read().await.configured_model_refs(),
+        vec![fallback.as_string()]
+    );
 }
 
 #[tokio::test]
@@ -635,7 +1617,7 @@ async fn runtime_failure_preserves_canonical_claim_for_bootstrap_reconciliation(
             text: "claim before runtime failure".into(),
         },
     );
-    message.work_item_id = Some(work_item.id.clone());
+    bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
     message.turn_id = Some("turn-runtime-failure-canonical-claim".into());
     let message = runtime.enqueue(message).await.unwrap();
     assert!(matches!(
@@ -663,6 +1645,20 @@ async fn runtime_failure_preserves_canonical_claim_for_bootstrap_reconciliation(
             .map(|entry| entry.status),
         Some(QueueEntryStatus::Dequeued)
     );
+    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("runtime failure should preserve the execution partition");
+    let attempt = &execution.attempts[&activation_id];
+    assert_eq!(
+        attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Open
+    );
+    assert!(attempt.terminal_outcome_id.is_none());
     assert!(runtime
         .storage()
         .read_recent_events(64)
@@ -675,7 +1671,7 @@ async fn runtime_failure_preserves_canonical_claim_for_bootstrap_reconciliation(
 }
 
 #[tokio::test]
-async fn legacy_recovery_plan_reconciles_an_existing_dispatch_reservation() {
+async fn interrupted_message_replay_creates_new_turn_without_current_focus_drift() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let runtime = RuntimeHandle::new(
@@ -683,369 +1679,445 @@ async fn legacy_recovery_plan_reconciles_an_existing_dispatch_reservation() {
         dir.path().to_path_buf(),
         workspace.path().to_path_buf(),
         "http://127.0.0.1:7878".into(),
-        Arc::new(CountingProvider {
-            calls: Mutex::new(0),
-            reply: "unused",
-        }),
+        Arc::new(StubProvider::new("unused")),
         "default".into(),
         context_config(),
     )
     .unwrap();
-    let work_item = runtime
-        .create_work_item(
-            "legacy recovery dispatch v1".into(),
-            Some(WorkItemPlanStatus::Ready),
-            None,
-            Vec::new(),
-        )
+    let message = runtime
+        .enqueue(trusted_operator_prompt(None, "replay interrupted message"))
         .await
         .unwrap();
-    runtime
-        .update_work_item_fields(
-            work_item.id.clone(),
-            Some("legacy recovery dispatch v2".into()),
-            None,
-            None,
-            None,
-            Some(None),
-        )
-        .await
-        .unwrap();
-    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
-    let registration = runtime
-        .register_wait_for(
-            "default",
-            Some(work_item.id.clone()),
-            WaitForWakeKind::External,
-            Some("github:holon-run/holon#recovery-dispatch".into()),
-            "waiting before legacy recovery".into(),
-            None,
-        )
-        .await
-        .unwrap();
-    let waiting_source = runtime
-        .latest_work_item(&work_item.id)
-        .await
-        .unwrap()
-        .unwrap();
-    let old_generation = waiting_source
-        .revision
-        .checked_sub(1)
-        .filter(|generation| *generation > 0)
-        .expect("fixture must have an older canonical generation");
-    let mut canonical =
-        canonical_waiting_snapshot(&waiting_source, &registration.condition.id, old_generation);
-    let demand = canonical.work.get_mut(&work_item.id).unwrap();
-    demand.metadata_revision = old_generation;
-    demand.scheduling_generation = old_generation;
-    runtime
+    let source_turn_id = message.turn_id.clone().expect("source turn id");
+    let mut interrupted = runtime
         .inner
         .runtime_db
-        .transitions()
-        .initialize_scheduler_protocol_partition("default", &canonical)
-        .unwrap();
-
-    let waiting_report =
-        scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
-            .unwrap();
-    let waiting_candidate = waiting_report
-        .legacy_adoptions
-        .iter()
-        .find(|candidate| candidate.work_item_id == work_item.id)
-        .expect("waiting legacy adoption candidate");
-    assert!(waiting_candidate.eligible);
-    apply_scheduler_recovery_plan(
-        &runtime.inner.storage,
-        &runtime.inner.runtime_db,
-        "default",
-        &waiting_report,
-    )
-    .unwrap();
-    let rearmed = runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    assert_eq!(
-        rearmed.waits[&registration.condition.id].generations[&old_generation].state,
-        WaitState::Resolved
-    );
-    assert_eq!(
-        rearmed.dispatch,
-        AgentDispatchState::Awaiting {
-            wait: WaitIdentity {
-                id: registration.condition.id.clone(),
-                generation: waiting_source.revision,
-            },
-        }
-    );
-
-    let mut resolved = runtime
-        .storage()
-        .latest_wait_conditions()
+        .queue_entries()
+        .latest(&message.id)
         .unwrap()
-        .into_iter()
-        .find(|condition| condition.id == registration.condition.id)
-        .expect("legacy wait condition");
-    let resolved_at = Utc::now();
-    resolved.status = WaitConditionStatus::Resolved;
-    resolved.updated_at = resolved_at;
-    resolved.resolved_at = Some(resolved_at);
-    runtime
-        .inner
-        .runtime_db
-        .wait_conditions()
-        .upsert(&resolved)
-        .unwrap();
-    runtime
-        .update_work_item_fields(
-            work_item.id.clone(),
-            Some("legacy recovery dispatch runnable".into()),
-            None,
-            None,
-            None,
-            Some(None),
-        )
+        .expect("queued message");
+    interrupted.status = QueueEntryStatus::Interrupted;
+    interrupted.updated_at = Utc::now();
+    runtime.storage().append_queue_entry(&interrupted).unwrap();
+    let current_work_item = runtime
+        .create_work_item("unrelated current focus".into(), None, None, Vec::new())
         .await
         .unwrap();
-    let runnable_source = runtime
-        .latest_work_item(&work_item.id)
-        .await
-        .unwrap()
-        .unwrap();
-    let runnable_report =
-        scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
-            .unwrap();
-    let runnable_candidate = runnable_report
-        .legacy_adoptions
-        .iter()
-        .find(|candidate| candidate.work_item_id == work_item.id)
-        .expect("runnable legacy adoption candidate");
-    assert!(
-        runnable_candidate.eligible,
-        "runnable candidate rejected: {}",
-        runnable_candidate.reason
-    );
-    apply_scheduler_recovery_plan(
-        &runtime.inner.storage,
-        &runtime.inner.runtime_db,
-        "default",
-        &runnable_report,
-    )
-    .unwrap();
-    let released = runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    assert_eq!(released.dispatch, AgentDispatchState::Open);
-    assert_eq!(
-        released.waits[&registration.condition.id].generations[&waiting_source.revision].state,
-        WaitState::Resolved
-    );
-    assert_eq!(
-        released.work[&work_item.id].scheduling_generation,
-        runnable_source.revision
-    );
-    assert_eq!(released.work[&work_item.id].status, WorkStatus::Runnable);
-}
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.current_work_item_id = Some(current_work_item.id.clone());
+        guard.state.current_turn_work_item_id = Some(current_work_item.id);
+        guard.persist_state(&runtime.inner.storage).unwrap();
+    }
 
-#[tokio::test]
-async fn legacy_recovery_isolates_a_stale_candidate_and_keeps_other_work_available() {
-    let dir = tempdir().unwrap();
-    let workspace = tempdir().unwrap();
-    let runtime = RuntimeHandle::new(
-        "default",
-        dir.path().to_path_buf(),
-        workspace.path().to_path_buf(),
-        "http://127.0.0.1:7878".into(),
-        Arc::new(CountingProvider {
-            calls: Mutex::new(0),
-            reply: "unused",
-        }),
-        "default".into(),
-        context_config(),
-    )
-    .unwrap();
-    let first = runtime
-        .create_work_item(
-            "legacy recovery first".into(),
-            Some(WorkItemPlanStatus::Ready),
-            None,
-            Vec::new(),
-        )
-        .await
-        .unwrap();
-    let stale = runtime
-        .create_work_item(
-            "legacy recovery stale".into(),
-            Some(WorkItemPlanStatus::Ready),
-            None,
-            Vec::new(),
-        )
-        .await
-        .unwrap();
-    let stale_report =
-        scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
-            .unwrap();
-    runtime
-        .update_work_item_fields(
-            stale.id.clone(),
-            Some("legacy recovery stale updated".into()),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        apply_scheduler_recovery_plan(
-            &runtime.inner.storage,
-            &runtime.inner.runtime_db,
-            "default",
-            &stale_report,
-        )
-        .unwrap()
-        .0,
-        1
-    );
-    let isolated = runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    assert!(isolated.work.contains_key(&first.id));
-    assert!(!isolated.work.contains_key(&stale.id));
-    assert!(runtime
-        .storage()
-        .read_recent_events(32)
-        .unwrap()
-        .iter()
-        .any(|event| {
-            event.kind == "scheduler_diagnostic"
-                && event.data["reason"] == "legacy_adoption_rejected"
-                && event.data["work_item_id"] == stale.id
-        }));
-
-    let fresh_report =
-        scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
-            .unwrap();
-    assert_eq!(
-        apply_scheduler_recovery_plan(
-            &runtime.inner.storage,
-            &runtime.inner.runtime_db,
-            "default",
-            &fresh_report,
-        )
-        .unwrap()
-        .0,
-        1
-    );
-    let recovered = runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    assert!(recovered.work.contains_key(&first.id));
-    assert!(recovered.work.contains_key(&stale.id));
-}
-
-#[tokio::test]
-async fn bootstrap_diagnostics_report_cross_model_scheduler_invariant_failures() {
-    let dir = tempdir().unwrap();
-    let workspace = tempdir().unwrap();
-    let runtime = RuntimeHandle::new(
-        "default",
-        dir.path().to_path_buf(),
-        workspace.path().to_path_buf(),
-        "http://127.0.0.1:7878".into(),
-        Arc::new(CountingProvider {
-            calls: Mutex::new(0),
-            reply: "unused",
-        }),
-        "default".into(),
-        context_config(),
-    )
-    .unwrap();
-    let work_item = runtime
-        .create_work_item("diagnose stuck activation".into(), None, None, Vec::new())
-        .await
-        .unwrap();
-    let mut message = MessageEnvelope::new(
-        "default",
-        MessageKind::SystemTick,
-        MessageOrigin::System {
-            subsystem: "work_queue".into(),
-        },
-        AuthorityClass::RuntimeInstruction,
-        Priority::Normal,
-        MessageBody::Text {
-            text: "claim and leave unsettled".into(),
-        },
-    );
-    message.work_item_id = Some(work_item.id.clone());
-    let message = runtime.enqueue(message).await.unwrap();
     let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
         .poll()
         .await
         .unwrap();
-    assert!(matches!(poll, scheduler_executor::RunLoopPoll::Message(_)));
-    finish_claimed_test_run(&runtime).await;
-
-    let mut completed = runtime
-        .inner
-        .runtime_db
-        .work_items()
-        .latest(&work_item.id)
-        .unwrap()
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("interrupted message should be claimed for replay");
+    };
+    assert_eq!(
+        scheduled.message.source_refs.get("replay_source_turn_id"),
+        Some(&source_turn_id)
+    );
+    runtime
+        .begin_interactive_turn(Some(&scheduled.message), None, None)
+        .await
         .unwrap();
-    let expected_revision = completed.revision;
-    completed.revision += 1;
-    completed.state = WorkItemState::Completed;
-    completed.updated_at = Utc::now();
-    assert!(runtime
-        .inner
-        .runtime_db
-        .work_items()
-        .update_expected(&completed, expected_revision)
-        .unwrap());
-
-    let mut turn = crate::types::TurnRecord::new("default", "turn-stuck", 1);
-    turn.trigger = Some(crate::types::TurnTriggerSummary::from_message(&message));
-    turn.terminal = Some(crate::types::TurnTerminalSummary {
-        kind: crate::types::TurnTerminalKind::Completed,
-        reason: None,
-        completed_at: Utc::now(),
-        duration_ms: 1,
-    });
-    runtime.storage().append_turn(&turn).unwrap();
+    let state = runtime.agent_state().await.unwrap();
+    let replay_turn_id = state.current_turn_id.expect("replay turn id");
+    assert_ne!(replay_turn_id, source_turn_id);
+    assert_eq!(state.current_turn_work_item_id, None);
 
     runtime
-        .record_scheduler_bootstrap_diagnostics()
+        .persist_turn_record(&TurnTerminalRecord {
+            turn_id: replay_turn_id.clone(),
+            turn_index: state.turn_index,
+            kind: TurnTerminalKind::Completed,
+            reason: None,
+            last_assistant_message: None,
+            no_brief_reason: None,
+            checkpoint: None,
+            completed_at: Utc::now(),
+            duration_ms: 1,
+        })
         .await
         .unwrap();
 
-    let reasons = runtime
+    assert!(runtime
         .storage()
-        .read_recent_events(64)
+        .read_turn_by_id(&source_turn_id)
+        .unwrap()
+        .is_none());
+    let replay = runtime
+        .storage()
+        .read_turn_by_id(&replay_turn_id)
+        .unwrap()
+        .expect("replay turn");
+    assert_eq!(replay.current_work_item_id, None);
+    assert_eq!(
+        replay.replay,
+        Some(crate::types::TurnReplayProvenance {
+            source_message_id: message.id.clone(),
+            source_turn_id,
+            reason: "interrupted_queue_claim_reentry".into(),
+            prior_terminal: None,
+        })
+    );
+
+    finish_claimed_test_run(&runtime).await;
+    runtime
+        .commit_queue_terminal_settlement(
+            QueueEntryRecord {
+                message_id: message.id.clone(),
+                agent_id: message.agent_id.clone(),
+                priority: message.priority,
+                status: QueueEntryStatus::Processed,
+                created_at: message.created_at,
+                updated_at: Utc::now(),
+            },
+            Vec::new(),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest(&message.id)
+            .unwrap()
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Processed)
+    );
+}
+#[tokio::test]
+async fn canonical_work_item_wait_keeps_other_runnable_work_schedulable() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let waiting_work = runtime
+        .create_work_item(
+            "waiting work should not reserve the agent lane".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runtime
+        .pick_work_item(waiting_work.id.clone())
+        .await
+        .unwrap();
+    runtime
+        .register_wait_for(
+            "default",
+            Some(waiting_work.id.clone()),
+            WaitForWakeKind::External,
+            Some("github:holon-run/holon#work-item-wait".into()),
+            "wait while another WorkItem runs".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let wait = runtime
+        .storage()
+        .latest_wait_conditions()
         .unwrap()
         .into_iter()
-        .filter(|event| event.kind == "scheduler_diagnostic")
-        .filter_map(|event| event.data["reason"].as_str().map(ToString::to_string))
-        .collect::<std::collections::BTreeSet<_>>();
-    assert!(reasons.contains("running_activation_without_active_run"));
-    assert!(reasons.contains("completed_work_item_has_running_activation"));
-    assert!(reasons.contains("terminal_turn_has_dequeued_queue"));
+        .find(|condition| condition.work_item_id.as_deref() == Some(waiting_work.id.as_str()))
+        .expect("active WorkItem wait");
+    let waiting_work = runtime
+        .latest_work_item(&waiting_work.id)
+        .await
+        .unwrap()
+        .expect("waiting WorkItem");
+    let runnable_work = runtime
+        .create_work_item(
+            "independent runnable work".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let mut execution = crate::domain::execution_protocol::ExecutionProtocolState::empty("default");
+    execution.work_items.insert(
+        waiting_work.id.clone(),
+        crate::domain::execution_protocol::WorkItemExecutionRecord {
+            source_revision: waiting_work.revision,
+            state: crate::domain::execution_protocol::WorkItemExecutionState::Waiting {
+                generation: waiting_work.revision,
+                wait: crate::domain::execution_protocol::WaitReference {
+                    wait_id: wait.id.clone(),
+                },
+            },
+        },
+    );
+    runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &execution))
+        .unwrap();
+
+    assert!(runtime.maybe_emit_pending_system_tick(None).await.unwrap());
+    let tick = runtime
+        .storage()
+        .read_recent_messages(10)
+        .unwrap()
+        .into_iter()
+        .find(|message| {
+            matches!(
+                (&message.kind, &message.origin),
+                (MessageKind::SystemTick, MessageOrigin::System { subsystem })
+                    if subsystem == "work_queue"
+            ) && message.work_item_id.as_deref() == Some(runnable_work.id.as_str())
+        })
+        .expect("runnable WorkItem should receive a work queue tick");
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+
+    let claimed = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap();
+    let claimed = claimed.expect("claim should initialize execution authority");
+    let activation_id = scheduler_executor::canonical_activation_id(&tick.id);
+    assert!(matches!(
+        claimed.attempts[&activation_id].binding,
+        crate::domain::execution_protocol::ExecutionBinding::WorkItem {
+            ref work_item_id
+        } if work_item_id == &runnable_work.id
+    ));
+    let expected_wait_id = wait.id.clone();
+    assert!(matches!(
+        claimed.work_items[&waiting_work.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Waiting {
+            ref wait,
+            ..
+        } if wait.wait_id == expected_wait_id
+    ));
+    assert!(matches!(
+        claimed.work_items[&runnable_work.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::InFlight {
+            ref attempt_id,
+            ..
+        } if attempt_id == &activation_id
+    ));
+    assert_eq!(
+        tick.work_item_id.as_deref(),
+        Some(runnable_work.id.as_str())
+    );
 }
 
 #[tokio::test]
-async fn bootstrap_recovery_marks_dequeued_canonical_activation_as_missing_settlement() {
+async fn late_terminal_task_result_for_completed_work_item_settles_without_model_reentry() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let provider = Arc::new(CountingProvider {
+        calls: Mutex::new(0),
+        reply: "unused",
+    });
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        provider.clone(),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "completed parent with late child result".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    append_completed_rejoin_task(
+        &runtime,
+        "task-late-child-result",
+        &work_item.id,
+        "turn-parent-completed",
+    );
+    runtime
+        .complete_work_item(work_item.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    let mut parent_turn = crate::types::TurnRecord::new("default", "turn-parent-completed", 1);
+    parent_turn.terminal = Some(crate::types::TurnTerminalSummary {
+        kind: TurnTerminalKind::Completed,
+        reason: Some("parent_completed".into()),
+        no_brief_reason: None,
+        completed_at: Utc::now(),
+        duration_ms: 1,
+    });
+    let mut parent_brief = BriefRecord::new(
+        "default",
+        BriefKind::Result,
+        "parent completion already delivered",
+        None,
+        None,
+    );
+    parent_brief.turn_index = Some(parent_turn.turn_index);
+    parent_brief.turn_id = Some(parent_turn.turn_id.clone());
+    runtime.storage().append_brief(&parent_brief).unwrap();
+    parent_turn.produced_brief_ids.push(parent_brief.id);
+    runtime.storage().append_turn(&parent_turn).unwrap();
+    let mut result = task_result_message("task-late-child-result").with_admission(
+        MessageDeliverySurface::TaskRejoin,
+        AdmissionContext::RuntimeOwned,
+    );
+    result.turn_id = Some(parent_turn.turn_id.clone());
+    result.metadata = Some(serde_json::json!({
+        "task_id": "task-late-child-result",
+        "task_kind": "child_agent_task",
+        "task_status": "completed",
+        "task_result_id": "result-late-child",
+        "work_item_id": work_item.id,
+    }));
+    let result = runtime.enqueue(result).await.unwrap();
+    let mut runner = tokio::spawn(runtime.clone().run());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if runner.is_finished() {
+            panic!(
+                "runtime exited while settling late terminal task result: {:?}",
+                (&mut runner).await
+            );
+        }
+        let processed = runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest_all()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == result.id)
+            .is_some_and(|entry| entry.status == QueueEntryStatus::Processed);
+        if processed {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let events = runtime.storage().read_recent_events(usize::MAX).unwrap();
+            panic!("late task result did not settle: {events:#?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(provider.call_count().await, 0);
+    let terminal_turn = runtime
+        .inner
+        .runtime_db
+        .turn_records()
+        .recent_for_agent("default", 10)
+        .unwrap()
+        .into_iter()
+        .find(|turn| {
+            turn.terminal.as_ref().is_some_and(|terminal| {
+                terminal.reason.as_deref() == Some("reducer_only/parent_turn_already_delivered")
+            })
+        })
+        .expect("suppressed TaskResult should persist a matching terminal Turn");
+    assert_eq!(
+        terminal_turn
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.kind.clone()),
+        Some(TurnTerminalKind::Completed)
+    );
+    assert!(terminal_turn.produced_brief_ids.is_empty());
+    assert_eq!(
+        terminal_turn
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.no_brief_reason.as_ref()),
+        Some(&TurnNoBriefReason::ReducerOnly {
+            reason: "parent_turn_already_delivered".into(),
+        })
+    );
+    assert_ne!(terminal_turn.turn_id, parent_turn.turn_id);
+    assert_eq!(
+        runtime
+            .storage()
+            .read_turn_by_id(&parent_turn.turn_id)
+            .unwrap(),
+        Some(parent_turn)
+    );
+
+    let operator = runtime
+        .enqueue(trusted_operator_prompt(
+            None,
+            "continue after late task result",
+        ))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if runner.is_finished() {
+            panic!(
+                "runtime exited before processing the following operator prompt: {:?}",
+                (&mut runner).await
+            );
+        }
+        let processed = runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest_all()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == operator.id)
+            .is_some_and(|entry| entry.status == QueueEntryStatus::Processed);
+        if processed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "operator prompt remained blocked after TaskResult settlement"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    runner.abort();
+
+    assert_eq!(provider.call_count().await, 1);
+    let events = runtime.storage().read_recent_events(usize::MAX).unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "task_result_received" && event.data["task_id"] == "task-late-child-result"
+    }));
+    assert!(!events.iter().any(|event| {
+        event.kind == "scheduler_authority_hard_blocker" && event.data["message_id"] == result.id
+    }));
+}
+
+#[tokio::test]
+async fn bootstrap_recovery_interrupts_open_attempt_and_releases_message_for_reentry() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let runtime = RuntimeHandle::new(
@@ -1082,7 +2154,7 @@ async fn bootstrap_recovery_marks_dequeued_canonical_activation_as_missing_settl
             text: "claim before restart".into(),
         },
     );
-    message.work_item_id = Some(work_item.id.clone());
+    bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
     let message = runtime.enqueue(message).await.unwrap();
     let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
         .poll()
@@ -1095,26 +2167,17 @@ async fn bootstrap_recovery_marks_dequeued_canonical_activation_as_missing_settl
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
         .unwrap();
-    let report =
-        scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
-            .unwrap();
-    assert_eq!(report.candidates.len(), 1);
-    assert!(report.candidates[0].eligible);
-    assert_eq!(report.candidates[0].reason, "terminal_turn_missing");
-    assert!(matches!(
-        report.candidates[0].proposed_commands.as_slice(),
-        [crate::domain::scheduler_protocol::ProtocolCommand::RecordMissingSettlement(_)]
-    ));
     assert_eq!(
         runtime
             .inner
             .runtime_db
             .transitions()
-            .load_scheduler_protocol_snapshot("default")
+            .load_execution_protocol_state_if_initialized("default")
             .unwrap(),
-        claimed
+        Some(claimed.clone())
     );
     assert_eq!(
         runtime
@@ -1139,41 +2202,40 @@ async fn bootstrap_recovery_marks_dequeued_canonical_activation_as_missing_settl
     );
 
     let activation_id = scheduler_executor::canonical_activation_id(&message.id);
-    let snapshot = runtime
+    let execution = runtime
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    assert_eq!(snapshot.slot, ActivationSlot::Idle);
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("bootstrap recovery should preserve the execution partition");
+    let attempt = &execution.attempts[&activation_id];
     assert_eq!(
-        snapshot
-            .activations
-            .get(&activation_id)
-            .map(|activation| activation.state.clone()),
-        Some(crate::domain::scheduler_protocol::ActivationState::SettlementMissing)
+        attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Interrupted
     );
     assert_eq!(
-        snapshot
-            .work
-            .get(&work_item.id)
-            .map(|demand| &demand.status),
-        Some(&WorkStatus::NeedsSettlement {
-            activation_id: activation_id.clone(),
-        })
+        execution.outcomes[attempt
+            .terminal_outcome_id
+            .as_deref()
+            .expect("bootstrap interruption should have terminal evidence")]
+        .outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Interrupted {
+                reason: "runtime_interrupted".into(),
+            },
+        )
     );
-    assert_eq!(
-        runtime
-            .inner
-            .runtime_db
-            .queue_entries()
-            .latest_all()
-            .unwrap()
-            .into_iter()
-            .find(|entry| entry.message_id == message.id)
-            .map(|entry| entry.status),
-        Some(QueueEntryStatus::Aborted)
-    );
+    let recovered_queue_status = runtime
+        .inner
+        .runtime_db
+        .queue_entries()
+        .latest_all()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.message_id == message.id)
+        .map(|entry| entry.status);
+    assert_eq!(recovered_queue_status, Some(QueueEntryStatus::Interrupted));
     assert!(runtime
         .storage()
         .read_recent_events(32)
@@ -1187,7 +2249,13 @@ async fn bootstrap_recovery_marks_dequeued_canonical_activation_as_missing_settl
 }
 
 #[tokio::test]
-async fn settlement_recovery_repairs_processed_cross_work_item_pick_as_targeted_yield() {
+async fn bootstrap_recovery_replays_task_result_claim_after_canonical_revision_sync() {
+    use crate::domain::execution_protocol::{
+        AdmittedFences, ExecutionAttempt, ExecutionAttemptState, ExecutionBinding, ExecutionOrigin,
+        ExecutionPriority, ExecutionProtocolState, ExecutionProvenance, ExecutionSource,
+        ExecutionSourceIdentity, ExecutionTrust, WorkItemExecutionRecord, WorkItemExecutionState,
+    };
+
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let runtime = RuntimeHandle::new(
@@ -1203,164 +2271,1095 @@ async fn settlement_recovery_repairs_processed_cross_work_item_pick_as_targeted_
         context_config(),
     )
     .unwrap();
-    let caller = runtime
-        .create_work_item("yield caller".into(), None, None, Vec::new())
+    let work_item = runtime
+        .create_work_item(
+            "recover stale TaskResult claim".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
         .await
         .unwrap();
-    let target = runtime
-        .create_work_item("yield target".into(), None, None, Vec::new())
+    append_running_rejoin_task(&runtime, "task-stale-bootstrap", &work_item.id);
+    let registration = runtime
+        .register_wait_for(
+            "default",
+            Some(work_item.id.clone()),
+            WaitForWakeKind::TaskResult,
+            Some("task-stale-bootstrap".into()),
+            "waiting for stale bootstrap task".into(),
+            None,
+        )
         .await
         .unwrap();
-    runtime.pick_work_item(caller.id.clone()).await.unwrap();
-    let mut message = MessageEnvelope::new(
-        "default",
-        MessageKind::SystemTick,
-        MessageOrigin::System {
-            subsystem: "work_queue".into(),
-        },
-        AuthorityClass::RuntimeInstruction,
-        Priority::Normal,
-        MessageBody::Text {
-            text: "yield caller activation".into(),
-        },
-    );
-    message.work_item_id = Some(caller.id.clone());
-    message.turn_id = Some("turn-targeted-yield-recovery".into());
-    let message = runtime.enqueue(message).await.unwrap();
-    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
-        .poll()
+    let waiting_work = runtime
+        .latest_work_item(&work_item.id)
         .await
-        .unwrap();
-    assert!(matches!(poll, scheduler_executor::RunLoopPoll::Message(_)));
-    runtime
-        .begin_interactive_turn(Some(&message), None, None)
-        .await
-        .unwrap();
-    let picked = runtime
-        .pick_work_item_with_reason(target.id.clone(), None)
-        .await
-        .unwrap();
-    assert!(picked.transition.terminal_transition);
-    let continuation_id = picked
-        .continuation_created
-        .expect("cross-work-item pick creates continuation")
-        .frame_id;
-    finish_claimed_test_run(&runtime).await;
-
-    let terminal = terminal_transition(&message, Some(&caller.id));
-    runtime
-        .storage()
-        .append_turn(&terminal.turn_record)
-        .unwrap();
-    let processed = QueueEntryRecord {
-        message_id: message.id.clone(),
-        agent_id: message.agent_id.clone(),
-        priority: message.priority.clone(),
-        status: QueueEntryStatus::Processed,
-        created_at: message.created_at,
-        updated_at: Utc::now(),
+        .unwrap()
+        .expect("waiting WorkItem");
+    let stale_revision = waiting_work.revision;
+    let rejoin = crate::domain::execution_protocol::RejoinFence {
+        obligation_id: "task-stale-bootstrap".into(),
+        generation: 1,
+        parent_turn_id: "turn-stale-bootstrap-parent".into(),
     };
-    let scheduler_protocol_commands = runtime
-        .canonical_queue_settlement_commands(&processed, Some(&terminal.turn_record))
+    let mut terminal_task = TaskRecord {
+        id: "task-stale-bootstrap".into(),
+        agent_id: "default".into(),
+        kind: TaskKind::CommandTask,
+        status: TaskStatus::Completed,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        parent_message_id: None,
+        work_item_id: Some(work_item.id.clone()),
+        summary: Some("task-stale-bootstrap completed".into()),
+        detail: Some(serde_json::json!({
+            "terminal_reentry": false,
+            "rejoin_obligation_id": rejoin.obligation_id,
+            "rejoin_generation": rejoin.generation,
+            "parent_turn_id": rejoin.parent_turn_id,
+        })),
+        recovery: None,
+    };
+    let mut result = task_result_message("task-stale-bootstrap").with_admission(
+        MessageDeliverySurface::TaskRejoin,
+        AdmissionContext::RuntimeOwned,
+    );
+    result.task_id = Some("task-stale-bootstrap".into());
+    result.work_item_id = Some(work_item.id.clone());
+    result.turn_id = Some("turn-stale-bootstrap-result".into());
+    terminal_task.parent_message_id = Some(result.id.clone());
+    assert!(!terminal_task.terminal_reentry());
+    runtime
+        .commit_terminal_task_result(&terminal_task, "task_completed", &result)
         .await
         .unwrap();
     assert!(matches!(
-        scheduler_protocol_commands.as_slice(),
-        [crate::domain::scheduler_protocol::ProtocolCommand::RecordMissingSettlement(_)]
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
     ));
+    let result = runtime
+        .storage()
+        .read_message_by_id(&result.id)
+        .unwrap()
+        .expect("persisted TaskResult");
+    let current_work = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .expect("resolved WorkItem");
+    assert!(current_work.revision > stale_revision);
+    assert_eq!(
+        registration.condition.id,
+        runtime
+            .storage()
+            .latest_wait_conditions()
+            .unwrap()
+            .into_iter()
+            .find(|wait| wait.trigger_message_id() == Some(result.id.as_str()))
+            .expect("resolved exact task wait")
+            .id
+    );
+
+    let authority = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_authority_fences("default")
+        .unwrap();
+    let attempt_id = scheduler_executor::canonical_activation_id(&result.id);
+    let mut stale = ExecutionProtocolState::empty("default");
+    stale.work_items.insert(
+        work_item.id.clone(),
+        WorkItemExecutionRecord {
+            source_revision: current_work.revision,
+            state: WorkItemExecutionState::InFlight {
+                generation: stale_revision,
+                attempt_id: attempt_id.clone(),
+            },
+        },
+    );
+    stale.attempts.insert(
+        attempt_id.clone(),
+        ExecutionAttempt {
+            attempt_id: attempt_id.clone(),
+            agent_id: "default".into(),
+            source_message_id: Some(result.id.clone()),
+            source: ExecutionSource {
+                identity: ExecutionSourceIdentity::TaskResult {
+                    task_id: "task-stale-bootstrap".into(),
+                    result_message_id: result.id.clone(),
+                },
+                generation: result.message_seq.expect("persisted message sequence"),
+            },
+            binding: ExecutionBinding::WorkItem {
+                work_item_id: work_item.id.clone(),
+            },
+            provenance: ExecutionProvenance {
+                origin: ExecutionOrigin::Task,
+                trust: ExecutionTrust::RuntimeInstruction,
+                priority: ExecutionPriority::Normal,
+                correlation_id: None,
+                causation_id: None,
+            },
+            admitted_fences: AdmittedFences {
+                source_revision: result.message_seq.unwrap(),
+                work_item_source_revision: Some(stale_revision),
+                work_item_generation: Some(stale_revision),
+                rejoin: Some(rejoin),
+                agent_control_revision: authority.agent_control_revision,
+                host_registry_revision: authority.host_registry_revision,
+            },
+            state: ExecutionAttemptState::Open,
+            run_id: None,
+            turn_id: result.turn_id.clone(),
+            recovery_of_attempt_id: None,
+            terminal_outcome_id: None,
+            admitted_at: Utc::now().to_rfc3339(),
+            terminal_at: None,
+        },
+    );
     runtime
         .inner
         .runtime_db
-        .transitions()
-        .commit_queue(&crate::runtime_db::transitions::QueueTransitionCommand {
-            agent_id: message.agent_id.clone(),
-            operation: crate::runtime_db::transitions::QueueOperation::Settle,
-            mutation: crate::runtime_db::transitions::QueueMutation::Upsert(processed),
-            scheduler_claim_work_item: None,
-            scheduler_protocol_bootstrap: None,
-            scheduler_protocol_commands,
-            agent_state: None,
-            message_evidence: Vec::new(),
-            transcript_entries: Vec::new(),
-            turn_record: None,
-            audit_events: Vec::new(),
-            notify_scheduler: false,
-            fault: None,
-            brief_evidence: Vec::new(),
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &stale))
+        .unwrap();
+    runtime
+        .inner
+        .runtime_db
+        .queue_entries()
+        .upsert(&QueueEntryRecord {
+            message_id: result.id.clone(),
+            agent_id: "default".into(),
+            priority: result.priority.clone(),
+            status: QueueEntryStatus::Dequeued,
+            created_at: result.created_at,
+            updated_at: Utc::now(),
         })
         .unwrap();
 
-    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
-    let missing = runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
     assert_eq!(
-        missing.work[&caller.id].status,
-        WorkStatus::NeedsSettlement {
-            activation_id: activation_id.clone(),
-        }
-    );
-    assert!(!missing.work.contains_key(&target.id));
-
-    let report =
-        scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
-            .unwrap();
-    let candidate = report
-        .candidates
-        .iter()
-        .find(|candidate| candidate.kind == SchedulerRecoveryCandidateKind::NeedsSettlement)
-        .expect("needs-settlement candidate");
-    assert_eq!(candidate.reason, "needs_settlement_continuation");
-    assert!(candidate
-        .evidence
-        .contains(&format!("continuation:{continuation_id}")));
-    assert_eq!(
-        apply_scheduler_recovery_plan(
-            &runtime.inner.storage,
-            &runtime.inner.runtime_db,
-            "default",
-            &report,
-        )
-        .unwrap()
-        .0,
+        runtime.recover_scheduler_bootstrap_claims().await.unwrap(),
         1
     );
-
+    assert_eq!(
+        runtime.recover_scheduler_bootstrap_claims().await.unwrap(),
+        0
+    );
     let recovered = runtime
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    let WorkStatus::Yielded { continuation } = &recovered.work[&caller.id].status else {
-        panic!("caller should be canonically yielded after recovery");
-    };
-    assert_eq!(continuation.continuation_id, continuation_id);
-    assert_eq!(continuation.source_work_item_id, caller.id);
-    assert_eq!(continuation.target_work_item_id, target.id);
-    assert_eq!(recovered.work[&target.id].status, WorkStatus::Runnable);
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("recovered execution partition");
     assert_eq!(
-        recovered.activations[&activation_id].state,
-        crate::domain::scheduler_protocol::ActivationState::Settled
+        recovered.attempts[&attempt_id].state,
+        ExecutionAttemptState::Interrupted
     );
     assert_eq!(
-        apply_scheduler_recovery_plan(
-            &runtime.inner.storage,
-            &runtime.inner.runtime_db,
-            "default",
-            &scheduler_recovery_report(
-                &runtime.inner.storage,
-                &runtime.inner.runtime_db,
-                "default",
-            )
-            .unwrap(),
-        )
+        recovered.work_items[&work_item.id].source_revision,
+        current_work.revision
+    );
+    assert!(matches!(
+        recovered.work_items[&work_item.id].state,
+        WorkItemExecutionState::Runnable {
+            recovery_ref: Some(ref recovery_ref),
+            ..
+        } if recovery_ref == "interrupted"
+    ));
+
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("expected the interrupted TaskResult claim to re-enter");
+    };
+    assert_eq!(scheduled.message.id, result.id);
+    assert!(
+        matches!(
+            scheduled.dispatch_plan.execution_admission_provenance,
+            crate::types::ExecutionAdmissionProvenance::Canonical { .. }
+        ),
+        "expected canonical replay admission, got {:?}",
+        scheduled.dispatch_plan.execution_admission_provenance
+    );
+    let replayed = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
         .unwrap()
-        .0,
+        .expect("replayed execution partition");
+    let replay_attempts = replayed
+        .attempts
+        .values()
+        .filter(|attempt| {
+            attempt.state == ExecutionAttemptState::Open
+                && attempt.source_message_id.as_deref() == Some(result.id.as_str())
+                && attempt.recovery_of_attempt_id.as_deref() == Some(attempt_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let [replay_attempt] = replay_attempts.as_slice() else {
+        panic!("expected one exact TaskResult replay attempt: {replayed:#?}");
+    };
+    assert_eq!(replay_attempt.state, ExecutionAttemptState::Open);
+    assert_eq!(
+        replay_attempt.recovery_of_attempt_id.as_deref(),
+        Some(attempt_id.as_str())
+    );
+    assert_eq!(
+        replay_attempt.admitted_fences.work_item_source_revision,
+        Some(current_work.revision)
+    );
+    assert_eq!(
+        replay_attempt.source.identity,
+        ExecutionSourceIdentity::TaskResult {
+            task_id: "task-stale-bootstrap".into(),
+            result_message_id: result.id,
+        }
+    );
+}
+
+struct StaleTaskResultClaimFixture {
+    _dir: tempfile::TempDir,
+    _workspace: tempfile::TempDir,
+    runtime: RuntimeHandle,
+    work_item_id: String,
+    result: MessageEnvelope,
+    attempt_id: String,
+    current_revision: u64,
+}
+
+async fn stale_task_result_claim_fixture(task_id: &str) -> StaleTaskResultClaimFixture {
+    task_result_claim_fixture(task_id, false).await
+}
+
+async fn cancelled_wait_task_result_claim_fixture(task_id: &str) -> StaleTaskResultClaimFixture {
+    task_result_claim_fixture(task_id, true).await
+}
+
+async fn missing_wait_task_result_claim_fixture(task_id: &str) -> StaleTaskResultClaimFixture {
+    let fixture = stale_task_result_claim_fixture(task_id).await;
+    let wait = fixture
+        .runtime
+        .storage()
+        .latest_wait_conditions()
+        .unwrap()
+        .into_iter()
+        .find(|condition| {
+            condition.trigger_message_id() == Some(fixture.result.id.as_str())
+                && condition.work_item_id.as_deref() == Some(fixture.work_item_id.as_str())
+        })
+        .expect("resolved TaskResult wait");
+    fixture
+        .runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| {
+            tx.execute(
+                "DELETE FROM wait_conditions WHERE wait_condition_id = ?1",
+                [&wait.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    fixture
+}
+
+async fn task_result_claim_fixture(
+    task_id: &str,
+    cancel_wait_before_result: bool,
+) -> StaleTaskResultClaimFixture {
+    use crate::domain::execution_protocol::{
+        AdmittedFences, ExecutionAttempt, ExecutionAttemptState, ExecutionBinding, ExecutionOrigin,
+        ExecutionPriority, ExecutionProtocolState, ExecutionProvenance, ExecutionSource,
+        ExecutionSourceIdentity, ExecutionTrust, WorkItemExecutionRecord, WorkItemExecutionState,
+    };
+
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            format!("recover stale TaskResult claim {task_id}"),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    append_running_rejoin_task(&runtime, task_id, &work_item.id);
+    runtime
+        .register_wait_for(
+            "default",
+            Some(work_item.id.clone()),
+            WaitForWakeKind::TaskResult,
+            Some(task_id.into()),
+            "waiting for stale recovery task".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let stale_revision = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .expect("waiting WorkItem")
+        .revision;
+    let rejoin = crate::domain::execution_protocol::RejoinFence {
+        obligation_id: task_id.into(),
+        generation: 1,
+        parent_turn_id: format!("turn-{task_id}-parent"),
+    };
+    let mut terminal_task = TaskRecord {
+        id: task_id.into(),
+        agent_id: "default".into(),
+        kind: TaskKind::CommandTask,
+        status: TaskStatus::Completed,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        parent_message_id: None,
+        work_item_id: Some(work_item.id.clone()),
+        summary: Some(format!("{task_id} completed")),
+        detail: Some(serde_json::json!({
+            "terminal_reentry": false,
+            "rejoin_obligation_id": rejoin.obligation_id,
+            "rejoin_generation": rejoin.generation,
+            "parent_turn_id": rejoin.parent_turn_id,
+        })),
+        recovery: None,
+    };
+    let mut result = task_result_message(task_id).with_admission(
+        MessageDeliverySurface::TaskRejoin,
+        AdmissionContext::RuntimeOwned,
+    );
+    result.task_id = Some(task_id.into());
+    result.work_item_id = Some(work_item.id.clone());
+    result.turn_id = Some(format!("turn-{task_id}-result"));
+    terminal_task.parent_message_id = Some(result.id.clone());
+    if cancel_wait_before_result {
+        let mut wait = runtime
+            .storage()
+            .latest_wait_conditions()
+            .unwrap()
+            .into_iter()
+            .find(|condition| {
+                condition.wake_sources.iter().any(|source| {
+                    matches!(source, WakeSource::TaskResult { task_id: source_task_id } if source_task_id == task_id)
+                })
+                    && condition.work_item_id.as_deref() == Some(work_item.id.as_str())
+            })
+            .expect("active TaskResult wait");
+        wait.status = WaitConditionStatus::Cancelled;
+        wait.updated_at = Utc::now();
+        wait.cancelled_at = Some(wait.updated_at);
+        wait.trigger_message_id = Some(result.id.clone());
+        runtime
+            .inner
+            .runtime_db
+            .wait_conditions()
+            .upsert(&wait)
+            .unwrap();
+    }
+    assert!(!terminal_task.terminal_reentry());
+    runtime
+        .commit_terminal_task_result(&terminal_task, "task_completed", &result)
+        .await
+        .unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+    let result = runtime
+        .storage()
+        .read_message_by_id(&result.id)
+        .unwrap()
+        .expect("persisted TaskResult");
+    let current_revision = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .expect("resolved WorkItem")
+        .revision;
+    let authority = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_authority_fences("default")
+        .unwrap();
+    let attempt_id = scheduler_executor::canonical_activation_id(&result.id);
+    let mut stale = ExecutionProtocolState::empty("default");
+    stale.work_items.insert(
+        work_item.id.clone(),
+        WorkItemExecutionRecord {
+            source_revision: current_revision,
+            state: WorkItemExecutionState::InFlight {
+                generation: stale_revision,
+                attempt_id: attempt_id.clone(),
+            },
+        },
+    );
+    stale.attempts.insert(
+        attempt_id.clone(),
+        ExecutionAttempt {
+            attempt_id: attempt_id.clone(),
+            agent_id: "default".into(),
+            source_message_id: Some(result.id.clone()),
+            source: ExecutionSource {
+                identity: ExecutionSourceIdentity::TaskResult {
+                    task_id: task_id.into(),
+                    result_message_id: result.id.clone(),
+                },
+                generation: result.message_seq.expect("persisted message sequence"),
+            },
+            binding: ExecutionBinding::WorkItem {
+                work_item_id: work_item.id.clone(),
+            },
+            provenance: ExecutionProvenance {
+                origin: ExecutionOrigin::Task,
+                trust: ExecutionTrust::RuntimeInstruction,
+                priority: ExecutionPriority::Normal,
+                correlation_id: None,
+                causation_id: None,
+            },
+            admitted_fences: AdmittedFences {
+                source_revision: result.message_seq.unwrap(),
+                work_item_source_revision: Some(stale_revision),
+                work_item_generation: Some(stale_revision),
+                rejoin: Some(rejoin),
+                agent_control_revision: authority.agent_control_revision,
+                host_registry_revision: authority.host_registry_revision,
+            },
+            state: ExecutionAttemptState::Open,
+            run_id: None,
+            turn_id: result.turn_id.clone(),
+            recovery_of_attempt_id: None,
+            terminal_outcome_id: None,
+            admitted_at: Utc::now().to_rfc3339(),
+            terminal_at: None,
+        },
+    );
+    runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &stale))
+        .unwrap();
+    runtime
+        .inner
+        .runtime_db
+        .queue_entries()
+        .upsert(&QueueEntryRecord {
+            message_id: result.id.clone(),
+            agent_id: "default".into(),
+            priority: result.priority.clone(),
+            status: QueueEntryStatus::Dequeued,
+            created_at: result.created_at,
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+
+    StaleTaskResultClaimFixture {
+        _dir: dir,
+        _workspace: workspace,
+        runtime,
+        work_item_id: work_item.id,
+        result,
+        attempt_id,
+        current_revision,
+    }
+}
+
+async fn unadvanced_task_result_claim_fixture(task_id: &str) -> StaleTaskResultClaimFixture {
+    use crate::domain::execution_protocol::WorkItemExecutionState;
+
+    let fixture = stale_task_result_claim_fixture(task_id).await;
+    let mut state = fixture
+        .runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("TaskResult fixture execution partition");
+    let attempt = state
+        .attempts
+        .get_mut(&fixture.attempt_id)
+        .expect("TaskResult fixture attempt");
+    attempt.admitted_fences.work_item_source_revision = Some(fixture.current_revision);
+    attempt.admitted_fences.work_item_generation = Some(fixture.current_revision);
+    state
+        .work_items
+        .get_mut(&fixture.work_item_id)
+        .expect("TaskResult fixture WorkItem")
+        .state = WorkItemExecutionState::InFlight {
+        generation: fixture.current_revision,
+        attempt_id: fixture.attempt_id.clone(),
+    };
+    fixture
+        .runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &state))
+        .unwrap();
+    fixture
+}
+
+fn isolated_task_result_claim_report(runtime: &RuntimeHandle) -> SchedulerRecoveryReport {
+    let mut report =
+        scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
+            .unwrap();
+    report.candidates.clear();
+    report.continuation_reconciliations.clear();
+    report
+}
+
+#[tokio::test]
+async fn bootstrap_recovers_unadvanced_task_result_claim_but_diagnostic_apply_does_not() {
+    use crate::domain::execution_protocol::{ExecutionAttemptState, WorkItemExecutionState};
+
+    let fixture = unadvanced_task_result_claim_fixture("task-bootstrap-unadvanced-recovery").await;
+    let report = isolated_task_result_claim_report(&fixture.runtime);
+    let [candidate] = report.task_result_claim_recoveries.as_slice() else {
+        panic!("expected one unadvanced TaskResult claim candidate: {report:#?}");
+    };
+    assert!(!candidate.eligible);
+    assert_eq!(candidate.health, SchedulerUnsettledClaimHealth::Unhealthy);
+    assert!(candidate.lane_blocked);
+    assert_eq!(candidate.reason, "requires_inactive_runtime_recovery");
+    assert!(candidate.proposed_command.is_none());
+
+    assert_eq!(
+        fixture
+            .runtime
+            .recover_scheduler_bootstrap_claims()
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .recover_scheduler_bootstrap_claims()
+            .await
+            .unwrap(),
         0
+    );
+    let recovered = fixture
+        .runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("recovered execution partition");
+    assert_eq!(
+        recovered.attempts[&fixture.attempt_id].state,
+        ExecutionAttemptState::Interrupted
+    );
+    assert_eq!(
+        recovered.work_items[&fixture.work_item_id].source_revision,
+        fixture.current_revision
+    );
+    assert!(matches!(
+        recovered.work_items[&fixture.work_item_id].state,
+        WorkItemExecutionState::Runnable {
+            recovery_ref: Some(ref recovery_ref),
+            ..
+        } if recovery_ref == "interrupted"
+    ));
+    assert_eq!(
+        fixture
+            .runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest(&fixture.result.id)
+            .unwrap()
+            .expect("requeued TaskResult")
+            .status,
+        QueueEntryStatus::Queued
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_quarantines_repeated_task_result_claim_recovery() {
+    use crate::domain::execution_protocol::ExecutionAttemptState;
+
+    let fixture = stale_task_result_claim_fixture("task-bootstrap-bounded-recovery").await;
+    let mut state = fixture
+        .runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("TaskResult fixture execution partition");
+    state
+        .attempts
+        .get_mut(&fixture.attempt_id)
+        .expect("TaskResult fixture attempt")
+        .recovery_of_attempt_id = Some("attempt:prior-recovery".into());
+    fixture
+        .runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &state))
+        .unwrap();
+
+    assert_eq!(
+        fixture
+            .runtime
+            .recover_scheduler_bootstrap_claims()
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .recover_scheduler_bootstrap_claims()
+            .await
+            .unwrap(),
+        0
+    );
+    let recovered = fixture
+        .runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("recovered execution partition");
+    assert_eq!(
+        recovered.attempts[&fixture.attempt_id].state,
+        ExecutionAttemptState::Interrupted
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest(&fixture.result.id)
+            .unwrap()
+            .expect("quarantined TaskResult")
+            .status,
+        QueueEntryStatus::Quarantined
+    );
+    let event = fixture
+        .runtime
+        .inner
+        .storage
+        .read_recent_events(100)
+        .unwrap()
+        .into_iter()
+        .find(|event| {
+            event.kind == "unsettled_claim_reconciled"
+                && event
+                    .data
+                    .get("message_id")
+                    .and_then(|value| value.as_str())
+                    == Some(fixture.result.id.as_str())
+        })
+        .expect("bounded recovery should emit durable reconciliation evidence");
+    assert_eq!(
+        event.data.get("decision").and_then(|value| value.as_str()),
+        Some("interrupt_and_quarantine")
+    );
+    assert_eq!(
+        event.data.get("reason").and_then(|value| value.as_str()),
+        Some("bounded_replay_exhausted")
+    );
+    let attempt = &recovered.attempts[&fixture.attempt_id];
+    assert!(matches!(
+        &recovered.outcomes[attempt
+            .terminal_outcome_id
+            .as_deref()
+            .expect("quarantine should persist interruption evidence")]
+        .outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Interrupted { reason }
+        ) if reason == "bounded_replay_exhausted"
+    ));
+}
+
+#[tokio::test]
+async fn scheduler_recovery_task_result_claim_is_atomic_fenced_and_idempotent() {
+    use crate::domain::execution_protocol::{ExecutionAttemptState, WorkItemExecutionState};
+    use crate::runtime_db::transitions::TransitionFaultPoint;
+
+    let fixture = stale_task_result_claim_fixture("task-scheduler-recovery-apply").await;
+    let report = isolated_task_result_claim_report(&fixture.runtime);
+    let [candidate] = report.task_result_claim_recoveries.as_slice() else {
+        panic!("expected one stale TaskResult claim candidate: {report:#?}");
+    };
+    assert!(candidate.eligible);
+    assert_eq!(candidate.reason, "stale_task_result_claim_revision");
+    assert_eq!(candidate.message_id, fixture.result.id);
+    assert_eq!(candidate.activation_id, fixture.attempt_id);
+    assert_eq!(candidate.work_item_id, fixture.work_item_id);
+    assert_eq!(candidate.queue_status, QueueEntryStatus::Dequeued);
+    assert!(candidate.expected_queue_entry.is_some());
+
+    assert_eq!(
+        apply_scheduler_recovery_plan_with_backup_policy(
+            &fixture.runtime.inner.storage,
+            &fixture.runtime.inner.runtime_db,
+            "default",
+            &report,
+            SchedulerRecoveryBackupPolicy::SkipApproved,
+        )
+        .unwrap(),
+        (1, None)
+    );
+    let recovered_execution = fixture
+        .runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("recovered execution partition");
+    assert_eq!(
+        recovered_execution.attempts[&fixture.attempt_id].state,
+        ExecutionAttemptState::Interrupted
+    );
+    assert_eq!(
+        recovered_execution.work_items[&fixture.work_item_id].source_revision,
+        fixture.current_revision
+    );
+    assert!(matches!(
+        recovered_execution.work_items[&fixture.work_item_id].state,
+        WorkItemExecutionState::Runnable { .. }
+    ));
+    assert_eq!(
+        fixture
+            .runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest(&fixture.result.id)
+            .unwrap()
+            .expect("requeued TaskResult")
+            .status,
+        QueueEntryStatus::Queued
+    );
+    assert_eq!(
+        apply_scheduler_recovery_plan_with_backup_policy(
+            &fixture.runtime.inner.storage,
+            &fixture.runtime.inner.runtime_db,
+            "default",
+            &report,
+            SchedulerRecoveryBackupPolicy::SkipApproved,
+        )
+        .unwrap(),
+        (0, None)
+    );
+
+    let fence_fixture = stale_task_result_claim_fixture("task-scheduler-recovery-fence").await;
+    let fence_report = isolated_task_result_claim_report(&fence_fixture.runtime);
+    let before_execution = fence_fixture
+        .runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    let mut changed_entry = fence_fixture
+        .runtime
+        .inner
+        .runtime_db
+        .queue_entries()
+        .latest(&fence_fixture.result.id)
+        .unwrap()
+        .unwrap();
+    changed_entry.updated_at += chrono::Duration::seconds(1);
+    fence_fixture
+        .runtime
+        .inner
+        .runtime_db
+        .queue_entries()
+        .upsert(&changed_entry)
+        .unwrap();
+    let error = apply_scheduler_recovery_plan_with_backup_policy(
+        &fence_fixture.runtime.inner.storage,
+        &fence_fixture.runtime.inner.runtime_db,
+        "default",
+        &fence_report,
+        SchedulerRecoveryBackupPolicy::SkipApproved,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("queue fence changed"));
+    assert_eq!(
+        fence_fixture
+            .runtime
+            .inner
+            .runtime_db
+            .transitions()
+            .load_execution_protocol_state_if_initialized("default")
+            .unwrap()
+            .unwrap(),
+        before_execution
+    );
+    assert_eq!(
+        fence_fixture
+            .runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest(&fence_fixture.result.id)
+            .unwrap()
+            .unwrap(),
+        changed_entry
+    );
+
+    let fault_fixture = stale_task_result_claim_fixture("task-scheduler-recovery-fault").await;
+    let fault_report = isolated_task_result_claim_report(&fault_fixture.runtime);
+    let before_execution = fault_fixture
+        .runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    let before_queue = fault_fixture
+        .runtime
+        .inner
+        .runtime_db
+        .queue_entries()
+        .latest(&fault_fixture.result.id)
+        .unwrap()
+        .unwrap();
+    let error = apply_scheduler_recovery_plan_with_task_result_fault(
+        &fault_fixture.runtime.inner.storage,
+        &fault_fixture.runtime.inner.runtime_db,
+        "default",
+        &fault_report,
+        TransitionFaultPoint::AfterCanonicalWrites,
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("injected runtime transition fault"));
+    assert_eq!(
+        fault_fixture
+            .runtime
+            .inner
+            .runtime_db
+            .transitions()
+            .load_execution_protocol_state_if_initialized("default")
+            .unwrap()
+            .unwrap(),
+        before_execution
+    );
+    assert_eq!(
+        fault_fixture
+            .runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest(&fault_fixture.result.id)
+            .unwrap()
+            .unwrap(),
+        before_queue
+    );
+}
+
+#[tokio::test]
+async fn scheduler_recovery_quarantines_repeated_task_result_claim() {
+    use crate::domain::execution_protocol::ExecutionAttemptState;
+
+    let fixture = stale_task_result_claim_fixture("task-debug-bounded-recovery").await;
+    let mut state = fixture
+        .runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("TaskResult fixture execution partition");
+    state
+        .attempts
+        .get_mut(&fixture.attempt_id)
+        .expect("TaskResult fixture attempt")
+        .recovery_of_attempt_id = Some("attempt:prior-recovery".into());
+    fixture
+        .runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &state))
+        .unwrap();
+
+    let report = isolated_task_result_claim_report(&fixture.runtime);
+    let [candidate] = report.task_result_claim_recoveries.as_slice() else {
+        panic!("expected one repeated TaskResult claim candidate: {report:#?}");
+    };
+    assert!(candidate.eligible);
+    assert_eq!(candidate.reason, "bounded_replay_exhausted");
+    assert_eq!(
+        candidate
+            .proposed_queue_entry
+            .as_ref()
+            .map(|entry| entry.status.clone()),
+        Some(QueueEntryStatus::Quarantined)
+    );
+
+    assert_eq!(
+        apply_scheduler_recovery_plan_with_backup_policy(
+            &fixture.runtime.inner.storage,
+            &fixture.runtime.inner.runtime_db,
+            "default",
+            &report,
+            SchedulerRecoveryBackupPolicy::SkipApproved,
+        )
+        .unwrap(),
+        (1, None)
+    );
+    let recovered = fixture
+        .runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("recovered execution partition");
+    assert_eq!(
+        recovered.attempts[&fixture.attempt_id].state,
+        ExecutionAttemptState::Interrupted
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest(&fixture.result.id)
+            .unwrap()
+            .expect("quarantined TaskResult")
+            .status,
+        QueueEntryStatus::Quarantined
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_recovery_uses_execution_attempt() {
+    let mut harness = LifecycleHarness::new();
+    let (message_id, activation_id) = {
+        let runtime = harness.runtime();
+        let work_item = runtime
+            .create_work_item(
+                "recover without scheduler compatibility partition".into(),
+                None,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let mut message = MessageEnvelope::new(
+            "default",
+            MessageKind::SystemTick,
+            MessageOrigin::System {
+                subsystem: "work_queue".into(),
+            },
+            AuthorityClass::RuntimeInstruction,
+            Priority::Normal,
+            MessageBody::Text {
+                text: "claim before compatibility projection loss".into(),
+            },
+        );
+        bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
+        let message = runtime.enqueue(message).await.unwrap();
+        assert!(matches!(
+            scheduler_executor::SchedulerDecisionExecutor::new(runtime)
+                .poll()
+                .await
+                .unwrap(),
+            scheduler_executor::RunLoopPoll::Message(_)
+        ));
+        finish_claimed_test_run(runtime).await;
+        let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+        let execution = runtime
+            .inner
+            .runtime_db
+            .transitions()
+            .load_execution_protocol_state_if_initialized("default")
+            .unwrap()
+            .expect("production claim should persist execution authority");
+        assert_eq!(
+            execution.attempts[&activation_id].state,
+            crate::domain::execution_protocol::ExecutionAttemptState::Open
+        );
+
+        (message.id, activation_id)
+    };
+
+    harness.restart();
+    let runtime = harness.runtime();
+    assert_eq!(
+        runtime.recover_scheduler_bootstrap_claims().await.unwrap(),
+        1
+    );
+    assert_eq!(
+        runtime.recover_scheduler_bootstrap_claims().await.unwrap(),
+        0
+    );
+    assert_eq!(
+        runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest_all()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == message_id)
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Interrupted)
+    );
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("bootstrap recovery should retain execution authority");
+    let attempt = &execution.attempts[&activation_id];
+    assert_eq!(
+        attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Interrupted
+    );
+    assert_eq!(
+        execution.outcomes[attempt
+            .terminal_outcome_id
+            .as_deref()
+            .expect("bootstrap recovery should persist interruption evidence")]
+        .outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Interrupted {
+                reason: "runtime_interrupted".into(),
+            },
+        )
     );
 }
 
@@ -1402,7 +3401,7 @@ async fn bootstrap_recovery_settles_dequeued_activation_from_terminal_turn() {
             text: "claim completed before restart".into(),
         },
     );
-    message.work_item_id = Some(work_item.id.clone());
+    bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
     message.turn_id = Some("turn-bootstrap-terminal".into());
     let message = runtime.enqueue(message).await.unwrap();
     let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
@@ -1417,21 +3416,6 @@ async fn bootstrap_recovery_settles_dequeued_activation_from_terminal_turn() {
         .append_turn(&terminal.turn_record)
         .unwrap();
 
-    let report =
-        scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
-            .unwrap();
-    assert_eq!(report.candidates.len(), 1);
-    assert!(report.candidates[0].eligible);
-    assert_eq!(report.candidates[0].reason, "terminal_turn_settlement");
-    assert_eq!(
-        report.candidates[0].target_queue_status,
-        Some(QueueEntryStatus::Processed)
-    );
-    assert!(matches!(
-        report.candidates[0].proposed_commands.as_slice(),
-        [crate::domain::scheduler_protocol::ProtocolCommand::SettleActivation(_)]
-    ));
-
     assert_eq!(
         runtime.recover_scheduler_bootstrap_claims().await.unwrap(),
         1
@@ -1442,26 +3426,24 @@ async fn bootstrap_recovery_settles_dequeued_activation_from_terminal_turn() {
     );
 
     let activation_id = scheduler_executor::canonical_activation_id(&message.id);
-    let snapshot = runtime
+    let execution = runtime
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
         .unwrap();
-    assert_eq!(snapshot.slot, ActivationSlot::Idle);
+    let attempt = &execution.attempts[&activation_id];
     assert_eq!(
-        snapshot
-            .activations
-            .get(&activation_id)
-            .map(|activation| activation.state.clone()),
-        Some(crate::domain::scheduler_protocol::ActivationState::Settled)
+        attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Settled
     );
-    assert!(snapshot
-        .settlements
-        .contains_key(&canonical_settlement_id(&message.id)));
-    assert!(!snapshot
-        .missing_settlements
-        .contains_key(&canonical_missing_settlement_id(&message.id)));
+    assert!(matches!(
+        &execution.outcomes[attempt.terminal_outcome_id.as_deref().unwrap()].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Continue
+        )
+    ));
     assert_eq!(
         runtime
             .inner
@@ -1477,9 +3459,9 @@ async fn bootstrap_recovery_settles_dequeued_activation_from_terminal_turn() {
 }
 
 #[tokio::test]
-async fn bootstrap_restart_repairs_legacy_queue_after_canonical_settlement() {
+async fn bootstrap_restart_reconciles_dequeued_queue_after_unified_settlement() {
     let mut harness = LifecycleHarness::new();
-    let (message_id, activation_id, settled_snapshot) = {
+    let (message_id, activation_id, settled_execution) = {
         let runtime = harness.runtime();
         let work_item = runtime
             .create_work_item(
@@ -1502,7 +3484,7 @@ async fn bootstrap_restart_repairs_legacy_queue_after_canonical_settlement() {
                 text: "canonical settlement committed before restart".into(),
             },
         );
-        message.work_item_id = Some(work_item.id.clone());
+        bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
         message.turn_id = Some("turn-bootstrap-split-restart".into());
         let message = runtime.enqueue(message).await.unwrap();
         assert!(matches!(
@@ -1518,26 +3500,37 @@ async fn bootstrap_restart_repairs_legacy_queue_after_canonical_settlement() {
             .storage()
             .append_turn(&terminal.turn_record)
             .unwrap();
-        let report =
-            scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
-                .unwrap();
-        let command = report.candidates[0].proposed_commands[0].clone();
-        runtime
-            .inner
-            .runtime_db
-            .transitions()
-            .commit_scheduler_protocol_command_unchecked_for_test("default", &command, None)
-            .unwrap();
         let activation_id = scheduler_executor::canonical_activation_id(&message.id);
-        let snapshot = runtime
+        let mut processed = runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest_all()
+            .unwrap();
+        let mut processed = processed
+            .drain(..)
+            .find(|entry| entry.message_id == message.id)
+            .expect("claimed queue entry");
+        processed.status = QueueEntryStatus::Processed;
+        processed.updated_at = runtime.now();
+        let execution_transition = execution_protocol_settlement_transition_from_facts(
+            &runtime.inner.storage,
+            &runtime.inner.runtime_db,
+            &processed,
+            Some(&terminal.turn_record),
+        )
+        .unwrap();
+        persist_execution_transition_only(runtime, execution_transition);
+        let settled_execution = runtime
             .inner
             .runtime_db
             .transitions()
-            .load_scheduler_protocol_snapshot("default")
-            .unwrap();
+            .load_execution_protocol_state_if_initialized("default")
+            .unwrap()
+            .expect("unified settlement should remain authoritative");
         assert_eq!(
-            snapshot.activations[&activation_id].state,
-            crate::domain::scheduler_protocol::ActivationState::Settled
+            settled_execution.attempts[&activation_id].state,
+            crate::domain::execution_protocol::ExecutionAttemptState::Settled
         );
         assert_eq!(
             runtime
@@ -1551,7 +3544,7 @@ async fn bootstrap_restart_repairs_legacy_queue_after_canonical_settlement() {
                 .map(|entry| entry.status),
             Some(QueueEntryStatus::Dequeued)
         );
-        (message.id, activation_id, snapshot)
+        (message.id, activation_id, settled_execution)
     };
 
     harness.restart();
@@ -1569,9 +3562,9 @@ async fn bootstrap_restart_repairs_legacy_queue_after_canonical_settlement() {
             .inner
             .runtime_db
             .transitions()
-            .load_scheduler_protocol_snapshot("default")
+            .load_execution_protocol_state_if_initialized("default")
             .unwrap(),
-        settled_snapshot
+        Some(settled_execution)
     );
     assert_eq!(
         runtime
@@ -1585,19 +3578,42 @@ async fn bootstrap_restart_repairs_legacy_queue_after_canonical_settlement() {
             .map(|entry| entry.status),
         Some(QueueEntryStatus::Processed)
     );
-    assert!(runtime
+    let recovery_event = runtime
         .storage()
         .read_recent_events(64)
         .unwrap()
         .iter()
-        .any(|event| {
+        .find(|event| {
             event.kind == "scheduler_bootstrap_claim_recovered"
                 && event.data["message_id"] == message_id
-                && event.data["activation_id"] == activation_id
-                && event.data["recovery_outcome"]
-                    == "legacy_queue_reconciled_from_canonical_settlement"
-                && event.data["provenance"] == "bootstrap_reconciliation"
-        }));
+        })
+        .cloned()
+        .expect("bootstrap recovery should emit reconciliation evidence");
+    assert_eq!(recovery_event.data["activation_id"], activation_id);
+    assert_eq!(
+        recovery_event.data["recovery_outcome"],
+        "legacy_queue_reconciled_from_execution_settlement"
+    );
+    assert_eq!(
+        recovery_event.data["provenance"],
+        "bootstrap_reconciliation"
+    );
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("bootstrap recovery should preserve execution authority");
+    let attempt = &execution.attempts[&activation_id];
+    assert_eq!(
+        attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Settled
+    );
+    assert!(attempt
+        .terminal_outcome_id
+        .as_ref()
+        .is_some_and(|outcome_id| execution.outcomes.contains_key(outcome_id)));
 }
 
 #[tokio::test]
@@ -1642,7 +3658,7 @@ async fn bootstrap_recovery_settles_completed_work_item_from_bound_terminal_evid
         MessageDeliverySurface::RuntimeSystem,
         AdmissionContext::RuntimeOwned,
     );
-    message.work_item_id = Some(work_item.id.clone());
+    bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
     message.turn_id = Some("turn-bootstrap-completed".into());
     let message = runtime.enqueue(message).await.unwrap();
     let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
@@ -1681,17 +3697,6 @@ async fn bootstrap_recovery_settles_completed_work_item_from_bound_terminal_evid
         .append_turn(&terminal.turn_record)
         .unwrap();
 
-    let report =
-        scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
-            .unwrap();
-    assert_eq!(report.candidates.len(), 1);
-    assert!(report.candidates[0].eligible);
-    assert_eq!(report.candidates[0].reason, "terminal_turn_settlement");
-    assert!(matches!(
-        report.candidates[0].proposed_commands.as_slice(),
-        [crate::domain::scheduler_protocol::ProtocolCommand::SettleActivation(_)]
-    ));
-
     assert_eq!(
         runtime.recover_scheduler_bootstrap_claims().await.unwrap(),
         1
@@ -1701,32 +3706,24 @@ async fn bootstrap_recovery_settles_completed_work_item_from_bound_terminal_evid
         0
     );
 
-    let snapshot = runtime
+    let execution = runtime
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
         .unwrap();
-    assert_eq!(snapshot.slot, ActivationSlot::Idle);
+    let attempt = &execution.attempts[&activation_id];
     assert_eq!(
-        snapshot
-            .activations
-            .get(&activation_id)
-            .map(|activation| activation.state.clone()),
-        Some(crate::domain::scheduler_protocol::ActivationState::Settled)
+        attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Settled
     );
-    let settlement = snapshot
-        .settlements
-        .get(&canonical_settlement_id(&message.id))
-        .expect("completed activation settlement");
-    assert_eq!(
-        settlement.operator_delivery.as_deref(),
-        Some(result_brief_id.as_str())
-    );
-    assert!(settlement
-        .evidence
-        .iter()
-        .any(|evidence| evidence == &format!("turn:{}", terminal.terminal.turn_id)));
+    assert!(matches!(
+        &execution.outcomes[attempt.terminal_outcome_id.as_deref().unwrap()].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Complete { completion }
+        ) if completion == &result_brief_id
+    ));
     assert_eq!(
         runtime
             .inner
@@ -1739,188 +3736,6 @@ async fn bootstrap_recovery_settles_completed_work_item_from_bound_terminal_evid
             .map(|entry| entry.status),
         Some(QueueEntryStatus::Processed)
     );
-}
-
-#[tokio::test]
-async fn stale_bootstrap_recovery_command_cannot_settle_successor_generation() {
-    let dir = tempdir().unwrap();
-    let workspace = tempdir().unwrap();
-    let runtime = RuntimeHandle::new(
-        "default",
-        dir.path().to_path_buf(),
-        workspace.path().to_path_buf(),
-        "http://127.0.0.1:7878".into(),
-        Arc::new(CountingProvider {
-            calls: Mutex::new(0),
-            reply: "unused",
-        }),
-        "default".into(),
-        context_config(),
-    )
-    .unwrap();
-    let work_item = runtime
-        .create_work_item(
-            "fence stale bootstrap recovery".into(),
-            None,
-            None,
-            Vec::new(),
-        )
-        .await
-        .unwrap();
-    let mut first_message = MessageEnvelope::new(
-        "default",
-        MessageKind::SystemTick,
-        MessageOrigin::System {
-            subsystem: "work_queue".into(),
-        },
-        AuthorityClass::RuntimeInstruction,
-        Priority::Normal,
-        MessageBody::Text {
-            text: "first claimed generation".into(),
-        },
-    );
-    first_message.work_item_id = Some(work_item.id.clone());
-    first_message.turn_id = Some("turn-bootstrap-stale-first".into());
-    let first_message = runtime.enqueue(first_message).await.unwrap();
-    assert!(matches!(
-        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
-            .poll()
-            .await
-            .unwrap(),
-        scheduler_executor::RunLoopPoll::Message(_)
-    ));
-    finish_claimed_test_run(&runtime).await;
-    let terminal = terminal_transition(&first_message, Some(&work_item.id));
-    runtime
-        .storage()
-        .append_turn(&terminal.turn_record)
-        .unwrap();
-    let report =
-        scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
-            .unwrap();
-    let mut stale_command = report.candidates[0].proposed_commands[0].clone();
-    let crate::domain::scheduler_protocol::ProtocolCommand::SettleActivation(command) =
-        &mut stale_command
-    else {
-        panic!("terminal recovery should propose settlement");
-    };
-    command.settlement.id = "settlement:stale-bootstrap-proposal".into();
-
-    let claimed = runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    assert_eq!(
-        runtime.recover_scheduler_bootstrap_claims().await.unwrap(),
-        1
-    );
-    let mut successor_message = MessageEnvelope::new(
-        "default",
-        MessageKind::SystemTick,
-        MessageOrigin::System {
-            subsystem: "work_queue".into(),
-        },
-        AuthorityClass::RuntimeInstruction,
-        Priority::Normal,
-        MessageBody::Text {
-            text: "successor claimed generation".into(),
-        },
-    );
-    successor_message.work_item_id = Some(work_item.id.clone());
-    let successor_message = runtime.enqueue(successor_message).await.unwrap();
-    assert!(matches!(
-        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
-            .poll()
-            .await
-            .unwrap(),
-        scheduler_executor::RunLoopPoll::Message(_)
-    ));
-    finish_claimed_test_run(&runtime).await;
-    let before = runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    assert_eq!(
-        before.work[&work_item.id].scheduling_generation,
-        claimed.work[&work_item.id].scheduling_generation + 1
-    );
-
-    let expected_entry = runtime
-        .inner
-        .runtime_db
-        .queue_entries()
-        .latest_all()
-        .unwrap()
-        .into_iter()
-        .find(|entry| entry.message_id == successor_message.id)
-        .unwrap();
-    let mut processed_entry = expected_entry.clone();
-    processed_entry.status = QueueEntryStatus::Processed;
-    processed_entry.updated_at = runtime.now();
-    let error = runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .commit_queue(&crate::runtime_db::transitions::QueueTransitionCommand {
-            agent_id: "default".into(),
-            operation: crate::runtime_db::transitions::QueueOperation::Settle,
-            mutation: crate::runtime_db::transitions::QueueMutation::CompareAndSet {
-                expected: expected_entry,
-                record: processed_entry,
-            },
-            scheduler_claim_work_item: None,
-            scheduler_protocol_bootstrap: None,
-            scheduler_protocol_commands: vec![stale_command],
-            agent_state: None,
-            message_evidence: Vec::new(),
-            transcript_entries: Vec::new(),
-            turn_record: None,
-            audit_events: vec![AuditEvent::legacy(
-                "stale_bootstrap_recovery_attempt",
-                serde_json::json!({"message_id": first_message.id}),
-            )],
-            notify_scheduler: true,
-            fault: None,
-            brief_evidence: Vec::new(),
-        })
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("activation_terminal_settlement_already_recorded"),
-        "unexpected stale recovery error: {error:#}"
-    );
-    assert_eq!(
-        runtime
-            .inner
-            .runtime_db
-            .transitions()
-            .load_scheduler_protocol_snapshot("default")
-            .unwrap(),
-        before
-    );
-    assert_eq!(
-        runtime
-            .inner
-            .runtime_db
-            .queue_entries()
-            .latest_all()
-            .unwrap()
-            .into_iter()
-            .find(|entry| entry.message_id == successor_message.id)
-            .map(|entry| entry.status),
-        Some(QueueEntryStatus::Dequeued)
-    );
-    assert!(runtime
-        .storage()
-        .read_recent_events(64)
-        .unwrap()
-        .iter()
-        .all(|event| event.kind != "stale_bootstrap_recovery_attempt"));
 }
 
 #[tokio::test]
@@ -1963,7 +3778,7 @@ async fn bootstrap_recovery_fault_rolls_back_queue_canonical_and_audit() {
                     text: "claim before recovery fault".into(),
                 },
             );
-            message.work_item_id = Some(work_item.id.clone());
+            bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
             message.turn_id = terminal_evidence
                 .then(|| format!("turn-bootstrap-fault-{terminal_evidence}-{fault:?}"));
             let message = runtime.enqueue(message).await.unwrap();
@@ -1984,8 +3799,9 @@ async fn bootstrap_recovery_fault_rolls_back_queue_canonical_and_audit() {
                 .inner
                 .runtime_db
                 .transitions()
-                .load_scheduler_protocol_snapshot("default")
-                .unwrap();
+                .load_execution_protocol_state_if_initialized("default")
+                .unwrap()
+                .expect("claim should initialize execution authority");
 
             runtime.inject_next_transition_fault(fault);
             let error = runtime
@@ -1998,9 +3814,9 @@ async fn bootstrap_recovery_fault_rolls_back_queue_canonical_and_audit() {
                     .inner
                     .runtime_db
                     .transitions()
-                    .load_scheduler_protocol_snapshot("default")
+                    .load_execution_protocol_state_if_initialized("default")
                     .unwrap(),
-                claimed
+                Some(claimed.clone())
             );
             assert_eq!(
                 runtime
@@ -2032,154 +3848,40 @@ async fn bootstrap_recovery_fault_rolls_back_queue_canonical_and_audit() {
                 runtime.recover_scheduler_bootstrap_claims().await.unwrap(),
                 0
             );
+            let recovered = runtime
+                .inner
+                .runtime_db
+                .transitions()
+                .load_execution_protocol_state_if_initialized("default")
+                .unwrap()
+                .expect("recovery should preserve execution authority");
+            let attempt_id = scheduler_executor::canonical_activation_id(&message.id);
+            assert_eq!(
+                recovered.attempts[&attempt_id].state,
+                if terminal_evidence {
+                    crate::domain::execution_protocol::ExecutionAttemptState::Settled
+                } else {
+                    crate::domain::execution_protocol::ExecutionAttemptState::Interrupted
+                }
+            );
+            assert_eq!(
+                runtime
+                    .inner
+                    .runtime_db
+                    .queue_entries()
+                    .latest_all()
+                    .unwrap()
+                    .into_iter()
+                    .find(|entry| entry.message_id == message.id)
+                    .map(|entry| entry.status),
+                Some(if terminal_evidence {
+                    QueueEntryStatus::Processed
+                } else {
+                    QueueEntryStatus::Interrupted
+                })
+            );
         }
     }
-}
-
-#[tokio::test]
-async fn legacy_engine_claim_and_settlement_do_not_write_canonical_protocol() {
-    let dir = tempdir().unwrap();
-    let workspace = tempdir().unwrap();
-    let runtime = RuntimeHandle::new_with_scheduler_engine(
-        "default",
-        dir.path().to_path_buf(),
-        workspace.path().to_path_buf(),
-        "http://127.0.0.1:7878".into(),
-        Arc::new(CountingProvider {
-            calls: Mutex::new(0),
-            reply: "unused",
-        }),
-        "default".into(),
-        context_config(),
-        crate::config::SchedulerEngineMode::Legacy,
-    )
-    .unwrap();
-    let work_item = runtime
-        .create_work_item("legacy production loop".into(), None, None, Vec::new())
-        .await
-        .unwrap();
-    let mut message = MessageEnvelope::new(
-        "default",
-        MessageKind::SystemTick,
-        MessageOrigin::System {
-            subsystem: "work_queue".into(),
-        },
-        AuthorityClass::RuntimeInstruction,
-        Priority::Normal,
-        MessageBody::Text {
-            text: "run legacy work".into(),
-        },
-    )
-    .with_admission(
-        MessageDeliverySurface::RuntimeSystem,
-        AdmissionContext::RuntimeOwned,
-    );
-    message.work_item_id = Some(work_item.id.clone());
-    message.turn_id = Some("turn-legacy-production-loop".into());
-    let message = runtime.enqueue(message).await.unwrap();
-
-    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
-        .poll()
-        .await
-        .unwrap();
-    assert!(matches!(poll, scheduler_executor::RunLoopPoll::Message(_)));
-    assert!(runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .load_scheduler_protocol_snapshot_if_initialized("default")
-        .unwrap()
-        .is_none());
-
-    finish_claimed_test_run(&runtime).await;
-    let terminal = terminal_transition(&message, Some(&work_item.id));
-    runtime
-        .commit_queue_terminal_settlement(
-            QueueEntryRecord {
-                message_id: message.id.clone(),
-                agent_id: message.agent_id.clone(),
-                priority: message.priority,
-                status: QueueEntryStatus::Processed,
-                created_at: message.created_at,
-                updated_at: Utc::now(),
-            },
-            Vec::new(),
-            true,
-            Some(&terminal),
-        )
-        .await
-        .unwrap();
-
-    assert!(runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .load_scheduler_protocol_snapshot_if_initialized("default")
-        .unwrap()
-        .is_none());
-}
-
-#[tokio::test]
-async fn legacy_engine_startup_rejects_running_canonical_activation() {
-    let dir = tempdir().unwrap();
-    let workspace = tempdir().unwrap();
-    let provider = Arc::new(CountingProvider {
-        calls: Mutex::new(0),
-        reply: "unused",
-    });
-    let runtime = RuntimeHandle::new(
-        "default",
-        dir.path().to_path_buf(),
-        workspace.path().to_path_buf(),
-        "http://127.0.0.1:7878".into(),
-        provider.clone(),
-        "default".into(),
-        context_config(),
-    )
-    .unwrap();
-    let work_item = runtime
-        .create_work_item("canonical in flight".into(), None, None, Vec::new())
-        .await
-        .unwrap();
-    let mut message = MessageEnvelope::new(
-        "default",
-        MessageKind::SystemTick,
-        MessageOrigin::System {
-            subsystem: "work_queue".into(),
-        },
-        AuthorityClass::RuntimeInstruction,
-        Priority::Normal,
-        MessageBody::Text {
-            text: "leave canonical activation running".into(),
-        },
-    );
-    message.work_item_id = Some(work_item.id);
-    message.turn_id = Some("turn-canonical-in-flight".into());
-    runtime.enqueue(message).await.unwrap();
-    assert!(matches!(
-        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
-            .poll()
-            .await
-            .unwrap(),
-        scheduler_executor::RunLoopPoll::Message(_)
-    ));
-    drop(runtime);
-
-    let legacy = RuntimeHandle::new_with_scheduler_engine(
-        "default",
-        dir.path().to_path_buf(),
-        workspace.path().to_path_buf(),
-        "http://127.0.0.1:7878".into(),
-        provider,
-        "default".into(),
-        context_config(),
-        crate::config::SchedulerEngineMode::Legacy,
-    )
-    .unwrap();
-    let error = legacy.run().await.unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("non-terminal canonical activations remain"));
 }
 
 #[tokio::test]
@@ -2219,7 +3921,7 @@ async fn production_protocol_claim_and_settlement_release_the_canonical_slot() {
         MessageDeliverySurface::RuntimeSystem,
         AdmissionContext::RuntimeOwned,
     );
-    message.work_item_id = Some(work_item.id.clone());
+    bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
     message.turn_id = Some("turn-canonical-production-loop".into());
     let message = runtime.enqueue(message).await.unwrap();
 
@@ -2234,20 +3936,20 @@ async fn production_protocol_claim_and_settlement_release_the_canonical_slot() {
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("claim should initialize execution authority");
     assert_eq!(
-        claimed.slot,
-        ActivationSlot::Running {
-            activation_id: activation_id.clone(),
-            owner: SchedulerOwner::WorkItem {
-                work_item_id: work_item.id.clone(),
-            },
-            admitted_generation: work_item.revision,
-            recovery_for: None,
-        }
+        claimed.attempts[&activation_id].state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Open
     );
-    assert!(claimed.activations.contains_key(&activation_id));
+    assert!(matches!(
+        claimed.work_items[&work_item.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::InFlight {
+            ref attempt_id,
+            ..
+        } if attempt_id == &activation_id
+    ));
 
     finish_claimed_test_run(&runtime).await;
     let terminal = terminal_transition(&message, Some(&work_item.id));
@@ -2278,23 +3980,36 @@ async fn production_protocol_claim_and_settlement_release_the_canonical_slot() {
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    assert_eq!(settled.slot, ActivationSlot::Idle);
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("settlement should preserve execution authority");
+    let outcome_id = format!("outcome:message:{}", message.id);
+    let attempt = &settled.attempts[&activation_id];
     assert_eq!(
-        settled.work.get(&work_item.id).map(|demand| &demand.status),
-        Some(&WorkStatus::Runnable)
+        attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Settled
     );
     assert_eq!(
-        settled
-            .work
-            .get(&work_item.id)
-            .map(|demand| demand.scheduling_generation),
-        Some(work_item.revision + 1)
+        attempt.terminal_outcome_id.as_deref(),
+        Some(outcome_id.as_str())
     );
-    assert!(settled
-        .settlements
-        .contains_key(&canonical_settlement_id(&message.id)));
+    assert_eq!(
+        settled.outcomes[&outcome_id].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Continue,
+        )
+    );
+    assert_eq!(
+        settled.work_items[&work_item.id].source_revision,
+        work_item.revision
+    );
+    assert_eq!(
+        settled.work_items[&work_item.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Runnable {
+            generation: work_item.revision + 1,
+            recovery_ref: None,
+        }
+    );
     assert_eq!(
         runtime
             .inner
@@ -2307,6 +4022,572 @@ async fn production_protocol_claim_and_settlement_release_the_canonical_slot() {
             .map(|entry| entry.status),
         Some(QueueEntryStatus::Processed)
     );
+
+    drop(runtime);
+    let reopened = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened
+            .inner
+            .runtime_db
+            .transitions()
+            .load_execution_protocol_state_if_initialized("default")
+            .unwrap(),
+        Some(settled)
+    );
+}
+
+#[tokio::test]
+async fn production_settlement_ignores_foreign_turn_read_model_yield_divergence() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let owner = runtime
+        .create_work_item("canonical settlement owner".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let target = runtime
+        .create_work_item(
+            "foreign turn continuation target".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::SystemTick,
+        MessageOrigin::System {
+            subsystem: "work_queue".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "settle from canonical facts".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    bind_autonomous_work_queue_tick(&mut message, &owner, "queued_available");
+    message.turn_id = Some("turn-canonical-read-model-divergence".into());
+    let message = runtime.enqueue(message).await.unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+
+    runtime
+        .storage()
+        .append_work_item_continuation(&crate::types::WorkItemContinuationFrame::new_on_completed(
+            "default",
+            owner.id.clone(),
+            target.id,
+            Some("turn-foreign-continuation".into()),
+        ))
+        .unwrap();
+    let projection = runtime.storage().work_queue_prompt_projection().unwrap();
+    assert_eq!(
+        projection
+            .items
+            .iter()
+            .find(|item| item.work_item.id == owner.id)
+            .map(|item| item.scheduling_state),
+        Some(WorkItemSchedulingState::YieldedToWorkItem)
+    );
+
+    finish_claimed_test_run(&runtime).await;
+    let terminal = terminal_transition(&message, Some(&owner.id));
+    runtime
+        .commit_queue_terminal_settlement(
+            QueueEntryRecord {
+                message_id: message.id.clone(),
+                agent_id: message.agent_id.clone(),
+                priority: message.priority,
+                status: QueueEntryStatus::Processed,
+                created_at: message.created_at,
+                updated_at: Utc::now(),
+            },
+            Vec::new(),
+            true,
+            Some(&terminal),
+        )
+        .await
+        .unwrap();
+
+    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+    let settled = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    let attempt = &settled.attempts[&activation_id];
+    assert_eq!(
+        settled.outcomes[attempt.terminal_outcome_id.as_deref().unwrap()].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Continue,
+        )
+    );
+}
+
+#[tokio::test]
+async fn production_settlement_yields_to_exact_matching_revision_continuation() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let owner = runtime
+        .create_work_item("yielding canonical owner".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let target = runtime
+        .create_work_item("canonical yield target".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::SystemTick,
+        MessageOrigin::System {
+            subsystem: "work_queue".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "yield to exact target".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    bind_autonomous_work_queue_tick(&mut message, &owner, "queued_available");
+    message.turn_id = Some("turn-canonical-exact-yield".into());
+    let message = runtime.enqueue(message).await.unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+
+    runtime
+        .storage()
+        .append_work_item_continuation(&crate::types::WorkItemContinuationFrame::new_on_completed(
+            "default",
+            owner.id.clone(),
+            target.id.clone(),
+            message.turn_id.clone(),
+        ))
+        .unwrap();
+    finish_claimed_test_run(&runtime).await;
+    let terminal = terminal_transition(&message, Some(&owner.id));
+    runtime
+        .commit_queue_terminal_settlement(
+            QueueEntryRecord {
+                message_id: message.id.clone(),
+                agent_id: message.agent_id.clone(),
+                priority: message.priority,
+                status: QueueEntryStatus::Processed,
+                created_at: message.created_at,
+                updated_at: Utc::now(),
+            },
+            Vec::new(),
+            true,
+            Some(&terminal),
+        )
+        .await
+        .unwrap();
+
+    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+    let settled = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    let attempt = &settled.attempts[&activation_id];
+    assert!(matches!(
+        &settled.outcomes[attempt.terminal_outcome_id.as_deref().unwrap()].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Yield {
+                target_work_item_id
+            }
+        ) if target_work_item_id == &target.id
+    ));
+    assert_eq!(
+        settled.work_items[&owner.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Paused {
+            generation: owner.revision + 1,
+            reason: format!("yielded_to:{}", target.id),
+        }
+    );
+}
+
+#[tokio::test]
+async fn production_settlement_interrupts_yield_to_stale_execution_revision() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let owner = runtime
+        .create_work_item("stale yield owner".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let target = runtime
+        .create_work_item("stale yield target".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::SystemTick,
+        MessageOrigin::System {
+            subsystem: "work_queue".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "reject stale yield target".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    bind_autonomous_work_queue_tick(&mut message, &owner, "queued_available");
+    message.turn_id = Some("turn-canonical-stale-yield".into());
+    let message = runtime.enqueue(message).await.unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+
+    let mut stale_target = target.clone();
+    stale_target.revision += 1;
+    stale_target.objective = "metadata advanced without canonical execution".into();
+    stale_target.updated_at = Utc::now();
+    runtime.storage().append_work_item(&stale_target).unwrap();
+    runtime
+        .storage()
+        .append_work_item_continuation(&crate::types::WorkItemContinuationFrame::new_on_completed(
+            "default",
+            owner.id.clone(),
+            target.id,
+            message.turn_id.clone(),
+        ))
+        .unwrap();
+
+    finish_claimed_test_run(&runtime).await;
+    let terminal = terminal_transition(&message, Some(&owner.id));
+    runtime
+        .commit_queue_terminal_settlement(
+            QueueEntryRecord {
+                message_id: message.id.clone(),
+                agent_id: message.agent_id.clone(),
+                priority: message.priority,
+                status: QueueEntryStatus::Processed,
+                created_at: message.created_at,
+                updated_at: Utc::now(),
+            },
+            Vec::new(),
+            true,
+            Some(&terminal),
+        )
+        .await
+        .unwrap();
+
+    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+    let settled = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    let attempt = &settled.attempts[&activation_id];
+    assert_eq!(
+        attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Interrupted
+    );
+    assert!(matches!(
+        &settled.outcomes[attempt.terminal_outcome_id.as_deref().unwrap()].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Interrupted { reason }
+        ) if reason == "yield_target_not_runnable"
+    ));
+}
+
+#[tokio::test]
+async fn production_settlement_accepts_authoritative_revision_advance_while_in_flight() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let owner = runtime
+        .create_work_item("advancing canonical owner".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::SystemTick,
+        MessageOrigin::System {
+            subsystem: "work_queue".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "continue after an authoritative revision advance".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    bind_autonomous_work_queue_tick(&mut message, &owner, "queued_available");
+    message.turn_id = Some("turn-canonical-revision-advance".into());
+    let message = runtime.enqueue(message).await.unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+
+    let updated = runtime
+        .update_work_item_fields(
+            owner.id.clone(),
+            Some("advanced while the canonical attempt remains in flight".into()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+    let in_flight = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    let attempt = &in_flight.attempts[&activation_id];
+    assert_eq!(
+        attempt.admitted_fences.work_item_source_revision,
+        Some(owner.revision)
+    );
+    assert_eq!(
+        in_flight.work_items[&owner.id].source_revision,
+        updated.revision
+    );
+    assert!(matches!(
+        &in_flight.work_items[&owner.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::InFlight {
+            attempt_id,
+            ..
+        } if attempt_id == &activation_id
+    ));
+
+    finish_claimed_test_run(&runtime).await;
+    let terminal = terminal_transition(&message, Some(&owner.id));
+    runtime
+        .commit_queue_terminal_settlement(
+            QueueEntryRecord {
+                message_id: message.id.clone(),
+                agent_id: message.agent_id.clone(),
+                priority: message.priority,
+                status: QueueEntryStatus::Processed,
+                created_at: message.created_at,
+                updated_at: Utc::now(),
+            },
+            Vec::new(),
+            true,
+            Some(&terminal),
+        )
+        .await
+        .unwrap();
+
+    let settled = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    let attempt = &settled.attempts[&activation_id];
+    assert_eq!(
+        attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Settled
+    );
+    assert_eq!(
+        settled.outcomes[attempt.terminal_outcome_id.as_deref().unwrap()].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Continue,
+        )
+    );
+}
+
+#[tokio::test]
+async fn production_settlement_interrupts_stale_owner_execution_revision() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let owner = runtime
+        .create_work_item("stale canonical owner".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::SystemTick,
+        MessageOrigin::System {
+            subsystem: "work_queue".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "reject stale owner revision".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    bind_autonomous_work_queue_tick(&mut message, &owner, "queued_available");
+    message.turn_id = Some("turn-canonical-stale-owner".into());
+    let message = runtime.enqueue(message).await.unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+
+    let mut stale_owner = owner.clone();
+    stale_owner.revision += 1;
+    stale_owner.objective = "metadata advanced beyond admitted execution".into();
+    stale_owner.updated_at = Utc::now();
+    runtime.storage().append_work_item(&stale_owner).unwrap();
+
+    finish_claimed_test_run(&runtime).await;
+    let terminal = terminal_transition(&message, Some(&owner.id));
+    runtime
+        .commit_queue_terminal_settlement(
+            QueueEntryRecord {
+                message_id: message.id.clone(),
+                agent_id: message.agent_id.clone(),
+                priority: message.priority,
+                status: QueueEntryStatus::Processed,
+                created_at: message.created_at,
+                updated_at: Utc::now(),
+            },
+            Vec::new(),
+            true,
+            Some(&terminal),
+        )
+        .await
+        .unwrap();
+
+    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+    let settled = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    let attempt = &settled.attempts[&activation_id];
+    assert_eq!(
+        attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Interrupted
+    );
+    assert!(matches!(
+        &settled.outcomes[attempt.terminal_outcome_id.as_deref().unwrap()].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Interrupted { reason }
+        ) if reason == "work_item_execution_revision_mismatch"
+    ));
 }
 
 #[tokio::test]
@@ -2346,7 +4627,7 @@ async fn production_protocol_wait_settlement_creates_rejoinable_wait_generation(
         MessageDeliverySurface::RuntimeSystem,
         AdmissionContext::RuntimeOwned,
     );
-    message.work_item_id = Some(work_item.id.clone());
+    bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
     message.turn_id = Some("turn-canonical-wait-settlement".into());
     let message = runtime.enqueue(message).await.unwrap();
     assert!(matches!(
@@ -2357,6 +4638,7 @@ async fn production_protocol_wait_settlement_creates_rejoinable_wait_generation(
         scheduler_executor::RunLoopPoll::Message(_)
     ));
 
+    append_running_rejoin_task(&runtime, "task-rejoin", &work_item.id);
     let registration = runtime
         .register_wait_for(
             "default",
@@ -2387,33 +4669,37 @@ async fn production_protocol_wait_settlement_creates_rejoinable_wait_generation(
         .await
         .unwrap();
 
+    let first_attempt_id = scheduler_executor::canonical_activation_id(&message.id);
     let settled = runtime
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    let wait_generation = work_item.revision + 1;
-    assert_eq!(settled.slot, ActivationSlot::Idle);
-    assert_eq!(settled.dispatch, AgentDispatchState::Open);
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("WaitFor should preserve execution authority");
+    let first_attempt = &settled.attempts[&first_attempt_id];
     assert_eq!(
-        settled.work.get(&work_item.id).map(|demand| &demand.status),
-        Some(&WorkStatus::Waiting {
-            wait_id: registration.condition.id.clone(),
-        })
+        first_attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Settled
     );
-    assert_eq!(
-        settled
-            .waits
-            .get(&registration.condition.id)
-            .map(|wait| wait.current_generation),
-        Some(wait_generation)
-    );
-    assert!(settled
-        .settlements
-        .contains_key(&canonical_settlement_id(&message.id)));
-    assert!(settled.missing_settlements.is_empty());
+    assert!(matches!(
+        &settled.outcomes[first_attempt.terminal_outcome_id.as_deref().unwrap()].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Wait { wait }
+        ) if wait.wait_id == registration.condition.id
+    ));
+    assert!(matches!(
+        &settled.work_items[&work_item.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Waiting { wait, .. }
+            if wait.wait_id == registration.condition.id
+    ));
 
+    append_completed_rejoin_task(
+        &runtime,
+        "task-rejoin",
+        &work_item.id,
+        "turn-canonical-wait-settlement",
+    );
     let mut rejoin = task_result_message("task-rejoin").with_admission(
         MessageDeliverySurface::TaskRejoin,
         AdmissionContext::RuntimeOwned,
@@ -2435,28 +4721,37 @@ async fn production_protocol_wait_settlement_creates_rejoinable_wait_generation(
             .unwrap(),
         scheduler_executor::RunLoopPoll::Message(_)
     ));
+    let rejoin_attempt_id = scheduler_executor::canonical_activation_id(&rejoin.id);
     let rejoined = runtime
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("task rejoin should preserve execution authority");
     assert!(matches!(
-        rejoined.slot,
-        ActivationSlot::Running {
-            owner: SchedulerOwner::WorkItem { ref work_item_id },
-            admitted_generation,
+        &rejoined.attempts[&rejoin_attempt_id].source.identity,
+        crate::domain::execution_protocol::ExecutionSourceIdentity::TaskResult {
+            task_id,
+            result_message_id,
+        } if task_id == "task-rejoin" && result_message_id == &rejoin.id
+    ));
+    assert!(matches!(
+        &rejoined.work_items[&work_item.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::InFlight {
+            attempt_id,
             ..
-        } if work_item_id == &work_item.id && admitted_generation == wait_generation
+        } if attempt_id == &rejoin_attempt_id
     ));
     assert_eq!(
-        rejoined.waits[&registration.condition.id].generations[&wait_generation].state,
-        WaitState::Consumed
-    );
-    assert_eq!(
-        rejoined.waits[&registration.condition.id].generations[&wait_generation]
-            .consuming_activation_id,
-        Some(scheduler_executor::canonical_activation_id(&rejoin.id))
+        runtime
+            .storage()
+            .latest_wait_conditions()
+            .unwrap()
+            .into_iter()
+            .find(|wait| wait.id == registration.condition.id)
+            .map(|wait| wait.status),
+        Some(WaitConditionStatus::Resolved)
     );
 
     let external_wait = runtime
@@ -2493,38 +4788,39 @@ async fn production_protocol_wait_settlement_creates_rejoinable_wait_generation(
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    let external_wait_generation = wait_generation + 1;
-    assert_eq!(settled_rejoin.slot, ActivationSlot::Idle);
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("second WaitFor should preserve execution authority");
+    let rejoin_attempt = &settled_rejoin.attempts[&rejoin_attempt_id];
     assert_eq!(
-        settled_rejoin
-            .work
-            .get(&work_item.id)
-            .map(|demand| &demand.status),
-        Some(&WorkStatus::Waiting {
-            wait_id: external_wait.condition.id.clone(),
-        })
+        rejoin_attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Settled
     );
+    assert!(matches!(
+        &settled_rejoin.outcomes
+            [rejoin_attempt.terminal_outcome_id.as_deref().unwrap()]
+            .outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Wait { wait }
+        ) if wait.wait_id == external_wait.condition.id
+    ));
+    assert!(matches!(
+        &settled_rejoin.work_items[&work_item.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Waiting { wait, .. }
+            if wait.wait_id == external_wait.condition.id
+    ));
     assert_eq!(
-        settled_rejoin
-            .waits
-            .get(&external_wait.condition.id)
-            .map(|wait| wait.current_generation),
-        Some(external_wait_generation)
+        runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest_all()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == rejoin.id)
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Processed)
     );
-    assert_eq!(
-        settled_rejoin.waits[&registration.condition.id].generations[&wait_generation].state,
-        WaitState::Resolved
-    );
-    assert_eq!(
-        settled_rejoin.waits[&registration.condition.id].generations[&wait_generation]
-            .consuming_activation_id,
-        None
-    );
-    assert!(settled_rejoin
-        .settlements
-        .contains_key(&canonical_settlement_id(&rejoin.id)));
 }
 
 #[tokio::test]
@@ -2615,25 +4911,33 @@ async fn lifecycle_settlement_adopts_wait_without_work_item_turn_binding() {
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
         .unwrap();
-    assert_eq!(settled.slot, ActivationSlot::Idle);
+    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+    let attempt = &settled.attempts[&activation_id];
     assert_eq!(
-        settled.work.get(&work_item.id).map(|demand| &demand.status),
-        Some(&WorkStatus::Waiting {
-            wait_id: registration.condition.id.clone(),
-        })
+        attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Settled
     );
+    assert!(matches!(
+        &settled.outcomes[attempt.terminal_outcome_id.as_deref().unwrap()].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::Conversation(
+            crate::domain::execution_protocol::ConversationOutcome::HandoffToWorkItemWait {
+                work_item_id,
+                wait,
+            }
+        ) if work_item_id == &work_item.id && wait.wait_id == registration.condition.id
+    ));
+    assert!(matches!(
+        &settled.work_items[&work_item.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Waiting { wait, .. }
+            if wait.wait_id == registration.condition.id
+    ));
     assert_eq!(
-        settled.waits[&registration.condition.id].generations[&updated_work_item.revision].owner,
-        SchedulerOwner::WorkItem {
-            work_item_id: work_item.id.clone(),
-        }
+        settled.work_items[&work_item.id].source_revision,
+        updated_work_item.revision
     );
-    assert!(settled
-        .settlements
-        .contains_key(&canonical_settlement_id(&message.id)));
-    assert!(settled.missing_settlements.is_empty());
     assert_eq!(
         runtime
             .inner
@@ -2676,20 +4980,6 @@ async fn lifecycle_wait_handoff_to_work_item_wait_is_atomic_idempotent_and_resta
         )
         .await
         .unwrap();
-    let lifecycle_generation = 1;
-    runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .initialize_scheduler_protocol_partition(
-            "default",
-            &canonical_lifecycle_waiting_snapshot(
-                &lifecycle_wait.condition.id,
-                lifecycle_generation,
-            ),
-        )
-        .unwrap();
-
     let mut message = trusted_operator_prompt(None, "create a WorkItem and wait for its task");
     message.turn_id = Some("turn-lifecycle-wait-handoff".into());
     let message = runtime.enqueue(message).await.unwrap();
@@ -2705,14 +4995,26 @@ async fn lifecycle_wait_handoff_to_work_item_wait_is_atomic_idempotent_and_resta
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
         .unwrap();
     assert!(matches!(
-        &admitted.activation_admissions[&activation_id]
-            .activation
-            .cause,
-        ActivationCause::LifecycleExternalNudge { message_id }
-            if message_id == &message.id
+        &admitted.attempts[&activation_id],
+        crate::domain::execution_protocol::ExecutionAttempt {
+            binding: crate::domain::execution_protocol::ExecutionBinding::Conversation {
+                interaction_id
+            },
+            source:
+                crate::domain::execution_protocol::ExecutionSource {
+                    identity:
+                        crate::domain::execution_protocol::ExecutionSourceIdentity::QueueMessage {
+                            message_id
+                        },
+                    ..
+                },
+            state: crate::domain::execution_protocol::ExecutionAttemptState::Open,
+            ..
+        } if interaction_id.starts_with("interaction1_") && message_id == &message.id
     ));
 
     runtime
@@ -2729,6 +5031,7 @@ async fn lifecycle_wait_handoff_to_work_item_wait_is_atomic_idempotent_and_resta
         .await
         .unwrap();
     runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    append_running_rejoin_task(&runtime, "task-lifecycle-handoff", &work_item.id);
     let work_wait = runtime
         .register_wait_for(
             "default",
@@ -2765,52 +5068,43 @@ async fn lifecycle_wait_handoff_to_work_item_wait_is_atomic_idempotent_and_resta
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
         .unwrap();
-    let work_generation = updated_work_item.revision;
-    assert_eq!(settled.slot, ActivationSlot::Idle);
+    let work_generation = settled.work_items[&work_item.id].state.generation();
+    let attempt = &settled.attempts[&activation_id];
     assert_eq!(
-        settled.waits[&lifecycle_wait.condition.id].generations[&lifecycle_generation].state,
-        WaitState::Resolved
+        attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Settled
     );
-    assert_eq!(
-        settled.work[&work_item.id].status,
-        WorkStatus::Waiting {
-            wait_id: work_wait.condition.id.clone(),
-        }
-    );
-    assert_eq!(
-        settled.waits[&work_wait.condition.id].generations[&work_generation].owner,
-        SchedulerOwner::WorkItem {
-            work_item_id: work_item.id.clone(),
-        }
-    );
-    assert_eq!(
-        settled.dispatch,
-        AgentDispatchState::Awaiting {
-            wait: WaitIdentity {
-                id: work_wait.condition.id.clone(),
-                generation: work_generation,
-            },
-        }
-    );
-    assert_eq!(settled.focus.as_deref(), Some(work_item.id.as_str()));
-    assert!(settled.missing_settlements.is_empty());
-
-    let replay_commands = runtime
-        .canonical_queue_settlement_commands(&processed, Some(&terminal.turn_record))
-        .await
-        .unwrap();
     assert!(matches!(
-        replay_commands.as_slice(),
-        [crate::domain::scheduler_protocol::ProtocolCommand::SettleActivation(_)]
+        &settled.outcomes[attempt.terminal_outcome_id.as_deref().unwrap()].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::Conversation(
+            crate::domain::execution_protocol::ConversationOutcome::HandoffToWorkItemWait {
+                work_item_id,
+                wait,
+            }
+        ) if work_item_id == &work_item.id && wait.wait_id == work_wait.condition.id
     ));
-    assert!(!runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .commit_scheduler_recovery_plan("default", &replay_commands)
-        .unwrap());
+    assert!(matches!(
+        &settled.work_items[&work_item.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Waiting { wait, .. }
+            if wait.wait_id == work_wait.condition.id
+    ));
+    assert_eq!(
+        settled.work_items[&work_item.id].source_revision,
+        updated_work_item.revision
+    );
+    assert_eq!(
+        runtime
+            .storage()
+            .raw_unresolved_wait_conditions_for_agent("default")
+            .unwrap()
+            .into_iter()
+            .find(|condition| condition.id == lifecycle_wait.condition.id)
+            .map(|condition| condition.status),
+        Some(WaitConditionStatus::Active)
+    );
 
     drop(runtime);
     let reopened = RuntimeHandle::new(
@@ -2826,6 +5120,23 @@ async fn lifecycle_wait_handoff_to_work_item_wait_is_atomic_idempotent_and_resta
         context_config(),
     )
     .unwrap();
+    let terminal_task = TaskRecord {
+        id: "task-lifecycle-handoff".into(),
+        agent_id: "default".into(),
+        kind: TaskKind::CommandTask,
+        status: TaskStatus::Completed,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        parent_message_id: None,
+        work_item_id: Some(work_item.id.clone()),
+        summary: Some("task-lifecycle-handoff completed".into()),
+        detail: Some(serde_json::json!({
+            "rejoin_obligation_id": "task-lifecycle-handoff",
+            "rejoin_generation": 1,
+            "parent_turn_id": "turn-lifecycle-wait-handoff",
+        })),
+        recovery: None,
+    };
     let mut rejoin = task_result_message("task-lifecycle-handoff").with_admission(
         MessageDeliverySurface::TaskRejoin,
         AdmissionContext::RuntimeOwned,
@@ -2839,7 +5150,18 @@ async fn lifecycle_wait_handoff_to_work_item_wait_is_atomic_idempotent_and_resta
         "work_item_id": work_item.id,
     }));
     rejoin.turn_id = Some("turn-lifecycle-handoff-rejoin".into());
-    let rejoin = reopened.enqueue(rejoin).await.unwrap();
+    reopened
+        .commit_terminal_task_result(&terminal_task, "task_completed", &rejoin)
+        .await
+        .unwrap();
+    let triggered = reopened
+        .storage()
+        .latest_wait_conditions()
+        .unwrap()
+        .into_iter()
+        .find(|condition| condition.id == work_wait.condition.id)
+        .expect("triggered task wait");
+    assert_eq!(triggered.status, WaitConditionStatus::Triggered);
     assert!(matches!(
         scheduler_executor::SchedulerDecisionExecutor::new(&reopened)
             .poll()
@@ -2847,30 +5169,654 @@ async fn lifecycle_wait_handoff_to_work_item_wait_is_atomic_idempotent_and_resta
             .unwrap(),
         scheduler_executor::RunLoopPoll::Message(_)
     ));
+    let resolved_work_item = reopened
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .expect("task result should retain the WorkItem");
+    assert!(resolved_work_item.revision > work_generation);
     let rejoined = reopened
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
         .unwrap();
+    let rejoin_activation_id = scheduler_executor::canonical_activation_id(&rejoin.id);
     assert!(matches!(
-        rejoined.slot,
-        ActivationSlot::Running {
-            owner: SchedulerOwner::WorkItem { ref work_item_id },
-            admitted_generation,
+        &rejoined.attempts[&rejoin_activation_id],
+        crate::domain::execution_protocol::ExecutionAttempt {
+            binding: crate::domain::execution_protocol::ExecutionBinding::WorkItem {
+                work_item_id
+            },
+            source:
+                crate::domain::execution_protocol::ExecutionSource {
+                    identity:
+                        crate::domain::execution_protocol::ExecutionSourceIdentity::TaskResult {
+                            task_id,
+                            result_message_id,
+                        },
+                    ..
+                },
+            state: crate::domain::execution_protocol::ExecutionAttemptState::Open,
             ..
-        } if work_item_id == &work_item.id && admitted_generation == work_generation
+        } if work_item_id == &work_item.id
+            && task_id == "task-lifecycle-handoff"
+            && result_message_id == &rejoin.id
+    ));
+    assert!(matches!(
+        &rejoined.work_items[&work_item.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::InFlight {
+            generation,
+            attempt_id,
+        } if *generation == work_generation && attempt_id == &rejoin_activation_id
     ));
     assert_eq!(
-        rejoined.waits[&work_wait.condition.id].generations[&work_generation].state,
-        WaitState::Consumed
+        reopened
+            .storage()
+            .latest_wait_conditions()
+            .unwrap()
+            .into_iter()
+            .find(|condition| condition.id == work_wait.condition.id)
+            .map(|condition| condition.status),
+        Some(WaitConditionStatus::Resolved)
+    );
+}
+
+#[tokio::test]
+async fn exact_task_rejoin_uses_canonical_wait_when_work_item_revision_advanced() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "task rejoin with stale legacy projection".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    append_running_rejoin_task(&runtime, "task-stale-legacy-rejoin", &work_item.id);
+    let registration = runtime
+        .register_wait_for(
+            "default",
+            Some(work_item.id.clone()),
+            WaitForWakeKind::TaskResult,
+            Some("task-stale-legacy-rejoin".into()),
+            "waiting for stale legacy rejoin task".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let waiting_work = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .expect("waiting WorkItem");
+    let wait_generation = waiting_work.revision;
+    let mut execution = crate::domain::execution_protocol::ExecutionProtocolState::empty("default");
+    execution.work_items.insert(
+        work_item.id.clone(),
+        crate::domain::execution_protocol::WorkItemExecutionRecord {
+            source_revision: work_item.revision.max(1),
+            state: crate::domain::execution_protocol::WorkItemExecutionState::Waiting {
+                generation: wait_generation,
+                wait: crate::domain::execution_protocol::WaitReference {
+                    wait_id: registration.condition.id.clone(),
+                },
+            },
+        },
+    );
+    runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &execution))
+        .unwrap();
+
+    let terminal_task = TaskRecord {
+        id: "task-stale-legacy-rejoin".into(),
+        agent_id: "default".into(),
+        kind: TaskKind::CommandTask,
+        status: TaskStatus::Completed,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        parent_message_id: None,
+        work_item_id: Some(work_item.id.clone()),
+        summary: Some("task-stale-legacy-rejoin completed".into()),
+        detail: Some(serde_json::json!({
+            "rejoin_obligation_id": "task-stale-legacy-rejoin",
+            "rejoin_generation": 1,
+            "parent_turn_id": "turn-stale-legacy-parent",
+        })),
+        recovery: None,
+    };
+    let mut rejoin = task_result_message("task-stale-legacy-rejoin").with_admission(
+        MessageDeliverySurface::TaskRejoin,
+        AdmissionContext::RuntimeOwned,
+    );
+    rejoin.work_item_id = Some(work_item.id.clone());
+    rejoin.metadata = Some(serde_json::json!({
+        "task_id": "task-stale-legacy-rejoin",
+        "task_kind": "command_task",
+        "task_status": "completed",
+        "task_result_id": "result-stale-legacy-rejoin",
+        "work_item_id": work_item.id,
+    }));
+    rejoin.turn_id = Some("turn-stale-legacy-rejoin".into());
+    runtime
+        .commit_terminal_task_result(&terminal_task, "task_completed", &rejoin)
+        .await
+        .unwrap();
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
+        .unwrap();
+    assert!(matches!(poll, scheduler_executor::RunLoopPoll::Message(_)));
+    let resolved_work = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .expect("resolved WorkItem");
+    assert!(resolved_work.revision > wait_generation);
+    let resolved_execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("task result should preserve execution authority");
+    assert_eq!(
+        resolved_execution.work_items[&work_item.id].source_revision,
+        resolved_work.revision
+    );
+    let claimed = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("task rejoin should preserve execution authority");
+    let attempt_id = scheduler_executor::canonical_activation_id(&rejoin.id);
+    assert!(matches!(
+        claimed.attempts[&attempt_id].binding,
+        crate::domain::execution_protocol::ExecutionBinding::WorkItem {
+            ref work_item_id
+        } if work_item_id == &work_item.id
+    ));
+    assert!(matches!(
+        claimed.attempts[&attempt_id].source.identity,
+        crate::domain::execution_protocol::ExecutionSourceIdentity::TaskResult {
+            ref task_id,
+            ref result_message_id,
+        } if task_id == "task-stale-legacy-rejoin" && result_message_id == &rejoin.id
+    ));
+    assert_eq!(
+        claimed.attempts[&attempt_id]
+            .admitted_fences
+            .work_item_source_revision,
+        Some(resolved_work.revision)
     );
     assert_eq!(
-        rejoined.waits[&work_wait.condition.id].generations[&work_generation]
-            .consuming_activation_id
-            .as_deref(),
-        Some(scheduler_executor::canonical_activation_id(&rejoin.id).as_str())
+        runtime
+            .storage()
+            .latest_wait_conditions()
+            .unwrap()
+            .into_iter()
+            .find(|wait| wait.id == registration.condition.id)
+            .map(|wait| wait.status),
+        Some(WaitConditionStatus::Resolved)
     );
+    assert_eq!(
+        runtime
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest_all()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == rejoin.id)
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Dequeued)
+    );
+}
+
+#[tokio::test]
+async fn stale_exact_task_rejoin_is_dropped_without_blocking_next_message() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "drop stale task rejoin queue head".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    append_running_rejoin_task(&runtime, "task-current-rejoin", &work_item.id);
+    let registration = runtime
+        .register_wait_for(
+            "default",
+            Some(work_item.id.clone()),
+            WaitForWakeKind::TaskResult,
+            Some("task-current-rejoin".into()),
+            "waiting for current task".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let waiting_work = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .expect("waiting WorkItem");
+    let wait_generation = waiting_work.revision;
+    let mut execution = crate::domain::execution_protocol::ExecutionProtocolState::empty("default");
+    execution.work_items.insert(
+        work_item.id.clone(),
+        crate::domain::execution_protocol::WorkItemExecutionRecord {
+            source_revision: work_item.revision.max(1),
+            state: crate::domain::execution_protocol::WorkItemExecutionState::Waiting {
+                generation: wait_generation,
+                wait: crate::domain::execution_protocol::WaitReference {
+                    wait_id: registration.condition.id.clone(),
+                },
+            },
+        },
+    );
+    runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &execution))
+        .unwrap();
+    append_completed_rejoin_task(
+        &runtime,
+        "task-stale-rejoin",
+        &work_item.id,
+        "turn-stale-rejoin-parent",
+    );
+    append_completed_rejoin_task(
+        &runtime,
+        "task-current-rejoin",
+        &work_item.id,
+        "turn-current-rejoin-parent",
+    );
+
+    let mut stale = task_result_message("task-stale-rejoin").with_admission(
+        MessageDeliverySurface::TaskRejoin,
+        AdmissionContext::RuntimeOwned,
+    );
+    stale.work_item_id = Some(work_item.id.clone());
+    stale.metadata = Some(serde_json::json!({
+        "task_id": "task-stale-rejoin",
+        "task_kind": "command_task",
+        "task_status": "completed",
+        "task_result_id": "result-stale-rejoin",
+        "work_item_id": work_item.id,
+    }));
+    stale.turn_id = Some("turn-stale-rejoin".into());
+    let stale = runtime.enqueue(stale).await.unwrap();
+    let mut valid = task_result_message("task-current-rejoin").with_admission(
+        MessageDeliverySurface::TaskRejoin,
+        AdmissionContext::RuntimeOwned,
+    );
+    valid.work_item_id = Some(work_item.id.clone());
+    valid.metadata = Some(serde_json::json!({
+        "task_id": "task-current-rejoin",
+        "task_kind": "command_task",
+        "task_status": "completed",
+        "task_result_id": "result-current-rejoin",
+        "work_item_id": work_item.id,
+    }));
+    valid.turn_id = Some("turn-current-rejoin".into());
+    let valid = runtime.enqueue(valid).await.unwrap();
+
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Idle
+    ));
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_queue_entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == stale.id)
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Dropped)
+    );
+    assert!(runtime
+        .storage()
+        .read_recent_events(usize::MAX)
+        .unwrap()
+        .iter()
+        .any(|event| {
+            event.kind == "scheduler_authority_input_rejected"
+                && event.data["message_id"] == stale.id
+                && event.data["reason"] == "canonical_task_rejoin_stale"
+                && event.data["queue_disposition"] == "dropped"
+        }));
+
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("valid message behind stale task result should be claimed");
+    };
+    assert_eq!(scheduled.message.id, valid.id);
+}
+
+#[tokio::test]
+async fn task_rejoin_without_execution_owner_is_dropped() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "pre-cutover task result owner".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    append_running_rejoin_task(&runtime, "task-pre-cutover", &work_item.id);
+    let registration = runtime
+        .register_wait_for(
+            "default",
+            Some(work_item.id.clone()),
+            WaitForWakeKind::TaskResult,
+            Some("task-pre-cutover".into()),
+            "legacy task wait".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let _waiting_work = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .expect("waiting WorkItem");
+    let mut stale = task_result_message("task-pre-cutover").with_admission(
+        MessageDeliverySurface::TaskRejoin,
+        AdmissionContext::RuntimeOwned,
+    );
+    stale.work_item_id = Some(work_item.id.clone());
+    stale.metadata = Some(serde_json::json!({
+        "task_id": "task-pre-cutover",
+        "task_kind": "command_task",
+        "task_status": "completed",
+        "task_result_id": "result-pre-cutover",
+        "work_item_id": work_item.id,
+    }));
+    stale.turn_id = Some("turn-pre-cutover".into());
+    let running = runtime
+        .storage()
+        .latest_task_record("task-pre-cutover")
+        .unwrap()
+        .expect("running task");
+    let terminal = TaskRecord {
+        status: TaskStatus::Completed,
+        updated_at: Utc::now(),
+        parent_message_id: Some(stale.id.clone()),
+        detail: Some(serde_json::json!({
+            "rejoin_obligation_id": "task-pre-cutover",
+            "rejoin_generation": 1,
+            "parent_turn_id": "turn-pre-cutover-parent",
+        })),
+        ..running
+    };
+    runtime
+        .persist_task_transition_with_message(&terminal, "task_status_updated", &stale)
+        .await
+        .unwrap();
+    let mut legacy_resolved = registration.condition.clone();
+    legacy_resolved.status = WaitConditionStatus::Resolved;
+    legacy_resolved.trigger_message_id = Some(stale.id.clone());
+    legacy_resolved.resolved_at = Some(Utc::now());
+    legacy_resolved.updated_at = Utc::now();
+    runtime
+        .storage()
+        .append_wait_condition(&legacy_resolved)
+        .unwrap();
+    let completing = runtime
+        .complete_work_item(work_item.id.clone(), Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(completing.state, WorkItemState::Completing);
+    assert!(runtime
+        .storage()
+        .latest_wait_conditions()
+        .unwrap()
+        .into_iter()
+        .any(|condition| {
+            condition.id == registration.condition.id
+                && condition.status == WaitConditionStatus::Resolved
+        }));
+    runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| {
+            tx.execute(
+                "DELETE FROM execution_protocol_work_items
+                 WHERE agent_id = ?1 AND work_item_id = ?2",
+                ["default", work_item.id.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let stale = runtime.enqueue(stale).await.unwrap();
+    let valid = runtime
+        .enqueue(trusted_operator_prompt(
+            None,
+            "continue after pre-cutover task result",
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Idle
+    ));
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_queue_entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == stale.id)
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Dropped)
+    );
+    let stale_events = runtime
+        .storage()
+        .read_recent_events(usize::MAX)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.data["message_id"] == stale.id)
+        .collect::<Vec<_>>();
+    assert!(
+        stale_events.iter().any(|event| {
+            event.kind == "scheduler_authority_input_rejected"
+                && event.data["reason"] == "canonical_task_rejoin_stale"
+                && event.data["queue_disposition"] == "dropped"
+        }),
+        "unexpected stale task-result events: {stale_events:#?}"
+    );
+
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("valid message behind pre-cutover task result should be claimed");
+    };
+    assert_eq!(scheduled.message.id, valid.id);
+}
+
+#[tokio::test]
+async fn task_rejoin_missing_from_initialized_execution_partition_is_rejected() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "pre-cutover exact task wait".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    append_running_rejoin_task(&runtime, "task-pre-cutover-current", &work_item.id);
+    let _registration = runtime
+        .register_wait_for(
+            "default",
+            Some(work_item.id.clone()),
+            WaitForWakeKind::TaskResult,
+            Some("task-pre-cutover-current".into()),
+            "current exact task wait".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let _waiting_work = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .expect("waiting WorkItem");
+    runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| {
+            tx.execute(
+                "DELETE FROM execution_protocol_work_items
+                 WHERE agent_id = ?1 AND work_item_id = ?2",
+                ["default", work_item.id.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    append_completed_rejoin_task(
+        &runtime,
+        "task-pre-cutover-current",
+        &work_item.id,
+        "turn-pre-cutover-current-parent",
+    );
+
+    let mut result = task_result_message("task-pre-cutover-current").with_admission(
+        MessageDeliverySurface::TaskRejoin,
+        AdmissionContext::RuntimeOwned,
+    );
+    result.work_item_id = Some(work_item.id.clone());
+    result.metadata = Some(serde_json::json!({
+        "task_id": "task-pre-cutover-current",
+        "task_kind": "command_task",
+        "task_status": "completed",
+        "task_result_id": "result-pre-cutover-current",
+        "work_item_id": work_item.id,
+    }));
+    let result = runtime.enqueue(result).await.unwrap();
+
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Idle
+    ));
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_queue_entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == result.id)
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Dropped)
+    );
+    assert!(runtime
+        .storage()
+        .read_recent_events(usize::MAX)
+        .unwrap()
+        .iter()
+        .any(|event| {
+            event.kind == "scheduler_authority_input_rejected"
+                && event.data["message_id"] == result.id
+                && event.data["reason"] == "canonical_wait_execution_authority_missing"
+        }));
+    assert!(!runtime
+        .storage()
+        .read_recent_events(usize::MAX)
+        .unwrap()
+        .iter()
+        .any(|event| {
+            event.kind == "scheduler_authority_input_rejected"
+                && event.data["message_id"] == result.id
+                && event.data["reason"] == "canonical_task_rejoin_stale"
+        }));
 }
 
 #[tokio::test]
@@ -2895,6 +5841,7 @@ async fn exact_task_rejoin_claim_is_atomic_and_restart_safe() {
         .await
         .unwrap();
     runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    append_running_rejoin_task(&runtime, "task-rejoin", &work_item.id);
     let registration = runtime
         .register_wait_for(
             "default",
@@ -2911,54 +5858,15 @@ async fn exact_task_rejoin_claim_is_atomic_and_restart_safe() {
         .await
         .unwrap()
         .unwrap();
-    let wait_generation = work_item.revision;
-    let initial_seed =
-        canonical_waiting_snapshot(&work_item, &registration.condition.id, wait_generation);
-    runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .initialize_scheduler_protocol_partition("default", &initial_seed)
-        .unwrap();
-    let initial = runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    runtime
-        .persist_task_transition(
-            &TaskRecord {
-                id: "task-rejoin".into(),
-                agent_id: "default".into(),
-                kind: TaskKind::CommandTask,
-                status: TaskStatus::Completed,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                parent_message_id: None,
-                work_item_id: Some(work_item.id.clone()),
-                summary: Some("task-rejoin".into()),
-                detail: None,
-                recovery: None,
-            },
-            "task_completed",
-        )
-        .await
-        .unwrap();
-    assert!(runtime
-        .storage()
-        .active_wait_conditions_for_work_item("default", &work_item.id)
-        .unwrap()
-        .is_empty());
+    persist_waiting_work_execution(&runtime, &work_item, &registration.condition.id);
+    append_completed_rejoin_task(&runtime, "task-rejoin", &work_item.id, "turn-task-parent");
     assert_eq!(
         runtime
             .storage()
-            .latest_wait_conditions()
+            .active_wait_conditions_for_work_item("default", &work_item.id)
             .unwrap()
-            .into_iter()
-            .find(|condition| condition.id == registration.condition.id)
-            .map(|condition| condition.status),
-        Some(WaitConditionStatus::Resolved)
+            .len(),
+        1
     );
 
     let mut message = task_result_message("task-rejoin").with_admission(
@@ -2975,10 +5883,17 @@ async fn exact_task_rejoin_claim_is_atomic_and_restart_safe() {
     }));
     let message = runtime.enqueue(message).await.unwrap();
     let state_before_claim = runtime.agent_state().await.unwrap();
+    let execution_before_claim = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("waiting execution authority");
+
     runtime.inject_next_transition_fault(
         crate::runtime_db::transitions::TransitionFaultPoint::AfterCanonicalWrites,
     );
-
     let error = match scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
         .poll()
         .await
@@ -2993,9 +5908,9 @@ async fn exact_task_rejoin_claim_is_atomic_and_restart_safe() {
             .inner
             .runtime_db
             .transitions()
-            .load_scheduler_protocol_snapshot("default")
+            .load_execution_protocol_state_if_initialized("default")
             .unwrap(),
-        initial
+        Some(execution_before_claim)
     );
     assert_eq!(
         runtime
@@ -3009,6 +5924,16 @@ async fn exact_task_rejoin_claim_is_atomic_and_restart_safe() {
             .map(|entry| entry.status),
         Some(QueueEntryStatus::Queued)
     );
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_wait_conditions()
+            .unwrap()
+            .into_iter()
+            .find(|condition| condition.id == registration.condition.id)
+            .map(|condition| condition.status),
+        Some(WaitConditionStatus::Triggered)
+    );
 
     let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
         .poll()
@@ -3019,45 +5944,52 @@ async fn exact_task_rejoin_claim_is_atomic_and_restart_safe() {
     };
     assert_eq!(scheduled.message.id, message.id);
     let activation_id = scheduler_executor::canonical_activation_id(&message.id);
-    let claimed = runtime
+    let execution = runtime
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("canonical claim should preserve execution protocol");
+    let attempt = &execution.attempts[&activation_id];
     assert_eq!(
-        claimed.slot,
-        ActivationSlot::Running {
-            activation_id: activation_id.clone(),
-            owner: SchedulerOwner::WorkItem {
-                work_item_id: work_item.id.clone(),
-            },
-            admitted_generation: work_item.revision,
-            recovery_for: None,
+        attempt.source.identity,
+        crate::domain::execution_protocol::ExecutionSourceIdentity::TaskResult {
+            task_id: "task-rejoin".into(),
+            result_message_id: message.id.clone(),
         }
     );
     assert_eq!(
-        claimed.waits[&registration.condition.id].generations[&wait_generation].state,
-        WaitState::Consumed
+        attempt.binding,
+        crate::domain::execution_protocol::ExecutionBinding::WorkItem {
+            work_item_id: work_item.id.clone(),
+        }
     );
     assert_eq!(
-        claimed.waits[&registration.condition.id].generations[&wait_generation]
-            .consuming_activation_id
-            .as_deref(),
-        Some(activation_id.as_str())
+        attempt.admitted_fences.rejoin,
+        Some(crate::domain::execution_protocol::RejoinFence {
+            obligation_id: "task-rejoin".into(),
+            generation: 1,
+            parent_turn_id: "turn-task-parent".into(),
+        })
     );
-    let admission = &claimed.activation_admissions[&activation_id].activation;
     assert!(matches!(
-        &admission.cause,
-        ActivationCause::TaskRejoin {
-            task_id,
-            message_id,
-            resume: Some(resume),
-        } if task_id == "task-rejoin"
-            && message_id == &message.id
-            && resume.wait_id == registration.condition.id
-            && resume.wait_generation == wait_generation
+        execution.work_items[&work_item.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::InFlight {
+            ref attempt_id,
+            ..
+        } if attempt_id == &activation_id
     ));
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_wait_conditions()
+            .unwrap()
+            .into_iter()
+            .find(|condition| condition.id == registration.condition.id)
+            .map(|condition| condition.status),
+        Some(WaitConditionStatus::Resolved)
+    );
     assert_eq!(
         runtime
             .inner
@@ -3085,17 +6017,19 @@ async fn exact_task_rejoin_claim_is_atomic_and_restart_safe() {
         context_config(),
     )
     .unwrap();
-    let restarted = reopened
-        .inner
-        .runtime_db
-        .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    assert_eq!(restarted, claimed);
+    assert_eq!(
+        reopened
+            .inner
+            .runtime_db
+            .transitions()
+            .load_execution_protocol_state_if_initialized("default")
+            .unwrap(),
+        Some(execution)
+    );
 }
 
 #[tokio::test]
-async fn terminal_task_result_without_work_item_uses_non_reentrant_dispatch() {
+async fn terminal_task_result_without_work_item_uses_reentrant_dispatch() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let runtime = RuntimeHandle::new(
@@ -3140,23 +6074,34 @@ async fn terminal_task_result_without_work_item_uses_non_reentrant_dispatch() {
     }));
     let message = runtime.enqueue(message).await.unwrap();
     assert!(message.work_item_id.is_none());
-    assert!(runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .load_scheduler_protocol_snapshot_if_initialized("default")
-        .unwrap()
-        .is_none());
+    assert_eq!(
+        scheduler::canonical_activation_candidate(
+            &message,
+            None,
+            runtime
+                .storage()
+                .latest_task_record("task-without-work-item")
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap(),
+        Some(scheduler::CanonicalActivationCandidate::UnboundTaskResultWaitOrReduce)
+    );
 
     let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
         .poll()
         .await
         .unwrap();
     let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
-        panic!("task result without a WorkItem should use ordinary dispatch");
+        panic!("unbound terminal TaskResult should be dispatched as the queued message");
     };
     assert_eq!(scheduled.message.id, message.id);
-    assert!(!scheduled
+    assert_eq!(
+        scheduled.scheduler_decision.kind,
+        scheduler::SchedulerDecisionKind::StartModelTurn
+    );
+    assert!(scheduled.scheduler_decision.model_reentry);
+    assert!(scheduled
         .dispatch_plan
         .continuation_resolution
         .as_ref()
@@ -3173,13 +6118,245 @@ async fn terminal_task_result_without_work_item_uses_non_reentrant_dispatch() {
             .map(|entry| entry.status),
         Some(QueueEntryStatus::Dequeued)
     );
-    assert!(runtime
+}
+
+#[tokio::test]
+async fn bootstrap_completion_releases_all_waiters() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let first = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.wait_for_bootstrap().await })
+    };
+    let second = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.wait_for_bootstrap().await })
+    };
+
+    tokio::task::yield_now().await;
+    runtime.complete_bootstrap(&Ok(()));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+    })
+    .await
+    .expect("all bootstrap waiters should observe the durable result");
+}
+
+#[tokio::test]
+async fn terminal_task_result_resumes_exact_agent_lifecycle_task_wait() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    runtime
+        .storage()
+        .append_task(&TaskRecord {
+            id: "task-lifecycle-wait".into(),
+            agent_id: "default".into(),
+            kind: TaskKind::CommandTask,
+            status: TaskStatus::Running,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            parent_message_id: None,
+            work_item_id: None,
+            summary: Some("task lifecycle wait".into()),
+            detail: None,
+            recovery: None,
+        })
+        .unwrap();
+    let registration = runtime
+        .register_wait_for(
+            "default",
+            None,
+            WaitForWakeKind::TaskResult,
+            Some("task-lifecycle-wait".into()),
+            "waiting for lifecycle task".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut message = task_result_message("task-lifecycle-wait").with_admission(
+        MessageDeliverySurface::TaskRejoin,
+        AdmissionContext::RuntimeOwned,
+    );
+    message.task_id = Some("task-lifecycle-wait".into());
+    message.metadata = Some(serde_json::json!({
+        "task_id": "task-lifecycle-wait",
+        "task_kind": "command_task",
+        "task_status": "completed",
+        "task_result_id": "result-lifecycle-wait",
+    }));
+    let terminal = TaskRecord {
+        status: TaskStatus::Completed,
+        updated_at: Utc::now(),
+        parent_message_id: Some(message.id.clone()),
+        ..runtime
+            .task_record("task-lifecycle-wait")
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    runtime
+        .commit_terminal_task_result(&terminal, "command_task_terminal_persisted", &message)
+        .await
+        .unwrap();
+    let triggered = runtime
+        .storage()
+        .latest_wait_conditions()
+        .unwrap()
+        .into_iter()
+        .find(|condition| condition.id == registration.condition.id)
+        .unwrap();
+    assert_eq!(triggered.status, WaitConditionStatus::Triggered);
+    assert_eq!(triggered.trigger_message_id(), Some(message.id.as_str()));
+
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("exact lifecycle task wait should resume into the model");
+    };
+    assert_eq!(scheduled.message.id, message.id);
+    let resolved = runtime
+        .storage()
+        .latest_wait_conditions()
+        .unwrap()
+        .into_iter()
+        .find(|condition| condition.id == registration.condition.id)
+        .unwrap();
+    assert_eq!(resolved.status, WaitConditionStatus::Resolved);
+    assert_eq!(resolved.trigger_message_id(), Some(message.id.as_str()));
+    let execution = runtime
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot_if_initialized("default")
+        .load_execution_protocol_state_if_initialized("default")
         .unwrap()
-        .is_none());
+        .unwrap();
+    let attempt = &execution.attempts[&scheduler_executor::canonical_activation_id(&message.id)];
+    assert!(matches!(
+        &attempt.source.identity,
+        crate::domain::execution_protocol::ExecutionSourceIdentity::TriggeredWait {
+            wait_id,
+            trigger_message_id,
+        } if wait_id == &registration.condition.id && trigger_message_id == &message.id
+    ));
+}
+
+#[tokio::test]
+async fn exact_agent_lifecycle_task_wait_runs_one_model_continuation() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let provider = Arc::new(CountingProvider {
+        calls: Mutex::new(0),
+        reply: "resumed",
+    });
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        provider.clone(),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    runtime
+        .storage()
+        .append_task(&TaskRecord {
+            id: "task-lifecycle-model-reentry".into(),
+            agent_id: "default".into(),
+            kind: TaskKind::CommandTask,
+            status: TaskStatus::Running,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            parent_message_id: None,
+            work_item_id: None,
+            summary: Some("task lifecycle model reentry".into()),
+            detail: None,
+            recovery: None,
+        })
+        .unwrap();
+    runtime
+        .register_wait_for(
+            "default",
+            None,
+            WaitForWakeKind::TaskResult,
+            Some("task-lifecycle-model-reentry".into()),
+            "waiting for lifecycle task model reentry".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut message = task_result_message("task-lifecycle-model-reentry").with_admission(
+        MessageDeliverySurface::TaskRejoin,
+        AdmissionContext::RuntimeOwned,
+    );
+    message.task_id = Some("task-lifecycle-model-reentry".into());
+    message.metadata = Some(serde_json::json!({
+        "task_id": "task-lifecycle-model-reentry",
+        "task_kind": "command_task",
+        "task_status": "completed",
+        "task_result_id": "result-lifecycle-model-reentry",
+    }));
+    let terminal = TaskRecord {
+        status: TaskStatus::Completed,
+        updated_at: Utc::now(),
+        parent_message_id: Some(message.id.clone()),
+        ..runtime
+            .task_record("task-lifecycle-model-reentry")
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    runtime
+        .commit_terminal_task_result(&terminal, "command_task_terminal_persisted", &message)
+        .await
+        .unwrap();
+
+    let runner = tokio::spawn(runtime.clone().run());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while provider.call_count().await == 0 {
+        assert!(
+            !runner.is_finished(),
+            "runtime exited before model continuation"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "exact lifecycle task wait did not enter the model"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(provider.call_count().await, 1);
+    runner.abort();
 }
 
 #[tokio::test(start_paused = true)]
@@ -3200,21 +6377,6 @@ async fn restarted_interrupted_unbound_operator_prompt_does_not_block_resent_pro
     assert_eq!(scheduled.message.id, first.id);
     finish_claimed_test_run(runtime).await;
 
-    let work_item = runtime
-        .create_work_item("operator wait".into(), None, None, Vec::new())
-        .await
-        .unwrap();
-    runtime
-        .register_wait_for(
-            "default",
-            Some(work_item.id),
-            WaitForWakeKind::OperatorInput,
-            None,
-            "waiting on work item".into(),
-            None,
-        )
-        .await
-        .unwrap();
     runtime
         .register_wait_for(
             "default",
@@ -3254,18 +6416,16 @@ async fn restarted_interrupted_unbound_operator_prompt_does_not_block_resent_pro
         runtime.recover_scheduler_bootstrap_claims().await.unwrap(),
         0
     );
-    assert_eq!(
-        runtime
-            .inner
-            .runtime_db
-            .queue_entries()
-            .latest_all()
-            .unwrap()
-            .into_iter()
-            .find(|entry| entry.message_id == first.id)
-            .map(|entry| entry.status),
-        Some(QueueEntryStatus::Aborted)
-    );
+    let recovered_first_status = runtime
+        .inner
+        .runtime_db
+        .queue_entries()
+        .latest_all()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.message_id == first.id)
+        .map(|entry| entry.status);
+    assert_eq!(recovered_first_status, Some(QueueEntryStatus::Quarantined));
     let second = runtime
         .enqueue(trusted_operator_prompt(None, "resent operator prompt"))
         .await
@@ -3355,44 +6515,28 @@ async fn authoritative_explicit_operator_binding_ignores_unrelated_waits() {
         .await
         .unwrap()
         .unwrap();
-    let mut initial =
-        canonical_waiting_snapshot(&target, &target_wait.condition.id, target.revision);
-    initial.work.insert(
-        unrelated.id.clone(),
-        WorkDemand {
-            metadata_revision: unrelated.revision,
-            scheduling_generation: unrelated.revision,
-            status: WorkStatus::Waiting {
-                wait_id: unrelated_wait.condition.id.clone(),
-            },
-            capabilities: Default::default(),
-            locks: Default::default(),
-            locality: "runtime".into(),
-            cost_class: "default".into(),
-        },
-    );
-    initial.waits.insert(
-        unrelated_wait.condition.id.clone(),
-        WaitRecord {
-            current_generation: unrelated.revision,
-            generations: std::collections::BTreeMap::from([(
-                unrelated.revision,
-                WaitGenerationRecord {
-                    owner: SchedulerOwner::WorkItem {
-                        work_item_id: unrelated.id,
+    let mut execution = crate::domain::execution_protocol::ExecutionProtocolState::empty("default");
+    for (work_item, wait_id) in [
+        (&target, &target_wait.condition.id),
+        (&unrelated, &unrelated_wait.condition.id),
+    ] {
+        execution.work_items.insert(
+            work_item.id.clone(),
+            crate::domain::execution_protocol::WorkItemExecutionRecord {
+                source_revision: work_item.revision,
+                state: crate::domain::execution_protocol::WorkItemExecutionState::Waiting {
+                    generation: work_item.revision,
+                    wait: crate::domain::execution_protocol::WaitReference {
+                        wait_id: wait_id.clone(),
                     },
-                    state: WaitState::Active,
-                    trigger: None,
-                    consuming_activation_id: None,
                 },
-            )]),
-        },
-    );
+            },
+        );
+    }
     runtime
         .inner
         .runtime_db
-        .transitions()
-        .initialize_scheduler_protocol_partition("default", &initial)
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &execution))
         .unwrap();
     let message = runtime
         .enqueue(trusted_operator_prompt(
@@ -3436,30 +6580,21 @@ async fn authoritative_explicit_operator_binding_ignores_unrelated_waits() {
         Some(target.id.as_str())
     );
     let activation_id = scheduler_executor::canonical_activation_id(&message.id);
-    let snapshot = runtime
+    let execution = runtime
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
         .unwrap();
-    let admission = &snapshot.activation_admissions[&activation_id].activation;
+    let attempt = &execution.attempts[&activation_id];
     assert!(matches!(
-        &admission.cause,
-        ActivationCause::OperatorInput {
-            message_id,
-            resume: Some(resume),
-        } if message_id == &message.id && resume.wait_id == target_wait.condition.id
+        &attempt.source.identity,
+        crate::domain::execution_protocol::ExecutionSourceIdentity::TriggeredWait {
+            wait_id,
+            trigger_message_id,
+        } if trigger_message_id == &message.id && wait_id == &target_wait.condition.id
     ));
-    let target_generation = snapshot.waits[&target_wait.condition.id].current_generation;
-    assert_eq!(
-        snapshot.waits[&target_wait.condition.id].generations[&target_generation].state,
-        WaitState::Consumed
-    );
-    let unrelated_generation = snapshot.waits[&unrelated_wait.condition.id].current_generation;
-    assert_eq!(
-        snapshot.waits[&unrelated_wait.condition.id].generations[&unrelated_generation].state,
-        WaitState::Active
-    );
     runtime
         .record_wait_reconciliation_signals(&message)
         .await
@@ -3521,7 +6656,7 @@ async fn canonical_processed_settlement_without_terminal_turn_fails_closed() {
             text: "must create a turn".into(),
         },
     );
-    message.work_item_id = Some(work_item.id.clone());
+    bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
     message.turn_id = Some("turn-missing-terminal".into());
     let message = runtime.enqueue(message).await.unwrap();
     assert!(matches!(
@@ -3549,6 +6684,9 @@ async fn canonical_processed_settlement_without_terminal_turn_fails_closed() {
         .await
         .unwrap_err();
     assert!(error
+        .downcast_ref::<crate::domain::execution_protocol::ExecutionSettlementConflict>()
+        .is_some());
+    assert!(error
         .to_string()
         .contains("without a matching terminal Turn"));
     assert_eq!(
@@ -3569,16 +6707,17 @@ async fn canonical_processed_settlement_without_terminal_turn_fails_closed() {
             .inner
             .runtime_db
             .transitions()
-            .load_scheduler_protocol_snapshot("default")
+            .load_execution_protocol_state_if_initialized("default")
             .unwrap()
-            .activations[&activation_id]
+            .unwrap()
+            .attempts[&activation_id]
             .state,
-        crate::domain::scheduler_protocol::ActivationState::Running
+        crate::domain::execution_protocol::ExecutionAttemptState::Open
     );
 }
 
 #[tokio::test]
-async fn authoritative_explicit_operator_wait_ambiguity_remains_queued() {
+async fn trusted_operator_conversation_owner_flows_from_admission_to_terminal_turn() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let runtime = RuntimeHandle::new(
@@ -3594,136 +6733,119 @@ async fn authoritative_explicit_operator_wait_ambiguity_remains_queued() {
         context_config(),
     )
     .unwrap();
-    let work_item = runtime
-        .create_work_item("ambiguous operator wait".into(), None, None, Vec::new())
-        .await
-        .unwrap();
-    let registration = runtime
-        .register_wait_for(
-            "default",
-            Some(work_item.id.clone()),
-            WaitForWakeKind::OperatorInput,
-            None,
-            "waiting for operator".into(),
-            None,
+    let message = runtime
+        .enqueue(
+            MessageEnvelope::new(
+                "default",
+                MessageKind::OperatorPrompt,
+                MessageOrigin::Operator {
+                    actor_id: Some("control".into()),
+                },
+                AuthorityClass::OperatorInstruction,
+                Priority::Normal,
+                MessageBody::Text {
+                    text: "continue the discussion".into(),
+                },
+            )
+            .with_admission(
+                MessageDeliverySurface::HttpControlPrompt,
+                AdmissionContext::ControlAuthenticated,
+            ),
         )
         .await
         .unwrap();
-    let mut duplicate = registration.condition.clone();
-    duplicate.id = format!("{}-duplicate", registration.condition.id);
-    runtime.storage().append_wait_condition(&duplicate).unwrap();
-    let wait_generation = 1;
-    let wait_record = |owner| WaitRecord {
-        current_generation: wait_generation,
-        generations: std::collections::BTreeMap::from([(
-            wait_generation,
-            WaitGenerationRecord {
-                owner,
-                state: WaitState::Active,
-                trigger: None,
-                consuming_activation_id: None,
-            },
-        )]),
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("trusted operator prompt should enter a model turn");
     };
-    runtime
+    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+    let execution = runtime
         .inner
         .runtime_db
         .transitions()
-        .initialize_scheduler_protocol_partition(
-            "default",
-            &Snapshot {
-                slot: ActivationSlot::Idle,
-                dispatch: AgentDispatchState::Awaiting {
-                    wait: WaitIdentity {
-                        id: registration.condition.id.clone(),
-                        generation: wait_generation,
-                    },
-                },
-                dispatch_revision: 1,
-                focus: None,
-                work: Default::default(),
-                waits: std::collections::BTreeMap::from([
-                    (
-                        registration.condition.id.clone(),
-                        wait_record(SchedulerOwner::AgentLifecycle {
-                            agent_id: "default".into(),
-                        }),
-                    ),
-                    (
-                        duplicate.id.clone(),
-                        wait_record(SchedulerOwner::AgentLifecycle {
-                            agent_id: "default".into(),
-                        }),
-                    ),
-                ]),
-                activations: Default::default(),
-                activation_admissions: Default::default(),
-                settlements: Default::default(),
-                missing_settlements: Default::default(),
-                admitted_generations: Default::default(),
-                continuation_admissions: Default::default(),
-                activation_inputs: Default::default(),
-            },
-        )
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
         .unwrap();
-    let message = runtime
-        .enqueue(trusted_operator_prompt(
-            Some(&work_item.id),
-            "ambiguous explicit operator input",
-        ))
+    let interaction_id = match &execution.attempts[&activation_id].binding {
+        crate::domain::execution_protocol::ExecutionBinding::Conversation { interaction_id } => {
+            interaction_id.clone()
+        }
+        binding => panic!("expected Conversation owner, found {binding:?}"),
+    };
+
+    runtime
+        .begin_reducer_only_turn(
+            &scheduled.message,
+            scheduled
+                .dispatch_plan
+                .execution_admission_provenance
+                .clone(),
+        )
         .await
         .unwrap();
+    assert_eq!(
+        runtime
+            .agent_state()
+            .await
+            .unwrap()
+            .current_execution_binding
+            .and_then(|binding| binding.owner),
+        Some(crate::types::TurnOwner::Conversation {
+            interaction_id: interaction_id.clone(),
+        })
+    );
 
-    for _ in 0..2 {
-        assert!(matches!(
-            scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
-                .poll()
-                .await
-                .unwrap(),
-            scheduler_executor::RunLoopPoll::Idle
-        ));
-    }
+    let transition = runtime
+        .build_reducer_only_terminal_transition("conversation owner regression", false)
+        .await
+        .unwrap();
+    runtime
+        .persist_terminal_transition(&transition)
+        .await
+        .unwrap();
+    assert_eq!(
+        transition.turn_record.effective_owner(),
+        crate::types::TurnOwner::Conversation {
+            interaction_id: interaction_id.clone(),
+        }
+    );
+    assert!(runtime
+        .commit_queue_terminal_settlement(
+            QueueEntryRecord {
+                message_id: message.id.clone(),
+                agent_id: message.agent_id.clone(),
+                priority: message.priority,
+                status: QueueEntryStatus::Processed,
+                created_at: message.created_at,
+                updated_at: Utc::now(),
+            },
+            Vec::new(),
+            true,
+            Some(&transition),
+        )
+        .await
+        .unwrap());
     assert_eq!(
         runtime
             .inner
             .runtime_db
-            .queue_entries()
-            .latest_all()
+            .turn_records()
+            .recent_for_owner(
+                "default",
+                &crate::types::TurnOwner::Conversation { interaction_id },
+                10,
+            )
             .unwrap()
-            .into_iter()
-            .find(|entry| entry.message_id == message.id)
-            .map(|entry| entry.status),
-        Some(QueueEntryStatus::Queued)
+            .len(),
+        1
     );
-    let advisories = runtime
-        .storage()
-        .read_recent_events(usize::MAX)
-        .unwrap()
-        .into_iter()
-        .filter(|event| {
-            event.kind == "scheduling_advisory"
-                && event.data["kind"] == "ambiguous_canonical_wait_binding"
-                && event.data["evidence"].as_array().is_some_and(|evidence| {
-                    evidence
-                        .iter()
-                        .any(|item| item == &format!("message_id={}", message.id))
-                })
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(advisories.len(), 1);
-    assert!(advisories[0].data["evidence"]
-        .as_array()
-        .is_some_and(|evidence| {
-            evidence.iter().any(|item| {
-                item.as_str().is_some_and(|item| {
-                    item.contains(&registration.condition.id) && item.contains(&duplicate.id)
-                })
-            })
-        }));
 }
 
 #[tokio::test]
-async fn authoritative_explicit_operator_missing_target_remains_queued_without_rollback() {
+async fn authoritative_explicit_operator_missing_target_is_bounded_across_restart() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let runtime = RuntimeHandle::new(
@@ -3746,13 +6868,20 @@ async fn authoritative_explicit_operator_missing_target_remains_queued_without_r
         ))
         .await
         .unwrap();
+    let valid = runtime
+        .enqueue(trusted_operator_prompt(
+            None,
+            "continue after quarantined missing target",
+        ))
+        .await
+        .unwrap();
 
     assert!(matches!(
         scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
             .poll()
             .await
             .unwrap(),
-        scheduler_executor::RunLoopPoll::Idle
+        scheduler_executor::RunLoopPoll::AuthorityBlocked
     ));
     assert_eq!(
         runtime
@@ -3766,15 +6895,64 @@ async fn authoritative_explicit_operator_missing_target_remains_queued_without_r
             .map(|entry| entry.status),
         Some(QueueEntryStatus::Queued)
     );
-    assert!(runtime
+    drop(runtime);
+
+    let reopened = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&reopened)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::AuthorityBlocked
+    ));
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&reopened)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Idle
+    ));
+    assert_eq!(
+        reopened
+            .inner
+            .runtime_db
+            .queue_entries()
+            .latest(&message.id)
+            .unwrap()
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Quarantined)
+    );
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&reopened)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("valid input should advance after the retained head is quarantined");
+    };
+    assert_eq!(scheduled.message.id, valid.id);
+    assert!(reopened
         .storage()
         .read_recent_events(usize::MAX)
         .unwrap()
         .iter()
         .any(|event| {
-            event.kind == "scheduler_authority_input_rejected"
+            event.kind == "scheduler_queue_head_quarantined"
                 && event.data["message_id"] == message.id
                 && event.data["reason"] == "explicit_binding_work_item_missing"
+                && event.data["attempt"] == 3
+                && event.data["queue_disposition"] == "quarantined"
         }));
 }
 
@@ -3811,10 +6989,10 @@ async fn authoritative_completion_terminalizes_canonical_work_and_binds_report()
         "http://127.0.0.1:7878".into(),
         Arc::new(CanonicalCompletionProvider {
             work_item_id: work_item.id.clone(),
-            calls: Mutex::new(0),
+            calls: Arc::new(Mutex::new(0)),
         }),
         "default".into(),
-        context_config(),
+        continuation_ready_context_config(&workspace, 16_000),
     )
     .unwrap();
     let mut message = MessageEnvelope::new(
@@ -3833,23 +7011,27 @@ async fn authoritative_completion_terminalizes_canonical_work_and_binds_report()
         MessageDeliverySurface::RuntimeSystem,
         AdmissionContext::RuntimeOwned,
     );
-    message.work_item_id = Some(work_item.id.clone());
+    bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
     let message = runtime.enqueue(message).await.unwrap();
     let activation_id = scheduler_executor::canonical_activation_id(&message.id);
 
     let runner = tokio::spawn(runtime.clone().run());
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let snapshot = runtime
+            let execution = runtime
                 .inner
                 .runtime_db
                 .transitions()
-                .load_scheduler_protocol_snapshot_if_initialized("default")
+                .load_execution_protocol_state_if_initialized("default")
                 .unwrap();
-            if snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot
-                    .settlements
-                    .contains_key(&canonical_settlement_id(&message.id))
+            if execution.as_ref().is_some_and(|execution| {
+                execution
+                    .attempts
+                    .get(&activation_id)
+                    .is_some_and(|attempt| {
+                        attempt.state
+                            == crate::domain::execution_protocol::ExecutionAttemptState::Settled
+                    })
             }) {
                 break;
             }
@@ -3870,33 +7052,43 @@ async fn authoritative_completion_terminalizes_canonical_work_and_binds_report()
         .result_brief_id
         .as_deref()
         .expect("completion report should bind");
-    let snapshot = runtime
+    let execution = runtime
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("completion should preserve execution authority");
     assert_eq!(
-        snapshot.activations[&activation_id].state,
-        crate::domain::scheduler_protocol::ActivationState::Settled
+        execution.attempts[&activation_id].state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Settled
     );
-    assert_eq!(snapshot.work[&work_item.id].status, WorkStatus::Terminal);
+    assert!(matches!(
+        execution.work_items[&work_item.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Terminal {
+            ref completion,
+            ..
+        } if completion == result_brief_id
+    ));
+    let outcome_id = execution.attempts[&activation_id]
+        .terminal_outcome_id
+        .as_deref()
+        .expect("completion attempt should reference outcome");
     assert_eq!(
-        snapshot.settlements[&canonical_settlement_id(&message.id)]
-            .operator_delivery
-            .as_deref(),
-        Some(result_brief_id)
+        execution.outcomes[outcome_id].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Complete {
+                completion: result_brief_id.to_string(),
+            },
+        )
     );
-    assert!(!snapshot
-        .missing_settlements
-        .contains_key(&canonical_missing_settlement_id(&message.id)));
 }
 
 #[tokio::test]
-async fn task_rejoin_ignores_legacy_wait_duplicate_missing_from_canonical_snapshot() {
+async fn authoritative_completion_resumes_parent_canonically_and_writes_terminal_once() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
-    let runtime = RuntimeHandle::new(
+    let seed_runtime = RuntimeHandle::new(
         "default",
         dir.path().to_path_buf(),
         workspace.path().to_path_buf(),
@@ -3909,81 +7101,511 @@ async fn task_rejoin_ignores_legacy_wait_duplicate_missing_from_canonical_snapsh
         context_config(),
     )
     .unwrap();
-    let work_item = runtime
-        .create_work_item("ambiguous task rejoin".into(), None, None, Vec::new())
-        .await
-        .unwrap();
-    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
-    let registration = runtime
-        .register_wait_for(
-            "default",
-            Some(work_item.id.clone()),
-            WaitForWakeKind::TaskResult,
-            Some("task-ambiguous".into()),
-            "waiting for task-ambiguous".into(),
+    let parent = seed_runtime
+        .create_work_item(
+            "resume canonical parent after child completion".into(),
             None,
+            None,
+            vec![TodoItem {
+                text: "continue parent after child completion".into(),
+                state: TodoItemState::Pending,
+            }],
         )
         .await
         .unwrap();
-    let mut duplicate_wait = registration.condition.clone();
-    duplicate_wait.id = "wait-task-ambiguous-duplicate".into();
-    runtime
-        .storage()
-        .append_wait_condition(&duplicate_wait)
-        .unwrap();
-
-    let mut message = task_result_message("task-ambiguous").with_admission(
-        MessageDeliverySurface::TaskRejoin,
-        AdmissionContext::RuntimeOwned,
-    );
-    message.work_item_id = Some(work_item.id.clone());
-    message.metadata = Some(serde_json::json!({
-        "task_id": "task-ambiguous",
-        "task_kind": "command_task",
-        "task_status": "completed",
-        "task_result_id": "result-ambiguous",
-        "work_item_id": work_item.id,
-    }));
-    let message = runtime.enqueue(message).await.unwrap();
-
-    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
-        .poll()
+    seed_runtime
+        .pick_work_item(parent.id.clone())
         .await
         .unwrap();
-    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
-        panic!("legacy-only duplicate wait should not block canonical task rejoin");
-    };
-    assert_eq!(scheduled.message.id, message.id);
+    let child = seed_runtime
+        .create_work_item("complete canonical child".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    seed_runtime.pick_work_item(child.id.clone()).await.unwrap();
+    let frame = seed_runtime
+        .storage()
+        .latest_work_item_continuations()
+        .unwrap()
+        .into_iter()
+        .find(|frame| {
+            frame.suspended_work_item_id == parent.id && frame.active_work_item_id == child.id
+        })
+        .expect("child pick should create a continuation frame");
+    drop(seed_runtime);
+    let provider = Arc::new(CanonicalCompletionProvider {
+        work_item_id: child.id.clone(),
+        calls: Arc::new(Mutex::new(0)),
+    });
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        provider.clone(),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let outbox_before = runtime
+        .inner
+        .runtime_db
+        .runtime_index_outbox()
+        .high_watermark_for_agent("default")
+        .unwrap();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::SystemTick,
+        MessageOrigin::System {
+            subsystem: "work_queue".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "complete canonical child".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    bind_autonomous_work_queue_tick(&mut message, &child, "queued_available");
+    let message = runtime.enqueue(message).await.unwrap();
+    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
 
-    assert_eq!(runtime.inner.agent.lock().await.queue.len(), 0);
+    let mut runner = tokio::spawn(runtime.clone().run());
+    tokio::select! {
+        result = &mut runner => {
+            panic!("runtime exited before canonical child completion settled: {result:?}");
+        }
+        result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let execution = runtime
+                    .inner
+                    .runtime_db
+                    .transitions()
+                    .load_execution_protocol_state_if_initialized("default")
+                    .unwrap();
+                if execution.as_ref().is_some_and(|execution| {
+                    execution
+                        .attempts
+                        .get(&activation_id)
+                        .is_some_and(|attempt| {
+                            attempt.state
+                                == crate::domain::execution_protocol::ExecutionAttemptState::Settled
+                        })
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }) => {
+            result.expect("canonical child completion should settle");
+        }
+    }
+    runner.abort();
+    let _ = runner.await;
+
+    let child_record = runtime
+        .latest_work_item(&child.id)
+        .await
+        .unwrap()
+        .expect("completed child");
+    assert_eq!(child_record.state, WorkItemState::Completed);
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("canonical execution state");
+    assert!(matches!(
+        execution.work_items[&child.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Terminal { .. }
+    ));
+    match &execution.work_items[&parent.id].state {
+        crate::domain::execution_protocol::WorkItemExecutionState::Runnable { .. } => {}
+        crate::domain::execution_protocol::WorkItemExecutionState::InFlight {
+            attempt_id, ..
+        } => {
+            assert!(matches!(
+                execution.attempts[attempt_id].binding,
+                crate::domain::execution_protocol::ExecutionBinding::WorkItem {
+                    ref work_item_id
+                } if work_item_id == &parent.id
+            ));
+        }
+        state => panic!("resumed parent execution state: {state:?}"),
+    }
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_work_item_continuations()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == frame.id)
+            .map(|candidate| candidate.state),
+        Some(crate::types::WorkItemContinuationState::Resumed)
+    );
+    let agent = runtime.agent_state().await.unwrap();
+    assert_eq!(
+        agent.current_work_item_id.as_deref(),
+        Some(parent.id.as_str())
+    );
+    assert_eq!(
+        agent.current_turn_work_item_id.as_deref(),
+        Some(parent.id.as_str())
+    );
     assert_eq!(
         runtime
             .inner
             .runtime_db
             .queue_entries()
-            .latest_all()
+            .latest(&message.id)
+            .unwrap()
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Processed)
+    );
+    let events = runtime.storage().read_recent_events(usize::MAX).unwrap();
+    let turn_id = execution.attempts[&activation_id]
+        .turn_id
+        .as_deref()
+        .expect("settled attempt should retain Turn identity");
+    for kind in ["turn_terminal", "turn_record"] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == kind && event.data["turn_id"] == turn_id)
+                .count(),
+            1,
+            "{kind} must be written exactly once"
+        );
+    }
+    assert_eq!(
+        runtime
+            .storage()
+            .read_recent_tool_executions(32)
             .unwrap()
             .into_iter()
-            .find(|entry| entry.message_id == message.id)
-            .map(|entry| entry.status),
-        Some(QueueEntryStatus::Dequeued)
+            .filter(|record| {
+                record.tool_name == "CompleteWorkItem"
+                    && record.work_item_id.as_deref() == Some(child.id.as_str())
+            })
+            .count(),
+        1
     );
-    let advisories = runtime
-        .storage()
-        .read_recent_events(64)
+    let outbox_changes = runtime
+        .inner
+        .runtime_db
+        .runtime_index_outbox()
+        .read_after("default", outbox_before, 16)
         .unwrap()
         .into_iter()
-        .filter(|event| {
-            event.kind == "scheduling_advisory"
-                && event.data["kind"] == "ambiguous_canonical_wait_binding"
-                && event.data["evidence"].as_array().is_some_and(|evidence| {
-                    evidence
-                        .iter()
-                        .any(|item| item == &format!("message_id={}", message.id))
-                })
-        })
+        .filter(|change| change.source_kind == "work_item" && change.source_id == child.id)
         .collect::<Vec<_>>();
-    assert!(advisories.is_empty());
+    assert_eq!(
+        outbox_changes.len(),
+        1,
+        "CompletionCommit should emit one WorkItem index change"
+    );
+
+    drop(runtime);
+    let reentry_started = Arc::new(tokio::sync::Notify::new());
+    let reentry_provider = Arc::new(WorkItemReentryProbeProvider {
+        started: reentry_started.clone(),
+        observed_work_items: Mutex::new(Vec::new()),
+    });
+    let restarted = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        reentry_provider.clone(),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let mut restarted_runner = tokio::spawn(restarted.clone().run());
+    tokio::select! {
+        result = &mut restarted_runner => {
+            panic!("restarted runtime exited before parent model re-entry: {result:?}");
+        }
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reentry_started.notified(),
+        ) => {
+            result.expect("restarted parent should re-enter the provider");
+        }
+    }
+    let observed_work_items = reentry_provider.observed_work_items.lock().await;
+    assert_eq!(observed_work_items.len(), 1);
+    assert!(observed_work_items[0].contains(&format!("- Id: {}", parent.id)));
+    assert!(observed_work_items[0].contains(&parent.objective));
+    let child_id_line = format!("- Id: {}", child.id);
+    assert!(!observed_work_items[0]
+        .lines()
+        .any(|line| line == child_id_line));
+    drop(observed_work_items);
+    let restarted_agent = restarted.agent_state().await.unwrap();
+    assert_eq!(
+        restarted_agent.current_work_item_id.as_deref(),
+        Some(parent.id.as_str())
+    );
+    assert_eq!(
+        restarted_agent.current_turn_work_item_id.as_deref(),
+        Some(parent.id.as_str())
+    );
+    let restarted_execution = restarted
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("restarted parent re-entry should preserve execution authority");
+    assert!(restarted_execution.attempts.values().any(|attempt| {
+        attempt.state == crate::domain::execution_protocol::ExecutionAttemptState::Open
+            && matches!(
+                &attempt.binding,
+                crate::domain::execution_protocol::ExecutionBinding::WorkItem { work_item_id }
+                    if work_item_id == &parent.id
+            )
+    }));
+    assert_eq!(
+        restarted
+            .storage()
+            .read_recent_tool_executions(32)
+            .unwrap()
+            .into_iter()
+            .filter(|record| {
+                record.tool_name == "CompleteWorkItem"
+                    && record.work_item_id.as_deref() == Some(child.id.as_str())
+            })
+            .count(),
+        1,
+        "restart and parent re-entry must not replay child completion"
+    );
+    for kind in ["turn_terminal", "turn_record"] {
+        assert_eq!(
+            restarted
+                .storage()
+                .read_recent_events(usize::MAX)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == kind && event.data["turn_id"] == turn_id)
+                .count(),
+            1,
+            "restart and parent re-entry must preserve exactly-once {kind}"
+        );
+    }
+    restarted_runner.abort();
+    let _ = restarted_runner.await;
+}
+
+#[tokio::test]
+async fn authoritative_completion_cancels_active_child_wait_and_resumes_parent() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let seed_runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let parent = seed_runtime
+        .create_work_item(
+            "resume canonical parent after waiting child completion".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    seed_runtime
+        .pick_work_item(parent.id.clone())
+        .await
+        .unwrap();
+    let child = seed_runtime
+        .create_work_item(
+            "complete canonical child with active wait".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    seed_runtime.pick_work_item(child.id.clone()).await.unwrap();
+    let frame = seed_runtime
+        .storage()
+        .latest_work_item_continuations()
+        .unwrap()
+        .into_iter()
+        .find(|frame| {
+            frame.suspended_work_item_id == parent.id && frame.active_work_item_id == child.id
+        })
+        .expect("child pick should create a continuation frame");
+    let registration = seed_runtime
+        .register_wait_for(
+            "default",
+            Some(child.id.clone()),
+            WaitForWakeKind::External,
+            Some("github:holon-run/holon#2540-acceptance".into()),
+            "waiting before canonical completion".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let waiting_child = seed_runtime
+        .latest_work_item(&child.id)
+        .await
+        .unwrap()
+        .expect("waiting child");
+    persist_waiting_work_execution(&seed_runtime, &waiting_child, &registration.condition.id);
+    drop(seed_runtime);
+
+    let completion_provider = Arc::new(CanonicalCompletionProvider {
+        work_item_id: child.id.clone(),
+        calls: Arc::new(Mutex::new(0)),
+    });
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        completion_provider.clone(),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let recovery = runtime
+        .enqueue(provider_recovery_message(&runtime, &child.id))
+        .await
+        .unwrap();
+    let activation_id = scheduler_executor::canonical_activation_id(&recovery.id);
+    let mut runner = tokio::spawn(runtime.clone().run());
+    tokio::select! {
+        result = &mut runner => {
+            panic!("runtime exited before waiting child completion settled: {result:?}");
+        }
+        result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let execution = runtime
+                    .inner
+                    .runtime_db
+                    .transitions()
+                    .load_execution_protocol_state_if_initialized("default")
+                    .unwrap();
+                if execution.as_ref().is_some_and(|execution| {
+                    execution
+                        .attempts
+                        .get(&activation_id)
+                        .is_some_and(|attempt| {
+                            attempt.state
+                                == crate::domain::execution_protocol::ExecutionAttemptState::Settled
+                        })
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }) => {
+            if result.is_err() {
+                let calls = *completion_provider.calls.lock().await;
+                let queue_status = runtime
+                    .inner
+                    .runtime_db
+                    .queue_entries()
+                    .latest(&recovery.id)
+                    .unwrap()
+                    .map(|entry| entry.status);
+                let attempt_state = runtime
+                    .inner
+                    .runtime_db
+                    .transitions()
+                    .load_execution_protocol_state_if_initialized("default")
+                    .unwrap()
+                    .and_then(|execution| {
+                        execution
+                            .attempts
+                            .get(&activation_id)
+                            .map(|attempt| attempt.state.clone())
+                    });
+                let diagnostic_events = runtime
+                    .storage()
+                    .read_recent_events(usize::MAX)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|event| {
+                        event.data["message_id"] == recovery.id
+                            || matches!(
+                                event.kind.as_str(),
+                                "runtime_error" | "queue_entry_settled"
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                panic!(
+                    "waiting child completion should settle: provider calls={calls}, queue={queue_status:?}, attempt={attempt_state:?}, events={diagnostic_events:#?}"
+                );
+            }
+        }
+    }
+    runner.abort();
+    let _ = runner.await;
+
+    assert!(runtime
+        .storage()
+        .active_wait_conditions_for_work_item("default", &child.id)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_wait_conditions()
+            .unwrap()
+            .into_iter()
+            .find(|condition| condition.id == registration.condition.id)
+            .map(|condition| condition.status),
+        Some(WaitConditionStatus::Cancelled)
+    );
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("canonical execution state");
+    assert!(matches!(
+        execution.work_items[&child.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Terminal { .. }
+    ));
+    assert!(matches!(
+        execution.work_items[&parent.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Runnable { .. }
+    ));
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_work_item_continuations()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == frame.id)
+            .map(|candidate| candidate.state),
+        Some(crate::types::WorkItemContinuationState::Resumed)
+    );
+    let agent = runtime.agent_state().await.unwrap();
+    assert_eq!(
+        agent.current_work_item_id.as_deref(),
+        Some(parent.id.as_str())
+    );
+    assert_eq!(
+        agent.current_turn_work_item_id.as_deref(),
+        Some(parent.id.as_str())
+    );
 }
 
 #[tokio::test]
@@ -4020,7 +7642,7 @@ async fn terminal_settlement_fault_rolls_back_all_facts_and_retry_is_idempotent(
                 text: "commit terminal atomically".into(),
             },
         );
-        message.work_item_id = Some(work_item.id.clone());
+        bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
         message.turn_id = Some(format!("turn-terminal-fault-{fault:?}"));
         let message = runtime.enqueue(message).await.unwrap();
         let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
@@ -4032,7 +7654,8 @@ async fn terminal_settlement_fault_rolls_back_all_facts_and_retry_is_idempotent(
             .inner
             .runtime_db
             .transitions()
-            .load_scheduler_protocol_snapshot("default")
+            .load_execution_protocol_state_if_initialized("default")
+            .unwrap()
             .unwrap();
         finish_claimed_test_run(&runtime).await;
 
@@ -4062,9 +7685,9 @@ async fn terminal_settlement_fault_rolls_back_all_facts_and_retry_is_idempotent(
                 .inner
                 .runtime_db
                 .transitions()
-                .load_scheduler_protocol_snapshot("default")
+                .load_execution_protocol_state_if_initialized("default")
                 .unwrap(),
-            claimed
+            Some(claimed)
         );
         assert_eq!(
             runtime
@@ -4135,12 +7758,14 @@ async fn terminal_settlement_fault_rolls_back_all_facts_and_retry_is_idempotent(
             .inner
             .runtime_db
             .transitions()
-            .load_scheduler_protocol_snapshot("default")
+            .load_execution_protocol_state_if_initialized("default")
+            .unwrap()
             .unwrap();
-        assert_eq!(settled.slot, ActivationSlot::Idle);
-        assert!(settled
-            .settlements
-            .contains_key(&canonical_settlement_id(&message.id)));
+        let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+        assert_eq!(
+            settled.attempts[&activation_id].state,
+            crate::domain::execution_protocol::ExecutionAttemptState::Settled
+        );
         assert_eq!(
             runtime
                 .inner
@@ -4170,6 +7795,267 @@ async fn terminal_settlement_fault_rolls_back_all_facts_and_retry_is_idempotent(
                 .count(),
             1
         );
+    }
+}
+
+#[tokio::test]
+async fn standalone_terminal_transition_fault_rolls_back_and_restart_replays_exactly_once() {
+    for fault in TERMINAL_PRE_COMMIT_FAULTS {
+        let dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let provider = Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        });
+        let runtime = RuntimeHandle::new(
+            "default",
+            dir.path().to_path_buf(),
+            workspace.path().to_path_buf(),
+            "http://127.0.0.1:7878".into(),
+            provider.clone(),
+            "default".into(),
+            context_config(),
+        )
+        .unwrap();
+        let mut message = MessageEnvelope::new(
+            "default",
+            MessageKind::OperatorPrompt,
+            MessageOrigin::Operator { actor_id: None },
+            AuthorityClass::OperatorInstruction,
+            Priority::Normal,
+            MessageBody::Text {
+                text: "persist terminal atomically".into(),
+            },
+        );
+        message.turn_id = Some(format!("turn-standalone-terminal-{fault:?}"));
+        let transition = terminal_transition(&message, None);
+        runtime.inject_next_transition_fault(fault);
+
+        let error = runtime
+            .persist_terminal_transition(&transition)
+            .await
+            .unwrap_err();
+        assert_injected_transition_fault(&error);
+        assert!(runtime
+            .inner
+            .runtime_db
+            .agent_states()
+            .latest("default")
+            .unwrap()
+            .unwrap()
+            .last_turn_terminal
+            .is_none());
+        assert!(runtime
+            .storage()
+            .read_recent_turns(16)
+            .unwrap()
+            .iter()
+            .all(|turn| turn.turn_id != transition.terminal.turn_id));
+        assert!(runtime
+            .storage()
+            .read_recent_events(64)
+            .unwrap()
+            .iter()
+            .all(|event| {
+                !(matches!(event.kind.as_str(), "turn_terminal" | "turn_record")
+                    && event.data["turn_id"] == transition.terminal.turn_id)
+            }));
+        drop(runtime);
+
+        let restarted = RuntimeHandle::new(
+            "default",
+            dir.path().to_path_buf(),
+            workspace.path().to_path_buf(),
+            "http://127.0.0.1:7878".into(),
+            provider.clone(),
+            "default".into(),
+            context_config(),
+        )
+        .unwrap();
+        restarted
+            .persist_terminal_transition(&transition)
+            .await
+            .unwrap();
+        restarted
+            .persist_terminal_transition(&transition)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            restarted
+                .storage()
+                .read_recent_turns(16)
+                .unwrap()
+                .iter()
+                .filter(|turn| turn.turn_id == transition.terminal.turn_id)
+                .count(),
+            1
+        );
+        for kind in ["turn_terminal", "turn_record"] {
+            assert_eq!(
+                restarted
+                    .storage()
+                    .read_recent_events(64)
+                    .unwrap()
+                    .iter()
+                    .filter(|event| {
+                        event.kind == kind && event.data["turn_id"] == transition.terminal.turn_id
+                    })
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            restarted
+                .inner
+                .runtime_db
+                .agent_states()
+                .latest("default")
+                .unwrap()
+                .unwrap()
+                .last_turn_terminal,
+            Some(transition.terminal.clone())
+        );
+    }
+}
+
+#[tokio::test]
+async fn standalone_terminal_transition_survives_post_commit_effect_faults() {
+    for (fault, expected_effect) in POST_COMMIT_FAULTS
+        .into_iter()
+        .filter(|(fault, _)| *fault != TransitionFaultPoint::BeforeSchedulerNotification)
+    {
+        let dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let runtime = RuntimeHandle::new(
+            "default",
+            dir.path().to_path_buf(),
+            workspace.path().to_path_buf(),
+            "http://127.0.0.1:7878".into(),
+            Arc::new(CountingProvider {
+                calls: Mutex::new(0),
+                reply: "unused",
+            }),
+            "default".into(),
+            context_config(),
+        )
+        .unwrap();
+        let mut message = MessageEnvelope::new(
+            "default",
+            MessageKind::OperatorPrompt,
+            MessageOrigin::Operator { actor_id: None },
+            AuthorityClass::OperatorInstruction,
+            Priority::Normal,
+            MessageBody::Text {
+                text: "retain committed terminal".into(),
+            },
+        );
+        message.turn_id = Some(format!("turn-standalone-post-commit-{fault:?}"));
+        let transition = terminal_transition(&message, None);
+        runtime.inject_next_transition_fault(fault);
+
+        runtime
+            .persist_terminal_transition(&transition)
+            .await
+            .unwrap();
+        let warnings = runtime.take_transition_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].effect, expected_effect);
+        assert_eq!(
+            runtime
+                .inner
+                .runtime_db
+                .agent_states()
+                .latest("default")
+                .unwrap()
+                .unwrap()
+                .last_turn_terminal,
+            Some(transition.terminal.clone())
+        );
+        assert_eq!(
+            runtime
+                .storage()
+                .read_recent_turns(16)
+                .unwrap()
+                .iter()
+                .filter(|turn| turn.turn_id == transition.terminal.turn_id)
+                .count(),
+            1
+        );
+        for kind in ["turn_terminal", "turn_record"] {
+            assert_eq!(
+                runtime
+                    .storage()
+                    .read_recent_events(64)
+                    .unwrap()
+                    .iter()
+                    .filter(|event| {
+                        event.kind == kind && event.data["turn_id"] == transition.terminal.turn_id
+                    })
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn standalone_aborted_terminal_commits_terminal_and_abort_audits_atomically() {
+    for fault in TERMINAL_PRE_COMMIT_FAULTS {
+        let dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let runtime = RuntimeHandle::new(
+            "default",
+            dir.path().to_path_buf(),
+            workspace.path().to_path_buf(),
+            "http://127.0.0.1:7878".into(),
+            Arc::new(CountingProvider {
+                calls: Mutex::new(0),
+                reply: "unused",
+            }),
+            "default".into(),
+            context_config(),
+        )
+        .unwrap();
+        let turn_id = {
+            let mut guard = runtime.inner.agent.lock().await;
+            guard.state.current_turn_id = Some(format!("turn-aborted-terminal-{fault:?}"));
+            guard.persist_state(&runtime.inner.storage).unwrap();
+            guard.state.current_turn_id.clone().unwrap()
+        };
+        runtime.inject_next_transition_fault(fault);
+
+        let error = runtime
+            .persist_turn_aborted_record("run-aborted", "operator_aborted", None, 1, true)
+            .await
+            .unwrap_err();
+        assert_injected_transition_fault(&error);
+        assert!(runtime
+            .inner
+            .runtime_db
+            .agent_states()
+            .latest("default")
+            .unwrap()
+            .unwrap()
+            .last_turn_terminal
+            .is_none());
+        assert!(runtime
+            .storage()
+            .read_recent_turns(16)
+            .unwrap()
+            .iter()
+            .all(|turn| turn.turn_id != turn_id));
+        assert!(runtime
+            .storage()
+            .read_recent_events(64)
+            .unwrap()
+            .iter()
+            .all(|event| {
+                !(matches!(
+                    event.kind.as_str(),
+                    "turn_terminal" | "turn_record" | "turn_terminal_aborted"
+                ) && event.data["turn_id"] == turn_id)
+            }));
     }
 }
 
@@ -4212,7 +8098,7 @@ async fn terminal_settlement_survives_post_commit_effect_faults() {
                 text: "retain committed terminal".into(),
             },
         );
-        message.work_item_id = Some(work_item.id.clone());
+        bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
         message.turn_id = Some(format!("turn-terminal-post-commit-{fault:?}"));
         let message = runtime.enqueue(message).await.unwrap();
         let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
@@ -4244,16 +8130,18 @@ async fn terminal_settlement_survives_post_commit_effect_faults() {
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].effect, expected_effect);
 
-        let snapshot = runtime
+        let execution = runtime
             .inner
             .runtime_db
             .transitions()
-            .load_scheduler_protocol_snapshot("default")
+            .load_execution_protocol_state_if_initialized("default")
+            .unwrap()
             .unwrap();
-        assert_eq!(snapshot.slot, ActivationSlot::Idle);
-        assert!(snapshot
-            .settlements
-            .contains_key(&canonical_settlement_id(&message.id)));
+        let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+        assert_eq!(
+            execution.attempts[&activation_id].state,
+            crate::domain::execution_protocol::ExecutionAttemptState::Settled
+        );
         assert_eq!(
             runtime
                 .inner
@@ -4326,7 +8214,7 @@ async fn runtime_failure_terminal_fault_rolls_back_queue_canonical_and_failure_e
             text: "fail after canonical claim".into(),
         },
     );
-    message.work_item_id = Some(work_item.id);
+    bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
     let message = runtime.enqueue(message).await.unwrap();
     let turn_id = message.turn_id.clone().expect("enqueued turn id");
 
@@ -4338,7 +8226,8 @@ async fn runtime_failure_terminal_fault_rolls_back_queue_canonical_and_failure_e
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
         .unwrap();
     runtime.inject_next_transition_fault(
         crate::runtime_db::transitions::TransitionFaultPoint::AfterAuditWrites,
@@ -4356,7 +8245,8 @@ async fn runtime_failure_terminal_fault_rolls_back_queue_canonical_and_failure_e
             .inner
             .runtime_db
             .transitions()
-            .load_scheduler_protocol_snapshot("default")
+            .load_execution_protocol_state_if_initialized("default")
+            .unwrap()
             .unwrap(),
         claimed
     );
@@ -4454,7 +8344,7 @@ async fn interrupted_terminal_fault_rolls_back_queue_canonical_and_turn_facts() 
             text: "abort after canonical claim".into(),
         },
     );
-    message.work_item_id = Some(work_item.id);
+    bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
     let message = runtime.enqueue(message).await.unwrap();
     let turn_id = message.turn_id.clone().expect("enqueued turn id");
 
@@ -4466,7 +8356,8 @@ async fn interrupted_terminal_fault_rolls_back_queue_canonical_and_turn_facts() 
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
         .unwrap();
     let run_id = runtime
         .agent_state()
@@ -4496,7 +8387,8 @@ async fn interrupted_terminal_fault_rolls_back_queue_canonical_and_turn_facts() 
             .inner
             .runtime_db
             .transitions()
-            .load_scheduler_protocol_snapshot("default")
+            .load_execution_protocol_state_if_initialized("default")
+            .unwrap()
             .unwrap(),
         claimed
     );
@@ -4578,41 +8470,6 @@ async fn completed_production_settlement_uses_exact_bound_result_brief() {
         )
         .await
         .unwrap();
-    let scheduling_generation = work_item.revision.saturating_sub(1);
-    runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .initialize_scheduler_protocol_partition(
-            "default",
-            &Snapshot {
-                slot: ActivationSlot::Idle,
-                dispatch: AgentDispatchState::Open,
-                dispatch_revision: 0,
-                focus: None,
-                work: std::collections::BTreeMap::from([(
-                    work_item.id.clone(),
-                    WorkDemand {
-                        metadata_revision: work_item.revision,
-                        scheduling_generation,
-                        status: WorkStatus::Runnable,
-                        capabilities: Default::default(),
-                        locks: Default::default(),
-                        locality: "runtime".into(),
-                        cost_class: "default".into(),
-                    },
-                )]),
-                waits: Default::default(),
-                activations: Default::default(),
-                activation_admissions: Default::default(),
-                settlements: Default::default(),
-                missing_settlements: Default::default(),
-                admitted_generations: Default::default(),
-                continuation_admissions: Default::default(),
-                activation_inputs: Default::default(),
-            },
-        )
-        .unwrap();
     let mut message = MessageEnvelope::new(
         "default",
         MessageKind::SystemTick,
@@ -4629,7 +8486,7 @@ async fn completed_production_settlement_uses_exact_bound_result_brief() {
         MessageDeliverySurface::RuntimeSystem,
         AdmissionContext::RuntimeOwned,
     );
-    message.work_item_id = Some(work_item.id.clone());
+    bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
     message.turn_id = Some("turn-exact-completion".into());
     let message = runtime.enqueue(message).await.unwrap();
 
@@ -4639,21 +8496,22 @@ async fn completed_production_settlement_uses_exact_bound_result_brief() {
         .unwrap();
     assert!(matches!(poll, scheduler_executor::RunLoopPoll::Message(_)));
     let activation_id = scheduler_executor::canonical_activation_id(&message.id);
-    let claimed = runtime
+    let execution = runtime
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    let activation = &claimed.activations[&activation_id];
-    assert_eq!(activation.admitted_generation, scheduling_generation);
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("production claim should initialize the execution partition");
+    let attempt = &execution.attempts[&activation_id];
     assert_eq!(
-        claimed.activation_admissions[&activation_id]
-            .activation
-            .source_revision,
+        attempt.admitted_fences.work_item_source_revision,
         Some(work_item.revision)
     );
-    assert_ne!(activation.admitted_generation, work_item.revision);
+    assert_eq!(
+        attempt.admitted_fences.work_item_generation,
+        Some(execution.work_items[&work_item.id].generation())
+    );
 
     runtime
         .begin_interactive_turn(Some(&message), None, None)
@@ -4753,20 +8611,16 @@ async fn completed_production_settlement_uses_exact_bound_result_brief() {
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
         .unwrap();
-    let settlement = settled
-        .settlements
-        .get(&canonical_settlement_id(&message.id))
-        .expect("completed activation should have an exact settlement");
-    assert_eq!(
-        settlement.operator_delivery.as_deref(),
-        Some(result_brief_id.as_str())
-    );
-    assert_ne!(
-        settlement.operator_delivery.as_deref(),
-        Some(decoy.id.as_str())
-    );
+    let attempt = &settled.attempts[&activation_id];
+    assert!(matches!(
+        &settled.outcomes[attempt.terminal_outcome_id.as_deref().unwrap()].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Complete { completion }
+        ) if completion == &result_brief_id && completion != &decoy.id
+    ));
 }
 
 #[tokio::test]
@@ -4811,7 +8665,7 @@ async fn completed_wait_resume_settlement_accepts_exact_reconciliation_revision(
         MessageDeliverySurface::RuntimeSystem,
         AdmissionContext::RuntimeOwned,
     );
-    wait_message.work_item_id = Some(work_item.id.clone());
+    bind_autonomous_work_queue_tick(&mut wait_message, &work_item, "queued_available");
     wait_message.turn_id = Some("turn-wait-before-completion".into());
     let wait_message = runtime.enqueue(wait_message).await.unwrap();
     assert!(matches!(
@@ -4821,6 +8675,7 @@ async fn completed_wait_resume_settlement_accepts_exact_reconciliation_revision(
             .unwrap(),
         scheduler_executor::RunLoopPoll::Message(_)
     ));
+    append_running_rejoin_task(&runtime, "task-complete-after-wait", &work_item.id);
     let registration = runtime
         .register_wait_for(
             "default",
@@ -4851,22 +8706,12 @@ async fn completed_wait_resume_settlement_accepts_exact_reconciliation_revision(
         .await
         .unwrap();
 
-    runtime
-        .storage()
-        .append_task(&TaskRecord {
-            id: "task-complete-after-wait".into(),
-            agent_id: "default".into(),
-            kind: TaskKind::CommandTask,
-            status: TaskStatus::Completed,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            parent_message_id: None,
-            work_item_id: Some(work_item.id.clone()),
-            summary: Some("task completed after wait".into()),
-            detail: None,
-            recovery: None,
-        })
-        .unwrap();
+    append_completed_rejoin_task(
+        &runtime,
+        "task-complete-after-wait",
+        &work_item.id,
+        "turn-wait-before-completion",
+    );
     let mut resume = task_result_message("task-complete-after-wait").with_admission(
         MessageDeliverySurface::TaskRejoin,
         AdmissionContext::RuntimeOwned,
@@ -4894,18 +8739,30 @@ async fn completed_wait_resume_settlement_accepts_exact_reconciliation_revision(
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    let source_revision = claimed.activation_admissions[&activation_id]
-        .activation
-        .source_revision
-        .expect("wait resume source revision");
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("wait resume should preserve execution authority");
+    let attempt = &claimed.attempts[&activation_id];
+    let source_revision = attempt
+        .admitted_fences
+        .work_item_source_revision
+        .expect("wait resume WorkItem source revision");
+    assert!(matches!(
+        &attempt.source.identity,
+        crate::domain::execution_protocol::ExecutionSourceIdentity::TaskResult {
+            task_id,
+            result_message_id,
+        } if task_id == "task-complete-after-wait" && result_message_id == &resume.id
+    ));
     assert_eq!(
-        claimed.waits[&registration.condition.id].generations
-            [&claimed.waits[&registration.condition.id].current_generation]
-            .consuming_activation_id
-            .as_deref(),
-        Some(activation_id.as_str())
+        runtime
+            .storage()
+            .latest_wait_conditions()
+            .unwrap()
+            .into_iter()
+            .find(|wait| wait.id == registration.condition.id)
+            .map(|wait| wait.status),
+        Some(WaitConditionStatus::Resolved)
     );
 
     runtime
@@ -4934,7 +8791,7 @@ async fn completed_wait_resume_settlement_accepts_exact_reconciliation_revision(
             .as_ref()
             .expect("completion intent")
             .expected_work_revision,
-        source_revision + 1
+        source_revision
     );
     let completed = runtime
         .promote_work_item_completion_report(
@@ -4974,19 +8831,24 @@ async fn completed_wait_resume_settlement_accepts_exact_reconciliation_revision(
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("completion should preserve execution authority");
+    let attempt = &settled.attempts[&activation_id];
     assert_eq!(
-        settled.settlements[&canonical_settlement_id(&resume.id)]
-            .operator_delivery
-            .as_deref(),
-        Some(result_brief_id.as_str())
+        attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Settled
     );
-    assert!(settled.missing_settlements.is_empty());
+    assert!(matches!(
+        &settled.outcomes[attempt.terminal_outcome_id.as_deref().unwrap()].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Complete { completion }
+        ) if completion == &result_brief_id
+    ));
 }
 
 #[tokio::test]
-async fn completed_production_settlement_records_missing_for_mismatched_completion_execution() {
+async fn completed_production_settlement_interrupts_mismatched_completion_execution() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let runtime = RuntimeHandle::new(
@@ -5027,7 +8889,7 @@ async fn completed_production_settlement_records_missing_for_mismatched_completi
         MessageDeliverySurface::RuntimeSystem,
         AdmissionContext::RuntimeOwned,
     );
-    message.work_item_id = Some(work_item.id.clone());
+    bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
     message.turn_id = Some("turn-mismatched-completion".into());
     let message = runtime.enqueue(message).await.unwrap();
 
@@ -5108,24 +8970,25 @@ async fn completed_production_settlement_records_missing_for_mismatched_completi
         .await
         .unwrap());
 
-    let snapshot = runtime
+    let execution = runtime
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
         .unwrap();
     let activation_id = scheduler_executor::canonical_activation_id(&message.id);
-    assert_eq!(snapshot.slot, ActivationSlot::Idle);
-    assert!(snapshot
-        .missing_settlements
-        .contains_key(&canonical_missing_settlement_id(&message.id)));
+    let attempt = &execution.attempts[&activation_id];
     assert_eq!(
-        snapshot
-            .activations
-            .get(&activation_id)
-            .map(|activation| activation.state.clone()),
-        Some(crate::domain::scheduler_protocol::ActivationState::SettlementMissing)
+        attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Interrupted
     );
+    assert!(matches!(
+        &execution.outcomes[attempt.terminal_outcome_id.as_deref().unwrap()].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Interrupted { .. }
+        )
+    ));
     assert_eq!(
         runtime
             .inner
@@ -5141,7 +9004,7 @@ async fn completed_production_settlement_records_missing_for_mismatched_completi
 }
 
 #[tokio::test]
-async fn completed_production_settlement_records_missing_without_result_report() {
+async fn completed_production_settlement_interrupts_without_result_report() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let runtime = RuntimeHandle::new(
@@ -5182,7 +9045,7 @@ async fn completed_production_settlement_records_missing_without_result_report()
         MessageDeliverySurface::RuntimeSystem,
         AdmissionContext::RuntimeOwned,
     );
-    message.work_item_id = Some(work_item.id.clone());
+    bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
     message.turn_id = Some("turn-missing-completion-report".into());
     let message = runtime.enqueue(message).await.unwrap();
 
@@ -5220,34 +9083,28 @@ async fn completed_production_settlement_records_missing_without_result_report()
         .unwrap());
 
     let activation_id = scheduler_executor::canonical_activation_id(&message.id);
-    let snapshot = runtime
+    let execution = runtime
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
         .unwrap();
-    assert_eq!(snapshot.slot, ActivationSlot::Idle);
-    assert!(snapshot
-        .missing_settlements
-        .contains_key(&canonical_missing_settlement_id(&message.id)));
+    let attempt = &execution.attempts[&activation_id];
     assert_eq!(
-        snapshot
-            .activations
-            .get(&activation_id)
-            .map(|activation| activation.state.clone()),
-        Some(crate::domain::scheduler_protocol::ActivationState::SettlementMissing)
+        attempt.state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Interrupted
     );
-    assert_eq!(
-        snapshot
-            .work
-            .get(&work_item.id)
-            .map(|demand| &demand.status),
-        Some(&WorkStatus::NeedsSettlement { activation_id })
-    );
+    assert!(matches!(
+        &execution.outcomes[attempt.terminal_outcome_id.as_deref().unwrap()].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Interrupted { reason }
+        ) if reason == "completion_brief_binding_missing"
+    ));
 }
 
 #[tokio::test]
-async fn production_protocol_settlement_fault_rolls_back_queue_and_canonical_facts() {
+async fn production_protocol_settlement_fault_rolls_back_queue_and_protocol_facts() {
     for fault in PRE_COMMIT_FAULTS {
         let dir = tempdir().unwrap();
         let workspace = tempdir().unwrap();
@@ -5285,7 +9142,7 @@ async fn production_protocol_settlement_fault_rolls_back_queue_and_canonical_fac
                 text: "run canonical work".into(),
             },
         );
-        message.work_item_id = Some(work_item.id.clone());
+        bind_autonomous_work_queue_tick(&mut message, &work_item, "queued_available");
         message.turn_id = Some(format!("turn-canonical-settlement-fault-{fault:?}"));
         let message = runtime.enqueue(message).await.unwrap();
         let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
@@ -5293,12 +9150,14 @@ async fn production_protocol_settlement_fault_rolls_back_queue_and_canonical_fac
             .await
             .unwrap();
         assert!(matches!(poll, scheduler_executor::RunLoopPoll::Message(_)));
-        let claimed = runtime
+
+        let claimed_execution = runtime
             .inner
             .runtime_db
             .transitions()
-            .load_scheduler_protocol_snapshot("default")
-            .unwrap();
+            .load_execution_protocol_state_if_initialized("default")
+            .unwrap()
+            .expect("claim should initialize the execution partition");
         finish_claimed_test_run(&runtime).await;
         let terminal = terminal_transition(&message, Some(&work_item.id));
         runtime.inject_next_transition_fault(fault);
@@ -5331,9 +9190,9 @@ async fn production_protocol_settlement_fault_rolls_back_queue_and_canonical_fac
                 .inner
                 .runtime_db
                 .transitions()
-                .load_scheduler_protocol_snapshot("default")
+                .load_execution_protocol_state_if_initialized("default")
                 .unwrap(),
-            claimed
+            Some(claimed_execution)
         );
         assert_eq!(
             runtime
@@ -5529,6 +9388,95 @@ async fn run_loop_stale_head_noops_before_canonical_claim() {
     assert!(!events.iter().any(|event| {
         event.kind == "queue_entry_claimed" && event.data["message_id"] == message.id
     }));
+}
+
+#[tokio::test]
+async fn stale_work_queue_revision_is_dropped_before_canonical_claim() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item("drop stale autonomous tick".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let mut message = MessageEnvelope::new(
+        "default",
+        MessageKind::SystemTick,
+        MessageOrigin::System {
+            subsystem: "work_queue".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Normal,
+        MessageBody::Text {
+            text: "stale autonomous continuation".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    message.work_item_id = Some(work_item.id.clone());
+    message.metadata = Some(serde_json::json!({
+        "work_queue": {
+            "reason": "queued_available",
+            "work_item_id": work_item.id,
+            "work_item_revision": work_item.revision
+        }
+    }));
+    let message = runtime.enqueue(message).await.unwrap();
+    let updated = runtime
+        .update_work_item_fields(
+            work_item.id.clone(),
+            Some("newer objective revision".into()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(updated.revision > work_item.revision);
+
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Idle
+    ));
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_queue_entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == message.id)
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Dropped)
+    );
+    assert!(runtime
+        .storage()
+        .read_recent_events(usize::MAX)
+        .unwrap()
+        .iter()
+        .any(|event| {
+            event.kind == "scheduler_authority_input_rejected"
+                && event.data["message_id"] == message.id
+                && event.data["reason"] == "canonical_autonomous_work_item_revision_stale"
+                && event.data["queue_disposition"] == "dropped"
+        }));
 }
 
 #[tokio::test]
@@ -5916,6 +9864,169 @@ async fn indefinite_sleep_with_queued_runnable_work_item_emits_selection_tick() 
 }
 
 #[tokio::test]
+async fn idle_tick_ignores_read_model_runnable_when_execution_is_paused() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "projection-only runnable work".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    persist_work_execution(
+        &runtime,
+        &work_item,
+        work_item.revision,
+        crate::domain::execution_protocol::WorkItemExecutionState::Paused {
+            generation: work_item.revision.max(1),
+            reason: "canonical pause".into(),
+        },
+    );
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.status = AgentStatus::AwakeIdle;
+        guard.persist_state(&runtime.inner.storage).unwrap();
+    }
+
+    assert!(!runtime.maybe_emit_pending_system_tick(None).await.unwrap());
+    assert!(runtime
+        .storage()
+        .read_recent_messages(10)
+        .unwrap()
+        .iter()
+        .all(|message| !matches!(
+            (&message.kind, &message.origin),
+            (MessageKind::SystemTick, MessageOrigin::System { subsystem })
+                if subsystem == "work_queue"
+        )));
+}
+
+#[tokio::test]
+async fn restart_sleep_ignores_read_model_runnable_when_execution_is_paused() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "restart projection divergence".into(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    persist_work_execution(
+        &runtime,
+        &work_item,
+        work_item.revision,
+        crate::domain::execution_protocol::WorkItemExecutionState::Paused {
+            generation: work_item.revision.max(1),
+            reason: "canonical pause survives restart".into(),
+        },
+    );
+    drop(runtime);
+
+    let reopened = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    {
+        let mut guard = reopened.inner.agent.lock().await;
+        guard.state.status = AgentStatus::AwakeRunning;
+        guard.state.current_run_id = Some("run-after-restart".into());
+        guard.persist_state(&reopened.inner.storage).unwrap();
+    }
+
+    reopened.transition_to_sleep(None).await.unwrap();
+
+    let state = reopened.agent_state().await.unwrap();
+    assert_eq!(state.status, AgentStatus::Asleep);
+    assert_eq!(state.pending, 0);
+    assert!(reopened
+        .storage()
+        .read_recent_events(usize::MAX)
+        .unwrap()
+        .iter()
+        .all(|event| event.data["reason"] != "sleep_overridden_runnable_work"));
+}
+
+#[tokio::test]
+async fn idle_tick_ignores_runnable_execution_with_stale_source_revision() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item("stale execution revision".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    persist_work_execution(
+        &runtime,
+        &work_item,
+        work_item.revision + 1,
+        crate::domain::execution_protocol::WorkItemExecutionState::Runnable {
+            generation: work_item.revision.max(1),
+            recovery_ref: None,
+        },
+    );
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.status = AgentStatus::AwakeIdle;
+        guard.persist_state(&runtime.inner.storage).unwrap();
+    }
+
+    assert!(!runtime.maybe_emit_pending_system_tick(None).await.unwrap());
+}
+
+#[tokio::test]
 async fn indefinite_sleep_with_waiting_operator_or_task_work_item_can_sleep() {
     for waiting_kind in ["operator", "task"] {
         let dir = tempdir().unwrap();
@@ -6011,6 +10122,7 @@ async fn wait_for_task_result_marks_work_item_waiting_and_allows_sleep() {
         runtime.storage().write_agent(&guard.state).unwrap();
     }
 
+    append_running_rejoin_task(&runtime, "task-1", &work.id);
     runtime
         .register_wait_for(
             "default",
@@ -6173,7 +10285,7 @@ async fn register_wait_for_external_recheck_sets_recoverable_work_item_deadline(
 }
 
 #[tokio::test]
-async fn task_result_resolves_wait_for_task_condition_and_clears_matching_blocker() {
+async fn canonical_task_result_claim_resolves_wait_and_clears_matching_blocker() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let runtime = RuntimeHandle::new(
@@ -6193,7 +10305,8 @@ async fn task_result_resolves_wait_for_task_condition_and_clears_matching_blocke
         .create_work_item("wait for task".into(), None, None, Vec::new())
         .await
         .unwrap();
-    runtime
+    append_running_rejoin_task(&runtime, "task-1", &work.id);
+    let registration = runtime
         .register_wait_for(
             "default",
             Some(work.id.clone()),
@@ -6204,7 +10317,15 @@ async fn task_result_resolves_wait_for_task_condition_and_clears_matching_blocke
         )
         .await
         .unwrap();
+    let work = runtime.latest_work_item(&work.id).await.unwrap().unwrap();
+    persist_waiting_work_execution(&runtime, &work, &registration.condition.id);
 
+    let mut message = task_result_message("task-1").with_admission(
+        MessageDeliverySurface::TaskRejoin,
+        AdmissionContext::RuntimeOwned,
+    );
+    message.task_id = Some("task-1".into());
+    message.work_item_id = Some(work.id.clone());
     let task = TaskRecord {
         id: "task-1".into(),
         agent_id: "default".into(),
@@ -6212,31 +10333,197 @@ async fn task_result_resolves_wait_for_task_condition_and_clears_matching_blocke
         status: TaskStatus::Completed,
         created_at: Utc::now(),
         updated_at: Utc::now(),
-        parent_message_id: None,
+        parent_message_id: Some(message.id.clone()),
         work_item_id: Some(work.id.clone()),
         summary: Some("task-1".into()),
-        detail: None,
+        detail: Some(serde_json::json!({
+            "rejoin_obligation_id": "task-1",
+            "rejoin_generation": 1,
+            "parent_turn_id": "turn-task-1-parent",
+        })),
         recovery: None,
     };
-    let mut message = task_result_message("task-1");
-    message.task_id = Some("task-1".into());
-    message.work_item_id = Some(work.id.clone());
     runtime
-        .reduce_task_result_message(&message, task, false, None)
+        .commit_terminal_task_result(&task, "task_status_updated", &message)
         .await
         .unwrap();
 
     let latest = runtime.latest_work_item(&work.id).await.unwrap().unwrap();
-    assert_eq!(latest.blocked_by, None);
-    let active_conditions = runtime
+    assert_eq!(latest.blocked_by.as_deref(), Some("waiting for task-1"));
+    let triggered = runtime
         .storage()
-        .active_wait_conditions_for_work_item("default", &work.id)
+        .latest_wait_conditions()
+        .unwrap()
+        .into_iter()
+        .find(|condition| condition.work_item_id.as_deref() == Some(work.id.as_str()))
+        .expect("triggered task wait");
+    assert_eq!(triggered.status, WaitConditionStatus::Triggered);
+    let planned_wait_resolution = runtime
+        .wait_resolution_transition_for_message(&message)
+        .unwrap()
+        .expect("triggered task wait should plan claim-time resolution");
+    assert!(
+        planned_wait_resolution.work_item.is_some(),
+        "claim-time wait resolution should clear the matching WorkItem blocker"
+    );
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
         .unwrap();
-    assert!(active_conditions.is_empty());
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("canonical task result should be claimed");
+    };
+    assert_eq!(scheduled.message.id, message.id);
+    let latest = runtime.latest_work_item(&work.id).await.unwrap().unwrap();
+    let resolved = runtime
+        .storage()
+        .latest_wait_conditions()
+        .unwrap()
+        .into_iter()
+        .find(|condition| condition.id == triggered.id)
+        .expect("resolved task wait");
+    assert_eq!(
+        (
+            resolved.status,
+            latest.revision,
+            latest.blocked_by.as_deref()
+        ),
+        (WaitConditionStatus::Resolved, work.revision + 1, None)
+    );
     let events = runtime.storage().read_recent_events(100).unwrap();
     assert!(events
         .iter()
-        .any(|event| event.kind == "wait_conditions_resolved"));
+        .any(|event| event.kind == "wait_condition_triggered"));
+}
+
+#[tokio::test]
+async fn resolved_task_result_uses_canonical_wait() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work = runtime
+        .create_work_item("resume resolved task wait".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    append_running_rejoin_task(&runtime, "task-unified-wait", &work.id);
+    let registration = runtime
+        .register_wait_for(
+            "default",
+            Some(work.id.clone()),
+            WaitForWakeKind::TaskResult,
+            Some("task-unified-wait".into()),
+            "waiting for unified task result".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let waiting = runtime.latest_work_item(&work.id).await.unwrap().unwrap();
+
+    let mut result = task_result_message("task-unified-wait").with_admission(
+        MessageDeliverySurface::TaskRejoin,
+        AdmissionContext::RuntimeOwned,
+    );
+    result.work_item_id = Some(waiting.id.clone());
+    result.task_id = Some("task-unified-wait".into());
+    result.metadata = Some(serde_json::json!({
+        "task_id": "task-unified-wait",
+        "task_kind": "command_task",
+        "task_status": "completed",
+        "task_result_id": "result-unified-wait",
+        "work_item_id": waiting.id,
+    }));
+    let now = Utc::now();
+    let mut resolved = registration.condition.clone();
+    resolved.status = WaitConditionStatus::Resolved;
+    resolved.updated_at = now;
+    resolved.resolved_at = Some(now);
+    resolved.trigger_message_id = Some(result.id.clone());
+    runtime.storage().append_wait_condition(&resolved).unwrap();
+    let resumed = WorkItemRecord {
+        revision: waiting.revision + 1,
+        blocked_by: None,
+        updated_at: now,
+        ..waiting
+    };
+    runtime.storage().append_work_item(&resumed).unwrap();
+
+    let generation = resumed.revision - 1;
+    let mut execution = crate::domain::execution_protocol::ExecutionProtocolState::empty("default");
+    execution.work_items.insert(
+        resumed.id.clone(),
+        crate::domain::execution_protocol::WorkItemExecutionRecord {
+            source_revision: resumed.revision,
+            state: crate::domain::execution_protocol::WorkItemExecutionState::Waiting {
+                generation,
+                wait: crate::domain::execution_protocol::WaitReference {
+                    wait_id: resolved.id.clone(),
+                },
+            },
+        },
+    );
+    runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &execution))
+        .unwrap();
+
+    append_completed_rejoin_task(
+        &runtime,
+        "task-unified-wait",
+        &resumed.id,
+        "turn-unified-wait",
+    );
+    assert!(!runtime
+        .storage()
+        .latest_task_record("task-unified-wait")
+        .unwrap()
+        .unwrap()
+        .terminal_reentry());
+    result.work_item_id = Some(resumed.id.clone());
+    result.metadata.as_mut().unwrap()["work_item_id"] =
+        serde_json::Value::String(resumed.id.clone());
+    let result = runtime.enqueue(result).await.unwrap();
+
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("unified waiting authority should admit the resolved task result");
+    };
+    assert_eq!(scheduled.message.id, result.id);
+    assert!(scheduled.scheduler_decision.model_reentry);
+    assert!(matches!(
+        scheduled.dispatch_plan.execution_admission_provenance,
+        crate::types::ExecutionAdmissionProvenance::Canonical { .. }
+    ));
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    let attempt = &execution.attempts[&scheduler_executor::canonical_activation_id(&result.id)];
+    assert!(matches!(
+        &attempt.source.identity,
+        crate::domain::execution_protocol::ExecutionSourceIdentity::TaskResult {
+            task_id,
+            result_message_id,
+        } if task_id == "task-unified-wait" && result_message_id == &result.id
+    ));
 }
 
 #[tokio::test]
@@ -6859,6 +11146,1706 @@ async fn enqueue_normalizes_runtime_followup_without_authority_upgrade() {
 }
 
 #[tokio::test]
+async fn enqueue_inherits_current_work_item_and_preserves_canonical_provenance() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item("enqueue follow-up owner".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.current_turn_work_item_id = Some(work_item.id.clone());
+        guard.persist_state(&runtime.inner.storage).unwrap();
+    }
+
+    crate::tool::tools::execute_builtin_tool(
+        &runtime,
+        "default",
+        &AuthorityClass::ExternalEvidence,
+        &crate::tool::ToolCall {
+            id: "enqueue-bound-follow-up".into(),
+            name: "Enqueue".into(),
+            input: serde_json::json!({
+                "text": "continue with external evidence",
+                "priority": "next"
+            }),
+        },
+    )
+    .await
+    .unwrap();
+
+    let message = runtime
+        .storage()
+        .read_recent_messages(10)
+        .unwrap()
+        .into_iter()
+        .find(|message| {
+            matches!(
+                &message.origin,
+                MessageOrigin::System { subsystem } if subsystem == "tool_enqueue"
+            )
+        })
+        .expect("Enqueue should persist its follow-up");
+    assert_eq!(message.work_item_id.as_deref(), Some(work_item.id.as_str()));
+    assert_eq!(message.authority_class, AuthorityClass::ExternalEvidence);
+
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("canonical claim should initialize execution protocol");
+    assert_eq!(
+        execution.attempts[&activation_id].provenance.trust,
+        crate::domain::execution_protocol::ExecutionTrust::ExternalEvidence
+    );
+    assert_eq!(
+        execution.attempts[&activation_id].provenance.origin,
+        crate::domain::execution_protocol::ExecutionOrigin::System
+    );
+    assert!(matches!(
+        execution.attempts[&activation_id].source.identity,
+        crate::domain::execution_protocol::ExecutionSourceIdentity::InternalFollowup { .. }
+    ));
+}
+
+#[tokio::test]
+async fn stale_bound_internal_followup_is_dropped_before_operator_resume() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "stale bound follow-up".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let mut followup = MessageEnvelope::new(
+        "default",
+        MessageKind::InternalFollowup,
+        MessageOrigin::System {
+            subsystem: "tool_enqueue".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Next,
+        MessageBody::Text {
+            text: "continue stale work".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    followup.work_item_id = Some(work_item.id.clone());
+    let followup = runtime.enqueue(followup).await.unwrap();
+    runtime
+        .update_work_item_fields(
+            work_item.id.clone(),
+            None,
+            Some(WorkItemPlanStatus::NeedsInput),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let operator = runtime
+        .enqueue(trusted_operator_prompt(
+            Some(&work_item.id),
+            "resume with new operator input",
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Idle
+    ));
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_queue_entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == followup.id)
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Dropped)
+    );
+    assert!(runtime
+        .storage()
+        .read_recent_events(usize::MAX)
+        .unwrap()
+        .iter()
+        .any(|event| {
+            event.kind == "scheduler_authority_input_rejected"
+                && event.data["message_id"] == followup.id
+                && event.data["reason"] == "canonical_internal_followup_work_item_not_runnable"
+                && event.data["queue_disposition"] == "dropped"
+        }));
+
+    drop(runtime);
+    let reopened = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&reopened)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("new operator input should advance after the stale follow-up");
+    };
+    assert_eq!(scheduled.message.id, operator.id);
+}
+
+#[tokio::test]
+async fn provider_recovery_claims_waiting_work_item_without_clearing_wait() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "provider recovery while waiting".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    let registration = runtime
+        .register_wait_for(
+            "default",
+            Some(work_item.id.clone()),
+            WaitForWakeKind::External,
+            Some("github:holon-run/holon#provider-recovery".into()),
+            "waiting for external review".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let waiting_work_item = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        runtime
+            .storage()
+            .work_queue_prompt_projection()
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| item.id == work_item.id)
+            .map(|item| item.scheduling_state),
+        Some(WorkItemSchedulingState::WaitingExternal)
+    );
+    persist_waiting_work_execution(&runtime, &waiting_work_item, &registration.condition.id);
+
+    let recovery = runtime
+        .enqueue(provider_recovery_message(&runtime, &work_item.id))
+        .await
+        .unwrap();
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("trusted provider recovery should claim the waiting WorkItem");
+    };
+    assert_eq!(scheduled.message.id, recovery.id);
+
+    let activation_id = scheduler_executor::canonical_activation_id(&recovery.id);
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("provider recovery should preserve execution authority");
+    let attempt = &execution.attempts[&activation_id];
+    assert!(matches!(
+        attempt.source.identity,
+        crate::domain::execution_protocol::ExecutionSourceIdentity::RuntimeRecovery {
+            ref recovery_id
+        } if recovery_id == &recovery.id
+    ));
+    assert_eq!(
+        attempt.provenance.origin,
+        crate::domain::execution_protocol::ExecutionOrigin::RuntimeRecovery
+    );
+    assert_eq!(
+        attempt.provenance.trust,
+        crate::domain::execution_protocol::ExecutionTrust::RuntimeInstruction
+    );
+    let expected_source_attempt_id = format!(
+        "attempt-provider-failure:{}",
+        recovery.causation_id.as_deref().unwrap()
+    );
+    assert_eq!(
+        attempt.recovery_of_attempt_id.as_deref(),
+        Some(expected_source_attempt_id.as_str())
+    );
+    assert!(matches!(
+        &execution.work_items[&work_item.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::InFlight {
+            attempt_id,
+            ..
+        } if attempt_id == &activation_id
+    ));
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_wait_conditions()
+            .unwrap()
+            .into_iter()
+            .find(|condition| condition.id == registration.condition.id)
+            .map(|condition| condition.status),
+        Some(WaitConditionStatus::Active)
+    );
+
+    finish_claimed_test_run(&runtime).await;
+    let terminal = terminal_transition(&recovery, Some(&work_item.id));
+    runtime
+        .commit_queue_terminal_settlement(
+            QueueEntryRecord {
+                message_id: recovery.id.clone(),
+                agent_id: recovery.agent_id.clone(),
+                priority: recovery.priority,
+                status: QueueEntryStatus::Processed,
+                created_at: recovery.created_at,
+                updated_at: Utc::now(),
+            },
+            Vec::new(),
+            true,
+            Some(&terminal),
+        )
+        .await
+        .unwrap();
+    let settled = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        &settled.work_items[&work_item.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Waiting { wait, .. }
+            if wait.wait_id == registration.condition.id
+    ));
+    let outcome_id = settled.attempts[&activation_id]
+        .terminal_outcome_id
+        .as_deref()
+        .unwrap();
+    assert!(matches!(
+        &settled.outcomes[outcome_id].outcome,
+        crate::domain::execution_protocol::ExecutionOutcome::WorkItem(
+            crate::domain::execution_protocol::WorkItemOutcome::Wait { wait }
+        ) if wait.wait_id == registration.condition.id
+    ));
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_wait_conditions()
+            .unwrap()
+            .into_iter()
+            .find(|condition| condition.id == registration.condition.id)
+            .map(|condition| condition.status),
+        Some(WaitConditionStatus::Active)
+    );
+}
+
+#[tokio::test]
+async fn provider_recovery_claims_execution_waiting_projection_drift() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "recover execution waiting projection drift".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .storage()
+            .work_queue_prompt_projection()
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| item.id == work_item.id)
+            .map(|item| item.scheduling_state),
+        Some(WorkItemSchedulingState::Runnable)
+    );
+    persist_waiting_work_execution(&runtime, &work_item, "wait-stale-projection");
+
+    let recovery = runtime
+        .enqueue(provider_recovery_message(&runtime, &work_item.id))
+        .await
+        .unwrap();
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("provider recovery should repair execution Waiting projection drift");
+    };
+    assert_eq!(scheduled.message.id, recovery.id);
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        &execution.work_items[&work_item.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::InFlight { .. }
+    ));
+}
+
+#[tokio::test]
+async fn malformed_provider_recovery_cannot_claim_waiting_work_item() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "reject malformed provider recovery".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    let registration = runtime
+        .register_wait_for(
+            "default",
+            Some(work_item.id.clone()),
+            WaitForWakeKind::External,
+            Some("github:holon-run/holon#malformed-provider-recovery".into()),
+            "waiting for external review".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let waiting_work_item = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    persist_waiting_work_execution(&runtime, &waiting_work_item, &registration.condition.id);
+
+    let mut malformed = provider_recovery_message(&runtime, &work_item.id);
+    malformed.metadata = None;
+    let malformed = runtime.enqueue(malformed).await.unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Idle
+    ));
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_queue_entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == malformed.id)
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Dropped)
+    );
+    assert!(runtime
+        .storage()
+        .read_recent_events(usize::MAX)
+        .unwrap()
+        .iter()
+        .any(|event| {
+            event.kind == "scheduler_authority_input_rejected"
+                && event.data["message_id"] == malformed.id
+                && event.data["reason"] == "canonical_provider_recovery_directive_invalid"
+        }));
+    assert!(matches!(
+        &runtime
+            .inner
+            .runtime_db
+            .transitions()
+            .load_execution_protocol_state_if_initialized("default")
+            .unwrap()
+            .unwrap()
+            .work_items[&work_item.id]
+            .state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Waiting { wait, .. }
+            if wait.wait_id == registration.condition.id
+    ));
+}
+
+#[tokio::test]
+async fn provider_recovery_rejects_missing_durable_source() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "reject provider recovery with missing source".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    let registration = runtime
+        .register_wait_for(
+            "default",
+            Some(work_item.id.clone()),
+            WaitForWakeKind::External,
+            Some("github:holon-run/holon#missing-recovery-source".into()),
+            "waiting for external review".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let waiting_work_item = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    persist_waiting_work_execution(&runtime, &waiting_work_item, &registration.condition.id);
+
+    let mut forged = provider_recovery_message(&runtime, &work_item.id);
+    forged.causation_id = Some("message-missing-provider-failure".into());
+    forged.source_refs.insert(
+        "source_message_id".into(),
+        "message-missing-provider-failure".into(),
+    );
+    forged.metadata.as_mut().unwrap()["provider_recovery"]["source_message_id"] =
+        serde_json::json!("message-missing-provider-failure");
+    let forged = runtime.enqueue(forged).await.unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Idle
+    ));
+    assert!(runtime
+        .storage()
+        .read_recent_events(usize::MAX)
+        .unwrap()
+        .iter()
+        .any(|event| {
+            event.kind == "scheduler_authority_input_rejected"
+                && event.data["message_id"] == forged.id
+                && event.data["reason"] == "canonical_provider_recovery_source_invalid"
+        }));
+}
+
+#[tokio::test]
+async fn triggered_wait_survives_provider_recovery_settlement_and_resumes() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "provider recovery wait trigger race".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    let registration = runtime
+        .register_wait_for(
+            "default",
+            Some(work_item.id.clone()),
+            WaitForWakeKind::OperatorInput,
+            None,
+            "waiting for operator".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let waiting_work_item = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    persist_waiting_work_execution(&runtime, &waiting_work_item, &registration.condition.id);
+
+    let recovery = runtime
+        .enqueue(provider_recovery_message(&runtime, &work_item.id))
+        .await
+        .unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+    let wake = runtime
+        .enqueue(trusted_operator_prompt(
+            Some(&work_item.id),
+            "operator wakes recovery wait",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_wait_conditions()
+            .unwrap()
+            .into_iter()
+            .find(|condition| condition.id == registration.condition.id)
+            .map(|condition| condition.status),
+        Some(WaitConditionStatus::Triggered)
+    );
+
+    finish_claimed_test_run(&runtime).await;
+    let terminal = terminal_transition(&recovery, Some(&work_item.id));
+    runtime
+        .commit_queue_terminal_settlement(
+            QueueEntryRecord {
+                message_id: recovery.id.clone(),
+                agent_id: recovery.agent_id.clone(),
+                priority: recovery.priority,
+                status: QueueEntryStatus::Processed,
+                created_at: recovery.created_at,
+                updated_at: Utc::now(),
+            },
+            Vec::new(),
+            true,
+            Some(&terminal),
+        )
+        .await
+        .unwrap();
+    let settled = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        &settled.work_items[&work_item.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Waiting { wait, .. }
+            if wait.wait_id == registration.condition.id
+    ));
+
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("triggered wait should resume after provider recovery settlement");
+    };
+    assert_eq!(scheduled.message.id, wake.id);
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_wait_conditions()
+            .unwrap()
+            .into_iter()
+            .find(|condition| condition.id == registration.condition.id)
+            .map(|condition| condition.status),
+        Some(WaitConditionStatus::Resolved)
+    );
+}
+
+#[tokio::test]
+async fn provider_recovery_cannot_claim_blocked_work_item() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "provider recovery blocked boundary".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let blocked = runtime
+        .update_work_item_fields(
+            work_item.id.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(Some("manual blocker".into())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .storage()
+            .work_queue_prompt_projection()
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| item.id == work_item.id)
+            .map(|item| item.scheduling_state),
+        Some(WorkItemSchedulingState::Blocked)
+    );
+    persist_waiting_work_execution(&runtime, &blocked, "wait-blocked-boundary");
+
+    let recovery = runtime
+        .enqueue(provider_recovery_message(&runtime, &work_item.id))
+        .await
+        .unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Idle
+    ));
+    assert!(runtime
+        .storage()
+        .read_recent_events(usize::MAX)
+        .unwrap()
+        .iter()
+        .any(|event| {
+            event.kind == "scheduler_authority_input_rejected"
+                && event.data["message_id"] == recovery.id
+                && event.data["reason"] == "canonical_provider_recovery_work_item_not_recoverable"
+        }));
+}
+
+#[tokio::test]
+async fn provider_recovery_cannot_claim_paused_execution() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "provider recovery paused execution boundary".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let generation = work_item.revision.max(1);
+    let mut execution = crate::domain::execution_protocol::ExecutionProtocolState::empty("default");
+    execution.work_items.insert(
+        work_item.id.clone(),
+        crate::domain::execution_protocol::WorkItemExecutionRecord {
+            source_revision: generation,
+            state: crate::domain::execution_protocol::WorkItemExecutionState::Paused {
+                generation,
+                reason: "manual pause".into(),
+            },
+        },
+    );
+    runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &execution))
+        .unwrap();
+
+    let recovery = runtime
+        .enqueue(provider_recovery_message(&runtime, &work_item.id))
+        .await
+        .unwrap();
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Idle
+    ));
+    assert!(runtime
+        .storage()
+        .read_recent_events(usize::MAX)
+        .unwrap()
+        .iter()
+        .any(|event| {
+            event.kind == "scheduler_authority_input_rejected"
+                && event.data["message_id"] == recovery.id
+                && event.data["reason"] == "canonical_provider_recovery_execution_not_recoverable"
+        }));
+}
+
+#[tokio::test]
+async fn claim_time_work_item_change_replans_and_drops_stale_internal_followup() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "claim race follow-up".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let mut followup = MessageEnvelope::new(
+        "default",
+        MessageKind::InternalFollowup,
+        MessageOrigin::System {
+            subsystem: "tool_enqueue".into(),
+        },
+        AuthorityClass::RuntimeInstruction,
+        Priority::Next,
+        MessageBody::Text {
+            text: "race with needs input".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    followup.work_item_id = Some(work_item.id.clone());
+    let followup = runtime.enqueue(followup).await.unwrap();
+    let operator = runtime
+        .enqueue(trusted_operator_prompt(
+            Some(&work_item.id),
+            "continue after claim race",
+        ))
+        .await
+        .unwrap();
+    runtime.inject_claim_work_item_plan_status_before_commit(
+        work_item.id.clone(),
+        WorkItemPlanStatus::NeedsInput,
+    );
+
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Idle
+    ));
+    assert_eq!(
+        runtime
+            .latest_work_item(&work_item.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .plan_status,
+        WorkItemPlanStatus::NeedsInput
+    );
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_queue_entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == followup.id)
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Dropped)
+    );
+
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("operator input behind claim-race follow-up should remain runnable");
+    };
+    assert_eq!(scheduled.message.id, operator.id);
+}
+
+#[tokio::test]
+async fn enqueue_does_not_bind_to_focus_without_current_turn_ownership() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item("focused but not executing".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    {
+        let mut guard = runtime.inner.agent.lock().await;
+        guard.state.current_work_item_id = Some(work_item.id);
+        guard.state.current_turn_work_item_id = None;
+        guard.state.current_execution_binding = None;
+        guard.persist_state(&runtime.inner.storage).unwrap();
+    }
+
+    crate::tool::tools::execute_builtin_tool(
+        &runtime,
+        "default",
+        &AuthorityClass::RuntimeInstruction,
+        &crate::tool::ToolCall {
+            id: "enqueue-unbound-focus".into(),
+            name: "Enqueue".into(),
+            input: serde_json::json!({
+                "text": "do not inherit focus",
+                "priority": "next"
+            }),
+        },
+    )
+    .await
+    .unwrap();
+
+    let message = runtime
+        .storage()
+        .read_recent_messages(10)
+        .unwrap()
+        .into_iter()
+        .find(|message| {
+            matches!(
+                &message.origin,
+                MessageOrigin::System { subsystem } if subsystem == "tool_enqueue"
+            )
+        })
+        .expect("Enqueue should persist its follow-up");
+    assert_eq!(message.work_item_id, None);
+}
+
+#[tokio::test]
+async fn runtime_owned_followup_preserves_all_authority_classes() {
+    use crate::domain::execution_protocol::ExecutionTrust;
+
+    for (authority, execution_trust) in [
+        (
+            AuthorityClass::OperatorInstruction,
+            ExecutionTrust::OperatorInstruction,
+        ),
+        (
+            AuthorityClass::RuntimeInstruction,
+            ExecutionTrust::RuntimeInstruction,
+        ),
+        (
+            AuthorityClass::IntegrationSignal,
+            ExecutionTrust::IntegrationSignal,
+        ),
+        (
+            AuthorityClass::ExternalEvidence,
+            ExecutionTrust::ExternalEvidence,
+        ),
+    ] {
+        let dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let runtime = RuntimeHandle::new(
+            "default",
+            dir.path().to_path_buf(),
+            workspace.path().to_path_buf(),
+            "http://127.0.0.1:7878".into(),
+            Arc::new(CountingProvider {
+                calls: Mutex::new(0),
+                reply: "unused",
+            }),
+            "default".into(),
+            context_config(),
+        )
+        .unwrap();
+        let message = runtime
+            .enqueue(
+                MessageEnvelope::new(
+                    "default",
+                    MessageKind::InternalFollowup,
+                    MessageOrigin::System {
+                        subsystem: "authority-preservation".into(),
+                    },
+                    authority.clone(),
+                    Priority::Next,
+                    MessageBody::Text {
+                        text: "preserve authority".into(),
+                    },
+                )
+                .with_admission(
+                    MessageDeliverySurface::RuntimeSystem,
+                    AdmissionContext::RuntimeOwned,
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+                .poll()
+                .await
+                .unwrap(),
+            scheduler_executor::RunLoopPoll::Message(_)
+        ));
+        let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+        let execution = runtime
+            .inner
+            .runtime_db
+            .transitions()
+            .load_execution_protocol_state_if_initialized("default")
+            .unwrap()
+            .expect("canonical claim should initialize execution protocol");
+        assert_eq!(
+            execution.attempts[&activation_id].provenance.trust,
+            execution_trust
+        );
+        assert_eq!(message.authority_class, authority);
+    }
+}
+
+#[tokio::test]
+async fn runtime_owned_task_followup_preserves_task_origin_and_external_evidence() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "child",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let message = runtime
+        .enqueue(
+            MessageEnvelope::new(
+                "child",
+                MessageKind::InternalFollowup,
+                MessageOrigin::Task {
+                    task_id: "task-parent".into(),
+                },
+                AuthorityClass::ExternalEvidence,
+                Priority::Next,
+                MessageBody::Text {
+                    text: "delegated evidence".into(),
+                },
+            )
+            .with_admission(
+                MessageDeliverySurface::RuntimeSystem,
+                AdmissionContext::RuntimeOwned,
+            ),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("child")
+        .unwrap()
+        .expect("canonical claim should initialize execution protocol");
+    assert_eq!(
+        execution.attempts[&activation_id].provenance.origin,
+        crate::domain::execution_protocol::ExecutionOrigin::Task
+    );
+    assert_eq!(
+        execution.attempts[&activation_id].provenance.trust,
+        crate::domain::execution_protocol::ExecutionTrust::ExternalEvidence
+    );
+}
+
+#[tokio::test]
+async fn runtime_owned_bound_task_followup_survives_scheduler_reload() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "child",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item("bound delegated follow-up".into(), None, None, Vec::new())
+        .await
+        .unwrap();
+    let mut followup = MessageEnvelope::new(
+        "child",
+        MessageKind::InternalFollowup,
+        MessageOrigin::Task {
+            task_id: "task-parent".into(),
+        },
+        AuthorityClass::ExternalEvidence,
+        Priority::Next,
+        MessageBody::Text {
+            text: "bound delegated evidence".into(),
+        },
+    )
+    .with_admission(
+        MessageDeliverySurface::RuntimeSystem,
+        AdmissionContext::RuntimeOwned,
+    );
+    followup.work_item_id = Some(work_item.id.clone());
+    let message = runtime.enqueue(followup).await.unwrap();
+
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Message(_)
+    ));
+    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+    drop(runtime);
+
+    let reopened = RuntimeHandle::new(
+        "child",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let execution = reopened
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("child")
+        .unwrap()
+        .expect("canonical claim should persist execution protocol");
+    assert!(matches!(
+        execution.attempts[&activation_id].source.identity,
+        crate::domain::execution_protocol::ExecutionSourceIdentity::InternalFollowup { .. }
+    ));
+    assert_eq!(
+        execution.attempts[&activation_id].provenance.origin,
+        crate::domain::execution_protocol::ExecutionOrigin::Task
+    );
+    assert_eq!(
+        execution.attempts[&activation_id].provenance.trust,
+        crate::domain::execution_protocol::ExecutionTrust::ExternalEvidence
+    );
+    assert!(matches!(
+        &execution.attempts[&activation_id].binding,
+        crate::domain::execution_protocol::ExecutionBinding::WorkItem { work_item_id }
+            if work_item_id == &work_item.id
+    ));
+}
+
+#[tokio::test]
+async fn canonical_unclassified_model_reentry_is_dropped_without_blocking_next_message() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let poison = runtime
+        .enqueue(MessageEnvelope::new(
+            "default",
+            MessageKind::InternalFollowup,
+            MessageOrigin::System {
+                subsystem: "untrusted_followup".into(),
+            },
+            AuthorityClass::ExternalEvidence,
+            Priority::Next,
+            MessageBody::Text {
+                text: "unclassified follow-up".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    let valid = runtime
+        .enqueue(trusted_operator_prompt(None, "continue after poison"))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Idle
+    ));
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_queue_entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == poison.id)
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Dropped)
+    );
+    assert!(runtime
+        .storage()
+        .read_recent_events(usize::MAX)
+        .unwrap()
+        .iter()
+        .any(|event| {
+            event.kind == "scheduler_authority_input_rejected"
+                && event.data["message_id"] == poison.id
+                && event.data["reason"] == "canonical_model_reentry_candidate_unclassified"
+                && event.data["queue_disposition"] == "dropped"
+        }));
+
+    drop(runtime);
+    let reopened = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&reopened)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("valid message behind dropped poison head should be claimed after restart");
+    };
+    assert_eq!(scheduled.message.id, valid.id);
+}
+
+#[tokio::test]
+async fn canonical_stale_correlated_wait_is_dropped_without_blocking_next_message() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let work_item = runtime
+        .create_work_item(
+            "stale correlated wait".into(),
+            Some(WorkItemPlanStatus::Ready),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runtime.pick_work_item(work_item.id.clone()).await.unwrap();
+    let registration = runtime
+        .register_wait_for(
+            "default",
+            Some(work_item.id.clone()),
+            WaitForWakeKind::External,
+            Some("github:holon-run/holon#stale-wait".into()),
+            "old wait".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let waiting = runtime
+        .latest_work_item(&work_item.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let current_generation = waiting.revision;
+    let old_generation = current_generation
+        .checked_sub(1)
+        .filter(|generation| *generation > 0)
+        .expect("wait fixture must have an older generation");
+    let mut execution = crate::domain::execution_protocol::ExecutionProtocolState::empty("default");
+    execution.work_items.insert(
+        waiting.id.clone(),
+        crate::domain::execution_protocol::WorkItemExecutionRecord {
+            source_revision: waiting.revision,
+            state: crate::domain::execution_protocol::WorkItemExecutionState::Waiting {
+                generation: current_generation,
+                wait: crate::domain::execution_protocol::WaitReference {
+                    wait_id: registration.condition.id.clone(),
+                },
+            },
+        },
+    );
+    runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &execution))
+        .unwrap();
+
+    let correlated_message = |text: &str, wait_id: &str, generation: u64, priority: Priority| {
+        let mut message = MessageEnvelope::new(
+            "default",
+            MessageKind::WebhookEvent,
+            MessageOrigin::Webhook {
+                source: "github".into(),
+                event_type: Some("pull_request".into()),
+            },
+            AuthorityClass::IntegrationSignal,
+            priority,
+            MessageBody::Text { text: text.into() },
+        )
+        .with_admission(
+            MessageDeliverySurface::HttpCallbackWake,
+            AdmissionContext::ExternalTriggerCapability,
+        );
+        message.work_item_id = Some(work_item.id.clone());
+        message
+            .source_refs
+            .insert("wait_id".into(), wait_id.to_string());
+        message
+            .source_refs
+            .insert("wait_generation".into(), generation.to_string());
+        message
+    };
+    let stale = correlated_message(
+        "stale webhook",
+        "wait-stale-history",
+        old_generation,
+        Priority::Next,
+    );
+    let stale = runtime.enqueue(stale).await.unwrap();
+    let valid = runtime
+        .enqueue(correlated_message(
+            "current webhook",
+            &registration.condition.id,
+            current_generation,
+            Priority::Normal,
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+            .poll()
+            .await
+            .unwrap(),
+        scheduler_executor::RunLoopPoll::Idle
+    ));
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_queue_entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.message_id == stale.id)
+            .map(|entry| entry.status),
+        Some(QueueEntryStatus::Dropped)
+    );
+    let scheduled = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = scheduled else {
+        panic!("message behind stale exact-wait head should be admitted");
+    };
+    assert_eq!(scheduled.message.id, valid.id);
+}
+
+#[tokio::test]
+async fn scheduler_recovery_reconciles_stale_continuation_yield_without_legacy_partition() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let parent = WorkItemRecord::new("default", "stale continuation parent", WorkItemState::Open);
+    let active = WorkItemRecord::new("default", "current continuation child", WorkItemState::Open);
+    let stale = WorkItemRecord::new(
+        "default",
+        "completed historical continuation child",
+        WorkItemState::Completed,
+    );
+    runtime.storage().append_work_item(&parent).unwrap();
+    runtime.storage().append_work_item(&active).unwrap();
+    runtime.storage().append_work_item(&stale).unwrap();
+    let frame = crate::types::WorkItemContinuationFrame::new_on_completed(
+        "default",
+        parent.id.clone(),
+        active.id.clone(),
+        None,
+    );
+    runtime
+        .storage()
+        .append_work_item_continuation(&frame)
+        .unwrap();
+    let execution = crate::domain::execution_protocol::ExecutionProtocolState {
+        agent_id: "default".into(),
+        attempts: Default::default(),
+        work_items: std::collections::BTreeMap::from([(
+            parent.id.clone(),
+            crate::domain::execution_protocol::WorkItemExecutionRecord {
+                source_revision: parent.revision,
+                state: crate::domain::execution_protocol::WorkItemExecutionState::Paused {
+                    generation: 7,
+                    reason: format!("yielded_to:{}", stale.id),
+                },
+            },
+        )]),
+        outcomes: Default::default(),
+    };
+    runtime
+        .inner
+        .runtime_db
+        .transaction(|tx| crate::runtime_db::transitions::persist_state_tx(tx, &execution))
+        .unwrap();
+
+    let report =
+        scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
+            .unwrap();
+    assert!(report.execution_partition_initialized);
+    let candidate = report
+        .continuation_reconciliations
+        .iter()
+        .find(|candidate| candidate.continuation_id == frame.id)
+        .expect("continuation reconciliation candidate");
+    assert!(
+        candidate.eligible,
+        "candidate rejected: {}",
+        candidate.reason
+    );
+    assert_eq!(
+        candidate.stale_active_work_item_id.as_deref(),
+        Some(stale.id.as_str())
+    );
+
+    let (changed, backup) = apply_scheduler_recovery_plan_with_backup_policy(
+        &runtime.inner.storage,
+        &runtime.inner.runtime_db,
+        "default",
+        &report,
+        SchedulerRecoveryBackupPolicy::SkipApproved,
+    )
+    .unwrap();
+    assert_eq!(changed, 1);
+    assert!(backup.is_none());
+    let repaired = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        repaired.work_items[&parent.id].state,
+        crate::domain::execution_protocol::WorkItemExecutionState::Paused {
+            generation: 8,
+            reason: format!("yielded_to:{}", active.id),
+        }
+    );
+    let after =
+        scheduler_recovery_report(&runtime.inner.storage, &runtime.inner.runtime_db, "default")
+            .unwrap();
+    let after_candidate = after
+        .continuation_reconciliations
+        .iter()
+        .find(|candidate| candidate.continuation_id == frame.id)
+        .unwrap();
+    assert!(!after_candidate.eligible);
+    assert_eq!(after_candidate.reason, "already_matched");
+    assert!(runtime
+        .storage()
+        .read_recent_events(64)
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == "work_item_continuation_reconciled"
+            && event.data["continuation_id"] == frame.id));
+}
+
+#[tokio::test]
+async fn lifecycle_ingress_ignores_completed_work_item_lane_before_claim() {
+    let dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let runtime = RuntimeHandle::new(
+        "default",
+        dir.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:7878".into(),
+        Arc::new(CountingProvider {
+            calls: Mutex::new(0),
+            reply: "unused",
+        }),
+        "default".into(),
+        context_config(),
+    )
+    .unwrap();
+    let completed = WorkItemRecord::new(
+        "default",
+        "completed lane before operator ingress",
+        WorkItemState::Completed,
+    );
+    runtime.storage().append_work_item(&completed).unwrap();
+    let wait = WaitConditionRecord {
+        id: "wait-completed-live".into(),
+        agent_id: "default".into(),
+        work_item_id: Some(completed.id.clone()),
+        status: WaitConditionStatus::Cancelled,
+        kind: WaitConditionKind::External,
+        source: None,
+        subject_ref: None,
+        waiting_for: "stale".into(),
+        wake_sources: vec![WakeSource::ExternalIngress {
+            external_trigger_id: None,
+        }],
+        continuation: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        expires_at: None,
+        resolved_at: None,
+        cancelled_at: Some(Utc::now()),
+        turn_id: None,
+        trigger_message_id: None,
+        triggered_at: None,
+    };
+    runtime.storage().append_wait_condition(&wait).unwrap();
+
+    let message = runtime
+        .enqueue(trusted_operator_prompt(
+            None,
+            "operator ingress after stale completion",
+        ))
+        .await
+        .unwrap();
+    let poll = scheduler_executor::SchedulerDecisionExecutor::new(&runtime)
+        .poll()
+        .await
+        .unwrap();
+    let scheduler_executor::RunLoopPoll::Message(scheduled) = poll else {
+        panic!("operator ingress should repair the stale lane before claim");
+    };
+    assert_eq!(scheduled.message.id, message.id);
+    let execution = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .unwrap();
+    let activation_id = scheduler_executor::canonical_activation_id(&message.id);
+    assert!(matches!(
+        &execution.attempts[&activation_id],
+        crate::domain::execution_protocol::ExecutionAttempt {
+            binding: crate::domain::execution_protocol::ExecutionBinding::Conversation {
+                interaction_id
+            },
+            state: crate::domain::execution_protocol::ExecutionAttemptState::Open,
+            ..
+        } if interaction_id.starts_with("interaction1_")
+    ));
+    assert_eq!(
+        runtime
+            .latest_work_item(&completed.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkItemState::Completed
+    );
+    assert_eq!(
+        runtime
+            .storage()
+            .latest_wait_conditions()
+            .unwrap()
+            .into_iter()
+            .find(|condition| condition.id == wait.id)
+            .map(|condition| condition.status),
+        Some(WaitConditionStatus::Cancelled)
+    );
+}
+
+#[tokio::test]
 async fn enqueue_normalizes_system_wake_as_coordination_with_work_item_binding() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
@@ -7280,22 +13267,32 @@ async fn abort_current_run_aborts_provider_turn_and_stops_agent() {
         context_config(),
     )
     .unwrap();
+    append_default_host_identity(&runtime);
     runtime
-        .enqueue(MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "block".into(),
-            },
-        ))
+        .enqueue(
+            MessageEnvelope::new(
+                "default",
+                MessageKind::OperatorPrompt,
+                MessageOrigin::Operator { actor_id: None },
+                AuthorityClass::OperatorInstruction,
+                Priority::Normal,
+                MessageBody::Text {
+                    text: "block".into(),
+                },
+            )
+            .with_admission(
+                MessageDeliverySurface::CliPrompt,
+                AdmissionContext::LocalProcess,
+            ),
+        )
         .await
         .unwrap();
 
-    let runner = tokio::spawn(runtime.clone().run());
-    started.notified().await;
+    let mut runner = tokio::spawn(runtime.clone().run());
+    tokio::select! {
+        _ = started.notified() => {}
+        result = &mut runner => panic!("runtime exited before provider start: {result:?}"),
+    }
     let run_id = runtime
         .agent_state()
         .await
@@ -7386,6 +13383,7 @@ async fn operator_interjection_prompt_is_interjected_before_next_provider_round(
         },
     )
     .unwrap();
+    append_default_host_identity(&runtime);
 
     runtime
         .enqueue(MessageEnvelope::new(
@@ -7401,8 +13399,11 @@ async fn operator_interjection_prompt_is_interjected_before_next_provider_round(
         .await
         .unwrap();
 
-    let runner = tokio::spawn(runtime.clone().run());
-    first_tool_round.notified().await;
+    let mut runner = tokio::spawn(runtime.clone().run());
+    tokio::select! {
+        _ = first_tool_round.notified() => {}
+        result = &mut runner => panic!("runtime exited before first provider round: {result:?}"),
+    }
 
     let interjection = MessageEnvelope::new(
         "default",
@@ -7485,7 +13486,7 @@ async fn operator_interjection_prompt_is_interjected_before_next_provider_round(
 }
 
 #[tokio::test]
-async fn operator_interjection_attaches_to_lifecycle_activation() {
+async fn operator_interjection_preserves_unified_lifecycle_attempt() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let runtime = RuntimeHandle::new(
@@ -7514,6 +13515,18 @@ async fn operator_interjection_attaches_to_lifecycle_activation() {
         .begin_interactive_turn(Some(&scheduled.message), None, None)
         .await
         .unwrap();
+    let execution_before = runtime
+        .inner
+        .runtime_db
+        .transitions()
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("lifecycle claim should initialize unified authority");
+    let attempt_id = scheduler_executor::canonical_activation_id(&message.id);
+    assert_eq!(
+        execution_before.attempts[&attempt_id].state,
+        crate::domain::execution_protocol::ExecutionAttemptState::Open
+    );
 
     let mut interjection = trusted_operator_prompt(None, "use the smaller lifecycle fix");
     interjection.priority = Priority::Interject;
@@ -7528,27 +13541,14 @@ async fn operator_interjection_attaches_to_lifecycle_activation() {
         .unwrap();
     assert_eq!(follow_ups.len(), 1);
 
-    let snapshot = runtime
+    let execution_after = runtime
         .inner
         .runtime_db
         .transitions()
-        .load_scheduler_protocol_snapshot("default")
-        .unwrap();
-    let attachment = snapshot
-        .activation_inputs
-        .values()
-        .find(|attachment| attachment.message_id == interjection.id)
-        .expect("lifecycle activation input attachment");
-    assert_eq!(
-        attachment.activation_id,
-        scheduler_executor::canonical_activation_id(&message.id)
-    );
-    assert_eq!(
-        attachment.owner,
-        SchedulerOwner::AgentLifecycle {
-            agent_id: "default".into(),
-        }
-    );
+        .load_execution_protocol_state_if_initialized("default")
+        .unwrap()
+        .expect("interjection should preserve unified authority");
+    assert_eq!(execution_after, execution_before);
     assert_eq!(
         runtime
             .storage()
@@ -7646,22 +13646,32 @@ async fn abort_current_run_rejects_stale_run_id() {
         context_config(),
     )
     .unwrap();
+    append_default_host_identity(&runtime);
     runtime
-        .enqueue(MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "block".into(),
-            },
-        ))
+        .enqueue(
+            MessageEnvelope::new(
+                "default",
+                MessageKind::OperatorPrompt,
+                MessageOrigin::Operator { actor_id: None },
+                AuthorityClass::OperatorInstruction,
+                Priority::Normal,
+                MessageBody::Text {
+                    text: "block".into(),
+                },
+            )
+            .with_admission(
+                MessageDeliverySurface::CliPrompt,
+                AdmissionContext::LocalProcess,
+            ),
+        )
         .await
         .unwrap();
 
-    let runner = tokio::spawn(runtime.clone().run());
-    started.notified().await;
+    let mut runner = tokio::spawn(runtime.clone().run());
+    tokio::select! {
+        _ = started.notified() => {}
+        result = &mut runner => panic!("runtime exited before provider start: {result:?}"),
+    }
 
     let err = runtime
         .abort_current_run(CurrentRunAbortRequest {
@@ -7809,10 +13819,58 @@ async fn task_status_routes_only_through_task_state_reduction() {
     assert!(events
         .iter()
         .any(|event| event.kind == "task_status_updated"));
+    let turn = runtime
+        .storage()
+        .read_recent_turns(1)
+        .unwrap()
+        .pop()
+        .expect("task_status reducer turn");
+    assert!(turn.produced_brief_ids.is_empty());
+    assert_eq!(
+        turn.terminal
+            .as_ref()
+            .and_then(|terminal| terminal.no_brief_reason.as_ref()),
+        Some(&TurnNoBriefReason::ReducerOnly {
+            reason: "task_status".into(),
+        })
+    );
+}
+
+#[test]
+fn task_rejoin_fence_requires_live_persisted_contract() {
+    let now = Utc::now();
+    let mut task = TaskRecord {
+        id: "task-rejoin-contract".into(),
+        agent_id: "default".into(),
+        kind: TaskKind::CommandTask,
+        status: TaskStatus::Completed,
+        created_at: now,
+        updated_at: now,
+        parent_message_id: Some("message-result".into()),
+        work_item_id: Some("work-rejoin-contract".into()),
+        summary: Some("task completed".into()),
+        detail: Some(serde_json::json!({
+            "rejoin_obligation_id": "task-rejoin-contract",
+            "rejoin_generation": 1,
+            "parent_turn_id": "turn-parent"
+        })),
+        recovery: None,
+    };
+
+    let fence = tasks::task_rejoin_fence(&task).unwrap();
+    assert_eq!(fence.obligation_id, task.id);
+    assert_eq!(fence.generation, 1);
+    assert_eq!(fence.parent_turn_id, "turn-parent");
+
+    task.detail.as_mut().unwrap()["rejoin_obligation_id"] = serde_json::json!("task-other");
+    assert!(tasks::task_rejoin_fence(&task)
+        .unwrap_err()
+        .to_string()
+        .contains("does not match"));
 }
 
 #[tokio::test]
-async fn unbound_task_result_routes_only_through_reduction() {
+async fn unbound_task_result_reenters_the_model() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let provider = Arc::new(CountingProvider {
@@ -7878,7 +13936,7 @@ async fn unbound_task_result_routes_only_through_reduction() {
         .await
         .unwrap();
 
-    assert_eq!(provider.call_count().await, 0);
+    assert_eq!(provider.call_count().await, 1);
     let active_tasks = runtime.active_tasks(10).await.unwrap();
     assert!(!active_tasks.iter().any(|task| task.id == "task-1"));
     let events = runtime.storage().read_recent_events(100).unwrap();
@@ -7931,6 +13989,8 @@ async fn task_result_records_wait_reconciliation_and_resolves_task_wait_conditio
             cancelled_at: None,
 
             turn_id: None,
+            trigger_message_id: None,
+            triggered_at: None,
         })
         .unwrap();
 
@@ -7992,113 +14052,6 @@ async fn task_result_records_wait_reconciliation_and_resolves_task_wait_conditio
 }
 
 #[tokio::test]
-async fn legacy_task_result_resolves_unique_wait_without_canonical_partition() {
-    let dir = tempdir().unwrap();
-    let workspace = tempdir().unwrap();
-    let runtime = RuntimeHandle::new_with_scheduler_engine(
-        "default",
-        dir.path().to_path_buf(),
-        workspace.path().to_path_buf(),
-        "http://127.0.0.1:7878".into(),
-        Arc::new(CountingProvider {
-            calls: Mutex::new(0),
-            reply: "legacy task follow-up",
-        }),
-        "default".into(),
-        context_config(),
-        crate::config::SchedulerEngineMode::Legacy,
-    )
-    .unwrap();
-    let now = Utc::now();
-    let mut work_item = WorkItemRecord::new("default", "legacy task wait", WorkItemState::Open);
-    work_item.id = "wi-legacy-task".into();
-    work_item.blocked_by = Some("task result".into());
-    runtime.storage().append_work_item(&work_item).unwrap();
-    runtime
-        .storage()
-        .append_wait_condition(&WaitConditionRecord {
-            id: "wait-legacy-task".into(),
-            agent_id: "default".into(),
-            work_item_id: Some(work_item.id.clone()),
-            status: WaitConditionStatus::Active,
-            kind: WaitConditionKind::Task,
-            source: None,
-            subject_ref: Some("task-legacy".into()),
-            waiting_for: "task result".into(),
-            wake_sources: vec![WakeSource::TaskResult {
-                task_id: "task-legacy".into(),
-            }],
-            continuation: None,
-            created_at: now,
-            updated_at: now,
-            expires_at: None,
-            resolved_at: None,
-            cancelled_at: None,
-            turn_id: None,
-        })
-        .unwrap();
-
-    let mut message = MessageEnvelope::new(
-        "default",
-        MessageKind::TaskResult,
-        MessageOrigin::Task {
-            task_id: "task-legacy".into(),
-        },
-        AuthorityClass::RuntimeInstruction,
-        Priority::Normal,
-        MessageBody::Text {
-            text: "task completed".into(),
-        },
-    )
-    .with_admission(
-        MessageDeliverySurface::TaskRejoin,
-        AdmissionContext::RuntimeOwned,
-    );
-    message.metadata = Some(serde_json::json!({
-        "task_id": "task-legacy",
-        "task_kind": "child_agent_task",
-        "task_status": "completed",
-        "work_item_id": work_item.id,
-    }));
-    message.task_id = Some("task-legacy".into());
-    message.work_item_id = Some(work_item.id.clone());
-
-    runtime
-        .process_message(
-            message,
-            closure_decision(
-                ClosureOutcome::Waiting,
-                Some(WaitingReason::AwaitingTaskResult),
-            ),
-        )
-        .await
-        .unwrap();
-
-    assert!(runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .load_scheduler_protocol_snapshot_if_initialized("default")
-        .unwrap()
-        .is_none());
-    assert!(runtime
-        .storage()
-        .latest_wait_conditions()
-        .unwrap()
-        .iter()
-        .any(|condition| {
-            condition.id == "wait-legacy-task" && condition.status == WaitConditionStatus::Resolved
-        }));
-    assert!(runtime
-        .inner
-        .runtime_db
-        .work_items()
-        .latest(&work_item.id)
-        .unwrap()
-        .is_some_and(|work| work.blocked_by.is_none()));
-}
-
-#[tokio::test]
 async fn timer_and_system_ticks_record_wait_reconciliation_signals() {
     let dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
@@ -8152,6 +14105,8 @@ async fn timer_and_system_ticks_record_wait_reconciliation_signals() {
                 cancelled_at: None,
 
                 turn_id: None,
+                trigger_message_id: None,
+                triggered_at: None,
             })
             .unwrap();
     }
@@ -8246,17 +14201,11 @@ async fn same_turn_message_does_not_reconcile_wait_condition() {
         resolved_at: None,
         cancelled_at: None,
         turn_id: Some("turn-seed".into()),
+        trigger_message_id: None,
+        triggered_at: None,
     };
     runtime.storage().append_wait_condition(&wait).unwrap();
-    runtime
-        .inner
-        .runtime_db
-        .transitions()
-        .initialize_scheduler_protocol_partition(
-            "default",
-            &canonical_waiting_snapshot(&work_item, &wait.id, work_item.revision),
-        )
-        .unwrap();
+    persist_waiting_work_execution(&runtime, &work_item, &wait.id);
 
     // Process an operator message that belongs to the SAME turn that created the
     // wait condition.  It must NOT reconcile the wait.
@@ -8320,7 +14269,6 @@ async fn same_turn_message_does_not_reconcile_wait_condition() {
         "different-turn message must reconcile the wait"
     );
 }
-
 #[tokio::test]
 async fn task_result_persists_reduced_state_when_agent_status_is_not_mutable() {
     let dir = tempdir().unwrap();
@@ -9361,8 +15309,6 @@ async fn scheduler_repair_only_drops_wake_only_queue_entries_with_occ() {
             operation: crate::runtime_db::transitions::QueueOperation::Admit,
             mutation: crate::runtime_db::transitions::QueueMutation::Upsert(entry.clone()),
             scheduler_claim_work_item: None,
-            scheduler_protocol_bootstrap: None,
-            scheduler_protocol_commands: Vec::new(),
             agent_state: None,
             message_evidence: vec![wake_message],
             transcript_entries: Vec::new(),
@@ -9575,8 +15521,6 @@ async fn post_commit_agent_state_projection_does_not_overwrite_newer_memory() {
                 updated_at: Utc::now(),
             }),
             scheduler_claim_work_item: None,
-            scheduler_protocol_bootstrap: None,
-            scheduler_protocol_commands: Vec::new(),
             agent_state: Some(crate::runtime_db::transitions::AgentStateMutation {
                 expected: Some(Box::new(expected)),
                 record: Box::new(committed),

@@ -17,12 +17,13 @@ use crate::{
     host::RuntimeHostBridge,
     model_discovery::{
         discovery_cache_needs_refresh, discovery_cache_path, discovery_cache_status_for_provider,
-        load_discovery_cache_at, refresh_provider_models, ModelDiscoveryCacheFile,
-        ModelDiscoveryCacheStatus, DEFAULT_DISCOVERY_CACHE_TTL,
+        load_discovery_cache_at, provider_discovers_model_capabilities, refresh_provider_models,
+        ModelDiscoveryCacheFile, ModelDiscoveryCacheStatus, DEFAULT_DISCOVERY_CACHE_TTL,
     },
     provider::{
         build_candidate_from_model_route, build_provider_from_model_chain,
-        resolved_model_availability, AgentProvider, ConversationMessage, ModelBlock,
+        build_provider_from_model_chain_with_override, resolved_model_availability, AgentProvider,
+        ConversationMessage, ModelBlock, ModelRouteReasoningEffortOverride,
         ProviderGenerateImageRequest, ProviderGenerateImageResponse,
         ProviderJsonSchemaResponseFormat, ProviderResponseFormatRequest, ProviderTurnRequest,
     },
@@ -42,6 +43,21 @@ use super::{
     scheduler_executor, workspace, AgentRuntimeProjectionCache, InitialWorkspaceBinding,
     RuntimeAgent, RuntimeHandle, RuntimeInner,
 };
+
+fn model_route_reasoning_effort_override(
+    state: &AgentState,
+) -> Option<ModelRouteReasoningEffortOverride<'_>> {
+    state
+        .model_override
+        .as_ref()
+        .zip(state.model_override_reasoning_effort.as_deref())
+        .map(
+            |(route_ref, reasoning_effort)| ModelRouteReasoningEffortOverride {
+                route_ref,
+                reasoning_effort,
+            },
+        )
+}
 
 /// Snapshot of config-derived runtime fields that can be hot-swapped at runtime.
 /// Stored behind an `ArcSwap` so that config reloads take effect on the next turn
@@ -90,6 +106,58 @@ impl ConfigSnapshot {
     }
 }
 
+pub(super) struct ModelDiscoveryRefreshGuard {
+    runtime: RuntimeHandle,
+    provider_id: crate::config::ProviderId,
+    released: bool,
+}
+
+impl ModelDiscoveryRefreshGuard {
+    pub(super) fn new(runtime: RuntimeHandle, provider_id: crate::config::ProviderId) -> Self {
+        Self {
+            runtime,
+            provider_id,
+            released: false,
+        }
+    }
+
+    async fn release(mut self) {
+        self.runtime
+            .inner
+            .model_discovery_refreshes
+            .lock()
+            .await
+            .remove(&self.provider_id);
+        self.runtime
+            .inner
+            .model_discovery_refresh_notify
+            .notify_waiters();
+        self.released = true;
+    }
+}
+
+impl Drop for ModelDiscoveryRefreshGuard {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let runtime = self.runtime.clone();
+        let provider_id = self.provider_id.clone();
+        tokio::spawn(async move {
+            runtime
+                .inner
+                .model_discovery_refreshes
+                .lock()
+                .await
+                .remove(&provider_id);
+            runtime
+                .inner
+                .model_discovery_refresh_notify
+                .notify_waiters();
+        });
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ProviderReconfigurator {
     pub(super) config: AppConfig,
@@ -134,42 +202,6 @@ impl RuntimeHandle {
             None,
             None,
             None,
-            crate::config::SchedulerEngineMode::Canonical,
-            Arc::new(SystemClock),
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_with_scheduler_engine(
-        agent_id: impl Into<String>,
-        data_dir: PathBuf,
-        initial_workspace: impl Into<InitialWorkspaceBinding>,
-        callback_base_url: String,
-        provider: Arc<dyn AgentProvider>,
-        default_agent_id: String,
-        context_config: ContextConfig,
-        scheduler_engine: crate::config::SchedulerEngineMode,
-    ) -> Result<Self> {
-        let base_context_config = context_config.clone();
-        Self::new_internal(
-            agent_id,
-            data_dir,
-            initial_workspace,
-            callback_base_url,
-            provider,
-            default_agent_id,
-            base_context_config,
-            context_config,
-            RuntimeModelCatalog::default(),
-            Vec::new(),
-            crate::tool::helpers::DEFAULT_TOOL_OUTPUT_TOKENS,
-            crate::tool::helpers::MAX_TOOL_OUTPUT_TOKENS,
-            crate::web::WebConfig::default(),
-            None,
-            None,
-            None,
-            None,
-            scheduler_engine,
             Arc::new(SystemClock),
         )
     }
@@ -198,7 +230,6 @@ impl RuntimeHandle {
             Some(runtime_db),
             None,
             None,
-            crate::config::SchedulerEngineMode::Canonical,
             Arc::new(SystemClock),
         )
     }
@@ -233,7 +264,6 @@ impl RuntimeHandle {
             None,
             None,
             None,
-            crate::config::SchedulerEngineMode::Canonical,
             clock,
         )
     }
@@ -250,7 +280,6 @@ impl RuntimeHandle {
         host_bridge: RuntimeHostBridge,
         model_catalog: RuntimeModelCatalog,
         event_bus: EventBus,
-        scheduler_engine: crate::config::SchedulerEngineMode,
     ) -> Result<Self> {
         let base_context_config = context_config.clone();
         Self::new_internal(
@@ -271,7 +300,6 @@ impl RuntimeHandle {
             Some(runtime_db),
             Some(host_bridge),
             Some(event_bus),
-            scheduler_engine,
             Arc::new(SystemClock),
         )
     }
@@ -299,7 +327,6 @@ impl RuntimeHandle {
             build_provider_from_model_chain(&provider_config, &model_catalog.provider_chain(None))?;
         let resolved_context_config =
             model_catalog.resolved_context_config(&base_context_config, None);
-        let scheduler_engine = config.scheduler_engine;
         Self::new_internal(
             agent_id,
             data_dir,
@@ -318,7 +345,6 @@ impl RuntimeHandle {
             Some(runtime_db),
             Some(host_bridge),
             Some(event_bus),
-            scheduler_engine,
             Arc::new(SystemClock),
         )
     }
@@ -341,7 +367,6 @@ impl RuntimeHandle {
         runtime_db: Option<RuntimeDb>,
         host_bridge: Option<RuntimeHostBridge>,
         event_bus: Option<EventBus>,
-        scheduler_engine: crate::config::SchedulerEngineMode,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
         let x_search_config = provider_reconfig
@@ -374,10 +399,9 @@ impl RuntimeHandle {
         }
 
         if let Some(reconfig) = config_snapshot.provider_reconfig.as_ref() {
-            let chain = config_snapshot.model_catalog.provider_chain_for_turn(
-                state.model_override.as_ref(),
-                state.pending_fallback_model.as_ref(),
-            );
+            let chain = config_snapshot
+                .model_catalog
+                .provider_chain(state.model_override.as_ref());
             let mut provider_config = reconfig.config.clone();
             provider_config.runtime_max_output_tokens = config_snapshot
                 .model_catalog
@@ -386,7 +410,11 @@ impl RuntimeHandle {
                     state.model_override.as_ref(),
                 )
                 .runtime_max_output_tokens;
-            provider = build_provider_from_model_chain(&provider_config, &chain)?;
+            provider = build_provider_from_model_chain_with_override(
+                &provider_config,
+                &chain,
+                model_route_reasoning_effort_override(&state),
+            )?;
         }
         let resolved_context_config = if config_snapshot.provider_reconfig.is_some() {
             config_snapshot.model_catalog.resolved_context_config(
@@ -396,6 +424,7 @@ impl RuntimeHandle {
         } else {
             context_config.clone()
         };
+        let base_provider = provider.clone();
 
         let runtime = Self {
             inner: Arc::new(RuntimeInner {
@@ -410,14 +439,16 @@ impl RuntimeHandle {
                 notify: Notify::new(),
                 storage,
                 runtime_db,
-                scheduler_engine,
                 clock,
+                base_provider,
                 provider: RwLock::new(provider),
+                turn_fallback_model: RwLock::new(None),
                 config_snapshot: ArcSwap::from(config_snapshot),
                 context_config: RwLock::new(resolved_context_config),
                 builtin_web_search_probe_cache: Mutex::new(HashMap::new()),
                 view_image_observation_cache: Mutex::new(HashMap::new()),
                 model_discovery_refreshes: Mutex::new(HashSet::new()),
+                model_discovery_refresh_notify: Notify::new(),
                 callback_base_url,
                 tools: ToolRegistry::new(PathBuf::new()),
                 system: Arc::new(LocalSystem::new()),
@@ -426,13 +457,23 @@ impl RuntimeHandle {
                 task_handles: Mutex::new(HashMap::new()),
                 recovered_tasks: Mutex::new(Some(active_tasks)),
                 recovered_timers: Mutex::new(Some(active_timers)),
+                bootstrap_result: StdMutex::new(None),
+                bootstrap_notify: Notify::new(),
                 suppress_next_continue_active_tick: Mutex::new(false),
                 shutdown_requested: AtomicBool::new(false),
                 transition_faults: StdMutex::new(std::collections::VecDeque::new()),
                 #[cfg(test)]
+                completion_binding_replacement: StdMutex::new(None),
+                #[cfg(test)]
                 task_transition_conflicts_remaining: AtomicUsize::new(0),
                 #[cfg(test)]
+                terminal_task_transition_conflicts_remaining: AtomicUsize::new(0),
+                #[cfg(test)]
                 fail_after_next_runtime_claim: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_non_retryable_after_next_runtime_claim: AtomicBool::new(false),
+                #[cfg(test)]
+                claim_work_item_plan_status_before_commit: StdMutex::new(None),
                 transition_warnings: StdMutex::new(Vec::new()),
             }),
         };
@@ -444,8 +485,36 @@ impl RuntimeHandle {
     }
 
     pub(crate) fn model_state_for(&self, state: &AgentState) -> crate::types::AgentModelState {
+        self.model_state_for_turn(state, None)
+    }
+
+    pub(crate) fn model_state_for_turn(
+        &self,
+        state: &AgentState,
+        fallback_model: Option<&ModelRouteRef>,
+    ) -> crate::types::AgentModelState {
         let snap = self.inner.config_snapshot.load();
-        super::agent_model_state_for_catalog(&snap.model_catalog, &snap.base_context_config, state)
+        let mut selected_state = state.clone();
+        selected_state.pending_fallback_model = None;
+        let mut model_state = super::agent_model_state_for_catalog(
+            &snap.model_catalog,
+            &snap.base_context_config,
+            &selected_state,
+        );
+        if let Some(fallback_model) = fallback_model {
+            model_state.active_model = Some(fallback_model.clone());
+            model_state.fallback_active = model_state.effective_model != *fallback_model;
+            model_state.resolved_policy = snap
+                .model_catalog
+                .resolved_model_policy(&snap.base_context_config, Some(fallback_model));
+            model_state.effective_fallback_models = snap
+                .model_catalog
+                .provider_chain_for_turn(state.model_override.as_ref(), Some(fallback_model))
+                .into_iter()
+                .skip(1)
+                .collect();
+        }
+        model_state
     }
 
     pub(crate) async fn current_apply_patch_surface(&self) -> ApplyPatchSurface {
@@ -453,7 +522,10 @@ impl RuntimeHandle {
             let guard = self.inner.agent.lock().await;
             guard.state.clone()
         };
-        self.apply_patch_surface_for_state(&state)
+        // The turn-local fallback binding keeps invocation-time patch parsing on
+        // the surface of the model that is actually serving this turn.
+        let fallback_model = self.inner.turn_fallback_model.read().await.clone();
+        self.apply_patch_surface_for_turn(&state, fallback_model.as_ref())
     }
 
     /// Attach a shared memory-index notify so the daemon-level indexer is
@@ -462,67 +534,103 @@ impl RuntimeHandle {
         let _ = self.inner.storage.enable_memory_index_notify(notify);
     }
 
-    pub(crate) fn apply_patch_surface_for_state(&self, state: &AgentState) -> ApplyPatchSurface {
+    pub(crate) fn apply_patch_surface_for_turn(
+        &self,
+        state: &AgentState,
+        fallback_model: Option<&ModelRouteRef>,
+    ) -> ApplyPatchSurface {
         let route_ref = self
-            .selected_model_ref_for_state(state)
+            .selected_model_ref_for_state(state, fallback_model)
             .unwrap_or_else(|| self.model_state_for(state).effective_model);
-        ApplyPatchSurface::for_model_ref(&route_ref.model_ref().as_string())
+        ApplyPatchSurface::for_model_route_ref(&route_ref.as_string())
     }
 
-    fn selected_model_ref_for_state(&self, state: &AgentState) -> Option<ModelRouteRef> {
+    fn selected_model_ref_for_state(
+        &self,
+        state: &AgentState,
+        fallback_model: Option<&ModelRouteRef>,
+    ) -> Option<ModelRouteRef> {
         let snap = self.inner.config_snapshot.load();
         snap.model_catalog
-            .provider_chain_for_turn(
-                state.model_override.as_ref(),
-                state.pending_fallback_model.as_ref(),
-            )
+            .provider_chain_for_turn(state.model_override.as_ref(), fallback_model)
             .into_iter()
             .next()
     }
 
     pub(crate) async fn reconfigure_provider_for_state(&self, state: &AgentState) -> Result<()> {
+        self.reconfigure_provider_for_state_and_fallback(state, None)
+            .await
+    }
+
+    async fn reconfigure_provider_for_state_and_fallback(
+        &self,
+        state: &AgentState,
+        fallback_model: Option<&ModelRouteRef>,
+    ) -> Result<()> {
         let snap = self.inner.config_snapshot.load();
         let Some(reconfig) = snap.provider_reconfig.as_ref() else {
             return Err(anyhow!(
                 "agent model override is unavailable for runtimes without host-managed provider configuration"
             ));
         };
-        let chain = snap.model_catalog.provider_chain_for_turn(
-            state.model_override.as_ref(),
-            state.pending_fallback_model.as_ref(),
-        );
-        let resolved_context_config = snap
+        let chain = snap
             .model_catalog
-            .resolved_context_config(&snap.base_context_config, state.model_override.as_ref());
+            .provider_chain_for_turn(state.model_override.as_ref(), fallback_model);
+        let resolved_context_config = snap.model_catalog.resolved_context_config(
+            &snap.base_context_config,
+            fallback_model.or(state.model_override.as_ref()),
+        );
         let mut provider_config = reconfig.config.clone();
-        if let (Some(primary), Some(reasoning_effort)) = (
-            chain.first(),
-            state.model_override_reasoning_effort.as_ref(),
-        ) {
-            if let Some(provider) = provider_config.providers.get_mut(&primary.provider) {
-                provider.reasoning_effort = Some(reasoning_effort.clone());
-            }
-        }
         provider_config.runtime_max_output_tokens = snap
             .model_catalog
             .resolved_model_policy(&snap.base_context_config, state.model_override.as_ref())
             .runtime_max_output_tokens;
-        let provider = build_provider_from_model_chain(&provider_config, &chain)?;
+        let provider = build_provider_from_model_chain_with_override(
+            &provider_config,
+            &chain,
+            model_route_reasoning_effort_override(state),
+        )?;
         *self.inner.provider.write().await = provider;
         *self.inner.context_config.write().await = resolved_context_config;
         Ok(())
     }
 
-    pub(crate) async fn reconfigure_provider_for_current_state(&self) -> Result<()> {
+    pub(crate) async fn reconfigure_provider_for_turn(
+        &self,
+        fallback_model: Option<&ModelRouteRef>,
+    ) -> Result<()> {
         let snap = self.inner.config_snapshot.load();
         if snap.provider_reconfig.is_none() {
+            match fallback_model {
+                Some(fallback_model) => {
+                    let provider = self
+                        .inner
+                        .base_provider
+                        .select_model_lineage(fallback_model)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "static provider cannot select recovery model lineage {}",
+                                fallback_model.as_string()
+                            )
+                        })?;
+                    *self.inner.provider.write().await = provider;
+                }
+                None if self.inner.turn_fallback_model.read().await.is_some() => {
+                    *self.inner.provider.write().await = self.inner.base_provider.clone();
+                }
+                None => {}
+            }
+            *self.inner.turn_fallback_model.write().await = fallback_model.cloned();
             return Ok(());
         }
         let state = {
             let guard = self.inner.agent.lock().await;
             guard.state.clone()
         };
-        self.reconfigure_provider_for_state(&state).await
+        self.reconfigure_provider_for_state_and_fallback(&state, fallback_model)
+            .await?;
+        *self.inner.turn_fallback_model.write().await = fallback_model.cloned();
+        Ok(())
     }
 
     /// Hot-reload config-derived runtime fields from a new `AppConfig`.
@@ -557,13 +665,140 @@ impl RuntimeHandle {
     pub(crate) async fn current_view_image_vision_selection(
         &self,
     ) -> Result<crate::types::ViewImageVisionSelection> {
+        let selection = self.view_image_vision_selection().await?;
+        if selection.selected_mode
+            == crate::types::ViewImageSelectedMode::NativeImageWithObservation
+        {
+            return Ok(selection);
+        }
+        let failures = self
+            .refresh_view_image_discovery_candidates(&selection)
+            .await?;
+        let mut selection = self.view_image_vision_selection().await?;
+        for (provider, error) in failures {
+            selection
+                .candidates
+                .push(crate::types::ViewImageVisionCandidate {
+                    provider: provider.as_str().to_string(),
+                    model: "*".to_string(),
+                    model_ref: format!("{}/*", provider.as_str()),
+                    image_input: false,
+                    reason: format!("provider_model_discovery_failed: {error}"),
+                });
+        }
+        Ok(selection)
+    }
+
+    async fn view_image_vision_selection(&self) -> Result<crate::types::ViewImageVisionSelection> {
         let state = self.agent_state().await?;
+        let fallback_model = self.inner.turn_fallback_model.read().await.clone();
         let snap = self.inner.config_snapshot.load();
         Ok(snap.model_catalog.select_view_image_vision_model(
             &snap.base_context_config,
             state.model_override.as_ref(),
-            state.pending_fallback_model.as_ref(),
+            fallback_model.as_ref(),
         ))
+    }
+
+    async fn refresh_view_image_discovery_candidates(
+        &self,
+        selection: &crate::types::ViewImageVisionSelection,
+    ) -> Result<Vec<(crate::config::ProviderId, String)>> {
+        let snap = self.inner.config_snapshot.load();
+        let Some(reconfig) = snap.provider_reconfig.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let config = reconfig.config.clone();
+        let cache_path = discovery_cache_path(&config.home_dir);
+        let cache_path_for_load = cache_path.clone();
+        let cache =
+            tokio::task::spawn_blocking(move || load_discovery_cache_at(&cache_path_for_load))
+                .await??;
+        let candidate_providers = selection
+            .candidates
+            .iter()
+            .filter_map(|candidate| crate::config::ProviderId::parse(&candidate.provider).ok())
+            .collect::<HashSet<_>>();
+        let providers = config
+            .providers
+            .values()
+            .filter(|provider| {
+                provider_discovers_model_capabilities(provider)
+                    && (candidate_providers.contains(&provider.id)
+                        || crate::provider::provider_definition(provider.id.as_str()).is_some_and(
+                            |definition| {
+                                definition.catalog_policy
+                                    == crate::provider::ProviderCatalogPolicy::DiscoveryOnly
+                            },
+                        ))
+                    && (provider.auth.kind == crate::config::CredentialKind::None
+                        || provider.has_configured_credential())
+                    && discovery_cache_needs_refresh(provider, &cache, DEFAULT_DISCOVERY_CACHE_TTL)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut failures = Vec::new();
+        for provider in providers {
+            if let Err(error) = self
+                .refresh_model_discovery_provider(provider.clone(), &cache_path)
+                .await
+            {
+                tracing::warn!(
+                    provider = %provider.id.as_str(),
+                    error = %error,
+                    "ViewImage model discovery refresh failed"
+                );
+                failures.push((provider.id, error.to_string()));
+            }
+        }
+        self.reload_model_discovery_cache_snapshot().await?;
+        Ok(failures)
+    }
+
+    async fn refresh_model_discovery_provider(
+        &self,
+        provider: crate::config::ProviderRuntimeConfig,
+        cache_path: &std::path::Path,
+    ) -> Result<()> {
+        loop {
+            let notified = self.inner.model_discovery_refresh_notify.notified();
+            let should_refresh = {
+                let mut in_flight = self.inner.model_discovery_refreshes.lock().await;
+                if in_flight.contains(&provider.id) {
+                    false
+                } else {
+                    in_flight.insert(provider.id.clone());
+                    true
+                }
+            };
+            if should_refresh {
+                let refresh_guard =
+                    ModelDiscoveryRefreshGuard::new(self.clone(), provider.id.clone());
+                let result = refresh_provider_models(&provider, cache_path).await;
+                refresh_guard.release().await;
+                result?;
+                return Ok(());
+            }
+            notified.await;
+            if self
+                .inner
+                .model_discovery_refreshes
+                .lock()
+                .await
+                .contains(&provider.id)
+            {
+                continue;
+            }
+            let cache_path = cache_path.to_path_buf();
+            let cache =
+                tokio::task::spawn_blocking(move || load_discovery_cache_at(&cache_path)).await??;
+            if !discovery_cache_needs_refresh(&provider, &cache, DEFAULT_DISCOVERY_CACHE_TTL) {
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "concurrent provider model discovery did not produce a fresh cache entry"
+            ));
+        }
     }
 
     pub(crate) async fn cached_view_image_observation(
@@ -661,13 +896,14 @@ impl RuntimeHandle {
         request: ProviderGenerateImageRequest,
     ) -> Result<ProviderGenerateImageResponse> {
         let state = self.agent_state().await?;
+        let fallback_model = self.inner.turn_fallback_model.read().await.clone();
         let snap = self.inner.config_snapshot.load();
         let route = snap
             .model_catalog
             .select_generate_image_route(
                 &snap.base_context_config,
                 state.model_override.as_ref(),
-                state.pending_fallback_model.as_ref(),
+                fallback_model.as_ref(),
             )
             .ok_or_else(|| anyhow!("no configured model supports image_generation"))?;
         let reconfig = snap.provider_reconfig.as_ref().ok_or_else(|| {
@@ -732,6 +968,8 @@ impl RuntimeHandle {
 
             let runtime = self.clone();
             let cache_path = discovery_cache_path(&config.home_dir);
+            let refresh_guard =
+                ModelDiscoveryRefreshGuard::new(runtime.clone(), provider_id.clone());
             tokio::spawn(async move {
                 let result = refresh_provider_models(&provider, &cache_path).await;
                 match result {
@@ -756,12 +994,7 @@ impl RuntimeHandle {
                         );
                     }
                 }
-                runtime
-                    .inner
-                    .model_discovery_refreshes
-                    .lock()
-                    .await
-                    .remove(&provider_id);
+                refresh_guard.release().await;
             });
         }
     }
@@ -868,6 +1101,20 @@ fn prepare_runtime_storage(
         )?,
     };
     let storage = AppStorage::new_for_agent(data_dir, agent_id.clone(), runtime_db.clone())?;
+    #[cfg(test)]
+    if runtime_db.agent_identities().latest(&agent_id)?.is_none() {
+        runtime_db
+            .agent_identities()
+            .upsert(&crate::types::AgentIdentityRecord::new(
+                agent_id.clone(),
+                crate::types::AgentKind::Default,
+                crate::types::AgentVisibility::Public,
+                crate::types::AgentOwnership::SelfOwned,
+                crate::types::AgentProfilePreset::PublicNamed,
+                None,
+                None,
+            ))?;
+    }
     let initial_workspace = initial_workspace.into();
     let initial_workspace_entry = match &initial_workspace {
         InitialWorkspaceBinding::Entry(entry) => Some(entry.clone()),
@@ -1017,6 +1264,16 @@ fn prepare_runtime_storage(
         .retain(|skill| matches!(skill.activation_state, SkillActivationState::SessionActive));
     for skill in &mut state.active_skills {
         skill.activation_source = SkillActivationSource::Restored;
+    }
+    if let Some(legacy_fallback) = state.pending_fallback_model.take() {
+        storage.append_event(&AuditEvent::legacy(
+            "legacy_pending_fallback_discarded",
+            serde_json::json!({
+                "agent_id": agent_id,
+                "fallback_model_ref": legacy_fallback,
+                "reason": "fallback_selection_is_message_bound",
+            }),
+        ))?;
     }
     state.pending = queue.len();
     state.total_message_count = storage.count_messages().unwrap_or_default();

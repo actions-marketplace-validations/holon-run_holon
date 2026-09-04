@@ -12,10 +12,11 @@ pub(crate) use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, MatchedPath, Path, Query, State},
     http::{
-        header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
+        header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
         HeaderMap, HeaderName, HeaderValue, Method, Request as AxumRequest, Response, StatusCode,
         Uri,
     },
+    middleware::{from_fn_with_state, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response as AxumResponse,
@@ -97,6 +98,10 @@ mod control;
 mod events;
 mod ingress;
 mod jobs;
+// S0 contract skeleton: DTOs/fixtures/capability evaluator are exercised by
+// unit tests now and wired into handlers by the S2/S4/S5 slices.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod observer_sync;
 mod projection_gate;
 mod skills;
 mod state;
@@ -107,6 +112,11 @@ mod web;
 mod workspace_files;
 
 // Re-export shared helpers used across submodules.
+pub(crate) use agents::load_observer_sync_verification;
+pub(crate) use observer_sync::{
+    advertised_observer_sync_capabilities, ObserverSyncCapabilityVerification,
+    PROJECTION_EFFECT_CAPABILITY,
+};
 pub(crate) use projection_gate::{
     ProjectionFailure, ProjectionGate, ProjectionGateError, ProjectionKey,
 };
@@ -125,6 +135,7 @@ pub use skills::{
     add_skill_to_catalog, disable_skill, enable_skill, install_skill, list_skills,
     remove_skill_from_catalog, skills_catalog, uninstall_skill,
 };
+pub(crate) use state::validate_invocation_context;
 pub use state::{
     agent_state, brief, briefs, briefs_batch_get, briefs_default, enqueue, enqueue_default,
     state_default, status, status_default, transcript, transcript_batch_get, transcript_default,
@@ -185,6 +196,8 @@ pub struct AppState {
     pub jobs: JobRegistry,
     pub skill_library_write_jobs: Arc<tokio::sync::Semaphore>,
     pub template_remote_source_sync_jobs: Arc<tokio::sync::Semaphore>,
+    pub(crate) roster_snapshot_limits: observer_sync::RosterSnapshotLimits,
+    pub(crate) projection_snapshot_limits: observer_sync::ProjectionSnapshotLimits,
     pub(crate) projection_gate: Arc<ProjectionGate>,
 }
 
@@ -266,8 +279,9 @@ impl HttpErrorEnvelope {
 pub(crate) const CALLBACK_BODY_LIMIT_BYTES: usize = 256 * 1024;
 pub(crate) const CONTROL_PROMPT_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const DEFAULT_EVENT_STREAM_WINDOW: usize = 128;
-pub(crate) const MAX_EVENT_STREAM_WINDOW: usize = 512;
+pub const MAX_EVENT_STREAM_WINDOW: usize = 512;
 pub(crate) const EVENT_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+pub(crate) const SESSION_COOKIE_NAME: &str = "holon_session";
 
 impl AppState {
     pub fn for_tcp(host: RuntimeHost) -> Self {
@@ -296,6 +310,8 @@ impl AppState {
             jobs,
             skill_library_write_jobs,
             template_remote_source_sync_jobs,
+            roster_snapshot_limits: observer_sync::RosterSnapshotLimits::default(),
+            projection_snapshot_limits: observer_sync::ProjectionSnapshotLimits::default(),
             projection_gate,
         }
     }
@@ -324,6 +340,8 @@ impl AppState {
             jobs,
             skill_library_write_jobs,
             template_remote_source_sync_jobs,
+            roster_snapshot_limits: observer_sync::RosterSnapshotLimits::default(),
+            projection_snapshot_limits: observer_sync::ProjectionSnapshotLimits::default(),
             projection_gate,
         }
     }
@@ -345,7 +363,16 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(agents::root))
         .route("/handshake", get(agents::handshake))
         .route("/models", get(agents::models_handler))
+        .route("/models/refresh", post(agents::refresh_models_handler))
         .route("/agents/list", get(agents::list_agent_entries))
+        .route(
+            "/agents/snapshot",
+            get(observer_sync::agent_roster_snapshot),
+        )
+        .route(
+            "/agents/{agent_id}/projection-snapshot",
+            get(observer_sync::agent_projection_snapshot),
+        )
         .route("/agents/{agent_id}/enqueue", post(state::enqueue))
         .route("/agents/{agent_id}/status", get(state::status))
         .route("/agents/{agent_id}/briefs", get(state::briefs))
@@ -522,6 +549,11 @@ pub fn router(state: AppState) -> Router {
             "/auth/{provider}/device/start",
             post(auth::start_oauth_device_login),
         )
+        .route("/auth/oidc/start", get(auth::start_oidc_login))
+        .route("/auth/oidc/callback", get(auth::complete_oidc_login))
+        .route("/auth/method", get(auth::auth_method))
+        .route("/auth/session/exchange", post(auth::exchange_session))
+        .route("/auth/session/logout", post(auth::logout))
         .route(
             "/control/runtime/credentials",
             get(control::list_credentials),
@@ -635,6 +667,10 @@ pub fn router(state: AppState) -> Router {
     let api_routes = api_routes
         .route("/search", post(agents::search))
         .route("/memory/get", post(agents::memory_get));
+    let api_routes = api_routes.layer(from_fn_with_state(
+        Arc::new(state.clone()),
+        session_auth_middleware,
+    ));
 
     Router::new()
         .nest("/api", api_routes)
@@ -844,6 +880,12 @@ pub(crate) fn projection_gate_error_response(error: ProjectionGateError) -> Axum
     }
 }
 pub(crate) fn authorize_control(headers: &HeaderMap, state: &AppState) -> Result<()> {
+    if state.host.config().auth.mode == crate::authentication::AuthenticationMode::Oidc {
+        return authenticate_session(headers, state).map(|_| ());
+    }
+    if session_credential(headers).is_some_and(|_| authenticate_session(headers, state).is_ok()) {
+        return Ok(());
+    }
     if !state.require_control_token {
         return Ok(());
     }
@@ -856,11 +898,9 @@ pub(crate) fn authorize_control(headers: &HeaderMap, state: &AppState) -> Result
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| anyhow!("missing Authorization header"))?;
-    let prefix = "Bearer ";
-    if !provided.starts_with(prefix) {
-        return Err(anyhow!("invalid Authorization scheme"));
-    }
-    let token = &provided[prefix.len()..];
+    let token = provided
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| anyhow!("invalid Authorization scheme"))?;
     if token != expected_token {
         return Err(anyhow!("invalid control token"));
     }
@@ -868,10 +908,104 @@ pub(crate) fn authorize_control(headers: &HeaderMap, state: &AppState) -> Result
 }
 
 pub(crate) fn authorize_remote_access(headers: &HeaderMap, state: &AppState) -> Result<()> {
-    if state.require_control_token {
+    if state.require_control_token
+        || state.host.config().auth.mode == crate::authentication::AuthenticationMode::Oidc
+    {
         authorize_control(headers, state)?;
     }
     Ok(())
+}
+
+pub(crate) fn session_credential(headers: &HeaderMap) -> Option<String> {
+    if let Some(value) = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    {
+        let mut parts = value.split_whitespace();
+        if parts
+            .next()
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("Bearer"))
+        {
+            if let Some(token) = parts.next().filter(|token| !token.is_empty()) {
+                if parts.next().is_none() {
+                    return Some(token.to_string());
+                }
+            }
+        }
+    }
+    headers
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value.split(';').find_map(|part| {
+                let (name, value) = part.trim().split_once('=')?;
+                (name == SESSION_COOKIE_NAME && !value.is_empty()).then(|| value.to_string())
+            })
+        })
+}
+
+pub(crate) fn authenticate_session(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<crate::authentication::AuthSessionRecord> {
+    let credential =
+        session_credential(headers).ok_or_else(|| anyhow!("missing session credential"))?;
+    let digest = crate::authentication::digest_secret(&credential);
+    let session = state
+        .host
+        .runtime_db()
+        .authentication()
+        .find_session(&digest)?
+        .ok_or_else(|| anyhow!("invalid or expired session"))?;
+    let config = state.host.config();
+    let now = Utc::now();
+    let idle_ttl = std::time::Duration::from_secs(config.auth.session.idle_ttl_seconds);
+    if !session.is_active_at(now, idle_ttl) {
+        return Err(anyhow!("session is expired or revoked"));
+    }
+    if state
+        .host
+        .runtime_db()
+        .authentication()
+        .find_user_by_id(&session.user_id)?
+        .is_some_and(|user| user.disabled_at.is_some())
+    {
+        return Err(anyhow!("session user is disabled"));
+    }
+    state
+        .host
+        .runtime_db()
+        .authentication()
+        .touch_session(&session.session_digest, now)?;
+    Ok(session)
+}
+
+async fn session_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    request: AxumRequest<Body>,
+    next: Next,
+) -> AxumResponse {
+    let path = request.uri().path();
+    let api_path = path.strip_prefix("/api").unwrap_or(path);
+    let anonymous = matches!(
+        api_path,
+        "/auth/oidc/start"
+            | "/auth/oidc/callback"
+            | "/auth/method"
+            | "/auth/session/exchange"
+            | "/login"
+    ) || api_path.starts_with("/callbacks/")
+        || api_path.starts_with("/webhooks/");
+
+    if state.host.config().auth.mode == crate::authentication::AuthenticationMode::Oidc
+        && !anonymous
+    {
+        if let Err(error) = authenticate_session(request.headers(), &state) {
+            return auth_required(error.to_string()).into_response();
+        }
+    }
+
+    next.run(request).await
 }
 
 pub(crate) fn into_origin(origin: IncomingOrigin) -> MessageOrigin {
@@ -952,10 +1086,10 @@ pub(crate) fn forbidden(reason: impl Into<String>) -> (StatusCode, Json<Value>) 
 
 pub(crate) fn auth_required(reason: impl Into<String>) -> (StatusCode, Json<Value>) {
     http_error(
-        StatusCode::FORBIDDEN,
+        StatusCode::UNAUTHORIZED,
         HttpErrorEnvelope::new(reason)
             .code("auth_required")
-            .hint("retry with an Authorization: Bearer <token> header"),
+            .hint("retry with an Authorization: Bearer <session> header or session cookie"),
     )
 }
 
@@ -1244,8 +1378,8 @@ pub async fn serve_unix(
 #[cfg(test)]
 mod tests {
     use super::{
-        error_response, projection_gate_error_response, router, AppState, ProjectionGate,
-        ProjectionGateError,
+        error_response, projection_gate_error_response, router, session_credential, AppState,
+        ProjectionGate, ProjectionGateError,
     };
     use crate::{
         config::AppConfig,
@@ -1255,7 +1389,7 @@ mod tests {
     };
     use axum::{
         body::{to_bytes, Body},
-        http::{header, Request, StatusCode},
+        http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     };
     use std::{fs, sync::Arc, time::Duration};
     use tempfile::tempdir;
@@ -1272,6 +1406,68 @@ mod tests {
         let host =
             RuntimeHost::new_with_provider(config, Arc::new(StubProvider::new("done"))).unwrap();
         (home, host)
+    }
+
+    fn oidc_test_host() -> (tempfile::TempDir, RuntimeHost) {
+        let home = tempdir().unwrap();
+        fs::write(
+            home.path().join("config.json"),
+            r#"{
+                "auth": {
+                    "mode": "oidc",
+                    "oidc": {
+                        "issuer_url": "https://issuer.example",
+                        "client_id": "holon-test",
+                        "redirect_uri": "https://holon.example/api/auth/oidc/callback"
+                    }
+                },
+                "model": {"default": "openai/gpt-5.4"}
+            }"#,
+        )
+        .unwrap();
+        let config = AppConfig::load_with_home(Some(home.path().to_path_buf())).unwrap();
+        let host =
+            RuntimeHost::new_with_provider(config, Arc::new(StubProvider::new("done"))).unwrap();
+        (home, host)
+    }
+
+    #[test]
+    fn session_credential_accepts_bearer_or_session_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer session-secret"),
+        );
+        assert_eq!(
+            session_credential(&headers).as_deref(),
+            Some("session-secret")
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("theme=dark; holon_session=cookie-secret"),
+        );
+        assert_eq!(
+            session_credential(&headers).as_deref(),
+            Some("cookie-secret")
+        );
+    }
+
+    #[test]
+    fn session_credential_rejects_empty_or_wrong_credentials() {
+        for value in ["Bearer ", "Basic session-secret"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, HeaderValue::from_static(value));
+            assert!(session_credential(&headers).is_none(), "{value}");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("holon_session=; theme=dark"),
+        );
+        assert!(session_credential(&headers).is_none());
     }
 
     #[tokio::test]
@@ -1296,6 +1492,60 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"<html>holon ui</html>");
+    }
+
+    #[tokio::test]
+    async fn oidc_routes_require_session_and_web_redirects_to_login() {
+        let (_home, host) = oidc_test_host();
+        let app = router(AppState::for_tcp(host));
+
+        let api_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api_response.status(), StatusCode::UNAUTHORIZED);
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(api_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], "auth_required");
+
+        let web_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/")
+                    .header(header::ACCEPT, "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(web_response.status(), StatusCode::FOUND);
+        assert_eq!(web_response.headers()[header::LOCATION], "/login");
+
+        let login_response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/login")
+                    .header(header::ACCEPT, "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1332,7 +1582,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
             assert!(
                 !response.headers().contains_key(header::RETRY_AFTER),
                 "{uri}"

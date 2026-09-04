@@ -34,7 +34,8 @@ use holon::{
         OperatorTransportBindingStatus, OperatorTransportCapabilities,
         OperatorTransportDeliveryAuth, OperatorTransportDeliveryAuthKind, Priority,
         QueueEntryStatus, TaskStatus, TodoItem, TodoItemState, TokenUsage, TranscriptEntry,
-        TranscriptEntryKind, TurnTerminalKind, WaitConditionKind, WaitingReason, WorkItemState,
+        TranscriptEntryKind, TurnNoBriefReason, TurnTerminalKind, WaitConditionKind, WaitingReason,
+        WorkItemState,
     },
 };
 use serde_json::json;
@@ -62,6 +63,24 @@ use crate::support::{
 
 // ============================================================================
 // Runtime waiting and reactivation domain test support
+
+fn admitted_operator_prompt(
+    agent_id: impl Into<String>,
+    text: impl Into<String>,
+) -> MessageEnvelope {
+    MessageEnvelope::new(
+        agent_id,
+        MessageKind::OperatorPrompt,
+        MessageOrigin::Operator { actor_id: None },
+        AuthorityClass::OperatorInstruction,
+        Priority::Normal,
+        MessageBody::Text { text: text.into() },
+    )
+    .with_admission(
+        holon::types::MessageDeliverySurface::CliPrompt,
+        holon::types::AdmissionContext::LocalProcess,
+    )
+}
 
 struct WaitForDispatchProvider {
     calls: Mutex<usize>,
@@ -122,21 +141,114 @@ impl AgentProvider for WaitForDispatchProvider {
     }
 }
 
+struct QueuedTaskResultWaitProvider {
+    calls: Mutex<usize>,
+    task_id: Mutex<Option<String>>,
+}
+
+impl QueuedTaskResultWaitProvider {
+    fn new() -> Self {
+        Self {
+            calls: Mutex::new(0),
+            task_id: Mutex::new(None),
+        }
+    }
+
+    async fn calls(&self) -> usize {
+        *self.calls.lock().await
+    }
+
+    async fn task_id(&self) -> Option<String> {
+        self.task_id.lock().await.clone()
+    }
+}
+
+#[async_trait]
+impl AgentProvider for QueuedTaskResultWaitProvider {
+    async fn complete_turn(&self, request: ProviderTurnRequest) -> Result<ProviderTurnResponse> {
+        let mut calls = self.calls.lock().await;
+        *calls += 1;
+        let call = *calls;
+        drop(calls);
+
+        let blocks = match call {
+            1 => vec![ModelBlock::ToolUse {
+                id: "promote-background-command".into(),
+                name: "ExecCommand".into(),
+                input: json!({
+                    "cmd": "sleep 0.4; printf background_done",
+                    "yield_time_ms": 100
+                }),
+                kind: holon::provider::ModelToolCallKind::Function,
+            }],
+            2 => {
+                let task_id = request
+                    .conversation
+                    .iter()
+                    .find_map(|message| match message {
+                        ConversationMessage::UserToolResults(results) => results
+                            .iter()
+                            .find_map(|result| {
+                                result
+                                    .content
+                                    .lines()
+                                    .find_map(|line| line.strip_prefix("Task: "))
+                            })
+                            .map(str::to_string),
+                        _ => None,
+                    })
+                    .expect("promoted command receipt should include the task id");
+                *self.task_id.lock().await = Some(task_id);
+                vec![ModelBlock::ToolUse {
+                    id: "wait-for-background-completion".into(),
+                    name: "ExecCommand".into(),
+                    input: json!({
+                        "cmd": "sleep 0.7",
+                        "yield_time_ms": 2_000
+                    }),
+                    kind: holon::provider::ModelToolCallKind::Function,
+                }]
+            }
+            3 => vec![ModelBlock::ToolUse {
+                id: "wait-for-queued-task-result".into(),
+                name: "WaitFor".into(),
+                input: json!({
+                    "reason": "consume the completed background command result",
+                    "wake": "task_result",
+                    "resource": self
+                        .task_id
+                        .lock()
+                        .await
+                        .clone()
+                        .expect("task id should be captured before WaitFor")
+                }),
+                kind: holon::provider::ModelToolCallKind::Function,
+            }],
+            4 => vec![ModelBlock::Text {
+                text: "background command result observed".into(),
+            }],
+            _ => anyhow::bail!("unexpected provider call {call}"),
+        };
+
+        Ok(ProviderTurnResponse {
+            blocks,
+            stop_reason: None,
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_usage: None,
+            provider_message_id: None,
+            provider_request_id: None,
+            request_diagnostics: None,
+        })
+    }
+}
+
 pub async fn tool_only_wait_for_persists_turn_without_result_brief() -> Result<()> {
     let provider = Arc::new(WaitForDispatchProvider::new(None));
     let host = RuntimeHost::new_with_provider(test_config(), provider.clone())?;
     let runtime = host.default_runtime().await?;
     let message = runtime
-        .enqueue(MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "wait for the checks".into(),
-            },
-        ))
+        .enqueue(admitted_operator_prompt("default", "wait for the checks"))
         .await?;
 
     wait_until(|| {
@@ -193,15 +305,9 @@ pub async fn wait_for_with_assistant_text_persists_result_brief() -> Result<()> 
     let host = RuntimeHost::new_with_provider(test_config(), provider.clone())?;
     let runtime = host.default_runtime().await?;
     let message = runtime
-        .enqueue(MessageEnvelope::new(
+        .enqueue(admitted_operator_prompt(
             "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "wait for the checks and tell me".into(),
-            },
+            "wait for the checks and tell me",
         ))
         .await?;
 
@@ -243,6 +349,76 @@ pub async fn wait_for_with_assistant_text_persists_result_brief() -> Result<()> 
     Ok(())
 }
 
+pub async fn queued_task_result_wait_settles_tool_only_turn_and_reenters_model() -> Result<()> {
+    let provider = Arc::new(QueuedTaskResultWaitProvider::new());
+    let host = RuntimeHost::new_with_provider(test_config(), provider.clone())?;
+    attach_default_workspace(&host).await?;
+    let runtime = host.default_runtime().await?;
+    let message = runtime
+        .enqueue(admitted_operator_prompt(
+            "default",
+            "wait for the promoted command result",
+        ))
+        .await?;
+
+    eventually_for(Duration::from_secs(10), || {
+        let queue_entries = runtime.storage().read_recent_queue_entries(20)?;
+        Ok(queue_entries.iter().any(|entry| {
+            entry.message_id == message.id && entry.status == QueueEntryStatus::Processed
+        }))
+    })
+    .await?;
+
+    assert_eq!(provider.calls().await, 4);
+    let task_id = provider
+        .task_id()
+        .await
+        .expect("provider should capture the promoted task id");
+    let task_result = runtime
+        .storage()
+        .read_recent_messages(20)?
+        .into_iter()
+        .find(|message| {
+            message.kind == MessageKind::TaskResult
+                && message.task_id.as_deref() == Some(task_id.as_str())
+        })
+        .expect("background command should enqueue its task result");
+
+    eventually_for(Duration::from_secs(10), || {
+        let queue_entries = runtime.storage().read_recent_queue_entries(20)?;
+        Ok(queue_entries.iter().any(|entry| {
+            entry.message_id == task_result.id && entry.status == QueueEntryStatus::Processed
+        }))
+    })
+    .await?;
+
+    let turns = runtime.storage().read_recent_turns(20)?;
+    let operator_turn = turns
+        .iter()
+        .find(|turn| turn.input_message_ids.contains(&message.id))
+        .expect("operator turn should settle");
+    assert!(operator_turn.produced_brief_ids.is_empty());
+    assert_eq!(
+        operator_turn
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.no_brief_reason.as_ref()),
+        Some(&TurnNoBriefReason::ToolOnlyWait)
+    );
+
+    let reducer_turn = turns
+        .iter()
+        .find(|turn| turn.input_message_ids.contains(&task_result.id))
+        .expect("queued task result should re-enter the model");
+    assert!(!reducer_turn.produced_brief_ids.is_empty());
+    assert!(reducer_turn
+        .terminal
+        .as_ref()
+        .and_then(|terminal| terminal.no_brief_reason.as_ref())
+        .is_none());
+    Ok(())
+}
+
 pub async fn turn_execution_boundary_persists_queue_transcript_and_briefs() -> Result<()> {
     let host = RuntimeHost::new_with_provider(
         test_config(),
@@ -251,15 +427,9 @@ pub async fn turn_execution_boundary_persists_queue_transcript_and_briefs() -> R
     let runtime = host.default_runtime().await?;
 
     let message = runtime
-        .enqueue(MessageEnvelope::new(
+        .enqueue(admitted_operator_prompt(
             "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "exercise the turn boundary".into(),
-            },
+            "exercise the turn boundary",
         ))
         .await?;
 
@@ -285,7 +455,8 @@ pub async fn turn_execution_boundary_persists_queue_transcript_and_briefs() -> R
             && entry.related_message_id.as_deref() == Some(message.id.as_str())
             && entry.data["body"].is_null()
             && entry.data["metadata"].is_null()
-            && entry.data["delivery_surface"].is_null()
+            && entry.data["delivery_surface"] == "cli_prompt"
+            && entry.data["admission_context"] == "local_process"
     }));
     assert!(transcript.iter().any(|entry| {
         entry.kind == TranscriptEntryKind::AssistantRound && entry.round == Some(1)
@@ -326,16 +497,7 @@ pub async fn message_processing_creates_briefs_and_sleeps() -> Result<()> {
         RuntimeHost::new_with_provider(test_config(), Arc::new(StubProvider::new("stub result")))?;
     let runtime = host.default_runtime().await?;
 
-    let message = MessageEnvelope::new(
-        "default",
-        MessageKind::OperatorPrompt,
-        MessageOrigin::Operator { actor_id: None },
-        AuthorityClass::OperatorInstruction,
-        Priority::Normal,
-        MessageBody::Text {
-            text: "hello".into(),
-        },
-    );
+    let message = admitted_operator_prompt("default", "hello");
     runtime.enqueue(message.clone()).await?;
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
@@ -365,19 +527,10 @@ pub async fn terminal_brief_uses_last_assistant_message_without_terminal_deliver
     attach_default_workspace(&host).await?;
     let runtime = host.default_runtime().await?;
 
-    let message = MessageEnvelope::new(
-        "default",
-        MessageKind::OperatorPrompt,
-        MessageOrigin::Operator { actor_id: None },
-        AuthorityClass::OperatorInstruction,
-        Priority::Normal,
-        MessageBody::Text {
-            text: "write and verify a file".into(),
-        },
-    );
+    let message = admitted_operator_prompt("default", "write and verify a file");
     runtime.enqueue(message.clone()).await?;
 
-    wait_until(|| {
+    eventually_for(Duration::from_secs(15), || {
         let briefs = runtime.storage().read_recent_briefs(10)?;
         Ok(briefs.iter().any(|brief| {
             brief.related_message_id.as_deref() == Some(message.id.as_str())
@@ -394,6 +547,13 @@ pub async fn terminal_brief_uses_last_assistant_message_without_terminal_deliver
     assert_eq!(
         briefs[0].text,
         "Verification is complete. I'll package the final answer now."
+    );
+    assert_eq!(
+        briefs[0].citations,
+        Some(vec![holon::types::Citation {
+            url: "https://example.com/verification".into(),
+            title: Some("Verification source".into()),
+        }])
     );
     assert!(
         !briefs[0]
@@ -444,16 +604,7 @@ pub async fn sleep_only_completion_keeps_last_assistant_message_from_previous_ro
     attach_default_workspace(&host).await?;
     let runtime = host.default_runtime().await?;
 
-    let message = MessageEnvelope::new(
-        "default",
-        MessageKind::OperatorPrompt,
-        MessageOrigin::Operator { actor_id: None },
-        AuthorityClass::OperatorInstruction,
-        Priority::Normal,
-        MessageBody::Text {
-            text: "write a file and then sleep".into(),
-        },
-    );
+    let message = admitted_operator_prompt("default", "write a file and then sleep");
     runtime.enqueue(message.clone()).await?;
 
     wait_until(|| {
@@ -627,19 +778,10 @@ pub async fn wake_hint_coalesces_while_running_and_reenters_once() -> Result<()>
     let runtime = host.default_runtime().await?;
 
     runtime
-        .enqueue(MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "do the first turn".into(),
-            },
-        ))
+        .enqueue(admitted_operator_prompt("default", "do the first turn"))
         .await?;
 
-    sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(10), provider.wait_for_first_call()).await?;
     let first = runtime
         .submit_wake_hint(WakeHint {
             agent_id: "default".into(),
@@ -672,9 +814,19 @@ pub async fn wake_hint_coalesces_while_running_and_reenters_once() -> Result<()>
         .await?;
     assert_eq!(first, WakeDisposition::Coalesced);
     assert_eq!(second, WakeDisposition::Coalesced);
+    provider.release_first_call();
 
     wait_until_async_for(Duration::from_secs(10), || async {
-        Ok(provider.calls().await == 2)
+        if provider.calls().await != 2 {
+            return Ok(false);
+        }
+        let state = runtime.storage().read_agent()?;
+        Ok(state
+            .and_then(|state| state.last_continuation)
+            .is_some_and(|continuation| {
+                continuation.class == holon::types::ContinuationClass::ResumeExpectedWait
+                    && continuation.model_reentry
+            }))
     })
     .await?;
 
@@ -742,27 +894,9 @@ pub async fn multi_session_state_is_isolated() -> Result<()> {
     let a = host.get_or_create_agent("alpha").await?;
     let b = host.get_or_create_agent("beta").await?;
 
-    let alpha_message = MessageEnvelope::new(
-        "alpha",
-        MessageKind::OperatorPrompt,
-        MessageOrigin::Operator { actor_id: None },
-        AuthorityClass::OperatorInstruction,
-        Priority::Normal,
-        MessageBody::Text {
-            text: "alpha".into(),
-        },
-    );
+    let alpha_message = admitted_operator_prompt("alpha", "alpha");
     a.enqueue(alpha_message.clone()).await?;
-    let beta_message = MessageEnvelope::new(
-        "beta",
-        MessageKind::OperatorPrompt,
-        MessageOrigin::Operator { actor_id: None },
-        AuthorityClass::OperatorInstruction,
-        Priority::Normal,
-        MessageBody::Text {
-            text: "beta".into(),
-        },
-    );
+    let beta_message = admitted_operator_prompt("beta", "beta");
     b.enqueue(beta_message.clone()).await?;
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
@@ -915,26 +1049,13 @@ pub async fn notify_operator_prefers_reply_route_for_delivery() -> Result<()> {
         ))
         .await?;
 
-    let inbound = MessageEnvelope {
-        metadata: Some(json!({
-            "operator_transport": {
-                "binding_id": "opbind-z-ingress",
-                "reply_route_id": "route-reply-preferred"
-            }
-        })),
-        ..MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator {
-                actor_id: Some("operator:jolestar".into()),
-            },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "route preference check".into(),
-            },
-        )
-    };
+    let mut inbound = admitted_operator_prompt("default", "route preference check");
+    inbound.metadata = Some(json!({
+        "operator_transport": {
+            "binding_id": "opbind-z-ingress",
+            "reply_route_id": "route-reply-preferred"
+        }
+    }));
     runtime.enqueue(inbound).await?;
     wait_until_async(|| {
         let runtime = runtime.clone();
@@ -979,26 +1100,13 @@ pub async fn notify_operator_ignores_reply_route_when_binding_no_longer_matches(
         ))
         .await?;
 
-    let inbound = MessageEnvelope {
-        metadata: Some(json!({
-            "operator_transport": {
-                "binding_id": "opbind-z-ingress",
-                "reply_route_id": "route-reply-preferred"
-            }
-        })),
-        ..MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator {
-                actor_id: Some("operator:jolestar".into()),
-            },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "route mismatch fallback check".into(),
-            },
-        )
-    };
+    let mut inbound = admitted_operator_prompt("default", "route mismatch fallback check");
+    inbound.metadata = Some(json!({
+        "operator_transport": {
+            "binding_id": "opbind-z-ingress",
+            "reply_route_id": "route-reply-preferred"
+        }
+    }));
     runtime.enqueue(inbound).await?;
     wait_until_async(|| {
         let runtime = runtime.clone();
@@ -1044,25 +1152,12 @@ pub async fn notify_operator_falls_back_to_default_route_without_reply_route() -
         ))
         .await?;
 
-    let inbound = MessageEnvelope {
-        metadata: Some(json!({
-            "operator_transport": {
-                "binding_id": "opbind-default"
-            }
-        })),
-        ..MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator {
-                actor_id: Some("operator:jolestar".into()),
-            },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "default route fallback check".into(),
-            },
-        )
-    };
+    let mut inbound = admitted_operator_prompt("default", "default route fallback check");
+    inbound.metadata = Some(json!({
+        "operator_transport": {
+            "binding_id": "opbind-default"
+        }
+    }));
     runtime.enqueue(inbound).await?;
     wait_until_async(|| {
         let runtime = runtime.clone();
@@ -1095,16 +1190,7 @@ pub async fn agent_summary_last_turn_token_usage_survives_transcript_windowing()
     let runtime = host.default_runtime().await?;
 
     runtime
-        .enqueue(MessageEnvelope::new(
-            "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "inspect session state".into(),
-            },
-        ))
+        .enqueue(admitted_operator_prompt("default", "inspect session state"))
         .await?;
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
@@ -1306,18 +1392,12 @@ pub async fn sleep_only_completion_preserves_brief_after_max_output_recovery() -
 
     // Send a prompt that will trigger max-output recovery followed by Sleep-only completion
     runtime
-        .enqueue(MessageEnvelope::new(
+        .enqueue(admitted_operator_prompt(
             "default",
-            MessageKind::OperatorPrompt,
-            MessageOrigin::Operator { actor_id: None },
-            AuthorityClass::OperatorInstruction,
-            Priority::Normal,
-            MessageBody::Text {
-                text: "Generate a comprehensive technical report covering multiple domains. \
-                      Include detailed sections on: 1) System architecture patterns 2) Data flow strategies \
-                      3) Security considerations 4) Performance optimization 5) Monitoring approaches. \
-                      After completing your analysis, finish with Sleep.".into()
-            },
+            "Generate a comprehensive technical report covering multiple domains. \
+             Include detailed sections on: 1) System architecture patterns 2) Data flow strategies \
+             3) Security considerations 4) Performance optimization 5) Monitoring approaches. \
+             After completing your analysis, finish with Sleep.",
         ))
         .await?;
 

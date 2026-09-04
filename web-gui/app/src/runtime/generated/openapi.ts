@@ -41,6 +41,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/agents/snapshot": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Agent roster snapshot
+         * @description Authoritative roster snapshot (RFC: observer sync): all-or-nothing membership with per-Agent event windows and latest Brief anchors from one committed read view. Served only while the agents.roster-snapshot.v1 capability is advertised; route registration alone is never sufficient.
+         */
+        get: operations["agentsSnapshot"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/agents/{agent_id}/briefs": {
         parameters: {
             query?: never;
@@ -130,7 +150,7 @@ export interface paths {
         };
         /**
          * Agent event page
-         * @description Return a bounded page of versioned runtime event envelopes. Query parameters: before_seq, after_seq, limit, order, max_level. Identity is (event_log_epoch, agent_id, event_seq); unknown kinds retain their opaque payload.
+         * @description Return a bounded page of versioned runtime event envelopes. Query parameters: before_seq, after_seq, limit, order, max_level. Identity is (event_log_epoch, agent_id, event_seq); unknown kinds retain their opaque payload. While events.projection-effect.v1 is advertised every envelope carries the additive projection_effect classification derived from the runtime event registry (envelope contract version 3); a max_level-filtered page changes presentation only and is never proof of raw continuity.
          */
         get: operations["agentEvents"];
         put?: never;
@@ -150,7 +170,7 @@ export interface paths {
         };
         /**
          * Agent event stream
-         * @description Return Server-Sent Events carrying raw StreamEventEnvelope JSON data. Query parameters: after_seq, limit. SSE id is event_seq; SSE event is the audit event kind; missing replay cursors return cursor_not_found before the stream opens. If the receiver lags, the server closes the stream so clients can backfill after the last contiguous SSE id before reconnecting. Breaking change: the projection query parameter and StreamEventEnvelope.projection field have been removed.
+         * @description Return Server-Sent Events carrying raw StreamEventEnvelope JSON data. Query parameters: after_seq, limit. SSE id is event_seq; SSE event is the audit event kind; missing replay cursors return cursor_not_found before the stream opens, carrying event_log_epoch, oldest_retained_seq, and event_head_seq from one committed read view so clients can distinguish a retained-prefix gap from an epoch change. Envelopes carry the additive projection_effect field while events.projection-effect.v1 is advertised. If the receiver lags, the server closes the stream so clients can backfill after the last contiguous SSE id before reconnecting. Breaking change: the projection query parameter and StreamEventEnvelope.projection field have been removed.
          */
         get: operations["agentEventsStream"];
         put?: never;
@@ -195,6 +215,26 @@ export interface paths {
          * @description Return persisted message envelopes for the selected agent. Missing or cross-agent ids are reported in missing_message_ids.
          */
         post: operations["agentMessagesBatchGet"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/{agent_id}/projection-snapshot": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Agent projection snapshot
+         * @description Per-Agent canonical projection snapshot (RFC: observer sync): compact current state plus revision anchors at one committed consistency boundary. snapshot_through_seq equals the committed per-Agent event head of the same view; clients replay only event_seq greater than it. Served only while the agents.projection-snapshot.v1 capability is advertised; route registration alone is never sufficient.
+         */
+        get: operations["agentProjectionSnapshot"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -561,6 +601,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/auth/method": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Authentication method
+         * @description Return the configured authentication mode used by the Web login page.
+         */
+        get: operations["authMethod"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/auth/{provider}/device/start": {
         parameters: {
             query?: never;
@@ -896,7 +956,7 @@ export interface paths {
         put?: never;
         /**
          * Apply scheduler repair
-         * @description Dry-run or apply one OCC-guarded scheduler repair operation and emit an audit event for committed changes.
+         * @description Dry-run or apply one OCC-guarded scheduler repair operation. Non-dry-run requests create and verify a SQLite backup before committing and emit an audit event.
          */
         post: operations["applySchedulerRepair"];
         delete?: never;
@@ -1593,6 +1653,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/models/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Refresh available models
+         * @description Discover models for providers with missing or expired caches, then return the model catalog and runtime availability.
+         */
+        post: operations["refreshModels"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/search": {
         parameters: {
             query?: never;
@@ -2033,6 +2113,18 @@ export interface components {
                 skill?: string | null;
             };
         };
+        /** @description First concrete AgentCanonicalProjection: compact current state plus stable revision anchors only. Deliberately excludes verbose timelines and full transcript/message history (see docs/implementation-decisions/104-agent-canonical-projection-v1-boundary.md). */
+        AgentCanonicalProjection: {
+            agent: components["schemas"]["AgentListEntry"];
+            conversation: components["schemas"]["ConversationRevisionAnchors"];
+            /** @description Current WorkItem anchor; null when the Agent has no current WorkItem. */
+            current_work_item: components["schemas"]["AgentWorkItemAnchor"] | null;
+            /** @description Records referenced by the projection but still resolvable through the batch record APIs. */
+            hydration_references: components["schemas"]["AgentHydrationKey"][];
+            /** @description Records deleted at or before the snapshot boundary; they terminate pending hydration without fetching a record that no longer exists. */
+            hydration_tombstones: components["schemas"]["AgentHydrationKey"][];
+            latest_brief: components["schemas"]["AgentLatestBrief"] | null;
+        };
         /** AgentDeletionResponse */
         AgentDeletionResponse: {
             created: boolean;
@@ -2116,6 +2208,68 @@ export interface components {
                 /** Format: date-time */
                 updated_at: string;
             } | null;
+        };
+        /** @description Committed event window for one Agent inside one snapshot read view. Values come from a committed database view, never from an in-memory watcher or a sequence allocator. */
+        AgentEventWindow: {
+            /** @description Greatest committed event_seq visible in the response read view. */
+            event_head_seq: number;
+            /** @description Durable retention floor. Zero means no retained prefix has ever been deleted; a positive value is the earliest sequence that may still be replayable. */
+            oldest_retained_seq: number;
+        };
+        /** @description Identifies one canonical record for hydration termination (tombstone) or batch resolution (reference). */
+        AgentHydrationKey: {
+            record_id: string;
+            /** @enum {string} */
+            record_kind: "message" | "brief" | "transcript_entry";
+        };
+        /** @description Latest Brief anchor derived from canonical Brief storage, not a second UI-summary table. */
+        AgentLatestBrief: {
+            brief_id: string;
+            /** Format: date-time */
+            created_at: string;
+            /** @description Immutable brief_created event linkage; null when the Brief cannot be linked to a unique retained event. Null-linked Briefs do not participate in exact unread calculation. */
+            created_event_seq: number | null;
+            /** @description Bounded to 512 UTF-8 bytes. Full Brief content remains available from the canonical Brief APIs. */
+            preview: string;
+        };
+        /** @description Public Agent entry, same shape as GET /api/agents/list response entries. Baseline object schema until the agents/list DTO stabilizes under a named schema. */
+        AgentListEntry: {
+            [key: string]: unknown;
+        };
+        /** @description Per-Agent canonical projection snapshot at one consistency boundary (RFC: observer sync). Served by GET /api/agents/{agent_id}/projection-snapshot only while the agents.projection-snapshot.v1 capability is advertised. */
+        AgentProjectionSnapshot: {
+            agent_id: string;
+            /** @constant */
+            contract_version: 1;
+            /** @description May exceed snapshot_through_seq; names a committed event available through the event page. Clients replay (snapshot_through_seq, event_head_seq] and later events. */
+            event_head_seq: number;
+            event_log_epoch: string;
+            /** @description Durable retention floor; zero means no retained prefix has ever been deleted. */
+            oldest_retained_seq: number;
+            projection: components["schemas"]["AgentCanonicalProjection"];
+            runtime_id: string;
+            /** @description Every event with event_seq <= snapshot_through_seq that affects current canonical state is already reflected in the projection or its revision anchors. */
+            snapshot_through_seq: number;
+            visibility_scope_id: string;
+        };
+        AgentRosterEntry: {
+            agent: components["schemas"]["AgentListEntry"];
+            event_window: components["schemas"]["AgentEventWindow"];
+            /** @description Latest canonical Brief; null when the Agent has no Brief yet. */
+            latest_brief: components["schemas"]["AgentLatestBrief"] | null;
+        };
+        /** @description Authoritative roster snapshot (RFC: observer sync). All-or-nothing membership with per-Agent event windows and latest Brief anchors. Served by GET /api/agents/snapshot only while the agents.roster-snapshot.v1 capability is advertised; route registration alone is never sufficient. */
+        AgentRosterSnapshot: {
+            /** @description Active public Agents visible to the caller in one committed read view. Private child Agents are never included. A failure to assemble one Agent fails the whole response. */
+            agents: components["schemas"]["AgentRosterEntry"][];
+            /** @constant */
+            contract_version: 1;
+            /** @description Current event log epoch; a changed value means historical event continuity is intentionally reset. */
+            event_log_epoch: string;
+            /** @description Stable public identity of the runtime installation. Distinguishes a replaced server at the same URL from an ordinary restart. Not a secret. */
+            runtime_id: string;
+            /** @description Server-generated scope id derived from stable runtime identity, resolved authority, normalized visibility entitlement, and policy generation. Never contains credentials or tokens. */
+            visibility_scope_id: string;
         };
         /** AgentStateSnapshotDto */
         AgentStateSnapshotDto: {
@@ -2247,6 +2401,17 @@ export interface components {
                         /** @enum {string} */
                         kind: "completed" | "aborted" | "baseline_over_budget" | "deferred_to_fallback" | "provider_failed_needs_recovery";
                         last_assistant_message?: string | null;
+                        no_brief_reason?: ({
+                            /** @constant */
+                            kind: "reducer_only";
+                            reason: string;
+                        } | {
+                            /** @constant */
+                            kind: "aborted";
+                        } | {
+                            /** @constant */
+                            kind: "tool_only_wait";
+                        }) | null;
                         reason?: string | null;
                         turn_id?: string;
                         /** Format: uint64 */
@@ -2370,6 +2535,17 @@ export interface components {
                     /** @enum {string} */
                     kind: "completed" | "aborted" | "baseline_over_budget" | "deferred_to_fallback" | "provider_failed_needs_recovery";
                     last_assistant_message?: string | null;
+                    no_brief_reason?: ({
+                        /** @constant */
+                        kind: "reducer_only";
+                        reason: string;
+                    } | {
+                        /** @constant */
+                        kind: "aborted";
+                    } | {
+                        /** @constant */
+                        kind: "tool_only_wait";
+                    }) | null;
                     reason?: string | null;
                     turn_id?: string;
                     /** Format: uint64 */
@@ -2431,7 +2607,7 @@ export interface components {
                 agent_id: string;
                 blocked_by?: string | null;
                 /** @enum {string} */
-                candidate_class: "current_runnable" | "triggered_blocked" | "queued_runnable" | "waiting_for_operator" | "yielded" | "blocked" | "completed_recent";
+                candidate_class: "current_runnable" | "triggered_blocked" | "queued_runnable" | "waiting_for_operator" | "yielded" | "blocked" | "completing" | "completed_recent";
                 /** Format: date-time */
                 created_at: string;
                 current_todo?: {
@@ -2440,7 +2616,7 @@ export interface components {
                     text: string;
                 } | null;
                 /** @enum {string} */
-                focus: "current" | "queued" | "yielded" | "blocked" | "completed";
+                focus: "current" | "queued" | "yielded" | "blocked" | "completing" | "completed";
                 id: string;
                 is_current: boolean;
                 is_runnable: boolean;
@@ -2448,9 +2624,9 @@ export interface components {
                 /** @enum {string} */
                 plan_status: "draft" | "ready" | "needs_input";
                 /** @enum {string} */
-                readiness: "runnable" | "yielded" | "waiting_for_operator" | "blocked" | "completed";
+                readiness: "runnable" | "yielded" | "waiting_for_operator" | "blocked" | "completing" | "completed";
                 /** @enum {string} */
-                reason_code: "completed" | "continuation_yielded" | "active_task_wait" | "active_operator_wait" | "active_timer_wait" | "active_external_wait" | "active_system_wait" | "manual_blocker" | "plan_needs_input" | "runnable";
+                reason_code: "completing" | "completed" | "continuation_yielded" | "active_task_wait" | "active_operator_wait" | "active_timer_wait" | "active_external_wait" | "active_system_wait" | "manual_blocker" | "plan_needs_input" | "runnable";
                 /** Format: date-time */
                 recheck_at?: string | null;
                 result_brief_id?: string | null;
@@ -2458,9 +2634,9 @@ export interface components {
                 /** Format: uint64 */
                 revision: number;
                 /** @enum {string} */
-                scheduling_state: "runnable" | "yielded_to_work_item" | "waiting_operator" | "waiting_task" | "waiting_external" | "waiting_timer" | "waiting_system" | "blocked" | "completed";
+                scheduling_state: "runnable" | "yielded_to_work_item" | "waiting_operator" | "waiting_task" | "waiting_external" | "waiting_timer" | "waiting_system" | "blocked" | "completing" | "completed";
                 /** @enum {string} */
-                state: "open" | "completed";
+                state: "open" | "completing" | "completed";
                 turn_id?: string | null;
                 /** Format: date-time */
                 updated_at: string;
@@ -2494,6 +2670,15 @@ export interface components {
                     } | null;
                 }[];
             };
+        };
+        AgentWorkItemAnchor: {
+            plan_status: string;
+            /** @description Canonical WorkItem revision at the snapshot boundary. */
+            revision: number;
+            state: string;
+            /** Format: date-time */
+            updated_at: string;
+            work_item_id: string;
         };
         /** @description Baseline request DTO schema. Per-field schemas will be tightened as HTTP envelope and DTO contracts stabilize. */
         AttachWorkspaceRequest: {
@@ -2535,6 +2720,10 @@ export interface components {
                 uri?: string | null;
                 value?: unknown;
             }[] | null;
+            citations?: {
+                title?: string | null;
+                url: string;
+            }[] | null;
             /**
              * @default {
              *       "kind": "inline"
@@ -2555,6 +2744,14 @@ export interface components {
             };
             /** Format: date-time */
             created_at: string;
+            /**
+             * Format: uint64
+             * @description Immutable linkage to the unique `brief_created` audit event committed
+             *      in the same runtime DB transition as this record. `None` for records
+             *      whose creating event cannot be identified (pre-linkage history or
+             *      ambiguous backfill candidates).
+             */
+            created_event_seq?: number | null;
             finalizes_assistant_round_id?: string | null;
             id: string;
             /** @enum {string} */
@@ -2592,6 +2789,22 @@ export interface components {
         CompleteWorkItemRequest: {
             /** @enum {string|null} */
             authority_class?: "operator_instruction" | "runtime_instruction" | "integration_signal" | "external_evidence" | null;
+            /**
+             * @description Declaration-based provenance supplied to a CLI launched by an agent.
+             *
+             *      These values describe the caller and its source activation, but are not
+             *      authentication material. A local process can forge them.
+             */
+            invocation_context?: {
+                caller_agent_id: string;
+                /** @enum {string|null} */
+                inherited_authority_class?: "operator_instruction" | "runtime_instruction" | "integration_signal" | "external_evidence" | null;
+                source_activation_id?: string | null;
+                source_task_id?: string | null;
+                source_turn_id?: string | null;
+                source_work_item_id?: string | null;
+            } | null;
+            report_text: string;
         };
         /** @description Baseline request DTO schema. Per-field schemas will be tightened as HTTP envelope and DTO contracts stabilize. */
         ControlPromptRequest: {
@@ -2604,6 +2817,11 @@ export interface components {
         /** @description Baseline request DTO schema. Per-field schemas will be tightened as HTTP envelope and DTO contracts stabilize. */
         ControlWakeRequest: {
             [key: string]: unknown;
+        };
+        /** @description Latest-record anchors for conversation families whose canonical records carry no per-record revision counter. Always present; null fields mean the family has no record at the boundary. */
+        ConversationRevisionAnchors: {
+            latest_message_id: string | null;
+            latest_transcript_entry_id: string | null;
         };
         /** @description Baseline request DTO schema. Per-field schemas will be tightened as HTTP envelope and DTO contracts stabilize. */
         CreateAgentRequest: {
@@ -2630,6 +2848,21 @@ export interface components {
         };
         /** @description Baseline request DTO schema. Per-field schemas will be tightened as HTTP envelope and DTO contracts stabilize. */
         CreateWorkItemRequest: {
+            [key: string]: unknown;
+        };
+        /** @description Rich cursor_not_found body for event pages and SSE. event_log_epoch, oldest_retained_seq, and event_head_seq must come from one committed read view so clients can distinguish a retained-prefix gap from an epoch change and select the correct reset path. */
+        CursorNotFoundError: {
+            after_seq: number;
+            /** @constant */
+            code: "cursor_not_found";
+            error: string;
+            event_head_seq: number;
+            event_log_epoch: string;
+            /** @constant */
+            ok: false;
+            /** @description Durable retention floor; zero means no retained prefix has ever been deleted. */
+            oldest_retained_seq: number;
+        } & {
             [key: string]: unknown;
         };
         /** @description Baseline request DTO schema. Per-field schemas will be tightened as HTTP envelope and DTO contracts stabilize. */
@@ -2686,6 +2919,11 @@ export interface components {
                 payload_schema: string;
                 /** Format: uint32 */
                 payload_schema_version: number;
+                /**
+                 * @description Additive classification derived from the runtime event registry.
+                 *      Present only while `events.projection-effect.v1` is advertised.
+                 */
+                projection_effect?: ("none" | "display_invalidation") | null;
                 provenance: {
                     admission_context?: unknown;
                     authority_class?: unknown;
@@ -2949,6 +3187,21 @@ export interface components {
             authority_class?: "operator_instruction" | "runtime_instruction" | "integration_signal" | "external_evidence" | null;
             /** @default false */
             clear_blocker: boolean;
+            /**
+             * @description Declaration-based provenance supplied to a CLI launched by an agent.
+             *
+             *      These values describe the caller and its source activation, but are not
+             *      authentication material. A local process can forge them.
+             */
+            invocation_context?: {
+                caller_agent_id: string;
+                /** @enum {string|null} */
+                inherited_authority_class?: "operator_instruction" | "runtime_instruction" | "integration_signal" | "external_evidence" | null;
+                source_activation_id?: string | null;
+                source_task_id?: string | null;
+                source_turn_id?: string | null;
+                source_work_item_id?: string | null;
+            } | null;
             reason?: string | null;
         };
         /** PickWorkItemResponse */
@@ -3008,7 +3261,7 @@ export interface components {
                  */
                 revision: number;
                 /** @enum {string} */
-                state: "open" | "completed";
+                state: "open" | "completing" | "completed";
                 todo_list?: {
                     /** @enum {string} */
                     state: "pending" | "in_progress" | "completed";
@@ -3091,7 +3344,7 @@ export interface components {
                  */
                 revision: number;
                 /** @enum {string} */
-                state: "open" | "completed";
+                state: "open" | "completing" | "completed";
                 todo_list?: {
                     /** @enum {string} */
                     state: "pending" | "in_progress" | "completed";
@@ -3123,10 +3376,10 @@ export interface components {
                 cancelled_wait_condition_ids?: string[];
                 current_focus_mode: string;
                 /** @enum {string} */
-                current_readiness: "runnable" | "yielded" | "waiting_for_operator" | "blocked" | "completed";
+                current_readiness: "runnable" | "yielded" | "waiting_for_operator" | "blocked" | "completing" | "completed";
                 current_work_item_id: string;
                 /** @enum {string|null} */
-                previous_readiness?: "runnable" | "yielded" | "waiting_for_operator" | "blocked" | "completed" | null;
+                previous_readiness?: "runnable" | "yielded" | "waiting_for_operator" | "blocked" | "completing" | "completed" | null;
                 previous_work_item_id?: string | null;
                 reason?: string | null;
                 switch_kind: string;
@@ -3137,6 +3390,11 @@ export interface components {
                 }[];
             };
         };
+        /**
+         * @description Additive top-level StreamEventEnvelope classification shared by event pages and SSE. The runtime event registry is the source of truth; legacy or otherwise unclassified events default conservatively to display_invalidation. Emitted only while events.projection-effect.v1 is advertised; introducing the field increments the envelope contract version.
+         * @enum {string}
+         */
+        ProjectionEffect: "none" | "display_invalidation";
         /** ReconcileSkillRequest */
         ReconcileSkillRequest: {
             name?: string | null;
@@ -3369,8 +3627,11 @@ export interface components {
                 resolved_at?: string | null;
                 source?: string | null;
                 /** @enum {string} */
-                status: "active" | "resolved" | "cancelled" | "expired";
+                status: "active" | "triggered" | "resolved" | "cancelled" | "expired";
                 subject_ref?: string | null;
+                trigger_message_id?: string | null;
+                /** Format: date-time */
+                triggered_at?: string | null;
                 turn_id?: string | null;
                 /** Format: date-time */
                 updated_at: string;
@@ -3405,7 +3666,7 @@ export interface components {
                 message_id: string;
                 /** @enum {string} */
                 priority: "interject" | "next" | "normal" | "background";
-                status: ("queued" | "dequeued" | "processed" | "interjected" | "aborted" | "dropped") | "interrupted";
+                status: ("queued" | "dequeued" | "processed" | "interjected" | "aborted" | "dropped" | "quarantined") | "interrupted";
                 /** Format: date-time */
                 updated_at: string;
             }[];
@@ -3416,14 +3677,14 @@ export interface components {
             dry_run: boolean;
             operation: {
                 /** @enum {string} */
-                expected_status: "active" | "resolved" | "cancelled" | "expired";
+                expected_status: "active" | "triggered" | "resolved" | "cancelled" | "expired";
                 /** Format: date-time */
                 expected_updated_at: string;
                 /** @constant */
                 kind: "cancel_wait";
                 wait_id: string;
             } | {
-                expected_status: ("queued" | "dequeued" | "processed" | "interjected" | "aborted" | "dropped") | "interrupted";
+                expected_status: ("queued" | "dequeued" | "processed" | "interjected" | "aborted" | "dropped" | "quarantined") | "interrupted";
                 /** Format: date-time */
                 expected_updated_at: string;
                 /** @constant */
@@ -3436,6 +3697,7 @@ export interface components {
         SchedulerRepairResult: {
             after: unknown;
             agent_id: string;
+            backup_path?: string | null;
             before: unknown;
             changed: boolean;
             dry_run: boolean;
@@ -3519,7 +3781,7 @@ export interface components {
             agent_id: string;
             blocked_by?: string | null;
             /** @enum {string} */
-            candidate_class: "current_runnable" | "triggered_blocked" | "queued_runnable" | "waiting_for_operator" | "yielded" | "blocked" | "completed_recent";
+            candidate_class: "current_runnable" | "triggered_blocked" | "queued_runnable" | "waiting_for_operator" | "yielded" | "blocked" | "completing" | "completed_recent";
             /** Format: date-time */
             created_at: string;
             current_todo?: {
@@ -3528,7 +3790,7 @@ export interface components {
                 text: string;
             } | null;
             /** @enum {string} */
-            focus: "current" | "queued" | "yielded" | "blocked" | "completed";
+            focus: "current" | "queued" | "yielded" | "blocked" | "completing" | "completed";
             id: string;
             is_current: boolean;
             is_runnable: boolean;
@@ -3536,9 +3798,9 @@ export interface components {
             /** @enum {string} */
             plan_status: "draft" | "ready" | "needs_input";
             /** @enum {string} */
-            readiness: "runnable" | "yielded" | "waiting_for_operator" | "blocked" | "completed";
+            readiness: "runnable" | "yielded" | "waiting_for_operator" | "blocked" | "completing" | "completed";
             /** @enum {string} */
-            reason_code: "completed" | "continuation_yielded" | "active_task_wait" | "active_operator_wait" | "active_timer_wait" | "active_external_wait" | "active_system_wait" | "manual_blocker" | "plan_needs_input" | "runnable";
+            reason_code: "completing" | "completed" | "continuation_yielded" | "active_task_wait" | "active_operator_wait" | "active_timer_wait" | "active_external_wait" | "active_system_wait" | "manual_blocker" | "plan_needs_input" | "runnable";
             /** Format: date-time */
             recheck_at?: string | null;
             result_brief_id?: string | null;
@@ -3546,9 +3808,9 @@ export interface components {
             /** Format: uint64 */
             revision: number;
             /** @enum {string} */
-            scheduling_state: "runnable" | "yielded_to_work_item" | "waiting_operator" | "waiting_task" | "waiting_external" | "waiting_timer" | "waiting_system" | "blocked" | "completed";
+            scheduling_state: "runnable" | "yielded_to_work_item" | "waiting_operator" | "waiting_task" | "waiting_external" | "waiting_timer" | "waiting_system" | "blocked" | "completing" | "completed";
             /** @enum {string} */
-            state: "open" | "completed";
+            state: "open" | "completing" | "completed";
             turn_id?: string | null;
             /** Format: date-time */
             updated_at: string;
@@ -3567,6 +3829,11 @@ export interface components {
             payload_schema: string;
             /** Format: uint32 */
             payload_schema_version: number;
+            /**
+             * @description Additive classification derived from the runtime event registry.
+             *      Present only while `events.projection-effect.v1` is advertised.
+             */
+            projection_effect?: ("none" | "display_invalidation") | null;
             provenance: {
                 admission_context?: unknown;
                 authority_class?: unknown;
@@ -4124,7 +4391,7 @@ export interface components {
             invocation_surface?: string | null;
             output: unknown;
             /** @enum {string} */
-            status: "success" | "error";
+            status: "deferred" | "success" | "error" | "interrupted";
             summary: string;
             tool_name: string;
             turn_id?: string | null;
@@ -4148,6 +4415,21 @@ export interface components {
             /** @enum {string|null} */
             authority_class?: "operator_instruction" | "runtime_instruction" | "integration_signal" | "external_evidence" | null;
             blocked_by?: unknown;
+            /**
+             * @description Declaration-based provenance supplied to a CLI launched by an agent.
+             *
+             *      These values describe the caller and its source activation, but are not
+             *      authentication material. A local process can forge them.
+             */
+            invocation_context?: {
+                caller_agent_id: string;
+                /** @enum {string|null} */
+                inherited_authority_class?: "operator_instruction" | "runtime_instruction" | "integration_signal" | "external_evidence" | null;
+                source_activation_id?: string | null;
+                source_task_id?: string | null;
+                source_turn_id?: string | null;
+                source_work_item_id?: string | null;
+            } | null;
             objective?: string | null;
             /** @enum {string|null} */
             plan_status?: "draft" | "ready" | "needs_input" | null;
@@ -4215,7 +4497,7 @@ export interface components {
              */
             revision: number;
             /** @enum {string} */
-            state: "open" | "completed";
+            state: "open" | "completing" | "completed";
             todo_list?: {
                 /** @enum {string} */
                 state: "pending" | "in_progress" | "completed";
@@ -4305,6 +4587,44 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["JsonValue"];
+                };
+            };
+            /** @description Client error JSON response. */
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Server error JSON response. */
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    agentsSnapshot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful JSON response using a stable DTO schema. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentRosterSnapshot"];
                 };
             };
             /** @description Client error JSON response. */
@@ -4640,6 +4960,47 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["BatchGetMessagesResponse"];
+                };
+            };
+            /** @description Client error JSON response. */
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Server error JSON response. */
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    agentProjectionSnapshot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent id. */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful JSON response using a stable DTO schema. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentProjectionSnapshot"];
                 };
             };
             /** @description Client error JSON response. */
@@ -5380,6 +5741,44 @@ export interface operations {
         };
     };
     startCodexDeviceLogin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful JSON response. Baseline schema is intentionally loose until per-route response DTO contracts are stabilized. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JsonValue"];
+                };
+            };
+            /** @description Client error JSON response. */
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Server error JSON response. */
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    authMethod: {
         parameters: {
             query?: never;
             header?: never;
@@ -7686,6 +8085,44 @@ export interface operations {
         };
     };
     models: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful JSON response. Baseline schema is intentionally loose until per-route response DTO contracts are stabilized. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JsonValue"];
+                };
+            };
+            /** @description Client error JSON response. */
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Server error JSON response. */
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    refreshModels: {
         parameters: {
             query?: never;
             header?: never;

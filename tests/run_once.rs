@@ -11,7 +11,10 @@ use holon::{
     },
     run_once::{run_once_with_host, RunFinalStatus, RunOnceRequest},
     system::{WorkspaceAccessMode, WorkspaceProjectionKind},
-    types::{AuthorityClass, ControlAction, FailureArtifactCategory, TaskStatus, TokenUsage},
+    types::{
+        AgentDurability, AgentRegistryStatus, AuthorityClass, ControlAction,
+        FailureArtifactCategory, TaskStatus, TokenUsage,
+    },
 };
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -79,6 +82,11 @@ async fn run_once_returns_completed_text_for_simple_prompt() -> Result<()> {
     assert!(!response.render_text().contains("Token usage:"));
     assert!(response.agent_id.starts_with("tmp_run_"));
     assert!(response.tasks.is_empty());
+    let identity = host
+        .agent_identity_record(&response.agent_id)?
+        .expect("temporary run identity should remain as a host tombstone");
+    assert_eq!(identity.status, AgentRegistryStatus::Deleted);
+    assert_eq!(identity.durability, Some(AgentDurability::Ephemeral));
     let listed_agents = host
         .list_agents()
         .await?
@@ -314,7 +322,7 @@ async fn run_once_prefers_completed_work_item_result_brief_over_latest_turn_text
     );
     assert_eq!(
         second.raw_final_text.as_deref(),
-        Some("Fixed two test annotation issues.")
+        Some("Implemented broad prompt/context snapshot coverage")
     );
     let runtime = host
         .get_public_agent_for_external_ingress("default")
@@ -1278,8 +1286,7 @@ async fn run_once_reports_completed_when_final_result_lands_on_max_turn_boundary
     Ok(())
 }
 
-#[tokio::test]
-async fn run_once_reports_completed_when_final_text_arrives_after_last_allowed_model_round(
+async fn assert_run_once_reports_completed_when_final_text_arrives_after_last_allowed_model_round(
 ) -> Result<()> {
     let test_config = test_config();
     let host = RuntimeHost::new_with_provider(
@@ -1302,8 +1309,16 @@ async fn run_once_reports_completed_when_final_text_arrives_after_last_allowed_m
     Ok(())
 }
 
-#[tokio::test]
-async fn run_once_multi_round_single_turn_does_not_exceed_max_turns() -> Result<()> {
+#[test]
+fn run_once_reports_completed_when_final_text_arrives_after_last_allowed_model_round() -> Result<()>
+{
+    run_on_large_stack(
+        "run-once-final-text-after-last-model-round",
+        assert_run_once_reports_completed_when_final_text_arrives_after_last_allowed_model_round,
+    )
+}
+
+async fn assert_run_once_multi_round_single_turn_does_not_exceed_max_turns() -> Result<()> {
     // TwoRoundProvider performs two model rounds within a single turn:
     // round 1 issues a tool call, round 2 returns terminal text.
     // With max_turns=1, this should complete because only one turn is
@@ -1329,6 +1344,14 @@ async fn run_once_multi_round_single_turn_does_not_exceed_max_turns() -> Result<
     assert_eq!(response.final_text, "two rounds complete");
     assert_eq!(response.model_rounds, 2);
     Ok(())
+}
+
+#[test]
+fn run_once_multi_round_single_turn_does_not_exceed_max_turns() -> Result<()> {
+    run_on_large_stack(
+        "run-once-multi-round-single-turn",
+        assert_run_once_multi_round_single_turn_does_not_exceed_max_turns,
+    )
 }
 
 #[tokio::test]
