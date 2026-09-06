@@ -20,10 +20,10 @@ use holon::{
     provider::{AgentProvider, StubProvider},
     system::{WorkspaceAccessMode, WorkspaceProjectionKind},
     types::{
-        AdmissionContext, AgentState, AgentStatus, AuthorityClass, BriefKind, BriefRecord,
-        CallbackDeliveryMode, CommandTaskSpec, ContinuationClass, ControlAction, MessageBody,
-        MessageDeliverySurface, MessageEnvelope, MessageKind, MessageOrigin, Priority, TodoItem,
-        TodoItemState, WorkItemState,
+        AdmissionContext, AgentBootstrapStatus, AgentState, AgentStatus, AuthorityClass, BriefKind,
+        BriefRecord, CallbackDeliveryMode, CommandTaskSpec, ContinuationClass, ControlAction,
+        MessageBody, MessageDeliverySurface, MessageEnvelope, MessageKind, MessageOrigin, Priority,
+        TodoItem, TodoItemState, WorkItemState,
     },
 };
 use reqwest::Client;
@@ -48,6 +48,43 @@ pub async fn control_prompt_is_open_on_loopback_auto() -> Result<()> {
         .send()
         .await?;
     assert!(response.status().is_success());
+    server.abort();
+    Ok(())
+}
+
+pub async fn control_agent_create_returns_degraded_receipt_and_repairs() -> Result<()> {
+    let host = RuntimeHost::new_with_provider(test_config(), Arc::new(StubProvider::new("ok")))?;
+    let (base, server) = spawn_server_for_host(host.clone()).await?;
+    let client = Client::new();
+
+    let create = client
+        .post(format!("{base}/api/control/agents/repair-me/create"))
+        .json(&serde_json::json!({ "template": "late" }))
+        .send()
+        .await?;
+    assert_eq!(create.status(), reqwest::StatusCode::OK);
+    let created: serde_json::Value = create.json().await?;
+    assert_eq!(created["receipt"]["stage"], "degraded");
+    assert_eq!(created["receipt"]["bootstrap"]["status"], "degraded");
+    assert_eq!(created["identity"]["agent_id"], "repair-me");
+
+    let template_dir = host.config().home_dir.join(".agents/agent_templates/late");
+    std::fs::create_dir_all(&template_dir)?;
+    std::fs::write(template_dir.join("AGENTS.md"), "# Repaired\n")?;
+
+    let repaired = client
+        .post(format!("{base}/api/control/agents/repair-me/repair"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await?;
+    assert_eq!(repaired.status(), reqwest::StatusCode::OK);
+    let repaired: serde_json::Value = repaired.json().await?;
+    assert_eq!(
+        repaired["bootstrap"]["status"],
+        serde_json::to_value(AgentBootstrapStatus::Ready)?
+    );
+    assert_eq!(repaired["identity"]["agent_id"], "repair-me");
+
     server.abort();
     Ok(())
 }
@@ -151,6 +188,36 @@ pub async fn control_agent_delete_rejects_default_and_reports_unknown() -> Resul
         .send()
         .await?;
     assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.abort();
+    Ok(())
+}
+
+pub async fn control_agent_name_validation_and_default_rename_errors_are_typed() -> Result<()> {
+    let (_host, base, server) = spawn_server().await?;
+    let client = Client::new();
+
+    let invalid_create = client
+        .post(format!("{base}/api/control/agents/invalid-name/create"))
+        .json(&serde_json::json!({ "name": "   " }))
+        .send()
+        .await?;
+    assert_eq!(invalid_create.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid_create.json::<serde_json::Value>().await?["code"],
+        "agent_name_invalid"
+    );
+
+    let default_rename = client
+        .patch(format!("{base}/api/control/agents/default/name"))
+        .json(&serde_json::json!({ "name": "Renamed Default" }))
+        .send()
+        .await?;
+    assert_eq!(default_rename.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        default_rename.json::<serde_json::Value>().await?["code"],
+        "agent_rename_forbidden"
+    );
 
     server.abort();
     Ok(())
@@ -2298,6 +2365,15 @@ pub async fn runtime_status_route_reports_runtime_metadata() -> Result<()> {
     assert_eq!(
         payload["startup_surface"]["home_dir"],
         config.home_dir.display().to_string()
+    );
+    assert_eq!(
+        payload["startup_surface"]["user_home_dir"],
+        serde_json::to_value(
+            config
+                .user_home_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+        )?
     );
     assert_eq!(
         payload["startup_surface"]["socket_path"],

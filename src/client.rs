@@ -734,8 +734,17 @@ impl LocalClient {
             &format!("/control/agents/{agent_id}/create"),
             &CreateAgentRequest {
                 authority_class: Some(AuthorityClass::OperatorInstruction),
+                name: None,
                 template,
             },
+        )
+        .await
+    }
+
+    pub async fn repair_agent(&self, agent_id: &str) -> Result<crate::types::AgentDetail> {
+        self.post_control_json(
+            &format!("/control/agents/{agent_id}/repair"),
+            &serde_json::json!({}),
         )
         .await
     }

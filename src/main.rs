@@ -1129,6 +1129,7 @@ mod tests {
             default_agent_id: "default".into(),
             http_addr: "127.0.0.1:7878".into(),
             callback_base_url: "http://127.0.0.1:7878".into(),
+            user_home_dir: None,
             home_dir: home.clone(),
             data_dir: home.clone(),
             socket_path: home.join("run").join("holon.sock"),
@@ -1360,6 +1361,17 @@ mod tests {
             panic!("expected agent abort command");
         };
         assert_eq!(agent_id.as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn agent_repair_command_requires_positional_agent_id() {
+        let cli = Cli::parse_from(["holon", "agent", "repair", "foo"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Agent {
+                command: Some(AgentCommands::Repair { agent_id })
+            } if agent_id == "foo"
+        ));
     }
 
     #[test]
@@ -4418,10 +4430,17 @@ async fn handle_agent_command(config: &AppConfig, command: Option<AgentCommands>
                 &format!("/control/agents/{agent_id}/create"),
                 &http::CreateAgentRequest {
                     authority_class: Some(AuthorityClass::OperatorInstruction),
+                    name: None,
                     template,
                 },
             )
             .await
+        }
+        Some(AgentCommands::Repair { agent_id }) => {
+            let client = LocalClient::new(config.clone())?;
+            print_json(&serde_json::to_value(
+                client.repair_agent(&agent_id).await?,
+            )?)
         }
         Some(AgentCommands::Start { agent_id }) => {
             control_agent_lifecycle(config, agent_id, ControlAction::Start).await

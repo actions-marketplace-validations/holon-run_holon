@@ -391,6 +391,29 @@ impl AgentIdentityRepository<'_> {
             .transaction(|tx| upsert_agent_identity_tx(tx, record))
     }
 
+    pub fn create_with_bootstrap(
+        &self,
+        identity: &AgentIdentityRecord,
+        bootstrap: &AgentBootstrapRecord,
+    ) -> Result<()> {
+        self.db.transaction(|tx| {
+            let existing = tx
+                .query_row(
+                    "SELECT agent_id FROM agent_identities WHERE agent_id = ?1",
+                    [&identity.agent_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            anyhow::ensure!(
+                existing.is_none(),
+                "agent_identity_conflict: agent {} already exists",
+                identity.agent_id
+            );
+            upsert_agent_identity_tx(tx, identity)?;
+            upsert_agent_bootstrap_tx(tx, bootstrap)
+        })
+    }
+
     pub fn latest_all(&self) -> Result<Vec<AgentIdentityRecord>> {
         let connection = self.db.connection()?;
         let mut statement = connection.prepare(
@@ -416,6 +439,87 @@ impl AgentIdentityRepository<'_> {
             )
             .optional()?
             .map(|payload| decode_agent_identity_payload(&payload))
+            .transpose()
+    }
+
+    pub fn rename(
+        &self,
+        agent_id: &str,
+        requested_name: &str,
+        actor: &str,
+    ) -> Result<AgentIdentityRecord> {
+        let name = normalize_agent_name(requested_name)?;
+        let name_key = agent_name_key(&name);
+        self.db.transaction(|tx| {
+            let payload = tx
+                .query_row(
+                    "SELECT payload_json FROM agent_identities WHERE agent_id = ?1",
+                    [agent_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| anyhow!("agent {agent_id} not found"))?;
+            let mut identity = decode_agent_identity_payload(&payload)?;
+            anyhow::ensure!(
+                identity.status == AgentRegistryStatus::Active,
+                "agent {agent_id} cannot be renamed while it is {:?}",
+                identity.status
+            );
+            let conflict = tx
+                .query_row(
+                    "SELECT agent_id FROM agent_identities
+                     WHERE name_key = ?1 AND agent_id <> ?2",
+                    params![name_key, agent_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(conflict) = conflict {
+                return Err(anyhow!(
+                    "agent_name_conflict: name {name:?} is already used by agent {conflict}"
+                ));
+            }
+            let previous_name = identity.name.clone();
+            let now = std::cmp::max(
+                Utc::now(),
+                identity.updated_at + chrono::Duration::nanoseconds(1),
+            );
+            identity.name = Some(name.clone());
+            identity.revision = identity.revision.saturating_add(1);
+            identity.updated_at = now;
+            upsert_agent_identity_tx(tx, &identity)?;
+            let event = AuditEvent::legacy(
+                "agent_renamed",
+                serde_json::json!({
+                    "agent_id": agent_id,
+                    "actor": actor,
+                    "previous_name": previous_name,
+                    "name": identity.name,
+                }),
+            );
+            append_audit_event_tx(tx, Some(agent_id), &event)?;
+            Ok(identity)
+        })
+    }
+}
+
+impl AgentBootstrapRepository<'_> {
+    pub fn upsert(&self, record: &AgentBootstrapRecord) -> Result<()> {
+        self.db
+            .transaction(|tx| upsert_agent_bootstrap_tx(tx, record))
+    }
+
+    pub fn latest(&self, agent_id: &str) -> Result<Option<AgentBootstrapRecord>> {
+        let connection = self.db.connection()?;
+        connection
+            .query_row(
+                "SELECT payload_json FROM agent_bootstraps WHERE agent_id = ?1",
+                [agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|payload| {
+                serde_json::from_str(&payload).context("decoding agent bootstrap payload")
+            })
             .transpose()
     }
 }
@@ -4720,6 +4824,32 @@ pub(crate) fn decode_wait_condition_row(row: &rusqlite::Row<'_>) -> Result<WaitC
         trigger_message_id,
         triggered_at: parse_optional_timestamp(triggered_at_str.as_deref())?,
     })
+}
+
+fn upsert_agent_bootstrap_tx(tx: &Transaction<'_>, record: &AgentBootstrapRecord) -> Result<()> {
+    let payload_json = serde_json::to_string(record)?;
+    let status = enum_string(&record.summary().status)?;
+    tx.execute(
+        "INSERT INTO agent_bootstraps (
+            agent_id, status, revision, created_at, updated_at, payload_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(agent_id) DO UPDATE SET
+            status = excluded.status,
+            revision = excluded.revision,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at,
+            payload_json = excluded.payload_json
+         WHERE excluded.revision > agent_bootstraps.revision",
+        params![
+            record.agent_id,
+            status,
+            record.revision,
+            timestamp(record.created_at),
+            timestamp(record.updated_at),
+            payload_json,
+        ],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn decode_queue_entry_payload(payload: &str) -> Result<QueueEntryRecord> {

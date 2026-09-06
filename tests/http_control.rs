@@ -13,6 +13,7 @@ macro_rules! http_async_tests {
 
 http_async_tests!(
     control_prompt_is_open_on_loopback_auto,
+    control_agent_create_returns_degraded_receipt_and_repairs,
     agent_state_route_returns_aggregated_snapshot,
     unloaded_agent_state_route_uses_storage_without_starting_runtime,
     runtime_search_route_returns_memory_search_results,
@@ -37,6 +38,7 @@ http_async_tests!(
     control_agent_model_override_validates_codex_reasoning_effort,
     control_agent_delete_fences_runtime_and_is_idempotent,
     control_agent_delete_rejects_default_and_reports_unknown,
+    control_agent_name_validation_and_default_rename_errors_are_typed,
     control_prompt_requires_bearer_token_when_required,
     control_prompt_rejects_oversized_body,
     remote_tcp_surfaces_require_bearer_token_when_required,

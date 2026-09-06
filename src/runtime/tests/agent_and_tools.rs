@@ -221,6 +221,10 @@ async fn detached_agent_does_not_load_workspace_agents_md() {
 
     let loaded = runtime.loaded_agents_md().await.unwrap();
     assert!(loaded.workspace_source.is_none());
+    assert_eq!(
+        loaded.workspace_status,
+        crate::types::AgentsMdLoadStatus::NotFound
+    );
 }
 
 #[tokio::test]
@@ -1306,6 +1310,7 @@ fn current_input_summary_extracts_body_from_context_section() {
     let prompt = EffectivePrompt {
         identity: AgentIdentityView {
             agent_id: "default".into(),
+            name: None,
             kind: AgentKind::Default,
             visibility: AgentVisibility::Public,
             ownership: AgentOwnership::SelfOwned,
