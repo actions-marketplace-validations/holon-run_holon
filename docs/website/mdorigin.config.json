@@ -31,7 +31,7 @@
       ]
     }
   ],
-  "favicon": "/assets/logo.png",
+  "favicon": "/favicon.svg",
   "socialImage": "/assets/logo.png",
   "logo": {
     "src": "/assets/logo.png",
