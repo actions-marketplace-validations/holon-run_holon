@@ -55,6 +55,12 @@ pub(crate) enum TransitionFaultPoint {
     BeforeSchedulerNotification,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliverySynchronization {
+    Required,
+    IfAvailable,
+}
+
 impl TransitionFaultPoint {
     fn is_post_commit(self) -> bool {
         matches!(
@@ -998,6 +1004,24 @@ impl RuntimeTransitionRepository<'_> {
         self.commit_queue_transaction(command, execution_protocol, None, None, None, &[], &[])
     }
 
+    pub(crate) fn commit_scheduler_recovery(
+        &self,
+        command: &QueueTransitionCommand,
+        execution_protocol: &ExecutionProtocolTransition,
+    ) -> Result<TransitionCommit> {
+        self.commit_queue_transaction_with_delivery(
+            command,
+            execution_protocol,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            DeliverySynchronization::IfAvailable,
+        )
+    }
+
     pub fn commit_queue_with_execution_protocol_and_terminal_tool_executions(
         &self,
         command: &QueueTransitionCommand,
@@ -1098,6 +1122,7 @@ impl RuntimeTransitionRepository<'_> {
             &[],
             &[],
             Some(delivery),
+            DeliverySynchronization::Required,
         )
     }
 
@@ -1120,6 +1145,7 @@ impl RuntimeTransitionRepository<'_> {
             terminal_tool_executions,
             extra_wait_conditions,
             None,
+            DeliverySynchronization::Required,
         )
     }
 
@@ -1134,8 +1160,20 @@ impl RuntimeTransitionRepository<'_> {
         terminal_tool_executions: &[ToolExecutionRecord],
         extra_wait_conditions: &[crate::types::WaitConditionRecord],
         delivery: Option<&AgentMessageDeliveryRecord>,
+        delivery_synchronization: DeliverySynchronization,
     ) -> Result<TransitionCommit> {
         self.db.transaction(|tx| {
+            let synchronize_delivery = match delivery_synchronization {
+                DeliverySynchronization::Required => true,
+                DeliverySynchronization::IfAvailable => tx.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM sqlite_master
+                        WHERE type = 'table' AND name = 'agent_message_deliveries'
+                    )",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )?,
+            };
             let delivery = delivery
                 .map(|delivery| prepare_delivery_admission_tx(tx, delivery))
                 .transpose()?;
@@ -1193,12 +1231,17 @@ impl RuntimeTransitionRepository<'_> {
                 terminal_tool_executions,
             )?;
             let queue_record = queue_mutation_record(&command.mutation);
-            if delivery_by_message_id_tx(tx, &queue_record.message_id)?.is_some_and(|delivery| {
-                !matches!(
-                    delivery.state,
-                    AgentMessageDeliveryState::Queued | AgentMessageDeliveryState::Dispatched
+            if synchronize_delivery
+                && delivery_by_message_id_tx(tx, &queue_record.message_id)?.is_some_and(
+                    |delivery| {
+                        !matches!(
+                            delivery.state,
+                            AgentMessageDeliveryState::Queued
+                                | AgentMessageDeliveryState::Dispatched
+                        )
+                    },
                 )
-            }) {
+            {
                 return Ok(TransitionCommit::default());
             }
             if let QueueMutation::Consume(record) = &command.mutation {
@@ -1287,7 +1330,9 @@ impl RuntimeTransitionRepository<'_> {
             if !matches!(&command.mutation, QueueMutation::Upsert(_)) && !mutation_applied {
                 return Ok(TransitionCommit::default());
             }
-            advance_delivery_for_queue_transition_tx(tx, command)?;
+            if synchronize_delivery {
+                advance_delivery_for_queue_transition_tx(tx, command)?;
+            }
             let agent_state_applied =
                 apply_agent_state_mutation_tx(tx, command.agent_state.as_ref())?;
             let execution_protocol_applied = execution_protocol
