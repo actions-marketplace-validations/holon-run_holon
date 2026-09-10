@@ -54,6 +54,7 @@ function sessionState(overrides: Partial<AgentSessionState> = {}): AgentSessionS
     contentStatus: "unknown",
     syncStatus: "idle",
     sendingPrompt: false,
+    abortingRun: false,
     detail: null,
     workItemDetailsById: {},
     taskDetailsById: {},
