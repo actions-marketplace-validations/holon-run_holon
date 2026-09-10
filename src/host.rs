@@ -63,16 +63,16 @@ use crate::{
         AgentDeletionJob, AgentDeletionStatus, AgentDetail, AgentDurability, AgentIdentityRecord,
         AgentIdentityView, AgentKind, AgentLifecycleHint, AgentListEntry,
         AgentMessageCallerContext, AgentMessageDeliveryOutcome, AgentMessageDeliveryRejectionCode,
-        AgentMessagePrincipalKind, AgentMessageSendRequest, AgentOwnership, AgentProfilePreset,
-        AgentRegistryStatus, AgentState, AgentStatus, AgentSummary, AgentSupervisionState,
-        AgentTokenUsageSummary, AgentTreeNode, AgentTreeProjection, AgentVisibility,
-        AuthorityClass, ChildAgentSummary, ClosureOutcome, CreateAgentRequest,
-        ExternalTriggerRecord, ExternalTriggerStatus, ExternalTriggerSummary, LoadedAgentsMdView,
-        MessageBody, MessageDeliverySurface, MessageEnvelope, MessageKind, MessageOrigin,
-        OperatorNotificationRecord, Priority, QueueEntryStatus, RuntimeFailureSummary,
-        SpawnAgentModelResolution, SpawnAgentModelResolutionStatus, TaskKind, TaskRecord,
-        TaskStatus, TimerRecord, TokenUsage, TranscriptEntry, TranscriptEntryKind,
-        WaitConditionSummary, WorkspaceEntry, WorkspaceOccupancyRecord,
+        AgentMessagePrincipalKind, AgentMessageSendRequest, AgentModelResolution,
+        AgentModelResolutionStatus, AgentOwnership, AgentProfilePreset, AgentRegistryStatus,
+        AgentState, AgentStatus, AgentSummary, AgentSupervisionState, AgentTokenUsageSummary,
+        AgentTreeNode, AgentTreeProjection, AgentVisibility, AuthorityClass, ChildAgentSummary,
+        ClosureOutcome, CreateAgentRequest, ExternalTriggerRecord, ExternalTriggerStatus,
+        ExternalTriggerSummary, LoadedAgentsMdView, MessageBody, MessageDeliverySurface,
+        MessageEnvelope, MessageKind, MessageOrigin, OperatorNotificationRecord, Priority,
+        QueueEntryStatus, RuntimeFailureSummary, TaskKind, TaskRecord, TaskStatus, TimerRecord,
+        TokenUsage, TranscriptEntry, TranscriptEntryKind, WaitConditionSummary, WorkspaceEntry,
+        WorkspaceOccupancyRecord,
     },
 };
 
@@ -570,9 +570,9 @@ pub(crate) struct ChildTaskTerminalResult {
 
 async fn apply_spawn_model_resolution(
     runtime: &RuntimeHandle,
-    resolution: &SpawnAgentModelResolution,
+    resolution: &AgentModelResolution,
 ) -> Result<()> {
-    if resolution.resolution_status == SpawnAgentModelResolutionStatus::Inherited {
+    if resolution.resolution_status == AgentModelResolutionStatus::Inherited {
         return Ok(());
     }
     let provider = crate::config::ProviderId::parse(&resolution.resolved_provider)?;
@@ -2357,12 +2357,12 @@ impl RuntimeHost {
         let bootstrap = self.reconcile_agent_bootstrap(agent_id).await?;
         let bootstrap_summary = bootstrap.summary();
         Ok(AgentCreateResult {
+            identity: AgentIdentityView::from_record(&identity, &self.config().default_agent_id),
             receipt: AgentCreateReceipt {
                 receipt_id: ids::runtime_id("agent_create"),
                 agent_id: identity.agent_id.clone(),
                 name: identity.name.clone(),
                 display_name: identity.display_name(),
-                preset: AgentProfilePreset::PublicNamed,
                 stage: if bootstrap_summary.status == AgentBootstrapStatus::Ready {
                     AgentCreateStage::Bootstrapped
                 } else {
@@ -2372,7 +2372,6 @@ impl RuntimeHost {
                 created,
                 bootstrap: bootstrap_summary,
             },
-            identity,
         })
     }
 
@@ -2421,12 +2420,15 @@ impl RuntimeHost {
                 let bootstrap = self.reconcile_agent_bootstrap(&request.agent_id).await?;
                 let bootstrap_summary = bootstrap.summary();
                 return Ok(AgentCreateResult {
+                    identity: AgentIdentityView::from_record(
+                        &identity,
+                        &self.config().default_agent_id,
+                    ),
                     receipt: AgentCreateReceipt {
                         receipt_id: ids::runtime_id("agent_create"),
                         agent_id: identity.agent_id.clone(),
                         name: identity.name.clone(),
                         display_name: identity.display_name(),
-                        preset: AgentProfilePreset::PublicNamed,
                         stage: if bootstrap_summary.status == AgentBootstrapStatus::Ready {
                             AgentCreateStage::Bootstrapped
                         } else {
@@ -2436,7 +2438,6 @@ impl RuntimeHost {
                         created: false,
                         bootstrap: bootstrap_summary,
                     },
-                    identity,
                 });
             }
         }
@@ -2926,7 +2927,7 @@ impl RuntimeHost {
         };
         let runtime = self.get_or_create_agent(&bootstrap.agent_id).await?;
         let current = runtime.agent_state().await?;
-        if resolution.resolution_status == SpawnAgentModelResolutionStatus::Inherited {
+        if resolution.resolution_status == AgentModelResolutionStatus::Inherited {
             return Ok(());
         }
         let provider = crate::config::ProviderId::parse(&resolution.resolved_provider)?;
@@ -3866,13 +3867,18 @@ impl RuntimeHost {
             .unwrap_or_else(|| build_provider_from_config(&config))?;
         let apply_patch_surface = ApplyPatchSurface::for_model_route_ref(&model_ref.as_string());
         let registry = ToolRegistry::new(execution.execution_root.clone());
+        let capability_policy = self
+            .runtime_db()
+            .agent_canonical_relations()
+            .latest(&identity.agent_id)?
+            .and_then(|relations| relations.capability_policy);
         let available_tools = registry
             .tool_specs_with_families_for_apply_patch_surface(apply_patch_surface)?
             .into_iter()
             .filter(|(family, _)| {
-                identity_view
-                    .profile_preset
-                    .allows_tool_capability_family(*family)
+                capability_policy
+                    .as_ref()
+                    .is_none_or(|policy| policy.allows(*family))
             })
             .map(|(_, tool)| tool)
             .collect::<Vec<_>>();
@@ -4252,7 +4258,7 @@ impl RuntimeHost {
         authority_class: AuthorityClass,
         worktree: bool,
         template: Option<String>,
-        model_resolution: SpawnAgentModelResolution,
+        model_resolution: AgentModelResolution,
     ) -> Result<ChildTaskSpawn> {
         let parent_state = parent_runtime.agent_state().await?;
         let parent_agent_home = self.agent_data_dir(&parent_state.id);
@@ -4529,7 +4535,7 @@ impl RuntimeHost {
         initial_message: Option<String>,
         authority_class: AuthorityClass,
         template: Option<String>,
-        model_resolution: SpawnAgentModelResolution,
+        model_resolution: AgentModelResolution,
     ) -> Result<AgentCreateResult> {
         let parent_state = parent_runtime.agent_state().await?;
         let parent_agent_home = self.agent_data_dir(&parent_state.id);
@@ -4991,6 +4997,16 @@ impl RuntimeHostBridge {
         self.host()?.agent_identity_record(agent_id)
     }
 
+    pub(crate) async fn canonical_relations_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<crate::types::AgentCanonicalRelationsProjection>> {
+        self.host()?
+            .runtime_db()
+            .agent_canonical_relations()
+            .latest(agent_id)
+    }
+
     pub(crate) async fn child_summaries(
         &self,
         parent_agent_id: &str,
@@ -5052,7 +5068,7 @@ impl RuntimeHostBridge {
         authority_class: AuthorityClass,
         worktree: bool,
         template: Option<String>,
-        model_resolution: SpawnAgentModelResolution,
+        model_resolution: AgentModelResolution,
     ) -> Result<ChildTaskSpawn> {
         self.host()?
             .spawn_child_task(
@@ -5607,13 +5623,13 @@ mod tests {
         assert!(!rendered.contains("Current ApplyPatch surface is a JSON/function tool"));
     }
 
-    fn inherited_model_resolution(provider: &str, model: &str) -> SpawnAgentModelResolution {
-        SpawnAgentModelResolution {
+    fn inherited_model_resolution(provider: &str, model: &str) -> AgentModelResolution {
+        AgentModelResolution {
             requested: None,
             resolved_provider: provider.to_string(),
             resolved_model: model.to_string(),
             resolved_parameters: None,
-            resolution_status: SpawnAgentModelResolutionStatus::Inherited,
+            resolution_status: AgentModelResolutionStatus::Inherited,
             policy_notes: Vec::new(),
         }
     }
@@ -5651,6 +5667,30 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("timed out waiting for task {task_id} to become terminal");
+    }
+
+    async fn invoke_new_subagent(
+        runtime: &RuntimeHandle,
+        message: String,
+        authority_class: AuthorityClass,
+        template: Option<String>,
+        model_request: Option<crate::types::AgentModelRequest>,
+    ) -> anyhow::Result<crate::types::AgentInvocationReceipt> {
+        let model_resolution = runtime
+            .resolve_agent_model_request("InvokeAgent", model_request)
+            .await?;
+        runtime
+            .agent_invocation_service()
+            .invoke(InvokeAgentRequest {
+                target: InvokeAgentTarget::NewSubagent {
+                    template,
+                    workspace_mode: ChildAgentWorkspaceMode::Inherit,
+                    model_resolution: Some(model_resolution),
+                },
+                message,
+                authority_class,
+            })
+            .await
     }
 
     struct BlockingProvider {
@@ -6142,7 +6182,6 @@ mod tests {
         assert_eq!(created.receipt.name.as_deref(), Some("Receipt Bot"));
         assert_eq!(created.receipt.display_name, "Receipt Bot");
         assert_eq!(created.receipt.agent_id, "receipt-bot");
-        assert_eq!(created.receipt.preset, AgentProfilePreset::PublicNamed);
         assert_eq!(created.receipt.stage, AgentCreateStage::Bootstrapped);
         assert_eq!(created.receipt.lifecycle, AgentRegistryStatus::Active);
         assert!(created.receipt.created);
@@ -6875,20 +6914,17 @@ mod tests {
         let parent = host.default_runtime().await.unwrap();
         let parent_agent_id = host.config().default_agent_id.clone();
 
-        let spawned = parent
-            .spawn_agent(
-                Some("tree navigation work".into()),
-                AuthorityClass::OperatorInstruction,
-                AgentProfilePreset::PrivateChild,
-                None,
-                false,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
+        let spawned = invoke_new_subagent(
+            &parent,
+            "tree navigation work".into(),
+            AuthorityClass::OperatorInstruction,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let child_agent_id = spawned.agent_id.clone();
-        assert!(spawned.supervision_task_id.is_some());
+        assert!(!spawned.task_handle.task_id.is_empty());
 
         let tree = host.operator_agent_tree().await.unwrap();
         assert_eq!(
@@ -7020,22 +7056,16 @@ mod tests {
         let parent_agent_id = parent.agent_state().await.unwrap().id;
         let initial_message = "  investigate   remote\nTUI  access ".to_string();
 
-        let spawned = parent
-            .spawn_agent(
-                Some(initial_message.clone()),
-                AuthorityClass::ExternalEvidence,
-                AgentProfilePreset::PrivateChild,
-                None,
-                false,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        let task_id = spawned
-            .supervision_task_id
-            .clone()
-            .expect("private child should return a supervision task");
+        let spawned = invoke_new_subagent(
+            &parent,
+            initial_message.clone(),
+            AuthorityClass::ExternalEvidence,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let task_id = spawned.task_handle.task_id.clone();
         let task = parent
             .storage()
             .latest_task_record(&task_id)
@@ -7125,24 +7155,21 @@ mod tests {
         .unwrap();
         let parent = host.default_runtime().await.unwrap();
 
-        let spawned = parent
-            .spawn_agent(
-                Some("review the implementation".into()),
-                AuthorityClass::OperatorInstruction,
-                AgentProfilePreset::PrivateChild,
-                None,
-                false,
-                Some("user_global:holon-reviewer@official".into()),
-                None,
-            )
-            .await
-            .unwrap();
+        let spawned = invoke_new_subagent(
+            &parent,
+            "review the implementation".into(),
+            AuthorityClass::OperatorInstruction,
+            Some("user_global:holon-reviewer@official".into()),
+            None,
+        )
+        .await
+        .unwrap();
 
         let child_home = host.agent_data_dir(&spawned.agent_id);
         assert!(fs::read_to_string(child_home.join("AGENTS.md"))
             .unwrap()
             .starts_with("# Official reviewer\n\nSynced reviewer template\n"));
-        assert!(spawned.supervision_task_id.is_some());
+        assert!(!spawned.task_handle.task_id.is_empty());
     }
 
     #[tokio::test]
@@ -7150,21 +7177,18 @@ mod tests {
         let (_home, host) = test_host();
         let parent = host.default_runtime().await.unwrap();
 
-        let error = parent
-            .spawn_agent(
-                Some("review the implementation".into()),
-                AuthorityClass::OperatorInstruction,
-                AgentProfilePreset::PrivateChild,
-                None,
-                false,
-                Some("user_global:reviewer%official".into()),
-                None,
-            )
-            .await
-            .expect_err("invalid template selector should fail after task creation");
+        let error = invoke_new_subagent(
+            &parent,
+            "review the implementation".into(),
+            AuthorityClass::OperatorInstruction,
+            Some("user_global:reviewer%official".into()),
+            None,
+        )
+        .await
+        .expect_err("invalid template selector should fail after task creation");
         let tool_error = crate::tool::ToolError::from_anyhow(&error);
 
-        assert_eq!(tool_error.kind, "spawn_agent_failed");
+        assert_eq!(tool_error.kind, "agent_invocation_failed");
         assert_eq!(
             tool_error.domain,
             Some(crate::runtime_error::RuntimeErrorDomain::Task)
@@ -7182,7 +7206,7 @@ mod tests {
             .and_then(|details| details.get("task_id"))
             .and_then(Value::as_str)
             .expect("tool error should identify the failed supervision task");
-        let rendered = tool_error.render_for_model(Some(crate::tool::names::SPAWN_AGENT));
+        let rendered = tool_error.render_for_model(Some("InvokeAgent"));
         assert!(rendered.contains("template install_id contains unsupported characters"));
 
         let task = parent
@@ -7213,36 +7237,22 @@ mod tests {
         let host = RuntimeHost::new(fixture.config).unwrap();
         let parent = host.default_runtime().await.unwrap();
 
-        let spawned = parent
-            .spawn_agent(
-                Some("compare implementation".into()),
-                AuthorityClass::OperatorInstruction,
-                AgentProfilePreset::PrivateChild,
-                None,
-                false,
-                None,
-                Some(crate::types::SpawnAgentModelRequest {
-                    provider: "anthropic".into(),
-                    model: "claude-haiku-4-5".into(),
-                    reasoning_effort: Some("high".into()),
-                    temperature: None,
-                    max_output_tokens: None,
-                    allow_fallback: Some(false),
-                }),
-            )
-            .await
-            .unwrap();
-
-        let resolution = spawned
-            .model_resolution
-            .as_ref()
-            .expect("spawn should return model resolution");
-        assert_eq!(
-            resolution.resolution_status,
-            SpawnAgentModelResolutionStatus::Accepted
-        );
-        assert_eq!(resolution.resolved_provider, "anthropic");
-        assert_eq!(resolution.resolved_model, "claude-haiku-4-5");
+        let spawned = invoke_new_subagent(
+            &parent,
+            "compare implementation".into(),
+            AuthorityClass::OperatorInstruction,
+            None,
+            Some(crate::types::AgentModelRequest {
+                provider: "anthropic".into(),
+                model: "claude-haiku-4-5".into(),
+                reasoning_effort: Some("high".into()),
+                temperature: None,
+                max_output_tokens: None,
+                allow_fallback: Some(false),
+            }),
+        )
+        .await
+        .unwrap();
 
         let child = host.get_or_create_agent(&spawned.agent_id).await.unwrap();
         let child_summary = child.agent_summary().await.unwrap();
@@ -7262,25 +7272,22 @@ mod tests {
         let host = RuntimeHost::new(fixture.config).unwrap();
         let parent = host.default_runtime().await.unwrap();
 
-        let error = parent
-            .spawn_agent(
-                Some("compare implementation".into()),
-                AuthorityClass::OperatorInstruction,
-                AgentProfilePreset::PrivateChild,
-                None,
-                false,
-                None,
-                Some(crate::types::SpawnAgentModelRequest {
-                    provider: "openai".into(),
-                    model: "gpt-5.4".into(),
-                    reasoning_effort: None,
-                    temperature: None,
-                    max_output_tokens: None,
-                    allow_fallback: Some(false),
-                }),
-            )
-            .await
-            .expect_err("unavailable explicit model should be rejected before child creation");
+        let error = invoke_new_subagent(
+            &parent,
+            "compare implementation".into(),
+            AuthorityClass::OperatorInstruction,
+            None,
+            Some(crate::types::AgentModelRequest {
+                provider: "openai".into(),
+                model: "gpt-5.4".into(),
+                reasoning_effort: None,
+                temperature: None,
+                max_output_tokens: None,
+                allow_fallback: Some(false),
+            }),
+        )
+        .await
+        .expect_err("unavailable explicit model should be rejected before child creation");
 
         assert!(error.to_string().contains("requested model"));
         assert!(error.to_string().contains("unavailable"));
@@ -7291,30 +7298,27 @@ mod tests {
         let (_home, host) = test_host();
         let parent = host.default_runtime().await.unwrap();
 
-        let error = parent
-            .spawn_agent(
-                Some("   \n\t  ".into()),
-                AuthorityClass::OperatorInstruction,
-                AgentProfilePreset::PrivateChild,
-                None,
-                false,
-                None,
-                None,
-            )
-            .await
-            .expect_err("blank private child initial_message should be rejected");
+        let error = invoke_new_subagent(
+            &parent,
+            "   \n\t  ".into(),
+            AuthorityClass::OperatorInstruction,
+            None,
+            None,
+        )
+        .await
+        .expect_err("blank private child initial_message should be rejected");
 
         assert!(error
             .to_string()
-            .contains("private_child spawn requires non-empty initial_message"));
+            .contains("agent invocation requires a non-empty message"));
     }
 
     #[tokio::test]
-    async fn public_named_initial_message_is_optional_and_inherits_only_attached_workspaces() {
+    async fn independent_agent_initial_message_is_optional_and_inherits_only_attached_workspaces() {
         let (_home, host) = test_host();
         let parent = host.default_runtime().await.unwrap();
-        let named_agent_id = format!("{}-no-bootstrap", host.config().default_agent_id);
-        let bootstrap_agent_id = format!("{}-bootstrap", host.config().default_agent_id);
+        let named_agent_id = "independent-no-bootstrap".to_string();
+        let bootstrap_agent_id = "independent-bootstrap".to_string();
         let bootstrap_message_id = format!("agent_bootstrap_message:{bootstrap_agent_id}");
         let workspace_home = tempdir().unwrap();
         let workspace_path = workspace_home.path().to_path_buf();

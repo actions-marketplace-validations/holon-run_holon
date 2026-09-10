@@ -338,29 +338,7 @@ pub enum AgentProfilePreset {
     PublicNamed,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ToolCapabilityFamily {
-    CoreAgent,
-    LocalEnvironment,
-    Web,
-    AgentCreation,
-    AuthorityExpanding,
-    ExternalTrigger,
-}
-
-impl ToolCapabilityFamily {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::CoreAgent => "core_agent",
-            Self::LocalEnvironment => "local_environment",
-            Self::Web => "web",
-            Self::AgentCreation => "agent_creation",
-            Self::AuthorityExpanding => "authority_expanding",
-            Self::ExternalTrigger => "external_trigger",
-        }
-    }
-}
+pub(crate) type ToolCapabilityFamily = AgentCapabilityFamily;
 
 impl AgentProfilePreset {
     pub fn label(self) -> &'static str {
@@ -540,7 +518,7 @@ pub struct AgentBootstrapDesiredState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<AgentBootstrapWorkspaceState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_resolution: Option<SpawnAgentModelResolution>,
+    pub model_resolution: Option<AgentModelResolution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_message: Option<AgentBootstrapInitialMessage>,
 }
@@ -654,7 +632,6 @@ pub struct AgentCreateReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub display_name: String,
-    pub preset: AgentProfilePreset,
     pub stage: AgentCreateStage,
     pub lifecycle: AgentRegistryStatus,
     pub created: bool,
@@ -663,7 +640,7 @@ pub struct AgentCreateReceipt {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct AgentCreateResult {
-    pub identity: AgentIdentityRecord,
+    pub identity: AgentIdentityView,
     pub receipt: AgentCreateReceipt,
 }
 
@@ -678,7 +655,7 @@ pub struct CreateAgentRequest {
     pub initial_message: Option<String>,
     pub authority_class: AuthorityClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_resolution: Option<SpawnAgentModelResolution>,
+    pub model_resolution: Option<AgentModelResolution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage_parent_agent_id: Option<String>,
     #[serde(default)]
@@ -697,7 +674,7 @@ pub enum InvokeAgentTarget {
         #[serde(default)]
         workspace_mode: ChildAgentWorkspaceMode,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        model_resolution: Option<SpawnAgentModelResolution>,
+        model_resolution: Option<AgentModelResolution>,
     },
 }
 
@@ -922,9 +899,17 @@ pub struct AgentIdentityView {
     pub agent_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip, default = "default_agent_kind")]
+    #[schemars(skip)]
     pub kind: AgentKind,
+    #[serde(skip, default = "default_agent_visibility")]
+    #[schemars(skip)]
     pub visibility: AgentVisibility,
+    #[serde(skip, default = "default_agent_ownership")]
+    #[schemars(skip)]
     pub ownership: AgentOwnership,
+    #[serde(skip, default = "default_agent_profile_preset")]
+    #[schemars(skip)]
     pub profile_preset: AgentProfilePreset,
     pub status: AgentRegistryStatus,
     pub is_default_agent: bool,
@@ -939,6 +924,22 @@ pub struct AgentIdentityView {
     pub lineage_parent_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegated_from_task_id: Option<String>,
+}
+
+fn default_agent_kind() -> AgentKind {
+    AgentKind::Named
+}
+
+fn default_agent_visibility() -> AgentVisibility {
+    AgentVisibility::Public
+}
+
+fn default_agent_ownership() -> AgentOwnership {
+    AgentOwnership::SelfOwned
+}
+
+fn default_agent_profile_preset() -> AgentProfilePreset {
+    AgentProfilePreset::PublicNamed
 }
 
 impl AgentIdentityView {
@@ -963,40 +964,11 @@ impl AgentIdentityView {
         self.name.as_deref().unwrap_or(&self.agent_id)
     }
 
-    pub fn contract_badge(&self) -> String {
-        format!(
-            "{}/{} ({})",
-            self.visibility.label(),
-            self.ownership.label(),
-            self.profile_preset.label()
-        )
-    }
-
-    pub fn contract_summary(&self) -> String {
-        match (
-            self.visibility,
-            self.ownership,
-            self.profile_preset,
-            self.kind,
-        ) {
-            (
-                AgentVisibility::Public,
-                AgentOwnership::SelfOwned,
-                AgentProfilePreset::PublicNamed,
-                _,
-            ) => "public self-owned agent addressed directly by `agent_id`".into(),
-            (
-                AgentVisibility::Private,
-                AgentOwnership::ParentSupervised,
-                AgentProfilePreset::PrivateChild,
-                AgentKind::Child,
-            ) => "private parent-supervised child that remains under a parent task handle".into(),
-            _ => format!(
-                "{} {} agent with `{}` profile",
-                self.visibility.label(),
-                self.ownership.phrase(),
-                self.profile_preset.label()
-            ),
+    pub fn relation_summary(&self) -> String {
+        if let Some(parent_agent_id) = self.lineage_parent_agent_id.as_deref() {
+            format!("agent with lineage parent `{parent_agent_id}`")
+        } else {
+            "independently addressable agent identity".into()
         }
     }
 }
@@ -1250,7 +1222,7 @@ impl AgentTemplateSourceKind {
 pub struct AgentTemplateCatalogEntry {
     /// Stable source-scoped catalog identifier, such as `user:holon-reviewer`.
     pub catalog_id: String,
-    /// Preferred selector accepted by SpawnAgent.template.
+    /// Preferred selector accepted by agent creation and invocation requests.
     ///
     /// `catalog_id` is also accepted, along with source aliases such as
     /// `user:`, `agent:`, and `remote:`.
@@ -1299,7 +1271,7 @@ pub struct AgentTemplateCatalogEntry {
 pub struct AgentTemplateDetail {
     /// Stable source-scoped catalog identifier, such as `user:holon-reviewer`.
     pub catalog_id: String,
-    /// Preferred selector accepted by SpawnAgent.template.
+    /// Preferred selector accepted by agent creation and invocation requests.
     pub template: String,
     /// Human-readable local id after precedence is applied.
     pub template_id: String,
@@ -3808,7 +3780,7 @@ pub struct TaskStatusSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<AgentTokenUsageSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_resolution: Option<SpawnAgentModelResolution>,
+    pub model_resolution: Option<AgentModelResolution>,
 }
 
 impl TaskStatusSnapshot {
@@ -4009,34 +3981,9 @@ pub struct GetAgentResult {
     pub agent: AgentSummary,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SpawnAgentResult {
-    pub agent_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub create_receipt: Option<AgentCreateReceipt>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub child_agent_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_handle: Option<TaskHandle>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supervision_task_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub child_supervision: Option<ChildSupervisionProjection>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary_text: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delegation_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_work_item_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub child_work_item_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_resolution: Option<SpawnAgentModelResolution>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct SpawnAgentModelRequest {
+pub struct AgentModelRequest {
     pub provider: String,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4051,7 +3998,7 @@ pub struct SpawnAgentModelRequest {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum SpawnAgentModelResolutionStatus {
+pub enum AgentModelResolutionStatus {
     Inherited,
     Accepted,
     Normalized,
@@ -4060,14 +4007,14 @@ pub enum SpawnAgentModelResolutionStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-pub struct SpawnAgentModelResolution {
+pub struct AgentModelResolution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub requested: Option<SpawnAgentModelRequest>,
+    pub requested: Option<AgentModelRequest>,
     pub resolved_provider: String,
     pub resolved_model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_parameters: Option<serde_json::Map<String, serde_json::Value>>,
-    pub resolution_status: SpawnAgentModelResolutionStatus,
+    pub resolution_status: AgentModelResolutionStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub policy_notes: Vec<String>,
 }
