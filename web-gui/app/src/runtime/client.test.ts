@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   buildWorkspaceFileUrl,
   createRuntimeClient,
+  httpRetryAfterMs,
   projectModelOptions,
   REQUIRED_OBSERVER_SYNC_CAPABILITIES,
 } from "./client";
@@ -18,10 +19,6 @@ function agentStateFixture(agentId: string): components["schemas"]["AgentStateSn
     agent: {
       identity: {
         agent_id: agentId,
-        kind: "named",
-        visibility: "public",
-        ownership: "self_owned",
-        profile_preset: "public_named",
         status: "active",
         is_default_agent: false,
         incarnation: 1,
@@ -416,7 +413,7 @@ describe("createRuntimeClient", () => {
     await expect(client.getAgentState("agent-one")).resolves.toEqual(
       expect.objectContaining({
         id: "agent-one",
-        profile: "public · self_owned · public_named",
+        profile: "public",
       }),
     );
     expect(seen).toEqual(["http://example.test:7878/api/agents/agent-one/state"]);
@@ -438,11 +435,17 @@ describe("createRuntimeClient", () => {
         )) as typeof fetch,
     });
 
-    await expect(client.getAgentState("agent-one")).rejects.toMatchObject({
+    const error = await client.getAgentState("agent-one").then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(error).toMatchObject({
       name: "RuntimeHttpError",
       status: 429,
       code: "projection_busy",
+      retryAfterSeconds: 1,
     });
+    expect(httpRetryAfterMs(error)).toBe(1_000);
   });
 
   it("loads agent detail without fetching the full roster", async () => {
