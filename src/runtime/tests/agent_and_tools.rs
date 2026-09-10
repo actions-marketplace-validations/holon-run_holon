@@ -545,8 +545,32 @@ async fn filtered_tool_specs_keep_agent_creation_family_for_public_named_agent()
 #[tokio::test]
 async fn invoke_agent_hides_unknown_and_unauthorized_targets() {
     let (_home, host, runtime) = host_backed_test_runtime().await;
-    host.create_named_agent("unauthorized-target", None)
+    let unauthorized_target = host
+        .create_named_agent("unauthorized-target", None)
         .await
+        .unwrap();
+    let message_policy_revision = host
+        .runtime_db()
+        .agent_canonical_relations()
+        .latest(&unauthorized_target.agent_id)
+        .unwrap()
+        .and_then(|relations| relations.message_policy)
+        .map_or(0, |policy| policy.revision)
+        .saturating_add(1);
+    host.runtime_db()
+        .agent_canonical_relations()
+        .upsert_message_policy(&crate::types::AgentMessagePolicyRecord {
+            agent_id: unauthorized_target.agent_id,
+            revision: message_policy_revision,
+            default_effect: crate::types::AgentPolicyEffect::Deny,
+            rules: vec![crate::types::AgentMessagePolicyRule {
+                principal_kind: crate::types::AgentMessagePrincipalKind::PeerAgent,
+                principal_id: None,
+                route: Some("agent_invocation".into()),
+                effect: crate::types::AgentPolicyEffect::Deny,
+            }],
+            created_at: unauthorized_target.created_at,
+        })
         .unwrap();
 
     let mut descriptors = Vec::new();
