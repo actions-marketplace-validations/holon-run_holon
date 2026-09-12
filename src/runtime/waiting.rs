@@ -8,6 +8,43 @@ use crate::types::{
 };
 use chrono::{DateTime, Utc};
 
+struct ReplacedWaitConditions {
+    records: Vec<WaitConditionRecord>,
+    cancelled_ids: Vec<String>,
+    resolved_after_trigger_ids: Vec<String>,
+}
+
+fn replace_wait_conditions(
+    existing: Vec<WaitConditionRecord>,
+    now: DateTime<Utc>,
+) -> ReplacedWaitConditions {
+    let mut records = Vec::with_capacity(existing.len());
+    let mut cancelled_ids = Vec::new();
+    let mut resolved_after_trigger_ids = Vec::new();
+    for mut record in existing {
+        record.updated_at = now;
+        match record.status {
+            WaitConditionStatus::Active => {
+                record.status = WaitConditionStatus::Cancelled;
+                record.cancelled_at = Some(now);
+                cancelled_ids.push(record.id.clone());
+            }
+            WaitConditionStatus::Triggered => {
+                record.status = WaitConditionStatus::Resolved;
+                record.resolved_at = Some(now);
+                resolved_after_trigger_ids.push(record.id.clone());
+            }
+            _ => continue,
+        }
+        records.push(record);
+    }
+    ReplacedWaitConditions {
+        records,
+        cancelled_ids,
+        resolved_after_trigger_ids,
+    }
+}
+
 #[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WaitForScope {
@@ -340,16 +377,11 @@ impl RuntimeHandle {
                 .filter(|record| record.work_item_id.is_none())
                 .collect()
         };
-        let mut wait_conditions = Vec::with_capacity(active_waits.len() + 1);
-        let mut cancelled_wait_condition_ids = Vec::with_capacity(active_waits.len());
-        for existing in active_waits {
-            let mut cancelled = existing.clone();
-            cancelled.status = WaitConditionStatus::Cancelled;
-            cancelled.updated_at = now;
-            cancelled.cancelled_at = Some(now);
-            cancelled_wait_condition_ids.push(existing.id);
-            wait_conditions.push(cancelled);
-        }
+        let replaced = replace_wait_conditions(active_waits, now);
+        let mut wait_conditions = replaced.records;
+        let cancelled_wait_condition_ids = replaced.cancelled_ids;
+        let resolved_after_trigger_wait_condition_ids = replaced.resolved_after_trigger_ids;
+        wait_conditions.reserve(1);
         let mut work_items = Vec::new();
         let mut audit_events = Vec::new();
         let mut index_changes = Vec::new();
@@ -362,6 +394,17 @@ impl RuntimeHandle {
                     "work_item_id": work_item_id,
                     "reason": "wait_for_replaced",
                     "wait_condition_ids": &cancelled_wait_condition_ids,
+                }),
+            ));
+        }
+        if !resolved_after_trigger_wait_condition_ids.is_empty() {
+            audit_events.push(AuditEvent::legacy(
+                "wait_conditions_resolved",
+                serde_json::json!({
+                    "agent_id": agent_id,
+                    "work_item_id": work_item_id,
+                    "reason": "wait_for_replaced_after_trigger",
+                    "wait_condition_ids": &resolved_after_trigger_wait_condition_ids,
                 }),
             ));
         }
@@ -673,12 +716,39 @@ impl RuntimeHandle {
                 result_message_id,
             });
         }
+        if let Some(existing) = self
+            .inner
+            .storage
+            .latest_wait_conditions_for_agent(&task.agent_id)?
+            .into_iter()
+            .find(|record| {
+                record.work_item_id == task.work_item_id
+                    && matches!(
+                        record.status,
+                        WaitConditionStatus::Triggered | WaitConditionStatus::Resolved
+                    )
+                    && record.kind == WaitConditionKind::Task
+                    && record.trigger_message_id() == Some(result_message_id.as_str())
+                    && record.wake_sources.iter().any(|source| {
+                        matches!(
+                            source,
+                            WakeSource::TaskResult { task_id } if task_id == &task.id
+                        )
+                    })
+            })
+        {
+            return Ok(WaitForRegistrationOutcome::TaskResultQueued {
+                task_id: task.id,
+                result_message_id,
+                wait_condition_id: existing.id,
+            });
+        }
 
         let now = self.now();
         // The fast path must leave the same durable wait semantics as a
         // normal WaitFor registration: the re-queued result message is the
         // exact promised wake, so the wait condition starts Triggered and
-        // replaced same-scope waits are cancelled atomically with the queue
+        // replaced same-scope waits are retired atomically with the queue
         // admission. Without this record the terminal result can be resolved
         // as liveness_only and the agent never re-enters the model.
         let current_turn_id = self.agent_state().await?.current_turn_id.clone();
@@ -712,26 +782,21 @@ impl RuntimeHandle {
             trigger_message_id: Some(result_message_id.clone()),
             triggered_at: Some(now),
         };
-        let mut wait_conditions = self
-            .inner
-            .storage
-            .raw_unresolved_wait_conditions_for_agent(&task.agent_id)?
-            .into_iter()
-            .filter(|record| match task.work_item_id.as_deref() {
-                Some(work_item_id) => record.work_item_id.as_deref() == Some(work_item_id),
-                None => record.work_item_id.is_none(),
-            })
-            .map(|mut record| {
-                record.status = WaitConditionStatus::Cancelled;
-                record.updated_at = now;
-                record.cancelled_at = Some(now);
-                record
-            })
-            .collect::<Vec<_>>();
-        let cancelled_wait_condition_ids = wait_conditions
-            .iter()
-            .map(|record| record.id.clone())
-            .collect::<Vec<_>>();
+        let replaced = replace_wait_conditions(
+            self.inner
+                .storage
+                .raw_unresolved_wait_conditions_for_agent(&task.agent_id)?
+                .into_iter()
+                .filter(|record| match task.work_item_id.as_deref() {
+                    Some(work_item_id) => record.work_item_id.as_deref() == Some(work_item_id),
+                    None => record.work_item_id.is_none(),
+                })
+                .collect(),
+            now,
+        );
+        let mut wait_conditions = replaced.records;
+        let cancelled_wait_condition_ids = replaced.cancelled_ids;
+        let resolved_after_trigger_wait_condition_ids = replaced.resolved_after_trigger_ids;
         let mut audit_events = vec![AuditEvent::legacy(
             "wait_condition_registered",
             serde_json::json!({
@@ -761,6 +826,17 @@ impl RuntimeHandle {
                     "work_item_id": task.work_item_id,
                     "reason": "wait_for_replaced",
                     "wait_condition_ids": &cancelled_wait_condition_ids,
+                }),
+            ));
+        }
+        if !resolved_after_trigger_wait_condition_ids.is_empty() {
+            audit_events.push(AuditEvent::legacy(
+                "wait_conditions_resolved",
+                serde_json::json!({
+                    "agent_id": task.agent_id,
+                    "work_item_id": task.work_item_id,
+                    "reason": "wait_for_replaced_after_trigger",
+                    "wait_condition_ids": &resolved_after_trigger_wait_condition_ids,
                 }),
             ));
         }
@@ -2162,6 +2238,9 @@ fn matching_wake_source(
             .then(|| ("operator_input".to_string(), actor_id.clone()))
         }
         (MessageKind::SystemTick, MessageOrigin::System { subsystem }) => {
+            if exact_wait_recheck_source(message, condition, subsystem) {
+                return Some(("wait_recheck".to_string(), Some(condition.id.clone())));
+            }
             if let Some(external) = matching_wake_hint_external_source(message, condition) {
                 return Some(external);
             }
@@ -2173,6 +2252,37 @@ fn matching_wake_source(
         }
         _ => None,
     }
+}
+
+fn exact_wait_recheck_source(
+    message: &MessageEnvelope,
+    condition: &WaitConditionRecord,
+    subsystem: &str,
+) -> bool {
+    if subsystem != "wait_condition_recheck"
+        || message.authority_class != AuthorityClass::RuntimeInstruction
+        || message.admission_context != Some(AdmissionContext::RuntimeOwned)
+        || message.delivery_surface != Some(MessageDeliverySurface::RuntimeSystem)
+        || message.source_refs.get("wait_id") != Some(&condition.id)
+    {
+        return false;
+    }
+    let Some(recheck_at) = condition.recheck_at() else {
+        return false;
+    };
+    let recheck = message
+        .metadata
+        .as_ref()
+        .and_then(|value| value.get("wait_condition_recheck"));
+    recheck
+        .and_then(|value| value.get("wait_id"))
+        .and_then(serde_json::Value::as_str)
+        == Some(condition.id.as_str())
+        && recheck
+            .and_then(|value| value.get("recheck_at"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<DateTime<Utc>>().ok())
+            == Some(recheck_at)
 }
 
 fn matching_wake_hint_external_source(
