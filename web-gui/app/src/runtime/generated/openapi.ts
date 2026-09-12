@@ -4351,6 +4351,15 @@ export interface components {
         RuntimeConfigReadResponse: {
             config_file_path: string;
             ok: boolean;
+            reload: {
+                /** Format: uint64 */
+                completed_generation: number;
+                last_error?: string | null;
+                /** Format: uint64 */
+                requested_generation: number;
+                /** @enum {string} */
+                state: "idle" | "applying" | "completed" | "failed";
+            };
             runtime_surface: {
                 /** @default [] */
                 available_search_provider_kinds: {
@@ -4453,9 +4462,18 @@ export interface components {
             changed: boolean;
             config_file_path: string;
             ok: boolean;
+            reload: {
+                /** Format: uint64 */
+                completed_generation: number;
+                last_error?: string | null;
+                /** Format: uint64 */
+                requested_generation: number;
+                /** @enum {string} */
+                state: "idle" | "applying" | "completed" | "failed";
+            };
             results: {
                 /** @enum {string} */
-                effect: "accepted_requires_restart" | "accepted_reloaded" | "rejected";
+                effect: "accepted_requires_restart" | "accepted_reload_scheduled" | "rejected";
                 key: string;
                 reason: string;
             }[];
@@ -4655,6 +4673,10 @@ export interface components {
         };
         /** SearchResponse */
         SearchResponse: {
+            /**
+             * @description Aggregate across the queried agents; per-agent detail is available in
+             *      `index_status_by_agent` when the request spanned multiple agents.
+             */
             index_status: {
                 consumption_was_limited?: boolean;
                 /**
@@ -4696,7 +4718,67 @@ export interface components {
                  *      by design; not a durable health history.
                  */
                 skipped_error_count?: number;
+                /**
+                 * @description Machine-readable reasons the index is not currently fresh:
+                 *      `index_missing`, `dirty_marker`, `backfill_incomplete`, `outbox_lag`,
+                 *      `pending_sources`, `stale_projection`, `consume_error`. Empty when
+                 *      fresh. The background daemon self-heals every reason; they are
+                 *      diagnostic, not a manual-work order.
+                 */
+                stale_reasons?: string[];
             };
+            index_status_by_agent?: {
+                [key: string]: {
+                    consumption_was_limited?: boolean;
+                    /**
+                     * Format: int64
+                     * @description Highest applied contiguous runtime outbox `change_seq`.
+                     */
+                    cursor: number;
+                    freshness: string;
+                    /**
+                     * Format: int64
+                     * @description Monotonic produced watermark: highest `change_seq` ever appended for
+                     *      the agent. Unlike the drained-outbox maximum, it never returns to 0.
+                     */
+                    high_watermark: number;
+                    indexing_needed?: boolean;
+                    /**
+                     * Format: int64
+                     * @description Sequence distance `produced - applied`. Cross-agent global
+                     *      autoincrement makes this an upper-bound hint only; `pending_count` is
+                     *      the exact backlog metric.
+                     */
+                    lag: number;
+                    /** Format: date-time */
+                    last_indexed_at?: string | null;
+                    /**
+                     * Format: int64
+                     * @description Age of the oldest pending outbox row, the real propagation delay.
+                     */
+                    oldest_pending_age_ms?: number | null;
+                    /**
+                     * Format: int64
+                     * @description Exact pending outbox row count for this agent.
+                     */
+                    pending_count?: number;
+                    results_may_be_incomplete?: boolean;
+                    /**
+                     * Format: uint
+                     * @description Failures hit by this index handle's current consume pass. Transient
+                     *      by design; not a durable health history.
+                     */
+                    skipped_error_count?: number;
+                    /**
+                     * @description Machine-readable reasons the index is not currently fresh:
+                     *      `index_missing`, `dirty_marker`, `backfill_incomplete`, `outbox_lag`,
+                     *      `pending_sources`, `stale_projection`, `consume_error`. Empty when
+                     *      fresh. The background daemon self-heals every reason; they are
+                     *      diagnostic, not a manual-work order.
+                     */
+                    stale_reasons?: string[];
+                };
+            } | null;
             /** Format: uint */
             limit: number;
             query: string;
